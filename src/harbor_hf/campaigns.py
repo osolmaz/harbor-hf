@@ -54,6 +54,15 @@ class PlannedRun(FrozenModel):
     shards: list[PlannedShard]
 
 
+class CampaignRecoveryPolicy(FrozenModel):
+    max_active_waves: int
+    max_physical_executions_per_trial: int
+    retry_base_seconds: int
+    retry_max_seconds: int
+    cancellation_grace_seconds: int
+    spend_cap_microusd: int | None = None
+
+
 class CampaignPlan(FrozenModel):
     schema_version: Literal["harbor-hf/campaign-plan/v1alpha1"] = (
         "harbor-hf/campaign-plan/v1alpha1"
@@ -65,6 +74,7 @@ class CampaignPlan(FrozenModel):
     shard_count: int
     trial_count: int
     max_shards_per_wave: int
+    recovery_policy: CampaignRecoveryPolicy
     runs: list[PlannedRun]
 
     @model_validator(mode="after")
@@ -117,6 +127,7 @@ class CampaignLock(FrozenModel):
     plan_digest: str
     artifact_prefix: str
     max_shards_per_wave: int
+    recovery_policy: CampaignRecoveryPolicy
     runs: list[CampaignRunLock]
 
 
@@ -165,6 +176,16 @@ def build_campaign_plan(spec: ExperimentSpec) -> CampaignPlan:
         shard_count=sum(len(run.shards) for run in runs),
         trial_count=sum(len(shard.trials) for run in runs for shard in run.shards),
         max_shards_per_wave=spec.execution.max_shards_per_wave,
+        recovery_policy=CampaignRecoveryPolicy(
+            max_active_waves=spec.execution.max_active_waves,
+            max_physical_executions_per_trial=(
+                spec.execution.max_physical_executions_per_trial
+            ),
+            retry_base_seconds=spec.execution.retry_base_seconds,
+            retry_max_seconds=spec.execution.retry_max_seconds,
+            cancellation_grace_seconds=spec.execution.cancellation_grace_seconds,
+            spend_cap_microusd=spec.execution.spend_cap_microusd,
+        ),
         runs=runs,
     )
 
@@ -298,6 +319,7 @@ def build_campaign_lock(
         plan_digest=plan.plan_digest,
         artifact_prefix=f"campaigns/{campaign_id}",
         max_shards_per_wave=plan.max_shards_per_wave,
+        recovery_policy=plan.recovery_policy,
         runs=runs,
     )
 

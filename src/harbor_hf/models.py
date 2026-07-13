@@ -190,7 +190,19 @@ class ExecutionSpec(StrictModel):
     concurrent_trials: int = Field(default=1, ge=1)
     max_trials_per_shard: int = Field(default=64, ge=1)
     max_shards_per_wave: int = Field(default=8, ge=1)
+    max_active_waves: int = Field(default=64, ge=1)
+    max_physical_executions_per_trial: int = Field(default=3, ge=1)
+    retry_base_seconds: int = Field(default=30, ge=1)
+    retry_max_seconds: int = Field(default=1800, ge=1)
+    cancellation_grace_seconds: int = Field(default=0, ge=0)
+    spend_cap_microusd: int | None = Field(default=None, ge=0)
     timeout_seconds: int = Field(default=3600, ge=1)
+
+    @model_validator(mode="after")
+    def retry_backoff_is_bounded(self) -> ExecutionSpec:
+        if self.retry_base_seconds > self.retry_max_seconds:
+            raise ValueError("retry base seconds must not exceed retry maximum")
+        return self
 
 
 class ArtifactStoreSpec(StrictModel):

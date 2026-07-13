@@ -19,19 +19,74 @@ _MAX_COMMIT_ATTEMPTS = 8
 
 SubjectType = Literal["campaign", "run", "shard", "trial", "execution", "wave"]
 Producer = Literal["cli", "reconciler", "wave-controller", "watchdog", "publisher"]
+RetryCategory = Literal[
+    "lost",
+    "transient",
+    "quota",
+    "rate-limit",
+    "ambiguous",
+    "benchmark",
+    "configuration",
+    "authentication",
+    "cleanup",
+]
 EventKind = Literal[
     "campaign.submitted",
     "campaign.cancel-requested",
+    "campaign.draining",
+    "campaign.manual-intervention-required",
     "campaign.completed",
     "campaign.partial",
     "campaign.failed",
     "campaign.cancelled",
+    "run.queued",
+    "run.active",
+    "run.verifying",
+    "run.publishing",
+    "run.complete",
+    "run.invalid",
+    "run.failed-infrastructure",
+    "run.cancelled",
+    "shard.queued",
+    "shard.active",
+    "shard.verifying",
+    "shard.publishing",
+    "shard.complete",
+    "shard.invalid",
+    "shard.failed-infrastructure",
+    "shard.cancelled",
+    "trial.complete",
+    "trial.invalid",
+    "trial.cancelled",
+    "execution.started",
+    "execution.completed",
+    "execution.failed",
+    "execution.cancelled",
+    "wave.acquiring",
+    "wave.provisioning",
+    "wave.ready",
+    "wave.active",
+    "wave.draining",
+    "wave.cleaning",
+    "wave.closed",
+    "wave.cleanup-failed",
+    "spend.recorded",
     "action.reserved",
     "action.succeeded",
     "action.failed",
     "action.ambiguous",
 ]
-ActionKind = Literal["submit-wave", "cancel-wave", "publish-results"]
+ActionKind = Literal[
+    "submit-wave",
+    "retry-shard",
+    "cancel-execution",
+    "cancel-wave",
+    "drain-wave",
+    "cleanup-wave",
+    "publish-results",
+    "publish-summary",
+    "manual-intervention",
+]
 
 
 class ControlError(RuntimeError):
@@ -60,6 +115,40 @@ class TerminalPayload(FrozenModel):
     message: str | None = None
 
 
+class LifecyclePayload(FrozenModel):
+    parent_id: str | None = None
+    message: str | None = None
+
+
+class WaveLifecyclePayload(FrozenModel):
+    deployment_digest: str
+    provider: str = Field(min_length=1)
+    shard_ids: list[str]
+    estimated_cost_microusd: int = Field(default=0, ge=0)
+
+
+class ExecutionStartedPayload(FrozenModel):
+    trial_id: str
+    shard_id: str
+    physical_attempt: int = Field(ge=1)
+    wave_id: str | None = None
+    estimated_cost_microusd: int = Field(default=0, ge=0)
+
+
+class ExecutionOutcomePayload(FrozenModel):
+    trial_id: str
+    physical_attempt: int = Field(ge=1)
+    category: RetryCategory | None = None
+    spend_microusd: int = Field(default=0, ge=0)
+    retry_after_seconds: int | None = Field(default=None, ge=0)
+    message: str | None = None
+
+
+class SpendRecordedPayload(FrozenModel):
+    amount_microusd: int = Field(ge=0)
+    source_execution_id: str | None = None
+
+
 class ActionReservedPayload(FrozenModel):
     action_id: str
     action_key: str
@@ -77,9 +166,43 @@ EventPayload = (
     CampaignSubmittedPayload
     | CancellationPayload
     | TerminalPayload
+    | LifecyclePayload
+    | WaveLifecyclePayload
+    | ExecutionStartedPayload
+    | ExecutionOutcomePayload
+    | SpendRecordedPayload
     | ActionReservedPayload
     | ActionOutcomePayload
 )
+
+_CAMPAIGN_TERMINAL_KINDS = {
+    "campaign.completed",
+    "campaign.partial",
+    "campaign.failed",
+    "campaign.cancelled",
+}
+_WAVE_KINDS = {
+    "wave.acquiring",
+    "wave.provisioning",
+    "wave.ready",
+    "wave.active",
+    "wave.draining",
+    "wave.cleaning",
+    "wave.closed",
+    "wave.cleanup-failed",
+}
+_EXECUTION_OUTCOME_KINDS = {
+    "execution.completed",
+    "execution.failed",
+    "execution.cancelled",
+}
+_EXACT_PAYLOAD_TYPES: dict[str, type[BaseModel]] = {
+    "campaign.submitted": CampaignSubmittedPayload,
+    "campaign.cancel-requested": CancellationPayload,
+    "execution.started": ExecutionStartedPayload,
+    "spend.recorded": SpendRecordedPayload,
+    "action.reserved": ActionReservedPayload,
+}
 
 
 class CampaignEvent(FrozenModel):
@@ -94,20 +217,31 @@ class CampaignEvent(FrozenModel):
 
     @model_validator(mode="after")
     def payload_matches_kind(self) -> CampaignEvent:
-        expected: type[BaseModel]
-        if self.kind == "campaign.submitted":
-            expected = CampaignSubmittedPayload
-        elif self.kind == "campaign.cancel-requested":
-            expected = CancellationPayload
-        elif self.kind.startswith("campaign."):
-            expected = TerminalPayload
-        elif self.kind == "action.reserved":
-            expected = ActionReservedPayload
-        else:
-            expected = ActionOutcomePayload
+        expected = _payload_type(self.kind)
         if not isinstance(self.payload, expected):
             raise ValueError(f"event payload does not match {self.kind}")
+        prefix = self.kind.split(".", maxsplit=1)[0]
+        if prefix in {"campaign", "run", "shard", "trial", "execution", "wave"}:
+            if self.subject_type != prefix:
+                raise ValueError(f"event subject type does not match {self.kind}")
+        elif self.kind.startswith("action.") and self.subject_type != "campaign":
+            raise ValueError("action events must have a campaign subject")
         return self
+
+
+def _payload_type(kind: EventKind) -> type[BaseModel]:
+    exact = _EXACT_PAYLOAD_TYPES.get(kind)
+    if exact is not None:
+        return exact
+    if kind in _CAMPAIGN_TERMINAL_KINDS:
+        return TerminalPayload
+    if kind in _EXECUTION_OUTCOME_KINDS:
+        return ExecutionOutcomePayload
+    if kind in _WAVE_KINDS:
+        return WaveLifecyclePayload
+    if kind.startswith("action."):
+        return ActionOutcomePayload
+    return LifecyclePayload
 
 
 class IdentifierFactory(Protocol):
@@ -144,6 +278,8 @@ CampaignStatus = Literal[
     "queued",
     "active",
     "cancel_requested",
+    "draining",
+    "manual_intervention",
     "completed",
     "partial",
     "failed",
@@ -173,7 +309,7 @@ class CampaignProjection(FrozenModel):
 def project_campaign(
     lock: CampaignLock, events: list[CampaignEvent]
 ) -> CampaignProjection:
-    ordered = _deduplicate_and_sort(events)
+    ordered = ordered_events(events)
     if not ordered:
         raise ControlError("campaign has no submission event")
     first = ordered[0]
@@ -191,11 +327,13 @@ def project_campaign(
     for event in ordered[1:]:
         if status in {"completed", "partial", "failed", "cancelled"}:
             raise ControlError("campaign has events after a terminal transition")
+        if event.subject_type != "campaign":
+            continue
         status = _apply_event(lock, event, cast(CampaignStatus, status), actions)
     return CampaignProjection(
         campaign_id=lock.campaign_id,
         plan_digest=lock.plan_digest,
-        status=status,
+        status=cast(CampaignStatus, status),
         event_count=len(ordered),
         last_observed_at=ordered[-1].observed_at,
         actions=actions,
@@ -213,7 +351,13 @@ def _apply_event(
     if event.kind == "campaign.submitted":
         raise ControlError("campaign has multiple submission events")
     if event.kind == "campaign.cancel-requested":
+        if status in {"draining", "manual_intervention"}:
+            return status
         return "cancel_requested"
+    if event.kind == "campaign.draining":
+        return "draining"
+    if event.kind == "campaign.manual-intervention-required":
+        return "manual_intervention"
     if event.kind.startswith("campaign."):
         return cast(CampaignStatus, event.kind.removeprefix("campaign."))
     _apply_action_event(event, actions)
@@ -246,7 +390,7 @@ def _apply_action_event(
     )
 
 
-def _deduplicate_and_sort(events: list[CampaignEvent]) -> list[CampaignEvent]:
+def ordered_events(events: list[CampaignEvent]) -> list[CampaignEvent]:
     unique: dict[str, CampaignEvent] = {}
     for event in events:
         previous = unique.get(event.event_id)
