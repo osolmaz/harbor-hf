@@ -4,7 +4,7 @@ import hashlib
 import re
 import shlex
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -16,10 +16,18 @@ _GITHUB_REPOSITORY = re.compile(
     r"^(?:https://github\.com/)?"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
+_LEASE_BUCKET_NAME = "harbor-hf-leases"
+_LEASE_MOUNT_PATH = "/harbor-hf-leases"
 
 
 class TextRunner(Protocol):
     def run_text(self, command: list[str]) -> str: ...
+
+
+class BucketApi(Protocol):
+    def create_bucket(self, bucket_id: str, **kwargs: object) -> object: ...
+
+    def bucket_info(self, bucket_id: str) -> object: ...
 
 
 class Submission(BaseModel):
@@ -62,6 +70,22 @@ def bucket_uri(bucket: str) -> str:
     return f"hf://buckets/{bucket.removeprefix('buckets/')}"
 
 
+def endpoint_lease_bucket(namespace: str) -> str:
+    return f"{namespace}/{_LEASE_BUCKET_NAME}"
+
+
+def ensure_private_lease_bucket(namespace: str, *, api: BucketApi | None = None) -> str:
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = cast(BucketApi, HfApi())
+    bucket = endpoint_lease_bucket(namespace)
+    api.create_bucket(bucket, private=True, exist_ok=True)
+    if getattr(api.bucket_info(bucket), "private", None) is not True:
+        raise ValueError(f"endpoint lease bucket {bucket} must be private")
+    return bucket
+
+
 def endpoint_lease_label(lock: RunLock) -> str:
     endpoint = lock.deployment.endpoint
     if endpoint is None:
@@ -102,6 +126,8 @@ def build_submit_command(
         f"{input_dir}:/input:ro",
         "--volume",
         f"{bucket_uri(bucket)}:/output:rw",
+        "--volume",
+        f"{bucket_uri(endpoint_lease_bucket(job.namespace))}:{_LEASE_MOUNT_PATH}:rw",
         "--",
         job.image,
         *locked_source_command(
@@ -122,7 +148,9 @@ def submit(
     input_dir: Path,
     bucket: str,
     runner: TextRunner,
+    bucket_api: BucketApi | None = None,
 ) -> Submission:
+    ensure_private_lease_bucket(lock.remote.job.namespace, api=bucket_api)
     command = build_submit_command(lock, input_dir=input_dir, bucket=bucket)
     output = runner.run_text(command)
     match = _JOB_ID.search(output)

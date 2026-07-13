@@ -173,8 +173,10 @@ begins. The pinned Harbor revision must expose the `hf-sandbox` optional
 dependency; the worker verifies that capability before it resumes the endpoint.
 
 For endpoint-backed runs, `remote.job.namespace` must equal the selected
-endpoint namespace. This gives every controller and watchdog targeting that
-endpoint one shared HF Jobs namespace for lease election.
+endpoint namespace. Submission creates or verifies a private
+`<namespace>/harbor-hf-leases` Bucket and mounts it into the controller and
+watchdog Jobs. The watchdog uses an endpoint-specific directory in that Bucket
+as an atomic lease and releases it only after verified cleanup.
 
 The controller Job timeout is limited to 85,800 seconds. The remaining 600
 seconds within HF Jobs' 86,400-second maximum are reserved for watchdog startup
@@ -205,10 +207,11 @@ Prefixed API, access, and private key names are treated as secrets, including
 camel-case and uppercase environment forms.
 
 Harbor's raw job tree is created on Job-local storage rather than the bucket
-mount. Only the finalized, scrubbed tree is copied to its immutable bucket
-prefix, and the terminal marker is copied last. If the controller is killed
-before finalization, raw sessions and logs disappear with the Job instead of
-remaining in the bucket.
+mount. The worker atomically reserves the immutable run prefix before remote
+work. Only the finalized, scrubbed tree is copied there, and the root terminal
+marker is copied last. Nested task markers are preserved. If the controller is
+killed before finalization, raw sessions and logs disappear with the Job
+instead of remaining in the bucket.
 
 ## Loading And Resolution
 

@@ -150,6 +150,8 @@ def _file_contains(path: Path, needle: bytes) -> bool:
 
 
 def _scrub_file(path: Path, needle: bytes) -> bool:
+    if not _file_contains(path, needle):
+        return False
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".harbor-hf-redact-", dir=path.parent
     )

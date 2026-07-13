@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import shutil
@@ -10,7 +11,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Protocol, cast
@@ -37,6 +38,7 @@ from harbor_hf.process import (
 )
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
+    endpoint_lease_bucket,
     endpoint_lease_label,
     endpoint_lease_label_for,
     github_repository,
@@ -54,16 +56,6 @@ class WorkerError(RuntimeError):
 
 class JobInspector(Protocol):
     def inspect_job(self, *, job_id: str, namespace: str | None = None) -> object: ...
-
-
-class LeaseApi(Protocol):
-    def list_jobs(
-        self,
-        *,
-        status: list[str],
-        labels: dict[str, str],
-        namespace: str,
-    ) -> Iterable[object]: ...
 
 
 class WatchdogApi(JobInspector, Protocol):
@@ -306,7 +298,6 @@ def run_worker(
     stream_runner: Callable[..., int] = run_streaming,
     source_preparer: Callable[[SourcePin, Path, CommandRunner], None] | None = None,
     watchdog_launcher: Callable[[RunLock, EndpointRef, str], str] | None = None,
-    lease_validator: Callable[[RunLock, str], None] | None = None,
 ) -> Path:
     spec = load_experiment(manifest_path)
     lock = RunLock.model_validate_json(
@@ -321,21 +312,24 @@ def run_worker(
     os.environ["HF_TOKEN"] = token
 
     destination = output_root / lock.artifact_prefix
-    if destination.exists():
-        raise FileExistsError(destination)
-    with tempfile.TemporaryDirectory(prefix="harbor-hf-run-") as staging:
-        return _run_staged_worker(
-            manifest_path,
-            lock,
-            Path(staging) / "run",
-            destination,
-            token,
-            runner=runner,
-            stream_runner=stream_runner,
-            source_preparer=source_preparer,
-            watchdog_launcher=watchdog_launcher,
-            lease_validator=lease_validator,
-        )
+    _reserve_evidence(destination)
+    try:
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-run-") as staging:
+            return _run_staged_worker(
+                manifest_path,
+                lock,
+                Path(staging) / "run",
+                destination,
+                token,
+                runner=runner,
+                stream_runner=stream_runner,
+                source_preparer=source_preparer,
+                watchdog_launcher=watchdog_launcher,
+            )
+    except Exception:
+        if (destination / "_RESERVED").is_file():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
 
 
 def _run_staged_worker(
@@ -349,7 +343,6 @@ def _run_staged_worker(
     stream_runner: Callable[..., int],
     source_preparer: Callable[[SourcePin, Path, CommandRunner], None] | None,
     watchdog_launcher: Callable[[RunLock, EndpointRef, str], str] | None,
-    lease_validator: Callable[[RunLock, str], None] | None,
 ) -> Path:
     root.mkdir(parents=True, exist_ok=False)
     (root / "harbor-jobs").mkdir()
@@ -363,14 +356,11 @@ def _run_staged_worker(
     manager = EndpointManager(endpoint.namespace, endpoint.name, process_runner)
     error: Exception | None = None
     cleanup_error: Exception | None = None
-    owns_endpoint = False
+    watchdog_started = False
 
     append_event(events, "worker_started", run_id=lock.run_id)
     try:
         require_executable("git")
-        (lease_validator or assert_exclusive_endpoint_lease)(lock, token)
-        owns_endpoint = True
-        append_event(events, "endpoint_lease_acquired")
         harbor_source = (
             root.parent / "sources" / (f"harbor-{lock.remote.harbor.source.revision}")
         )
@@ -384,6 +374,8 @@ def _run_staged_worker(
             endpoint,
             token,
         )
+        watchdog_started = True
+        append_event(events, "endpoint_lease_acquired", watchdog_job_id=watchdog_id)
         append_event(events, "cleanup_watchdog_started", job_id=watchdog_id)
         _execute_benchmark(
             root,
@@ -397,7 +389,7 @@ def _run_staged_worker(
     except Exception as caught:
         error = caught
     finally:
-        if owns_endpoint:
+        if watchdog_started:
             append_event(events, "endpoint_pause_requested")
             try:
                 final_snapshot = manager.pause_and_verify()
@@ -485,35 +477,6 @@ def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
         raise WorkerError("run lock fields do not match the resolved manifest cell")
 
 
-def assert_exclusive_endpoint_lease(
-    lock: RunLock,
-    token: str,
-    *,
-    api: LeaseApi | None = None,
-) -> None:
-    controller_job_id = os.environ.get("JOB_ID", "")
-    if not controller_job_id:
-        raise WorkerError("controller JOB_ID is required for endpoint lease")
-    if api is None:
-        from huggingface_hub import HfApi
-
-        api = HfApi(token=token)
-    active_jobs = api.list_jobs(
-        status=["SCHEDULING", "RUNNING"],
-        labels={"harbor-hf-endpoint": endpoint_lease_label(lock)},
-        namespace=lock.remote.job.namespace,
-    )
-    active_ids = sorted(
-        job_id
-        for job in active_jobs
-        if isinstance((job_id := getattr(job, "id", None)), str)
-    )
-    if controller_job_id not in active_ids:
-        raise WorkerError("controller Job is not visible in its endpoint lease")
-    if active_ids[0] != controller_job_id:
-        raise WorkerError(f"endpoint lease is held by controller {active_ids[0]}")
-
-
 def _publish_success(root: Path, events: Path, token: str) -> None:
     append_event(events, "run_succeeded")
     try:
@@ -539,19 +502,34 @@ def _publish_evidence(source: Path, destination: Path) -> None:
     markers = [name for name in ("_FAILED", "_SUCCESS") if (source / name).is_file()]
     if len(markers) != 1:
         raise WorkerError("finalized evidence must have exactly one terminal marker")
-    destination.mkdir(parents=True, exist_ok=False)
+    if not (destination / "_RESERVED").is_file():
+        raise WorkerError("run evidence destination is not reserved")
     try:
+        source_root = source.resolve()
         shutil.copytree(
             source,
             destination,
             dirs_exist_ok=True,
-            ignore=lambda _directory, names: [
-                name for name in names if name in {"_FAILED", "_SUCCESS"}
-            ],
+            ignore=lambda directory, names: (
+                [name for name in names if name in {"_FAILED", "_SUCCESS"}]
+                if Path(directory).resolve() == source_root
+                else []
+            ),
         )
+        (destination / "_RESERVED").unlink()
         shutil.copyfile(source / markers[0], destination / markers[0])
     except Exception:
         shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def _reserve_evidence(destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.mkdir(exist_ok=False)
+    try:
+        (destination / "_RESERVED").write_text("\n", encoding="utf-8")
+    except Exception:
+        destination.rmdir()
         raise
 
 
@@ -668,7 +646,7 @@ def prepare_locked_source(
 
 
 def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) -> str:
-    from huggingface_hub import HfApi
+    from huggingface_hub import HfApi, Volume
 
     controller_job_id = os.environ.get("JOB_ID")
     if not controller_job_id:
@@ -692,6 +670,8 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
         lock.remote.job.token_secret_name,
         "--timeout-seconds",
         str(lock.remote.job.timeout_seconds),
+        "--lease-root",
+        "/harbor-hf-leases",
     )
     api = HfApi(token=token)
     info = api.run_job(
@@ -704,6 +684,14 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
             "harbor-hf-watchdog": lock.run_id,
             "harbor-hf-endpoint": endpoint_lease_label(lock),
         },
+        volumes=[
+            Volume(
+                type="bucket",
+                source=endpoint_lease_bucket(lock.remote.job.namespace),
+                mount_path="/harbor-hf-leases",
+                read_only=False,
+            )
+        ],
         namespace=lock.remote.job.namespace,
     )
     job_id = getattr(info, "id", None)
@@ -757,6 +745,7 @@ def run_endpoint_watchdog(
     run_id: str,
     token_secret_name: str,
     timeout_seconds: int,
+    lease_root: Path,
     api: WatchdogApi | None = None,
     runner: CommandRunner | None = None,
     sleep: Callable[[float], None] = time.sleep,
@@ -774,17 +763,25 @@ def run_endpoint_watchdog(
     watchdog_job_id = os.environ.get("JOB_ID", "")
     if not watchdog_job_id:
         raise WorkerError("watchdog JOB_ID is required")
-    api.update_job_labels(
-        job_id=watchdog_job_id,
-        labels={
-            "harbor-hf-watchdog": run_id,
-            "harbor-hf-endpoint": endpoint_lease_label_for(
-                endpoint_namespace, endpoint_name
-            ),
-            _WATCHDOG_READY_LABEL: "true",
-        },
-        namespace=controller_namespace,
+    lease = _acquire_endpoint_lease(
+        lease_root,
+        endpoint_namespace,
+        endpoint_name,
+        controller_job_id,
+        watchdog_job_id,
     )
+    try:
+        _mark_watchdog_ready(
+            api,
+            watchdog_job_id,
+            controller_namespace,
+            endpoint_namespace,
+            endpoint_name,
+            run_id,
+        )
+    except Exception:
+        _release_endpoint_lease(lease, controller_job_id, watchdog_job_id)
+        raise
     deadline = monotonic() + timeout_seconds
     terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
     while monotonic() < deadline:
@@ -806,7 +803,74 @@ def run_endpoint_watchdog(
         endpoint_name,
         runner or SubprocessRunner(),
     )
-    return manager.pause_and_verify()
+    snapshot = manager.pause_and_verify()
+    _release_endpoint_lease(lease, controller_job_id, watchdog_job_id)
+    return snapshot
+
+
+def _mark_watchdog_ready(
+    api: WatchdogApi,
+    watchdog_job_id: str,
+    controller_namespace: str,
+    endpoint_namespace: str,
+    endpoint_name: str,
+    run_id: str,
+) -> None:
+    api.update_job_labels(
+        job_id=watchdog_job_id,
+        labels={
+            "harbor-hf-watchdog": run_id,
+            "harbor-hf-endpoint": endpoint_lease_label_for(
+                endpoint_namespace, endpoint_name
+            ),
+            _WATCHDOG_READY_LABEL: "true",
+        },
+        namespace=controller_namespace,
+    )
+
+
+def _acquire_endpoint_lease(
+    lease_root: Path,
+    endpoint_namespace: str,
+    endpoint_name: str,
+    controller_job_id: str,
+    watchdog_job_id: str,
+) -> Path:
+    lease_root.mkdir(parents=True, exist_ok=True)
+    lease = lease_root / endpoint_lease_label_for(endpoint_namespace, endpoint_name)
+    try:
+        lease.mkdir()
+    except FileExistsError as error:
+        raise WorkerError("endpoint lease is held by another watchdog") from error
+    try:
+        write_json(
+            lease / "owner.json",
+            {
+                "controller_job_id": controller_job_id,
+                "watchdog_job_id": watchdog_job_id,
+            },
+        )
+    except Exception:
+        shutil.rmtree(lease, ignore_errors=True)
+        raise
+    return lease
+
+
+def _release_endpoint_lease(
+    lease: Path, controller_job_id: str, watchdog_job_id: str
+) -> None:
+    owner_path = lease / "owner.json"
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkerError("endpoint lease owner cannot be verified") from error
+    if owner != {
+        "controller_job_id": controller_job_id,
+        "watchdog_job_id": watchdog_job_id,
+    }:
+        raise WorkerError("endpoint lease ownership changed before release")
+    owner_path.unlink()
+    lease.rmdir()
 
 
 def _job_stage(info: object) -> str:
@@ -967,10 +1031,14 @@ def validate_harbor_result(
         if not isinstance(rewards, Mapping) or not rewards:
             raise WorkerError(f"Harbor trial {task_name} has no verifier rewards")
         if not all(
-            isinstance(value, int | float) and not isinstance(value, bool)
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
             for value in rewards.values()
         ):
-            raise WorkerError(f"Harbor trial {task_name} rewards must be numeric")
+            raise WorkerError(
+                f"Harbor trial {task_name} rewards must be finite numbers"
+            )
         verified.append({"task_name": task_name, "rewards": dict(rewards)})
     return {
         "trial_count": len(verified),

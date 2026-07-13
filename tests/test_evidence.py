@@ -203,7 +203,7 @@ def test_stream_helpers_use_bounded_reads_and_private_temporary_prefix(
     assert _file_contains(path, b"missing") is False
     assert _scrub_file(path, b"missing") is False
     assert set(read_sizes) == {2}
-    assert prefixes == [".harbor-hf-redact-"]
+    assert prefixes == []
 
 
 def test_json_and_event_writers_create_nested_canonical_records(
@@ -243,3 +243,16 @@ def test_archive_and_empty_secret_operations(tmp_path: Path) -> None:
 
     with tarfile.open(destination, "r:gz") as archive:
         assert archive.getnames() == ["source", "source/value.txt"]
+
+
+def test_scrub_missing_secret_does_not_create_temporary_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "large.bin").write_bytes(b"ordinary evidence")
+
+    def fail_mkstemp(**_kwargs: object) -> tuple[int, str]:
+        raise AssertionError("temporary copy should not be created")
+
+    monkeypatch.setattr("harbor_hf.evidence.tempfile.mkstemp", fail_mkstemp)
+
+    assert scrub_secret(tmp_path, "missing-secret") == []

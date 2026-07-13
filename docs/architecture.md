@@ -65,15 +65,18 @@ not execute benchmark tasks. Provider-backed runs will skip endpoint
 provisioning but retain request, quota, retry, and accounting state.
 
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
-derived from the endpoint namespace and name. Before creating a watchdog or
-changing endpoint state, a controller lists active Jobs in that label group.
-The lowest active Job ID is the sole lease holder. The watchdog remains in the
-same lease group until it has verified endpoint cleanup, preventing a new
-controller from taking ownership during cleanup. A controller that does not
-hold the lease fails without resuming or pausing the endpoint, so overlapping
-submissions cannot interrupt the elected run's endpoint.
-Controllers and watchdogs must run in the endpoint namespace so every
-contender queries the same lease scope.
+derived from the endpoint namespace and name. They also mount one private,
+namespace-level `harbor-hf-leases` Bucket. A watchdog atomically creates the
+endpoint's lease directory before publishing its readiness handshake. Because
+directory creation is exclusive, two snapshots of the Jobs API cannot elect
+two owners. A competing watchdog exits before its controller changes endpoint
+state.
+
+The lease records both controller and watchdog Job IDs. It remains present
+while the watchdog observes the controller and is removed only after the
+endpoint reports `paused` with zero ready replicas. Ownership is revalidated
+before removal. If cleanup cannot be verified, the lease remains fail-closed
+and blocks another run from inheriting an endpoint whose state is unknown.
 
 ### Harbor Adapter
 
@@ -88,6 +91,10 @@ resolved configuration, endpoint snapshots, Harbor output, trajectories,
 sessions, verifier records, logs, and checksums are written under an immutable
 run prefix. Sanitized run evidence is published after validation and resource
 cleanup, and `_SUCCESS` is written only for a complete run.
+The worker first reserves the immutable run prefix with exclusive directory
+creation. Duplicate run IDs therefore fail before source preparation, endpoint
+work, or failure publication. Terminal markers are delayed only at the run
+root; marker-shaped files within Harbor task artifacts are preserved.
 
 Raw Harbor output is staged on the controller Job's local filesystem, outside
 the bucket mount. After endpoint cleanup, the controller redacts secret values,
@@ -182,11 +189,12 @@ label written from inside the watchdog's monitoring process; a submitted or
 merely running Job is not sufficient. The watchdog observes the controller Job
 and pauses the endpoint after the controller terminates or its own deadline
 expires. The controller also pauses the endpoint after its last active shard in
-a `finally` path, but only after it has acquired the endpoint lease. A controller
-that loses lease election records skipped cleanup and never changes endpoint
-state. Cleanup success is part of endpoint run completion, not an optional
-maintenance action. Provider-backed runs have no endpoint lease but still close
-worker resources and record final usage and request state.
+a `finally` path, but only after its watchdog has acquired the endpoint lease. A
+controller whose watchdog cannot acquire the lease records skipped cleanup and
+never changes endpoint state. Cleanup success is part of endpoint run
+completion, not an optional maintenance action. Provider-backed runs have no
+endpoint lease but still close worker resources and record final usage and
+request state.
 
 The worker verifies `status.state = paused` and `readyReplica = 0` before it
 writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may

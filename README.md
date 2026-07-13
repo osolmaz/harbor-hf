@@ -12,9 +12,11 @@ archives evidence to an HF Bucket, and verifies that the endpoint is paused
 before declaring success. Before resuming an endpoint, it starts an independent
 HF Job watchdog, waits for its readiness handshake, and then resumes the
 endpoint. The watchdog pauses the endpoint if the controller exits or is killed.
-Controllers and watchdogs targeting the same endpoint are labeled as one lease
-group. Only the elected run may change endpoint state; other controllers fail
-without pausing an endpoint owned by the active run.
+Controllers and watchdogs targeting the same endpoint share an atomic lease in
+the namespace's private `harbor-hf-leases` Bucket. The watchdog acquires the
+lease before it advertises readiness and releases it only after verified
+endpoint cleanup. A competing watchdog fails before its controller can resume
+or pause the endpoint.
 
 ## Install
 
@@ -68,6 +70,9 @@ health route before Harbor starts.
 Harbor writes raw sessions and logs only to Job-local storage. The controller
 redacts and validates that staging tree before publishing it to the bucket, and
 copies `_SUCCESS` or `_FAILED` last.
+Submission creates or verifies the namespace-level lease Bucket and refuses to
+use it if it is public. Each run prefix is atomically reserved before remote
+work, so duplicate run IDs cannot overwrite or invalidate one another.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution

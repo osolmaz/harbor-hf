@@ -126,6 +126,8 @@ def test_watchdog_command_reports_verified_pause(
             "HF_TOKEN",
             "--timeout-seconds",
             "60",
+            "--lease-root",
+            "/leases",
         ],
     )
 

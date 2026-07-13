@@ -9,6 +9,7 @@ from harbor_hf.submission import (
     build_submit_command,
     endpoint_lease_label,
     endpoint_lease_label_for,
+    ensure_private_lease_bucket,
     github_archive,
     github_repository,
     locked_source_command,
@@ -26,6 +27,20 @@ class FakeRunner:
         return self.output
 
 
+class FakeBucketApi:
+    def __init__(self, *, private: bool = True) -> None:
+        self.private = private
+        self.created: list[tuple[str, dict[str, object]]] = []
+
+    def create_bucket(self, bucket_id: str, **kwargs: object) -> object:
+        self.created.append((bucket_id, kwargs))
+        return object()
+
+    def bucket_info(self, bucket_id: str) -> object:
+        assert bucket_id == "osolmaz/harbor-hf-leases"
+        return type("BucketInfo", (), {"private": self.private})()
+
+
 def test_build_submit_command_contains_only_secret_name(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
@@ -35,7 +50,7 @@ def test_build_submit_command_contains_only_secret_name(
         lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
     )
 
-    assert command[:22] == [
+    assert command[:24] == [
         "hf",
         "jobs",
         "run",
@@ -56,14 +71,16 @@ def test_build_submit_command_contains_only_secret_name(
         f"{tmp_path}:/input:ro",
         "--volume",
         "hf://buckets/osolmaz/benchmark-runs:/output:rw",
+        "--volume",
+        "hf://buckets/osolmaz/harbor-hf-leases:/harbor-hf-leases:rw",
         "--",
         "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
     ]
-    assert command[22:25] == ["bash", "-lc", command[24]]
-    assert "git clone --filter=blob:none --no-checkout" in command[24]
-    assert "uv run --project" in command[24]
-    assert "--locked" in command[24]
-    assert command[25:] == [
+    assert command[24:27] == ["bash", "-lc", command[26]]
+    assert "git clone --filter=blob:none --no-checkout" in command[26]
+    assert "uv run --project" in command[26]
+    assert "--locked" in command[26]
+    assert command[27:] == [
         "locked-source",
         "harbor-hf",
         "worker",
@@ -108,16 +125,21 @@ def test_endpoint_lease_label_requires_endpoint_binding(
 def test_submit_parses_job_id(remote_spec: ExperimentSpec, tmp_path: Path) -> None:
     lock = build_run_lock(remote_spec, run_id="run-1")
     runner = FakeRunner("Job started: 0123456789abcdef01234567\n")
+    bucket_api = FakeBucketApi()
 
     result = submit(
         lock,
         input_dir=tmp_path,
         bucket="osolmaz/benchmark-runs",
         runner=runner,
+        bucket_api=bucket_api,
     )
 
     assert result.job_id == "0123456789abcdef01234567"
     assert runner.command is not None
+    assert bucket_api.created == [
+        ("osolmaz/harbor-hf-leases", {"private": True, "exist_ok": True})
+    ]
 
 
 def test_submit_rejects_missing_job_id(
@@ -131,7 +153,36 @@ def test_submit_rejects_missing_job_id(
             input_dir=tmp_path,
             bucket="osolmaz/benchmark-runs",
             runner=FakeRunner("submitted"),
+            bucket_api=FakeBucketApi(),
         )
+
+
+def test_submit_ensures_private_shared_lease_bucket() -> None:
+    api = FakeBucketApi()
+
+    assert ensure_private_lease_bucket("osolmaz", api=api) == (
+        "osolmaz/harbor-hf-leases"
+    )
+    assert api.created == [
+        ("osolmaz/harbor-hf-leases", {"private": True, "exist_ok": True})
+    ]
+
+
+def test_submit_builds_default_authenticated_bucket_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeBucketApi()
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: api)
+
+    assert ensure_private_lease_bucket("osolmaz") == "osolmaz/harbor-hf-leases"
+    assert api.created == [
+        ("osolmaz/harbor-hf-leases", {"private": True, "exist_ok": True})
+    ]
+
+
+def test_submit_rejects_public_lease_bucket() -> None:
+    with pytest.raises(ValueError, match="must be private"):
+        ensure_private_lease_bucket("osolmaz", api=FakeBucketApi(private=False))
 
 
 def test_source_and_bucket_normalization() -> None:

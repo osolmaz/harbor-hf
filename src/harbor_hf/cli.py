@@ -125,6 +125,7 @@ def watchdog(
     run_id: Annotated[str, typer.Option("--run-id")],
     token_secret_name: Annotated[str, typer.Option("--token-secret-name")],
     timeout_seconds: Annotated[int, typer.Option("--timeout-seconds", min=1)],
+    lease_root: Annotated[Path, typer.Option("--lease-root", file_okay=False)],
 ) -> None:
     """Pause an endpoint after its controller Job exits or times out."""
     try:
@@ -136,6 +137,7 @@ def watchdog(
             run_id=run_id,
             token_secret_name=token_secret_name,
             timeout_seconds=timeout_seconds,
+            lease_root=lease_root,
         )
     except (OSError, ValueError, WorkerError) as error:
         typer.echo(f"Error: {error}", err=True)
