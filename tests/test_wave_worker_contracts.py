@@ -290,7 +290,7 @@ def test_publish_immutable_file_avoids_hf_mount_reserved_prefix(
     original_copyfile = wave_worker.shutil.copyfile
     temporary_names: list[str] = []
 
-    def reject_reserved_prefix(source_path: Path, destination_path: Path) -> str:
+    def reject_reserved_prefix(source_path: Path, destination_path: Path) -> Path:
         temporary_names.append(destination_path.name)
         if destination_path.name.startswith("._"):
             raise PermissionError("HF bucket mounts reserve the ._ prefix")
