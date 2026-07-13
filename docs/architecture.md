@@ -100,6 +100,21 @@ If publishing the readiness label returns an ambiguous provider error, the
 watchdog also retains the lease, waits for the controller to exit or time out,
 verifies endpoint pause, and only then releases ownership.
 
+### Endpoint Provisioner
+
+The [endpoint provisioning boundary](endpoint-provisioning.md) converts locked
+model and deployment profiles into deterministic campaign-scoped managed
+identities and exact effective Hugging Face Endpoint configuration. Its typed
+port supports create, inspect/adopt, pause, and explicit delete without
+depending on SDK response models. Adoption requires managed identity, complete
+configuration equality, and paused-zero-ready state. Ambiguous create outcomes
+are resolved by inspecting the deterministic name rather than issuing another
+create.
+
+This boundary is intentionally independent of the future wave controller. A
+wave must still acquire the endpoint lease and start the watchdog before resume
+or shard execution.
+
 ### Harbor Adapter
 
 Harbor remains the only benchmark execution engine. The adapter translates a

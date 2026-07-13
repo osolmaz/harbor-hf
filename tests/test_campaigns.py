@@ -9,6 +9,7 @@ from harbor_hf.campaigns import (
     build_campaign_plan,
     campaign_json_schemas,
 )
+from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import ExperimentSpec, MatrixRule
 
 
@@ -21,6 +22,9 @@ def test_builds_content_addressed_campaign_plan(remote_spec: ExperimentSpec) -> 
     assert plan.shard_count == 1
     assert plan.trial_count == 1
     assert plan.runs[0].shards[0].trials[0].logical_attempt == 1
+    assert plan.runs[0].deployment_digest == deployment_digest(
+        remote_spec.matrix.models[0], remote_spec.matrix.deployments[0]
+    )
 
 
 def test_shards_ordered_task_attempts_deterministically(

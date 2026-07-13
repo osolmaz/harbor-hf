@@ -123,7 +123,9 @@ policy. Harbor remains responsible for task execution and verification.
 The [architecture](docs/architecture.md) describes the execution and storage
 boundaries. The [run specification](docs/run-spec.md) defines the portable
 manifest, and the [implementation plan](docs/implementation-plan.md) tracks the
-path to remote execution.
+path to remote execution. The
+[endpoint provisioning contract](docs/endpoint-provisioning.md) documents the
+deterministic create/adopt/pause/delete slice used by future deployment waves.
 
 ## License
 

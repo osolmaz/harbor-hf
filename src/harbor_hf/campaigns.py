@@ -10,6 +10,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import (
     AgentProfile,
     DeploymentProfile,
@@ -218,11 +219,8 @@ def _plan_run(
     ],
 ) -> PlannedRun:
     models, deployments, agents = profiles
-    deployment_digest = _digest(
-        {
-            "model": _dump_profile(models[cell.model]),
-            "deployment": _dump_profile(deployments[cell.deployment]),
-        }
+    resolved_deployment_digest = deployment_digest(
+        models[cell.model], deployments[cell.deployment]
     )
     cell_digest = _digest(
         {
@@ -247,7 +245,7 @@ def _plan_run(
     ]
     return PlannedRun(
         cell_digest=cell_digest,
-        deployment_digest=deployment_digest,
+        deployment_digest=resolved_deployment_digest,
         model=cell.model,
         deployment=cell.deployment,
         agent=cell.agent,
