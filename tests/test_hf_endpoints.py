@@ -178,7 +178,7 @@ def test_create_maps_every_effective_field_and_resolves_secrets(
             "healthRoute": "/ready",
             "port": 8080,
         },
-        "container_command": desired.configuration.model.command,
+        "container_command": None,
         "container_args": desired.configuration.model.arguments,
         "env": desired.configuration.model.environment,
         "secrets": {"HF_TOKEN": "value-for-HF_TOKEN"},
