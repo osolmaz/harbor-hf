@@ -85,6 +85,21 @@ def test_submit_reports_process_failure_without_traceback(
     assert result.stderr == "Error: submission failed\n"
 
 
+def test_submit_reports_malformed_job_output_without_traceback(
+    remote_manifest: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("HF Jobs submission did not return a job ID")
+
+    monkeypatch.setattr("harbor_hf.cli.submit_job", fail)
+
+    result = runner.invoke(app, ["submit", str(remote_manifest)])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Error: HF Jobs submission did not return a job ID\n"
+
+
 def test_watchdog_command_reports_verified_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

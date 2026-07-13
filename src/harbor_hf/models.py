@@ -7,6 +7,27 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
 _CONTROLLER_HEADROOM_SECONDS = 4200
+_SENSITIVE_ENVIRONMENT_KEYS = frozenset(
+    {
+        "authorization",
+        "credential",
+        "credentials",
+        "api_key",
+        "access_key",
+        "password",
+        "password_value",
+        "private_key",
+        "secret",
+        "secrets",
+        "token",
+    }
+)
+_SENSITIVE_ENVIRONMENT_SUFFIXES = (
+    "_credential",
+    "_password",
+    "_secret",
+    "_token",
+)
 
 
 class StrictModel(BaseModel):
@@ -52,6 +73,21 @@ class EngineSpec(StrictModel):
     arguments: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     secret_names: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def environment_contains_no_inline_secrets(self) -> EngineSpec:
+        declared = set(self.secret_names)
+        inline = [
+            key
+            for key in self.environment
+            if key in declared or _is_sensitive_environment_key(key)
+        ]
+        if inline:
+            raise ValueError(
+                "engine environment must not contain inline secret values: "
+                + ", ".join(sorted(inline))
+            )
+        return self
 
 
 class EndpointRef(StrictModel):
@@ -171,3 +207,10 @@ class ExperimentSpec(StrictModel):
                 f"{_CONTROLLER_HEADROOM_SECONDS} seconds"
             )
         return self
+
+
+def _is_sensitive_environment_key(key: str) -> bool:
+    normalized = key.replace("-", "_").lower()
+    return normalized in _SENSITIVE_ENVIRONMENT_KEYS or normalized.endswith(
+        _SENSITIVE_ENVIRONMENT_SUFFIXES
+    )

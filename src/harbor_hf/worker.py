@@ -577,12 +577,12 @@ def wait_watchdog_ready(
     terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
     while True:
         info = api.inspect_job(job_id=job_id, namespace=namespace)
-        labels = getattr(info, "labels", None)
-        if isinstance(labels, Mapping) and labels.get(_WATCHDOG_READY_LABEL) == "true":
-            return
         stage = _job_stage(info)
         if stage in terminal:
             raise WorkerError(f"cleanup watchdog exited before readiness: {stage}")
+        labels = getattr(info, "labels", None)
+        if isinstance(labels, Mapping) and labels.get(_WATCHDOG_READY_LABEL) == "true":
+            return
         if monotonic() >= deadline:
             raise WorkerError("cleanup watchdog readiness timed out")
         sleep(poll_seconds)

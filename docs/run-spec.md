@@ -94,7 +94,8 @@ precision belong to the deployment profile because they are runtime choices.
 
 Deployment `engine.environment` contains non-secret values. `secret_names`
 contains environment-variable names that the remote Job or Endpoint must inject.
-Secret values are invalid manifest content.
+Secret-like keys and keys declared in `secret_names` are rejected from
+`engine.environment`; credentials must be injected by the remote platform.
 
 Provider-specific values belong in `parameters`. They must be representable as
 JSON and are preserved in the resolved lock.

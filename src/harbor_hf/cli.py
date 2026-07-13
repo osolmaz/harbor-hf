@@ -95,7 +95,7 @@ def submit(
                     bucket=spec.artifacts.bucket,
                     runner=SubprocessRunner(),
                 )
-            except ProcessError as error:
+            except (ProcessError, ValueError) as error:
                 typer.echo(f"Error: {error}", err=True)
                 raise typer.Exit(code=1) from error
     typer.echo(json.dumps(result.model_dump(mode="json"), indent=2))

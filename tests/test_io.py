@@ -6,6 +6,7 @@ from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import (
     AgentProfile,
     BenchmarkSpec,
+    EngineSpec,
     ExperimentSpec,
     RemoteJobSpec,
 )
@@ -94,3 +95,25 @@ def test_agent_revision_metadata_is_explicit() -> None:
             revision_kind="package",
             reported_version="different",
         )
+
+
+@pytest.mark.parametrize("key", ["HF_TOKEN", "api-key", "PASSWORD"])
+def test_engine_environment_rejects_inline_secret_values(key: str) -> None:
+    with pytest.raises(ValueError, match="must not contain inline secret values"):
+        EngineSpec(
+            name="vllm",
+            image="image",
+            environment={key: "credential"},
+            secret_names=["HF_TOKEN"],
+        )
+
+
+def test_engine_environment_allows_non_secret_runtime_controls() -> None:
+    engine = EngineSpec(
+        name="vllm",
+        image="image",
+        environment={"VLLM_USE_FLASHINFER_MOE_FP4": "1"},
+        secret_names=["HF_TOKEN"],
+    )
+
+    assert engine.environment == {"VLLM_USE_FLASHINFER_MOE_FP4": "1"}

@@ -490,7 +490,8 @@ def test_wait_watchdog_ready_rejects_early_exit(stage: str) -> None:
     class FakeApi:
         def inspect_job(self, **_kwargs: object) -> object:
             return SimpleNamespace(
-                labels={}, status=SimpleNamespace(stage=SimpleNamespace(value=stage))
+                labels={"harbor-hf-watchdog-ready": "true"},
+                status=SimpleNamespace(stage=SimpleNamespace(value=stage)),
             )
 
     with pytest.raises(WorkerError, match=f"exited before readiness: {stage}"):
