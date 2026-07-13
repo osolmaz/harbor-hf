@@ -142,6 +142,13 @@ GitHub commit. `remote.harbor.source` likewise pins Harbor to an exact GitHub
 commit and configures the HF Sandbox flavor and idle timeout. Source revisions
 must be full lowercase 40-character Git commit IDs.
 
+The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
+verifier command. A command can keep one streaming SDK request open without
+resetting the Sandbox idle timer; if the timer expires first, the remote job is
+terminated mid-command. The default is 3,600 seconds. Set it above the
+benchmark's agent timeout while keeping the controller Job timeout as the
+outer bound.
+
 Only secret names are serialized. `HF_TOKEN` is forwarded through the HF Jobs
 secret mechanism and inherited by Harbor through process environment. Its value
 is absent from commands, locks, and evidence.

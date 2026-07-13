@@ -52,9 +52,9 @@ the model.
 
 The Job writes evidence under
 `runs/<experiment>/<run-id>/` in the configured private HF Bucket. `_SUCCESS`
-is written only after one numeric Harbor verifier result exists and the
-Inference Endpoint reports `paused` with zero ready replicas. Failures write
-`_FAILED` after attempting the same cleanup.
+is written only after one exception-free Harbor trial has a numeric verifier
+result and the Inference Endpoint reports `paused` with zero ready replicas.
+Failures write `_FAILED` after attempting the same cleanup.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution

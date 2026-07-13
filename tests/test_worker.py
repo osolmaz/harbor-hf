@@ -215,7 +215,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "--environment-kwarg",
         "flavor=cpu-basic",
         "--environment-kwarg",
-        "job_timeout=600",
+        "job_timeout=3600",
         "--jobs-dir",
         str(tmp_path),
         "--n-concurrent",
@@ -344,6 +344,35 @@ def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
     )
 
     with pytest.raises(WorkerError, match="^Harbor trial failed with AgentError$"):
+        validate_harbor_result(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("exception_info", "message"),
+    [
+        ([], "Harbor trial failed with list"),
+        ({}, "Harbor trial failed with an exception"),
+    ],
+)
+def test_validate_harbor_result_rejects_malformed_trial_exception(
+    tmp_path: Path,
+    exception_info: object,
+    message: str,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "exception_info": exception_info,
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match=f"^{message}$"):
         validate_harbor_result(tmp_path)
 
 

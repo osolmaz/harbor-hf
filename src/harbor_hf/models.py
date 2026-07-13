@@ -121,7 +121,7 @@ class HarborRuntimeSpec(StrictModel):
     source: SourcePin
     environment: Literal["hf-sandbox"] = "hf-sandbox"
     sandbox_flavor: str = Field(default="cpu-basic", min_length=1)
-    sandbox_idle_timeout_seconds: int = Field(default=600, ge=1, le=86400)
+    sandbox_idle_timeout_seconds: int = Field(default=3600, ge=1, le=86400)
 
 
 class RemoteExecutionSpec(StrictModel):

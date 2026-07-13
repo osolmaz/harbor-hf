@@ -162,7 +162,9 @@ The worker verifies `status.state = paused` and `readyReplica = 0` before it
 writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may
 remain nonzero on a paused endpoint. HF Sandbox environments are killed by
 Harbor, and their idle timeout limits abandoned resources if the controller is
-terminated.
+terminated. The idle timeout must exceed the longest uninterrupted agent or
+verifier command because an active streaming command does not necessarily
+refresh the Sandbox idle timer.
 
 ## Boundaries
 
