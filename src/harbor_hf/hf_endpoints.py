@@ -125,7 +125,12 @@ class HuggingFaceEndpointAdapter(EndpointProvisioningPort):
             )
 
         resource = _provider_call("create", request, ambiguous=AmbiguousEndpointCreate)
-        return _validated_snapshot(resource, identity.namespace)
+        try:
+            return _validated_snapshot(resource, identity.namespace)
+        except EndpointProviderError as error:
+            raise AmbiguousEndpointCreate(
+                "Hugging Face endpoint create returned an invalid response"
+            ) from error
 
     def inspect(self, identity: ManagedEndpointIdentity) -> EndpointSnapshot | None:
         try:
@@ -352,6 +357,8 @@ def _scaling_measure(
     metric, threshold = next(iter(measure.items()))
     if metric not in {"pendingRequests", "hardwareUsage"}:
         raise ValueError("scaling.measure contains an unsupported metric")
+    if threshold is None:
+        return None, None
     if not isinstance(threshold, int | float) or isinstance(threshold, bool):
         raise TypeError("scaling.measure threshold must be numeric")
     return cast(Literal["pendingRequests", "hardwareUsage"], metric), float(threshold)

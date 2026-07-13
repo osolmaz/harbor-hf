@@ -219,6 +219,25 @@ def test_inspect_validates_and_normalizes_sanitized_contract(
     ]
 
 
+def test_inspect_accepts_provider_default_scaling_measure(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    raw = _raw(desired)
+    scaling = cast(
+        dict[str, object], cast(dict[str, object], raw["compute"])["scaling"]
+    )
+    scaling["measure"] = {"hardwareUsage": None}
+
+    snapshot = HuggingFaceEndpointAdapter(api=FakeApi(Resource(raw))).inspect(
+        desired.identity
+    )
+
+    assert snapshot is not None
+    assert snapshot.configuration.compute.scaling.metric is None
+    assert snapshot.configuration.compute.scaling.threshold is None
+
+
 def test_pause_and_delete_use_only_exact_identity(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -350,6 +369,20 @@ def test_rejects_malformed_provider_contract(
 
     with pytest.raises(EndpointProviderError, match="expected contract"):
         HuggingFaceEndpointAdapter(api=api).inspect(desired.identity)
+
+
+def test_create_treats_malformed_success_response_as_ambiguous(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    raw = _raw(desired)
+    cast(dict[str, object], raw["status"])["readyReplica"] = "zero"
+
+    with pytest.raises(AmbiguousEndpointCreate, match="invalid response"):
+        HuggingFaceEndpointAdapter(
+            api=FakeApi(Resource(raw)),
+            secret_resolver=lambda name: "secret",
+        ).create(desired)
 
 
 def test_missing_secret_fails_before_provider_create(
