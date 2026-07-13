@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+import harbor_hf.wave_worker as wave_worker
 from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveRunLock
 from harbor_hf.evidence import write_checksums
 from harbor_hf.runs import RunLock
@@ -278,6 +279,31 @@ def test_publish_immutable_file_copies_exact_bytes_once(tmp_path: Path) -> None:
     )
     assert destination.read_bytes() == b"payload"
     assert [path.name for path in destination.parent.iterdir()] == ["destination.json"]
+
+
+def test_publish_immutable_file_avoids_hf_mount_reserved_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"terminal\n")
+    destination = tmp_path / "bucket" / "_SUCCESS"
+    original_copyfile = wave_worker.shutil.copyfile
+    temporary_names: list[str] = []
+
+    def reject_reserved_prefix(source_path: Path, destination_path: Path) -> str:
+        temporary_names.append(destination_path.name)
+        if destination_path.name.startswith("._"):
+            raise PermissionError("HF bucket mounts reserve the ._ prefix")
+        return original_copyfile(source_path, destination_path)
+
+    monkeypatch.setattr(wave_worker.shutil, "copyfile", reject_reserved_prefix)
+
+    _publish_immutable_file(source, destination)
+
+    assert destination.read_bytes() == b"terminal\n"
+    assert len(temporary_names) == 1
+    assert temporary_names[0].startswith(".harbor-hf-")
+    assert temporary_names[0].endswith("-_SUCCESS.tmp")
 
 
 def test_publish_digest_sidecar_writes_exact_digest_line(tmp_path: Path) -> None:

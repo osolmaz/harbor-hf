@@ -884,7 +884,9 @@ def _publish_immutable_file(source: Path, destination: Path) -> None:
                 f"evidence path already has different contents: {destination}"
             )
         return
-    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    temporary = destination.with_name(
+        f".harbor-hf-{uuid.uuid4().hex}-{destination.name}.tmp"
+    )
     try:
         shutil.copyfile(source, temporary)
         os.replace(temporary, destination)
