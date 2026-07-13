@@ -11,7 +11,7 @@ import typer
 from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.planner import build_plan
-from harbor_hf.process import SubprocessRunner
+from harbor_hf.process import ProcessError, SubprocessRunner
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
@@ -88,12 +88,16 @@ def submit(
                 command=command,
             )
         else:
-            result = submit_job(
-                lock,
-                input_dir=staging,
-                bucket=spec.artifacts.bucket,
-                runner=SubprocessRunner(),
-            )
+            try:
+                result = submit_job(
+                    lock,
+                    input_dir=staging,
+                    bucket=spec.artifacts.bucket,
+                    runner=SubprocessRunner(),
+                )
+            except ProcessError as error:
+                typer.echo(f"Error: {error}", err=True)
+                raise typer.Exit(code=1) from error
     typer.echo(json.dumps(result.model_dump(mode="json"), indent=2))
 
 

@@ -50,7 +50,7 @@ def test_build_submit_command_contains_only_secret_name(
         f"{tmp_path}:/input:ro",
         "--volume",
         "hf://buckets/osolmaz/benchmark-runs:/output:rw",
-        "ghcr.io/astral-sh/uv:python3.12-bookworm-slim",
+        "ghcr.io/astral-sh/uv:python3.12-bookworm",
         "uvx",
         "--from",
         "https://github.com/osolmaz/harbor-hf/archive/"

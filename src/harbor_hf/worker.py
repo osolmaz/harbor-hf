@@ -210,6 +210,7 @@ def run_worker(
 
     append_event(events, "worker_started", run_id=lock.run_id)
     try:
+        require_executable("git")
         _execute_benchmark(root, events, lock, manager, token, stream_runner)
     except Exception as caught:
         error = caught
@@ -311,6 +312,11 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
         raise WorkerError(
             "endpoint model does not match the locked repository and revision"
         )
+
+
+def require_executable(name: str) -> None:
+    if shutil.which(name) is None:
+        raise WorkerError(f"required controller executable is missing: {name}")
 
 
 def _finalize_evidence(root: Path, token: str) -> None:

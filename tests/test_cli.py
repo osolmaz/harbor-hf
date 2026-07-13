@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from harbor_hf.cli import _write_lock, app
 from harbor_hf.models import ExperimentSpec
+from harbor_hf.process import ProcessError
 from harbor_hf.runs import build_run_lock
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
@@ -66,3 +68,18 @@ def test_lock_writer_uses_canonical_json(
     assert path.read_text(encoding="utf-8") == (
         json.dumps(lock.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
     )
+
+
+def test_submit_reports_process_failure_without_traceback(
+    remote_manifest: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise ProcessError("submission failed")
+
+    monkeypatch.setattr("harbor_hf.cli.submit_job", fail)
+
+    result = runner.invoke(app, ["submit", str(remote_manifest)])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Error: submission failed\n"

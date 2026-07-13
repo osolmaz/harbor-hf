@@ -104,7 +104,7 @@ class PublishingSpec(StrictModel):
 class RemoteJobSpec(StrictModel):
     namespace: str = Field(min_length=1)
     image: str = Field(
-        default="ghcr.io/astral-sh/uv:python3.12-bookworm-slim",
+        default="ghcr.io/astral-sh/uv:python3.12-bookworm",
         min_length=1,
     )
     flavor: str = Field(default="cpu-basic", min_length=1)

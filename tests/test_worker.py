@@ -21,6 +21,7 @@ from harbor_hf.worker import (
     endpoint_state,
     endpoint_url,
     probe_runtime,
+    require_executable,
     run_worker,
     validate_endpoint_model,
     validate_harbor_result,
@@ -160,6 +161,15 @@ def test_endpoint_model_must_match_lock(remote_spec: ExperimentSpec) -> None:
         validate_endpoint_model(lock, wrong)
     with pytest.raises(WorkerError, match="^endpoint response has no model object$"):
         validate_endpoint_model(lock, {})
+
+
+def test_controller_requires_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("harbor_hf.worker.shutil.which", lambda _name: None)
+
+    with pytest.raises(
+        WorkerError, match="^required controller executable is missing: git$"
+    ):
+        require_executable("git")
 
 
 def test_cleanup_timeout() -> None:
