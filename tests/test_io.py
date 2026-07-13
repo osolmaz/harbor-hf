@@ -163,6 +163,9 @@ def test_agent_parameter_keys_are_unambiguous_for_harbor(key: str) -> None:
         "FOO_SECRET_KEY",
         "APIKEY",
         "OPENAI_APIKEY",
+        "PAT",
+        "GITHUB_PAT",
+        "GH_PAT",
     ],
 )
 def test_engine_environment_rejects_inline_secret_values(key: str) -> None:
@@ -179,11 +182,14 @@ def test_engine_environment_allows_non_secret_runtime_controls() -> None:
     engine = EngineSpec(
         name="vllm",
         image="image",
-        environment={"VLLM_USE_FLASHINFER_MOE_FP4": "1"},
+        environment={"VLLM_USE_FLASHINFER_MOE_FP4": "1", "COMPAT": "enabled"},
         secret_names=["HF_TOKEN"],
     )
 
-    assert engine.environment == {"VLLM_USE_FLASHINFER_MOE_FP4": "1"}
+    assert engine.environment == {
+        "VLLM_USE_FLASHINFER_MOE_FP4": "1",
+        "COMPAT": "enabled",
+    }
 
 
 def test_serialized_parameters_reject_nested_secret_keys(

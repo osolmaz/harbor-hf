@@ -2063,6 +2063,7 @@ def test_task_count_validation_accepts_exact_attempts() -> None:
     _validate_task_counts(trials, {"one": 2, "two": 2})
     _validate_task_counts(trials, {"one": 2, "two": 2}, 2)
     _validate_task_counts(trials, None)
+    _validate_task_counts(trials, None, 2, ("o*", "two"))
 
 
 def test_validate_harbor_result_requires_a_wildcard_selected_trial(
@@ -2093,6 +2094,56 @@ def test_validate_harbor_result_requires_every_wildcard_attempt(
             expected_trials=None,
             expected_attempts_per_task=2,
         )
+
+
+def test_validate_harbor_result_rejects_task_outside_requested_patterns(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "database-test",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match="task counts do not match"):
+        validate_harbor_result(
+            tmp_path,
+            expected_trials=None,
+            expected_attempts_per_task=1,
+            expected_task_names=("shell-*",),
+        )
+
+
+def test_validate_harbor_result_accepts_task_matching_requested_pattern(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "shell-selected",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        validate_harbor_result(
+            tmp_path,
+            expected_trials=None,
+            expected_attempts_per_task=1,
+            expected_task_names=("shell-*",),
+        )["trial_count"]
+        == 1
+    )
 
 
 def test_validate_harbor_result_requires_exact_task_mixed_with_wildcard(

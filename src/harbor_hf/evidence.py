@@ -46,6 +46,8 @@ def is_sensitive_key(key: object) -> bool:
     return (
         normalized in _SENSITIVE_KEYS
         or normalized.endswith(_SENSITIVE_SUFFIXES)
+        or normalized == "pat"
+        or normalized.endswith("_pat")
         or collapsed.endswith("apikey")
         or collapsed.endswith("secretkey")
     )

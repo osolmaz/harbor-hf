@@ -30,6 +30,7 @@ def test_redact_removes_nested_sensitive_values() -> None:
                 "OPENAI_API_KEY": "three",
                 "awsAccessKey": "four",
                 "openAIKey": "five",
+                "GITHUB_PAT": "six",
                 "ok": 3,
             }
         ],
@@ -45,6 +46,7 @@ def test_redact_removes_nested_sensitive_values() -> None:
                 "OPENAI_API_KEY": "[REDACTED]",
                 "awsAccessKey": "[REDACTED]",
                 "openAIKey": "[REDACTED]",
+                "GITHUB_PAT": "[REDACTED]",
                 "ok": 3,
             }
         ],

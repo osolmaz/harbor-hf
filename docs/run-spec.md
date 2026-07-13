@@ -139,7 +139,8 @@ Every task selected by `benchmark.task_names` is passed to Harbor. Exact task
 names have a deterministic expected trial count of tasks multiplied by
 attempts. Glob selections are resolved by Harbor; the controller requires at
 least one result, requires every observed task to contain the configured number
-of attempts, preserves required counts for exact names mixed with globs, and
+of attempts, requires every observed task name to match an exact or glob
+selection, preserves required counts for exact names mixed with globs, and
 validates every resulting trial for exceptions and numeric verifier rewards.
 
 Agent revisions declare how they are enforced. `package` passes the revision to
@@ -213,8 +214,8 @@ inherited by Harbor through process environment. Its value is absent from
 commands, locks, and evidence. Before archiving, secret values are redacted from
 both file contents and path components using bounded-memory streaming. Symbolic
 links are rejected before evidence is read, modified, hashed, or archived.
-Prefixed API, access, and private key names are treated as secrets, including
-camel-case and uppercase environment forms.
+Prefixed API, access, private key, and personal access token (`PAT`) names are
+treated as secrets, including camel-case and uppercase environment forms.
 
 Harbor's raw job tree is created on Job-local storage rather than the bucket
 mount. Before remote work, the worker creates a permanent run reservation with

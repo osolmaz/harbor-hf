@@ -11,7 +11,8 @@ import tomllib
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
@@ -609,6 +610,7 @@ def _execute_benchmark(
         expected_trials=_expected_trial_count(lock),
         expected_task_counts=_expected_task_counts(lock),
         expected_attempts_per_task=lock.attempts,
+        expected_task_names=lock.benchmark_tasks,
         expected_agent_name=lock.agent.name,
         expected_agent_version=_expected_agent_version(lock),
         expected_model_provider="openai",
@@ -1089,6 +1091,7 @@ def validate_harbor_result(
     *,
     expected_task_counts: Mapping[str, int] | None = None,
     expected_attempts_per_task: int | None = None,
+    expected_task_names: Sequence[str] | None = None,
     expected_agent_name: str | None = None,
     expected_agent_version: str | None = None,
     expected_model_provider: str | None = None,
@@ -1105,6 +1108,7 @@ def validate_harbor_result(
         trials,
         expected_task_counts,
         expected_attempts_per_task,
+        expected_task_names,
     )
 
     verified: list[dict[str, object]] = []
@@ -1149,12 +1153,18 @@ def _validate_task_counts(
     trials: list[dict[str, object]],
     expected: Mapping[str, int] | None,
     attempts_per_observed_task: int | None = None,
+    expected_task_names: Sequence[str] | None = None,
 ) -> None:
     observed = Counter(str(trial["task_name"]) for trial in trials)
     valid = all(observed[task] == count for task, count in (expected or {}).items())
     if attempts_per_observed_task is not None:
         valid = valid and all(
             count == attempts_per_observed_task for count in observed.values()
+        )
+    if expected_task_names is not None:
+        valid = valid and all(
+            any(fnmatch(task, requested) for requested in expected_task_names)
+            for task in observed
         )
     if not valid:
         raise WorkerError(
