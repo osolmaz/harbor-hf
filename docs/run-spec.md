@@ -189,6 +189,10 @@ inherit the Harbor execution timeout.
 Readiness requires every positive `targetReplica` to be represented by a ready
 replica. The controller then probes the endpoint's reported `healthRoute`
 instead of assuming a custom image uses `/health`.
+Before benchmarking, it compares the observable endpoint model, custom image,
+effective serving arguments, non-secret environment, provider region, hardware,
+accelerator count, and declared replica limits with the resolved deployment.
+A mismatch is a run failure, not a warning.
 
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without
@@ -212,6 +216,8 @@ work. Only the finalized, scrubbed tree is copied there, and the root terminal
 marker is copied last. Nested task markers are preserved. If the controller is
 killed before finalization, raw sessions and logs disappear with the Job
 instead of remaining in the bucket.
+Submission queries the configured artifact Bucket and refuses to start a Job
+unless that Bucket is private.
 
 ## Loading And Resolution
 

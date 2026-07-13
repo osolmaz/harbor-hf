@@ -70,6 +70,10 @@ def bucket_uri(bucket: str) -> str:
     return f"hf://buckets/{bucket.removeprefix('buckets/')}"
 
 
+def bucket_id(bucket: str) -> str:
+    return bucket.removeprefix("hf://buckets/").removeprefix("buckets/")
+
+
 def endpoint_lease_bucket(namespace: str) -> str:
     return f"{namespace}/{_LEASE_BUCKET_NAME}"
 
@@ -84,6 +88,13 @@ def ensure_private_lease_bucket(namespace: str, *, api: BucketApi | None = None)
     if getattr(api.bucket_info(bucket), "private", None) is not True:
         raise ValueError(f"endpoint lease bucket {bucket} must be private")
     return bucket
+
+
+def require_private_bucket(bucket: str, *, api: BucketApi) -> str:
+    normalized = bucket_id(bucket)
+    if getattr(api.bucket_info(normalized), "private", None) is not True:
+        raise ValueError(f"artifact bucket {normalized} must be private")
+    return normalized
 
 
 def endpoint_lease_label(lock: RunLock) -> str:
@@ -150,7 +161,12 @@ def submit(
     runner: TextRunner,
     bucket_api: BucketApi | None = None,
 ) -> Submission:
+    if bucket_api is None:
+        from huggingface_hub import HfApi
+
+        bucket_api = cast(BucketApi, HfApi())
     ensure_private_lease_bucket(lock.remote.job.namespace, api=bucket_api)
+    require_private_bucket(bucket, api=bucket_api)
     command = build_submit_command(lock, input_dir=input_dir, bucket=bucket)
     output = runner.run_text(command)
     match = _JOB_ID.search(output)

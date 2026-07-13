@@ -19,6 +19,7 @@ from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
     _acquire_endpoint_lease,
+    _argument_options,
     _expected_agent_version,
     _expected_task_counts,
     _expected_trial_count,
@@ -28,6 +29,7 @@ from harbor_hf.worker import (
     _publish_evidence,
     _release_endpoint_lease,
     _reserve_evidence,
+    _validate_endpoint_compute,
     _validate_task_counts,
     _validate_trial_count,
     build_harbor_command,
@@ -53,6 +55,26 @@ def snapshot(state: str, ready: int) -> dict[str, object]:
         "model": {
             "repository": "nvidia/Qwen3.6-35B-A3B-NVFP4",
             "revision": "0123456789abcdef0123456789abcdef01234567",
+            "image": {
+                "custom": {
+                    "url": "ghcr.io/example/vllm@sha256:replace-with-image-digest"
+                }
+            },
+            "args": [
+                "--model",
+                "/repository",
+                "--max-model-len",
+                "65536",
+                "--kv-cache-dtype",
+                "fp8",
+            ],
+            "env": {"VLLM_USE_FLASHINFER_MOE_FP4": "1"},
+        },
+        "provider": {"vendor": "aws", "region": "us-east-1"},
+        "compute": {
+            "instanceType": "nvidia-rtx-pro-6000",
+            "instanceSize": "x1",
+            "scaling": {"minReplica": 0, "maxReplica": 1},
         },
         "status": {
             "state": state,
@@ -244,6 +266,154 @@ def test_endpoint_model_must_match_lock(remote_spec: ExperimentSpec) -> None:
         validate_endpoint_model(lock, wrong)
     with pytest.raises(WorkerError, match="^endpoint response has no model object$"):
         validate_endpoint_model(lock, {})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "image",
+            {"custom": {"url": "different"}},
+            "endpoint image does not match the locked deployment",
+        ),
+        (
+            "args",
+            ["--max-model-len", "32768"],
+            "endpoint arguments do not match the locked deployment",
+        ),
+        (
+            "args",
+            [
+                "--max-model-len",
+                "65536",
+                "--kv-cache-dtype",
+                "fp8",
+                "--max-model-len",
+                "32768",
+            ],
+            "endpoint arguments do not match the locked deployment",
+        ),
+        (
+            "env",
+            {"VLLM_USE_FLASHINFER_MOE_FP4": "0"},
+            "endpoint environment does not match the locked deployment",
+        ),
+    ],
+)
+def test_endpoint_model_requires_locked_serving_configuration(
+    remote_spec: ExperimentSpec, field: str, value: object, message: str
+) -> None:
+    endpoint_snapshot = snapshot("running", 1)
+    model = cast(dict[str, object], endpoint_snapshot["model"])
+    model[field] = value
+
+    with pytest.raises(WorkerError, match=f"^{message}$"):
+        validate_endpoint_model(build_run_lock(remote_spec), endpoint_snapshot)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("provider", {"vendor": "aws", "region": "us-west-2"}, "compute"),
+        (
+            "compute",
+            {
+                "instanceType": "nvidia-h200",
+                "instanceSize": "x1",
+                "scaling": {"minReplica": 0, "maxReplica": 1},
+            },
+            "compute",
+        ),
+        (
+            "compute",
+            {
+                "instanceType": "nvidia-rtx-pro-6000",
+                "instanceSize": "x2",
+                "scaling": {"minReplica": 0, "maxReplica": 1},
+            },
+            "compute",
+        ),
+        (
+            "compute",
+            {
+                "instanceType": "nvidia-rtx-pro-6000",
+                "instanceSize": "x1",
+                "scaling": {"minReplica": 1, "maxReplica": 1},
+            },
+            "scaling",
+        ),
+    ],
+)
+def test_endpoint_compute_requires_locked_deployment(
+    remote_spec: ExperimentSpec, field: str, value: object, message: str
+) -> None:
+    endpoint_snapshot = snapshot("running", 1)
+    endpoint_snapshot[field] = value
+
+    with pytest.raises(WorkerError, match=f"endpoint {message} does not match"):
+        validate_endpoint_model(build_run_lock(remote_spec), endpoint_snapshot)
+
+
+def test_argument_options_parse_effective_cli_values() -> None:
+    assert _argument_options(
+        [
+            "positional",
+            "--alpha=a=b",
+            "--flag",
+            "--value",
+            "one",
+            "ignored",
+            "--value=two",
+            "--final",
+        ]
+    ) == {
+        "--alpha": "a=b",
+        "--flag": True,
+        "--value": "two",
+        "--final": True,
+    }
+
+
+def test_endpoint_compute_validation_covers_complete_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = build_run_lock(remote_spec)
+    endpoint_snapshot = snapshot("running", 1)
+
+    _validate_endpoint_compute(lock, endpoint_snapshot)
+
+    for missing in ("provider", "compute"):
+        incomplete = snapshot("running", 1)
+        incomplete.pop(missing)
+        with pytest.raises(
+            WorkerError,
+            match="^endpoint response has no deployment compute identity$",
+        ):
+            _validate_endpoint_compute(lock, incomplete)
+
+    missing_scaling = snapshot("running", 1)
+    cast(dict[str, object], missing_scaling["compute"]).pop("scaling")
+    with pytest.raises(
+        WorkerError, match="^endpoint response has no scaling configuration$"
+    ):
+        _validate_endpoint_compute(lock, missing_scaling)
+
+    wrong_region = snapshot("running", 1)
+    cast(dict[str, object], wrong_region["provider"])["region"] = "us-west-2"
+    with pytest.raises(
+        WorkerError,
+        match="^endpoint compute does not match the locked deployment$",
+    ):
+        _validate_endpoint_compute(lock, wrong_region)
+
+    wrong_maximum = snapshot("running", 1)
+    compute = cast(dict[str, object], wrong_maximum["compute"])
+    scaling = cast(dict[str, object], compute["scaling"])
+    scaling["maxReplica"] = 2
+    with pytest.raises(
+        WorkerError, match="^endpoint scaling does not match the locked deployment$"
+    ):
+        _validate_endpoint_compute(lock, wrong_maximum)
 
 
 def test_controller_requires_git(monkeypatch: pytest.MonkeyPatch) -> None:

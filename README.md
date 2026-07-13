@@ -63,16 +63,19 @@ the model.
 The Job writes evidence under
 `runs/<experiment>/<run-id>/` in the configured private HF Bucket. `_SUCCESS`
 is written only after every requested Harbor attempt is exception-free, has
-numeric verifier results, and the Inference Endpoint reports `paused` with zero
-ready replicas. Failures write `_FAILED` after attempting the same cleanup.
+finite numeric verifier results, and the Inference Endpoint reports `paused`
+with zero ready replicas. Failures write `_FAILED` after attempting the same cleanup.
 The controller waits for every target replica and probes the endpoint's reported
-health route before Harbor starts.
+health route before Harbor starts. It also verifies the endpoint's model,
+custom image, serving arguments, non-secret environment, provider region,
+hardware, accelerator count, and declared scaling limits against the run lock.
 Harbor writes raw sessions and logs only to Job-local storage. The controller
 redacts and validates that staging tree before publishing it to the bucket, and
 copies `_SUCCESS` or `_FAILED` last.
 Submission creates or verifies the namespace-level lease Bucket and refuses to
-use it if it is public. Each run prefix is atomically reserved before remote
-work, so duplicate run IDs cannot overwrite or invalidate one another.
+use it if it is public. It separately verifies that the configured artifact
+Bucket is private. Each run prefix is atomically reserved before remote work,
+so duplicate run IDs cannot overwrite or invalidate one another.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution

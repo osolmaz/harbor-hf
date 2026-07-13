@@ -894,6 +894,88 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
         raise WorkerError(
             "endpoint model does not match the locked repository and revision"
         )
+    image = model.get("image")
+    custom = image.get("custom") if isinstance(image, Mapping) else None
+    observed_image = custom.get("url") if isinstance(custom, Mapping) else None
+    if observed_image != lock.deployment.engine.image:
+        raise WorkerError("endpoint image does not match the locked deployment")
+    observed_arguments = model.get("args")
+    if not isinstance(observed_arguments, list) or not _arguments_match(
+        lock.deployment.engine.arguments,
+        [str(argument) for argument in observed_arguments],
+    ):
+        raise WorkerError("endpoint arguments do not match the locked deployment")
+    observed_environment = model.get("env")
+    if not isinstance(observed_environment, Mapping) or any(
+        observed_environment.get(key) != value
+        for key, value in lock.deployment.engine.environment.items()
+    ):
+        raise WorkerError("endpoint environment does not match the locked deployment")
+    _validate_endpoint_compute(lock, snapshot)
+
+
+def _arguments_match(expected: list[str], observed: list[str]) -> bool:
+    expected_options = _argument_options(expected)
+    observed_options = _argument_options(observed)
+    return all(
+        observed_options.get(key) == value for key, value in expected_options.items()
+    )
+
+
+def _argument_options(arguments: list[str]) -> dict[str, str | bool]:
+    options: dict[str, str | bool] = {}
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if not argument.startswith("--"):
+            position += 1
+            continue
+        if "=" in argument:
+            name, value = argument.split("=", 1)
+            options[name] = value
+        elif position + 1 < len(arguments) and not arguments[position + 1].startswith(
+            "--"
+        ):
+            options[argument] = arguments[position + 1]
+            position += 1
+        else:
+            options[argument] = True
+        position += 1
+    return options
+
+
+def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) -> None:
+    provider = snapshot.get("provider")
+    compute = snapshot.get("compute")
+    if not isinstance(provider, Mapping) or not isinstance(compute, Mapping):
+        raise WorkerError("endpoint response has no deployment compute identity")
+    vendor = provider.get("vendor")
+    region = provider.get("region")
+    observed_region = f"{vendor}-{region}"
+    instance_type = compute.get("instanceType")
+    normalized_hardware = (
+        instance_type.removeprefix("nvidia-")
+        if isinstance(instance_type, str)
+        else None
+    )
+    instance_size = compute.get("instanceSize")
+    if (
+        observed_region != lock.deployment.region
+        or normalized_hardware != lock.deployment.hardware
+        or instance_size != f"x{lock.deployment.accelerator_count}"
+    ):
+        raise WorkerError("endpoint compute does not match the locked deployment")
+    scaling = compute.get("scaling")
+    if not isinstance(scaling, Mapping):
+        raise WorkerError("endpoint response has no scaling configuration")
+    expected_scaling = {
+        "min_replicas": "minReplica",
+        "max_replicas": "maxReplica",
+    }
+    for parameter, field in expected_scaling.items():
+        expected = lock.deployment.parameters.get(parameter)
+        if expected is not None and scaling.get(field) != expected:
+            raise WorkerError("endpoint scaling does not match the locked deployment")
 
 
 def require_executable(name: str) -> None:

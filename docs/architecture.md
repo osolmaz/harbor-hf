@@ -95,6 +95,7 @@ The worker first reserves the immutable run prefix with exclusive directory
 creation. Duplicate run IDs therefore fail before source preparation, endpoint
 work, or failure publication. Terminal markers are delayed only at the run
 root; marker-shaped files within Harbor task artifacts are preserved.
+Submission verifies the artifact Bucket's privacy before it launches a Job.
 
 Raw Harbor output is staged on the controller Job's local filesystem, outside
 the bucket mount. After endpoint cleanup, the controller redacts secret values,
