@@ -238,8 +238,10 @@ the finalized, scrubbed tree is copied to its reserved Bucket prefix, and the
 root terminal marker is copied last. Nested task markers are preserved. If the
 controller is killed before finalization, raw sessions and logs disappear with
 the Job instead of remaining in the bucket. Submission queries both the
-configured artifact Bucket and Hugging Face's implicit `jobs-artifacts` input
-Bucket and refuses to start a Job unless both are private.
+configured artifact Bucket and the managed `jobs-artifacts` input Bucket and
+refuses to start a Job unless both are private. It uploads manifests and locks
+under a content-addressed Job input prefix and mounts that exact Bucket
+subdirectory read-only.
 
 ## Loading And Resolution
 

@@ -1,8 +1,9 @@
 # Normalized Result Publication
 
-Milestone 6 treats the private artifact Bucket as canonical evidence and result
-Datasets as derived indexes. Publication is intentionally an application-layer
-slice: campaign reconciliation and CLI wiring will call it later.
+The private artifact Bucket is canonical evidence and result Datasets are
+derived indexes. Campaign reconciliation invokes publication automatically for
+a completed campaign; `harbor-hf results publish` exposes the same verified,
+idempotent path for explicit operation and recovery.
 
 ## Safety boundary
 

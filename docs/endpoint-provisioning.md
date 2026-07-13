@@ -1,9 +1,9 @@
 # Endpoint Provisioning
 
-Milestone 3 endpoint provisioning is implemented as a domain service and a
-narrow Hugging Face adapter. This slice deliberately stops before deployment
-wave execution: it does not resume endpoints, submit shards, modify the
-campaign reconciler, or add CLI commands.
+Endpoint provisioning is implemented as a domain service and a narrow Hugging
+Face adapter. The campaign application layer composes it with deployment-wave
+execution, while lifecycle resume, shard submission, and watchdog ownership
+remain separate responsibilities.
 
 ## Boundary
 
@@ -74,7 +74,7 @@ Provisioning first inspects the deterministic identity:
 2. An exact existing endpoint is adopted only if it already reports
    `state=paused` and `readyReplica=0`.
 3. An active existing endpoint is rejected without pausing it; lifecycle lease
-   ownership belongs to the later wave controller.
+   ownership belongs to the wave controller.
 4. A create timeout, transport failure, conflict, or server error is treated as
    ambiguous. The provisioner repeatedly inspects the same deterministic
    identity and adopts it only after managed identity and complete effective
@@ -104,12 +104,11 @@ found. Ambiguous delete responses are likewise resolved through inspection.
 
 ## Integration Boundary
 
-The future deployment wave controller should build `DesiredEndpoint` from its
-locked model and deployment profiles, acquire the endpoint lease before any
-lifecycle mutation, call `create_or_adopt`, and retain the returned final
-snapshot as provisioning evidence. It must continue to use the independent
-watchdog before resume. This provisioning slice does not grant lifecycle
-ownership and does not replace the existing watchdog or lease behavior.
+The deployment wave controller builds `DesiredEndpoint` from its locked model
+and deployment profiles, acquires the endpoint lease before lifecycle mutation,
+calls `create_or_adopt`, and retains the returned final snapshot as provisioning
+evidence. It uses the independent watchdog before resume. Provisioning itself
+does not grant lifecycle ownership or replace the watchdog or lease behavior.
 
 Tests use only in-memory ports and sanitized SDK response contracts. They do
 not load models, call remote endpoints, create paid resources, or benchmark.

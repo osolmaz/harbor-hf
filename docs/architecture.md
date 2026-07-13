@@ -111,9 +111,8 @@ configuration equality, and paused-zero-ready state. Ambiguous create outcomes
 are resolved by inspecting the deterministic name rather than issuing another
 create.
 
-This boundary is intentionally independent of the future wave controller. A
-wave must still acquire the endpoint lease and start the watchdog before resume
-or shard execution.
+This boundary remains independent of the wave controller. A wave acquires the
+endpoint lease and starts the watchdog before resume or shard execution.
 
 ### Harbor Adapter
 
@@ -137,7 +136,8 @@ publication. Equivalent Bucket URI spellings are normalized before deriving the
 reservation identity. Terminal markers are delayed only at the run root;
 marker-shaped files within Harbor task artifacts are preserved and included in
 the root checksum manifest. Submission verifies the
-artifact Bucket and implicit Job input Bucket are private before launch.
+artifact Bucket and managed Job input Bucket are private before launch. Job
+inputs use content-addressed Bucket prefixes mounted read-only by `hf://` URI.
 
 Raw Harbor output is staged on the controller Job's local filesystem, outside
 the bucket mount. After endpoint cleanup, the controller redacts secret values,

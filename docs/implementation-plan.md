@@ -12,10 +12,19 @@ This plan is ordered by dependency, not calendar time. Each milestone must be
 independently releasable and must preserve the current single-run safety
 properties.
 
+## Implementation Status
+
+The campaign control plane, endpoint and provider wave execution, recovery,
+admission control, evidence finalization, normalized publication, and read-only
+presentation layers are implemented. Production adapters are exercised through
+the same application layer as the in-memory fault tests. The remaining work is
+operational hardening through broader remote campaigns and upstream integration,
+not a separate execution architecture.
+
 ## Starting Point
 
-The merged implementation already provides the execution kernel for one
-resolved matrix cell:
+The original single-run implementation provides the execution kernel reused by
+campaign waves:
 
 - immutable source, model, image, dataset, task, and agent references;
 - permanent run reservations and compare-and-swap endpoint leases;
@@ -27,8 +36,8 @@ resolved matrix cell:
 - terminal success or failure markers written after verified endpoint cleanup;
 - endpoint-backed execution without local inference or task execution.
 
-The next implementation must reuse this kernel. It must not create a second
-execution path with weaker validation or cleanup behavior.
+Campaign execution reuses this kernel and its validation and cleanup behavior;
+it does not maintain a weaker parallel worker path.
 
 ## Architectural Decisions
 
