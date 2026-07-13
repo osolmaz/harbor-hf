@@ -86,6 +86,14 @@ Secret values are invalid manifest content.
 Provider-specific values belong in `parameters`. They must be representable as
 JSON and are preserved in the resolved lock.
 
+Engine identity is more than `engine.name`. Resolution and submission preserve
+the engine version and build or commit, immutable image digest, full arguments,
+non-secret environment, secret names, runtime and driver versions, parser and
+chat-template identity, cache precision, batching limits, and feature controls
+such as prefix caching, speculation or MTP, CUDA graphs, attention backend, and
+MoE backend. Values observed after startup are stored separately from requested
+values so a provider default cannot silently change the run definition.
+
 The current `v1alpha1` deployment shape represents Hugging Face Inference
 Endpoints. vLLM and llama.cpp are independent engine choices within that
 endpoint type. A planned discriminated Inference Providers profile will cover
@@ -116,6 +124,12 @@ Validation checks only the requested document. Planning expands the matrix and
 computes a digest from canonical JSON. Submission will resolve mutable names to
 immutable revisions, query effective provider configuration, and write a
 separate lock. The requested document is never rewritten with resolved values.
+
+Every submitted run writes `manifest.yaml`, `run.lock.json`,
+`endpoint.snapshot.json`, and `runtime-environment.json`. Provider-backed runs
+must mark hidden details as `not_reported`; failed collection is `unknown`, and
+irrelevant fields are `not_applicable`. These statuses accompany null values
+rather than being stored as fake version or hardware strings.
 
 ## Not Covered
 

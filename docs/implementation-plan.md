@@ -28,6 +28,10 @@ two clean machines when its remote inputs have not changed.
   vLLM and llama.cpp engine profiles.
 - Add endpoint create, resume, readiness, pause, and inspection operations.
 - Capture requested and effective endpoint configuration with redaction.
+- Probe and preserve exact engine, image, driver, framework, parser, template,
+  precision, backend, cache, graph, batching, and feature-control identity.
+- Write separate manifest, resolved lock, endpoint snapshot, and runtime
+  environment artifacts with explicit evidence status for unavailable fields.
 - Implement endpoint leases and an independent stale-resource watchdog.
 - Add an Inference Providers adapter for models that are too large or expensive
   for dedicated endpoints, without assuming knowledge of hidden serving

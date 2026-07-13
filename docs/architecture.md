@@ -106,14 +106,44 @@ A resolved run lock records:
 - Harbor, agent, tool, prompt, and skill revisions;
 - model, tokenizer, chat-template, and generation-config revisions;
 - weight format and quantization separately from activation and KV precision;
-- resource type and, when known, provider, region, hardware, replica, image,
-  engine, and driver information;
+- resource type and, when known, provider, region, hardware, accelerator count,
+  replica policy, and driver information;
+- serving engine name, version, build or commit, immutable container image
+  digest, complete arguments, non-secret environment, and secret names;
+- CUDA, framework, attention, reasoning-parser, and other serving-library
+  versions reported by the runtime;
+- chat template source and digest, context and output limits, batching and
+  sequence capacity, and activation and KV-cache precision;
+- prefix caching, speculative decoding or MTP, CUDA graph mode, attention
+  backend, MoE backend, and other behavior-affecting engine controls;
 - context, output, batching, concurrency, retry, timeout, and sampling settings;
 - requested provider configuration and the effective configuration returned by
   the provider.
 
 Secret values are never recorded. Manifests store only the names of secrets
 that must be injected by the remote platform.
+
+### Canonical Configuration Artifacts
+
+Each run preserves four separate configuration records:
+
+| Artifact | Authority |
+| --- | --- |
+| `manifest.yaml` | Immutable copy of what the user requested. |
+| `run.lock.json` | Resolved revisions, matrix cell, policy, and reproducibility contract fixed before execution. |
+| `endpoint.snapshot.json` | Effective endpoint or provider configuration observed after readiness. |
+| `runtime-environment.json` | Versions and feature controls reported from inside the serving runtime. |
+
+The endpoint snapshot never overwrites the requested manifest or resolved lock.
+Differences between requested and effective values remain explicit and are
+published as comparison fields.
+
+Runtime evidence uses a status alongside nullable values. `reported` means the
+value came from a named probe or provider response, `not_reported` means the
+remote service did not expose it, `not_applicable` means the field does not
+apply to that serving path, and `unknown` means collection was expected but
+failed. The system never infers a hidden vLLM version, quantization, hardware,
+or other provider detail from model behavior.
 
 ## Failure And Cleanup
 
