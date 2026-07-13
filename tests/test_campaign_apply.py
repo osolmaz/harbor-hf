@@ -4,7 +4,6 @@ import itertools
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
@@ -515,11 +514,26 @@ class FakeHfJobsApi:
 
 
 class FakeBucketApi:
+    def __init__(self) -> None:
+        self.staged: dict[str, bytes] = {}
+
     def create_bucket(self, bucket_id: str, **kwargs: object) -> object:
         return SimpleNamespace(id=bucket_id, arguments=kwargs)
 
     def bucket_info(self, bucket_id: str) -> object:
         return SimpleNamespace(id=bucket_id, private=True)
+
+    def batch_bucket_files(
+        self,
+        bucket_id: str,
+        *,
+        add: list[tuple[bytes, str]],
+        **kwargs: object,
+    ) -> object:
+        assert bucket_id == "osolmaz/jobs-artifacts"
+        assert kwargs == {}
+        self.staged.update({path: content for content, path in add})
+        return object()
 
     def create_repo(self, repo_id: str, **kwargs: object) -> object:
         return SimpleNamespace(id=repo_id, arguments=kwargs)
@@ -536,21 +550,9 @@ class FakeBucketApi:
 class InspectingRunner:
     def __init__(self) -> None:
         self.command: list[str] | None = None
-        self.staged: dict[str, object] = {}
 
     def run_text(self, command: list[str]) -> str:
         self.command = command
-        volume = next(value for value in command if value.endswith(":/input:ro"))
-        input_dir = Path(volume.removesuffix(":/input:ro"))
-        self.staged = {
-            "request": (input_dir / "manifest.yaml").read_bytes(),
-            "campaign": json.loads(
-                (input_dir / "campaign.lock.json").read_text(encoding="utf-8")
-            ),
-            "wave": json.loads(
-                (input_dir / "wave.lock.json").read_text(encoding="utf-8")
-            ),
-        }
         return "Job started: 0123456789abcdef01234567"
 
 
@@ -562,21 +564,25 @@ def test_hf_wave_adapter_submits_staged_locks_through_submission_module(
     endpoint = managed_wave_endpoint(lock, remote_spec, action.deployment_digest)
     wave = build_wave_lock(lock, remote_spec, action, endpoint=endpoint)
     runner = InspectingRunner()
+    bucket_api = FakeBucketApi()
     adapter = HuggingFaceWaveJobAdapter(
         api=FakeHfJobsApi(),
         runner=runner,
-        bucket_api=FakeBucketApi(),
+        bucket_api=bucket_api,
     )
 
     job = adapter.submit(wave, request=request, campaign=lock)
 
     assert job.job_id == "0123456789abcdef01234567"
     assert runner.command is not None
-    assert runner.staged == {
-        "request": request,
-        "campaign": lock.model_dump(mode="json"),
-        "wave": wave.model_dump(mode="json"),
+    staged = {
+        path.rsplit("/", 1)[-1]: content for path, content in bucket_api.staged.items()
     }
+    assert staged["manifest.yaml"] == request
+    assert json.loads(staged["campaign.lock.json"]) == lock.model_dump(mode="json")
+    assert json.loads(staged["wave.lock.json"]) == wave.model_dump(mode="json")
+    volume = next(value for value in runner.command if value.endswith(":/input:ro"))
+    assert volume.startswith("hf://buckets/osolmaz/jobs-artifacts/job-inputs/")
 
 
 def test_hf_wave_adapter_adopts_only_exact_labels() -> None:
@@ -612,6 +618,85 @@ def test_hf_wave_adapter_adopts_only_exact_labels() -> None:
     )
     api.jobs = [wrong]
     with pytest.raises(ActionExecutionError, match="wrong managed labels"):
+        adapter.find_wave(
+            namespace="org",
+            wave_id="wave-one",
+            endpoint_label="endpoint-one",
+        )
+
+
+def test_hf_wave_adapter_recovers_one_active_or_completed_duplicate() -> None:
+    labels = {
+        "harbor-hf-wave": "wave-one",
+        "harbor-hf-endpoint": "endpoint-one",
+    }
+
+    def resource(job_id: str, stage: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=job_id,
+            labels=labels,
+            status=SimpleNamespace(stage=stage),
+        )
+
+    canceled = resource("000000000000000000000000", "CANCELED")
+    active = resource("111111111111111111111111", "RUNNING")
+    completed = resource("222222222222222222222222", "COMPLETED")
+    api = FakeHfJobsApi([canceled, active])
+    adapter = HuggingFaceWaveJobAdapter(
+        api=api,
+        runner=InspectingRunner(),
+        bucket_api=FakeBucketApi(),
+    )
+
+    observed = adapter.find_wave(
+        namespace="org",
+        wave_id="wave-one",
+        endpoint_label="endpoint-one",
+    )
+    assert observed is not None
+    assert observed.job_id == active.id
+
+    api.jobs = [canceled, completed]
+    observed = adapter.find_wave(
+        namespace="org",
+        wave_id="wave-one",
+        endpoint_label="endpoint-one",
+    )
+    assert observed is not None
+    assert observed.job_id == completed.id
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [("RUNNING", "SCHEDULING"), ("COMPLETED", "COMPLETED")],
+)
+def test_hf_wave_adapter_rejects_unresolved_duplicate_identity(
+    stages: tuple[str, str],
+) -> None:
+    labels = {
+        "harbor-hf-wave": "wave-one",
+        "harbor-hf-endpoint": "endpoint-one",
+    }
+    api = FakeHfJobsApi(
+        [
+            SimpleNamespace(
+                id=f"{index + 1}" * 24,
+                labels=labels,
+                status=SimpleNamespace(stage=stage),
+            )
+            for index, stage in enumerate(stages)
+        ]
+    )
+    adapter = HuggingFaceWaveJobAdapter(
+        api=api,
+        runner=InspectingRunner(),
+        bucket_api=FakeBucketApi(),
+    )
+
+    with pytest.raises(
+        ActionExecutionError,
+        match="^multiple HF Jobs have the managed wave identity: wave-one$",
+    ):
         adapter.find_wave(
             namespace="org",
             wave_id="wave-one",

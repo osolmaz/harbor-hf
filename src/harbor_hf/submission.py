@@ -34,6 +34,14 @@ class BucketApi(Protocol):
 
     def bucket_info(self, bucket_id: str) -> object: ...
 
+    def batch_bucket_files(
+        self,
+        bucket_id: str,
+        *,
+        add: list[tuple[bytes, str]],
+        **kwargs: object,
+    ) -> object: ...
+
     def create_repo(self, repo_id: str, **kwargs: object) -> object: ...
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
@@ -152,6 +160,34 @@ def ensure_private_job_input_bucket(namespace: str, *, api: BucketApi) -> str:
     return bucket
 
 
+def stage_job_input(
+    input_dir: Path,
+    *,
+    bucket: str,
+    identity: str,
+    api: BucketApi,
+) -> str:
+    """Upload a content-addressed input bundle and return its HF mount URI."""
+    files = sorted(path for path in input_dir.rglob("*") if path.is_file())
+    if not files:
+        raise ValueError("Job input directory must contain at least one file")
+    digest = hashlib.sha256()
+    additions: list[tuple[bytes, str]] = []
+    staged: list[tuple[str, bytes]] = []
+    for path in files:
+        relative = path.relative_to(input_dir).as_posix()
+        content = path.read_bytes()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+        staged.append((relative, content))
+    prefix = f"job-inputs/{identity}/{digest.hexdigest()}"
+    additions.extend((content, f"{prefix}/{relative}") for relative, content in staged)
+    api.batch_bucket_files(bucket, add=additions)
+    return f"hf://buckets/{bucket}/{prefix}"
+
+
 def require_private_bucket(bucket: str, *, api: BucketApi) -> str:
     normalized = bucket_id(bucket)
     if getattr(api.bucket_info(normalized), "private", None) is not True:
@@ -172,7 +208,7 @@ def endpoint_lease_label_for(namespace: str, name: str) -> str:
 def build_submit_command(
     lock: RunLock,
     *,
-    input_dir: Path,
+    input_dir: Path | str,
     bucket: str,
 ) -> list[str]:
     job = lock.remote.job
@@ -214,7 +250,7 @@ def build_submit_command(
 def build_submit_wave_command(
     lock: WaveLock,
     *,
-    input_dir: Path,
+    input_dir: Path | str,
     bucket: str,
 ) -> list[str]:
     job = lock.remote.job
@@ -292,9 +328,17 @@ def submit(
 
         bucket_api = cast(BucketApi, HfApi())
     ensure_private_coordination_repository(lock.remote.job.namespace, api=bucket_api)
-    ensure_private_job_input_bucket(lock.remote.job.namespace, api=bucket_api)
+    input_bucket = ensure_private_job_input_bucket(
+        lock.remote.job.namespace, api=bucket_api
+    )
     require_private_bucket(bucket, api=bucket_api)
-    command = build_submit_command(lock, input_dir=input_dir, bucket=bucket)
+    input_source = stage_job_input(
+        input_dir,
+        bucket=input_bucket,
+        identity=lock.run_id,
+        api=bucket_api,
+    )
+    command = build_submit_command(lock, input_dir=input_source, bucket=bucket)
     output = runner.run_text(command)
     match = _JOB_ID.search(output)
     if match is None:
@@ -320,9 +364,17 @@ def submit_wave(
 
         bucket_api = cast(BucketApi, HfApi())
     ensure_private_coordination_repository(lock.remote.job.namespace, api=bucket_api)
-    ensure_private_job_input_bucket(lock.remote.job.namespace, api=bucket_api)
+    input_bucket = ensure_private_job_input_bucket(
+        lock.remote.job.namespace, api=bucket_api
+    )
     require_private_bucket(bucket, api=bucket_api)
-    command = build_submit_wave_command(lock, input_dir=input_dir, bucket=bucket)
+    input_source = stage_job_input(
+        input_dir,
+        bucket=input_bucket,
+        identity=lock.wave_id,
+        api=bucket_api,
+    )
+    command = build_submit_wave_command(lock, input_dir=input_source, bucket=bucket)
     output = runner.run_text(command)
     match = _JOB_ID.search(output)
     if match is None:

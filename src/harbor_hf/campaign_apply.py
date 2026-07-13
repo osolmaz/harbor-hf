@@ -217,6 +217,12 @@ class HuggingFaceWaveJobAdapter:
         except (HfHubHTTPError, httpx.TransportError) as error:
             raise ActionExecutionError("HF Jobs inspection failed") from error
         if len(jobs) > 1:
+            active = [job for job in jobs if not job.terminal]
+            if len(active) == 1:
+                return active[0]
+            completed = [job for job in jobs if job.stage == "COMPLETED"]
+            if not active and len(completed) == 1:
+                return completed[0]
             raise ActionExecutionError(
                 f"multiple HF Jobs have the managed wave identity: {wave_id}"
             )

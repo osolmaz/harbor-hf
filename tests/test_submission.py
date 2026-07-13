@@ -30,6 +30,7 @@ from harbor_hf.submission import (
     github_repository,
     locked_source_command,
     require_private_bucket,
+    stage_job_input,
     submit,
     submit_wave,
 )
@@ -63,6 +64,9 @@ class FakeBucketApi:
         self.created_repositories: list[tuple[str, dict[str, object]]] = []
         self.inspected_repositories: list[tuple[str, dict[str, object]]] = []
         self.repository_commits: list[tuple[str, list[object], dict[str, object]]] = []
+        self.bucket_batches: list[
+            tuple[str, list[tuple[bytes, str]], dict[str, object]]
+        ] = []
 
     def create_bucket(self, bucket_id: str, **kwargs: object) -> object:
         self.created.append((bucket_id, kwargs))
@@ -72,6 +76,16 @@ class FakeBucketApi:
         self.inspected.append(bucket_id)
         private = self.privacy.get(bucket_id, self.private)
         return type("BucketInfo", (), {"private": private})()
+
+    def batch_bucket_files(
+        self,
+        bucket_id: str,
+        *,
+        add: list[tuple[bytes, str]],
+        **kwargs: object,
+    ) -> object:
+        self.bucket_batches.append((bucket_id, add, kwargs))
+        return object()
 
     def create_repo(self, repo_id: str, **kwargs: object) -> object:
         self.created_repositories.append((repo_id, kwargs))
@@ -217,6 +231,7 @@ def test_submit_wave_parses_job_id_and_checks_private_stores(
     lock = _wave_lock(remote_spec)
     runner = FakeRunner("Job started: 0123456789abcdef01234567\n")
     api = FakeBucketApi()
+    (tmp_path / "manifest.yaml").write_text("kind: Experiment\n")
 
     result = submit_wave(
         lock,
@@ -229,6 +244,18 @@ def test_submit_wave_parses_job_id_and_checks_private_stores(
     assert result.wave_id == lock.wave_id
     assert result.job_id == "0123456789abcdef01234567"
     assert api.inspected == ["osolmaz/jobs-artifacts", "example/benchmark-runs"]
+    assert len(api.bucket_batches) == 1
+    input_bucket, additions, kwargs = api.bucket_batches[0]
+    assert input_bucket == "osolmaz/jobs-artifacts"
+    assert kwargs == {}
+    assert additions[0][0] == b"kind: Experiment\n"
+    assert additions[0][1].endswith("/manifest.yaml")
+    assert runner.command is not None
+    assert any(
+        value.startswith("hf://buckets/osolmaz/jobs-artifacts/job-inputs/")
+        and value.endswith(":/input:ro")
+        for value in runner.command
+    )
 
 
 def _wave_lock(spec: ExperimentSpec) -> WaveLock:
@@ -278,6 +305,7 @@ def test_submit_parses_job_id(remote_spec: ExperimentSpec, tmp_path: Path) -> No
     lock = build_run_lock(remote_spec, run_id="run-1")
     runner = FakeRunner("Job started: 0123456789abcdef01234567\n")
     bucket_api = FakeBucketApi()
+    (tmp_path / "manifest.yaml").write_text("kind: Experiment\n")
 
     result = submit(
         lock,
@@ -312,6 +340,7 @@ def test_submit_builds_default_bucket_api(
     api = FakeBucketApi()
     monkeypatch.setattr("huggingface_hub.HfApi", lambda: api)
     runner = FakeRunner("0123456789abcdef01234567")
+    (tmp_path / "manifest.yaml").write_text("kind: Experiment\n")
 
     result = submit(
         build_run_lock(remote_spec),
@@ -322,7 +351,11 @@ def test_submit_builds_default_bucket_api(
 
     assert result.job_id == "0123456789abcdef01234567"
     assert runner.command is not None
-    assert f"{tmp_path}:/input:ro" in runner.command
+    assert any(
+        value.startswith("hf://buckets/osolmaz/jobs-artifacts/job-inputs/")
+        and value.endswith(":/input:ro")
+        for value in runner.command
+    )
     assert api.inspected == [
         "osolmaz/jobs-artifacts",
         "osolmaz/benchmark-runs",
@@ -333,6 +366,7 @@ def test_submit_rejects_missing_job_id(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
     lock = build_run_lock(remote_spec)
+    (tmp_path / "manifest.yaml").write_text("kind: Experiment\n")
 
     with pytest.raises(
         ValueError, match="^HF Jobs submission did not return a job ID$"
@@ -343,6 +377,49 @@ def test_submit_rejects_missing_job_id(
             bucket="osolmaz/benchmark-runs",
             runner=FakeRunner("submitted"),
             bucket_api=FakeBucketApi(),
+        )
+
+
+def test_stage_job_input_is_content_addressed_and_rejects_empty_directory(
+    tmp_path: Path,
+) -> None:
+    api = FakeBucketApi()
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "manifest.yaml").write_bytes(b"manifest")
+    (tmp_path / "nested" / "lock.json").write_bytes(b"lock")
+
+    first = stage_job_input(
+        tmp_path,
+        bucket="osolmaz/jobs-artifacts",
+        identity="wave-one",
+        api=api,
+    )
+    second = stage_job_input(
+        tmp_path,
+        bucket="osolmaz/jobs-artifacts",
+        identity="wave-one",
+        api=api,
+    )
+
+    assert first == second
+    assert first.startswith("hf://buckets/osolmaz/jobs-artifacts/job-inputs/wave-one/")
+    assert api.bucket_batches[0] == api.bucket_batches[1]
+    assert [path for _content, path in api.bucket_batches[0][1]] == [
+        first.removeprefix("hf://buckets/osolmaz/jobs-artifacts/") + "/manifest.yaml",
+        first.removeprefix("hf://buckets/osolmaz/jobs-artifacts/")
+        + "/nested/lock.json",
+    ]
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(
+        ValueError, match="^Job input directory must contain at least one file$"
+    ):
+        stage_job_input(
+            empty,
+            bucket="osolmaz/jobs-artifacts",
+            identity="wave-empty",
+            api=api,
         )
 
 
