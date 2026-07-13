@@ -107,6 +107,18 @@ def test_agent_revision_metadata_is_explicit() -> None:
         )
 
 
+@pytest.mark.parametrize("key", ["", " version", "version ", "version=x"])
+def test_agent_parameter_keys_are_unambiguous_for_harbor(key: str) -> None:
+    with pytest.raises(ValueError, match="agent parameter keys must not"):
+        AgentProfile(
+            id="agent",
+            name="openclaw",
+            revision="1.0.0",
+            revision_kind="package",
+            parameters={key: "value"},
+        )
+
+
 @pytest.mark.parametrize(
     "key",
     ["HF_TOKEN", "api-key", "PASSWORD", "OPENAI_API_KEY", "AWS_ACCESS_KEY"],

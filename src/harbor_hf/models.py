@@ -105,6 +105,16 @@ class AgentProfile(StrictModel):
             raise ValueError("package agents report their package revision")
         if self.revision_kind == "harbor-source" and self.reported_version is None:
             raise ValueError("Harbor-source agents require reported_version")
+        ambiguous_keys = [
+            key
+            for key in self.parameters
+            if not key or key != key.strip() or "=" in key
+        ]
+        if ambiguous_keys:
+            raise ValueError(
+                "agent parameter keys must not be empty, contain '=', or have "
+                "surrounding whitespace"
+            )
         _reject_sensitive_parameters(self.parameters, "agent")
         return self
 

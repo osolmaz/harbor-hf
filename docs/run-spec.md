@@ -100,7 +100,9 @@ Secret-like keys and keys declared in `secret_names` are rejected from
 
 Provider-specific values belong in `parameters`. They must be representable as
 JSON and are preserved in the resolved lock. Secret-like keys are rejected
-recursively from deployment and agent parameter mappings.
+recursively from deployment and agent parameter mappings. Top-level agent
+parameter keys cannot be empty, contain `=`, or have surrounding whitespace,
+because Harbor parses them as command-line `KEY=VALUE` pairs.
 
 An endpoint-backed deployment used for submission also has an `endpoint`
 binding with `namespace`, `name`, and the OpenAI-compatible

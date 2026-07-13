@@ -36,6 +36,10 @@ def experiment_digest(spec: ExperimentSpec) -> str:
     return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
+def is_task_pattern(task: str) -> bool:
+    return any(character in task for character in "*?[")
+
+
 def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
     cells = [
         RunCell(model=model.id, deployment=deployment.id, agent=agent.id)
@@ -46,7 +50,9 @@ def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
         )
     ]
     task_count = (
-        None if "*" in spec.benchmark.task_names else len(spec.benchmark.task_names)
+        None
+        if any(is_task_pattern(task) for task in spec.benchmark.task_names)
+        else len(spec.benchmark.task_names)
     )
     logical_trial_count = (
         None

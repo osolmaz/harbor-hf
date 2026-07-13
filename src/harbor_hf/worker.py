@@ -28,7 +28,7 @@ from harbor_hf.evidence import (
 )
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
-from harbor_hf.planner import experiment_digest
+from harbor_hf.planner import experiment_digest, is_task_pattern
 from harbor_hf.process import (
     CommandRunner,
     ProcessError,
@@ -867,9 +867,7 @@ def probe_runtime(
 
 
 def _expected_trial_count(lock: RunLock) -> int | None:
-    if any(
-        any(character in task for character in "*?[") for task in lock.benchmark_tasks
-    ):
+    if any(is_task_pattern(task) for task in lock.benchmark_tasks):
         return None
     return len(lock.benchmark_tasks) * lock.attempts
 
@@ -878,7 +876,7 @@ def _expected_task_counts(lock: RunLock) -> dict[str, int] | None:
     return {
         task: lock.attempts
         for task in lock.benchmark_tasks
-        if not any(character in task for character in "*?[")  # pragma: no mutate
+        if not is_task_pattern(task)  # pragma: no mutate
     }
 
 

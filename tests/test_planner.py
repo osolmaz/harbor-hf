@@ -42,3 +42,16 @@ def test_counts_explicit_tasks_and_attempts() -> None:
 
     assert plan.run_count == 2
     assert plan.logical_trial_count == 12
+
+
+def test_patterns_have_unresolved_trial_counts() -> None:
+    spec = load_experiment(EXAMPLE)
+
+    for task in ("task-*", "task?", "task[12]"):
+        patterned = spec.model_copy(
+            update={
+                "benchmark": spec.benchmark.model_copy(update={"task_names": [task]})
+            }
+        )
+
+        assert build_plan(patterned).logical_trial_count is None
