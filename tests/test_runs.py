@@ -11,9 +11,9 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
 
-    assert lock.run_id == "20260713T010203Z-7d33f3735e"
+    assert lock.run_id == "20260713T010203Z-238f5a87ca"
     assert lock.spec_digest == (
-        "sha256:af49d43b01fe12dcc29c074bf2fc5bda87610788d8c10f9075af4b53bffa7d10"
+        "sha256:ea31d8bc038656fce6547cb7ce73640ba5a6ba50a336404d9bb5b5c15251e4fb"
     )
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
     assert lock.deployment.endpoint is not None

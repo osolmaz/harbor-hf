@@ -234,7 +234,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "--agent-kwarg",
         "compaction=true",
         "--agent-kwarg",
-        "thinking=false",
+        'thinking="off"',
     ]
 
 

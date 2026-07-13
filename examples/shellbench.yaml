@@ -53,7 +53,7 @@ matrix:
       name: openclaw
       revision: replace-with-commit
       parameters:
-        thinking: false
+        thinking: "off"
         compaction: true
 execution:
   attempts: 1
