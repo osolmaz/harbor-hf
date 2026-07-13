@@ -1,0 +1,62 @@
+[project]
+name = "harbor-hf"
+version = "0.1.0"
+description = "Run reproducible Harbor benchmarks on Hugging Face infrastructure."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Onur Solmaz" }]
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.11.7",
+  "pyyaml>=6.0.2",
+  "typer>=0.16.0",
+]
+
+[project.urls]
+Repository = "https://github.com/osolmaz/harbor-hf"
+Issues = "https://github.com/osolmaz/harbor-hf/issues"
+
+[project.scripts]
+harbor-hf = "harbor_hf.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "mutmut==3.6.0",
+  "pip-audit>=2.9.0",
+  "pytest>=8.4.0",
+  "pytest-cov>=6.2.0",
+  "ruff>=0.15.21",
+  "slophammer-py==0.4.0",
+  "ty>=0.0.59",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8
+
+[tool.coverage.run]
+branch = true
+source = ["src/harbor_hf"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.mutmut]
+source_paths = ["src/harbor_hf"]
+pytest_add_cli_args_test_selection = ["tests"]
+also_copy = ["examples"]

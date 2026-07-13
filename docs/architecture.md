@@ -1,0 +1,118 @@
+# Architecture
+
+## Purpose
+
+`harbor-hf` is the control plane around Harbor. Harbor owns tasks, agents,
+environments, verification, trajectories, and trial results. `harbor-hf` owns
+experiment expansion, Hugging Face resource lifecycle, reproducibility
+metadata, raw artifact retention, and result publication.
+
+The package must remain useful as an independent Harbor plugin and be shaped so
+that it could later move into a Harbor monorepo package without architectural
+changes.
+
+## Components
+
+```text
+experiment.yaml
+      |
+      v
+planner -> resolved run locks -> controller
+                                  |      |
+                         HF Endpoint   HF Jobs/Sandboxes
+                                  |      |
+                                  + Harbor trials
+                                          |
+                                private HF bucket
+                                          |
+                                   publisher job
+                                          |
+                               versioned HF Datasets
+                                          |
+                                  leaderboard Space
+```
+
+### Planner
+
+The planner validates an experiment, expands its matrix, and produces one
+homogeneous run per model, deployment, and agent cell. Planning must not create
+remote resources. Every resolved run receives a content digest before it is
+submitted.
+
+### Controller
+
+The controller reconciles desired runs with remote state. It starts inference
+only when work is ready, submits bounded task shards, records lifecycle events,
+and pauses unused endpoints. Operations must be idempotent so a stopped
+controller can continue without duplicating completed trials.
+
+### Harbor Adapter
+
+Harbor remains the only benchmark execution engine. The adapter translates a
+resolved run into Harbor job configuration and registers public lifecycle hooks
+for incremental artifact publication. It must not patch Harbor internals.
+
+### Artifact Store
+
+A private HF Storage Bucket is the complete evidence archive. Requested and
+resolved configuration, endpoint snapshots, Harbor output, trajectories,
+sessions, verifier records, logs, and checksums are written under an immutable
+run prefix. Trial archives are uploaded as trials finish. A `_SUCCESS` marker is
+written only after validation and resource cleanup.
+
+### Results Publisher
+
+One serialized publisher converts completed runs into normalized Parquet tables.
+Benchmark-specific Dataset repositories contain run, trial, execution, metric,
+and artifact tables. A small global index contains one row per completed run.
+The bucket is canonical evidence; Datasets are the query and presentation layer.
+
+## Identity
+
+The stable hierarchy is:
+
+1. An experiment groups a requested matrix.
+2. A run represents one homogeneous matrix cell.
+3. A trial represents one task and logical attempt.
+4. An execution represents one physical invocation, including infrastructure
+   retries.
+
+Retries never replace previous executions. Composite or manually selected
+results must be labeled explicitly and must not appear as single-run results.
+
+## Reproducibility Boundary
+
+A resolved run lock records:
+
+- benchmark source, revision, task-set digest, and verifier digest;
+- Harbor, agent, tool, prompt, and skill revisions;
+- model, tokenizer, chat-template, and generation-config revisions;
+- weight format and quantization separately from activation and KV precision;
+- provider, region, hardware, replica, image, engine, and driver information;
+- context, output, batching, concurrency, retry, timeout, and sampling settings;
+- requested provider configuration and the effective configuration returned by
+  the provider.
+
+Secret values are never recorded. Manifests store only the names of secrets
+that must be injected by the remote platform.
+
+## Failure And Cleanup
+
+Runs progress through `planned`, `submitted`, `provisioning`, `running`,
+`verifying`, `publishing`, and a terminal state. Every transition is an
+append-only event.
+
+The controller pauses an endpoint after its last active shard in a `finally`
+path. A separate scheduled watchdog finds stale endpoint leases and pauses them,
+covering controller termination before cleanup. Cleanup success is part of run
+completion, not an optional maintenance action.
+
+## Boundaries
+
+- No local model loading or inference.
+- No benchmark-specific behavior in package code.
+- No raw sessions in public Dataset repositories.
+- No secret values in manifests, logs, locks, or artifacts.
+- No state that exists only on the submitting machine.
+- No direct writes from trial workers to shared Dataset Git repositories.
+

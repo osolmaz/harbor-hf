@@ -1,0 +1,116 @@
+# Experiment Manifest
+
+This specification defines the initial portable experiment format consumed by
+`harbor-hf`. An experiment is one YAML file with a required `Experiment`
+resource. The format is pre-release and identified as `harbor-hf/v1alpha1`.
+
+## Minimal Shape
+
+```yaml
+api_version: harbor-hf/v1alpha1
+kind: Experiment
+metadata:
+  name: example
+benchmark:
+  dataset: terminal-bench@2.0
+matrix:
+  models:
+    - id: model
+      repo: organization/model
+      revision: replace-with-immutable-revision
+      weights:
+        format: safetensors
+        quantization:
+          method: compressed-tensors
+          scheme: fp8
+  deployments:
+    - id: h200
+      hardware: h200
+      region: aws-us-east-1
+      engine:
+        name: vllm
+        image: registry/image@sha256:replace-with-digest
+  agents:
+    - id: agent
+      name: terminus-2
+      revision: replace-with-immutable-revision
+artifacts:
+  bucket: organization/benchmark-runs
+publishing:
+  dataset: organization/terminal-bench-results
+```
+
+Unknown fields are rejected. Use `harbor-hf validate PATH` before submission.
+
+## Fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `api_version` | Yes | Manifest schema version. |
+| `kind` | Yes | Must be `Experiment`. |
+| `metadata` | Yes | Human identity and labels. |
+| `benchmark` | Yes | Harbor dataset and task selection. |
+| `matrix` | Yes | Models, deployments, and agents to combine. |
+| `execution` | No | Attempt, concurrency, and timeout policy. |
+| `artifacts` | Yes | Private raw bucket destination. |
+| `publishing` | Yes | Result Dataset destinations. |
+
+### Metadata
+
+`metadata.name` is a lowercase identifier containing letters, digits, and
+hyphens. `metadata.labels` is optional non-executing metadata.
+
+### Benchmark
+
+`benchmark.dataset` is a Harbor dataset reference. `task_names` defaults to
+`["*"]`. The planner cannot calculate a trial count for wildcard selection
+until the dataset is resolved; a later resolved lock must contain every task
+digest.
+
+### Matrix
+
+The initial alpha format takes the Cartesian product of `models`, `deployments`,
+and `agents`. IDs must be unique within each dimension. A future format may add
+explicit inclusion and exclusion rules without changing the resolved run model.
+
+Model revisions and runtime image references should be immutable commit or
+content digests. `weights.format` describes the weight container, such as
+Safetensors or GGUF. Optional `weights.quantization` records the quantization
+method and scheme; unquantized weights omit it. Activation and KV-cache
+precision belong to the deployment profile because they are runtime choices.
+
+Deployment `engine.environment` contains non-secret values. `secret_names`
+contains environment-variable names that the remote Job or Endpoint must inject.
+Secret values are invalid manifest content.
+
+Provider-specific values belong in `parameters`. They must be representable as
+JSON and are preserved in the resolved lock.
+
+### Execution
+
+`attempts` counts independent logical attempts. Infrastructure retries do not
+consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
+provider request concurrency is part of the deployment profile. Timeout values
+are in seconds.
+
+### Artifacts
+
+`artifacts.bucket` identifies private raw storage for complete run evidence.
+
+### Publishing
+
+`publishing.dataset` identifies the versioned, benchmark-specific publication.
+`index_dataset` optionally identifies the global run catalog.
+
+## Loading And Resolution
+
+Validation checks only the requested document. Planning expands the matrix and
+computes a digest from canonical JSON. Submission will resolve mutable names to
+immutable revisions, query effective provider configuration, and write a
+separate lock. The requested document is never rewritten with resolved values.
+
+## Not Covered
+
+The manifest does not define Harbor tasks, verifier behavior, agent internals,
+leaderboard presentation, secret storage, or provider credentials. Those remain
+owned by Harbor, the selected agent, Hugging Face, or the presentation layer.

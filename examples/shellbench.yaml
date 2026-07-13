@@ -1,0 +1,66 @@
+api_version: harbor-hf/v1alpha1
+kind: Experiment
+metadata:
+  name: shellbench-qwen-hardware
+  labels:
+    purpose: serving-comparison
+benchmark:
+  dataset: shellbench@public-115
+  task_names:
+    - "*"
+matrix:
+  models:
+    - id: qwen36-nvfp4
+      repo: nvidia/Qwen3.6-35B-A3B-NVFP4
+      revision: 0123456789abcdef0123456789abcdef01234567
+      weights:
+        format: safetensors
+        quantization:
+          method: modelopt
+          scheme: nvfp4
+  deployments:
+    - id: rtx-pro-6000
+      hardware: rtx-pro-6000
+      accelerator_count: 1
+      region: aws-us-east-1
+      engine:
+        name: vllm
+        image: ghcr.io/example/vllm@sha256:replace-with-image-digest
+        arguments:
+          - --max-model-len=65536
+          - --kv-cache-dtype=fp8
+        environment:
+          VLLM_USE_FLASHINFER_MOE_FP4: "1"
+        secret_names:
+          - HF_TOKEN
+      parameters:
+        min_replicas: 0
+        max_replicas: 1
+    - id: h200
+      hardware: h200
+      accelerator_count: 1
+      region: aws-us-east-1
+      engine:
+        name: vllm
+        image: ghcr.io/example/vllm@sha256:replace-with-image-digest
+        arguments:
+          - --max-model-len=65536
+          - --kv-cache-dtype=fp8
+        secret_names:
+          - HF_TOKEN
+  agents:
+    - id: openclaw
+      name: openclaw
+      revision: replace-with-commit
+      parameters:
+        thinking: false
+        compaction: true
+execution:
+  attempts: 1
+  concurrent_trials: 8
+  timeout_seconds: 7200
+artifacts:
+  bucket: example/benchmark-runs
+publishing:
+  dataset: example/shellbench-results
+  index_dataset: example/benchmark-run-index

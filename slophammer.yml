@@ -1,0 +1,21 @@
+python:
+  coverage:
+    threshold: 85
+    paths:
+      - src/harbor_hf
+  complexity:
+    max: 8
+  dry:
+    max_findings: 0
+    paths:
+      - src/harbor_hf
+    copied_blocks:
+      enabled: true
+      min_tokens: 100
+  mutation:
+    targets:
+      - src/harbor_hf
+  dependency_boundaries:
+    - from: src/harbor_hf
+      allow: []
+
