@@ -29,7 +29,7 @@ class ExperimentPlan(BaseModel):
 
 def experiment_digest(spec: ExperimentSpec) -> str:
     canonical = json.dumps(
-        spec.model_dump(mode="json"),
+        spec.model_dump(mode="json", exclude_none=True),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")

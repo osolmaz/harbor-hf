@@ -1,8 +1,11 @@
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
 
-from harbor_hf.cli import app
+from harbor_hf.cli import _write_lock, app
+from harbor_hf.models import ExperimentSpec
+from harbor_hf.runs import build_run_lock
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
 runner = CliRunner()
@@ -32,3 +35,34 @@ def test_invalid_manifest_reports_stderr_and_exit_two(tmp_path: Path) -> None:
     assert result.stdout == ""
     assert "Error:" in result.stderr
     assert "Field required" in result.stderr
+
+
+def test_submit_dry_run_prints_sanitized_remote_command(
+    remote_manifest: Path,
+) -> None:
+    result = runner.invoke(app, ["submit", str(remote_manifest), "--dry-run"])
+
+    assert result.exit_code == 0
+    assert '"job_id": null' in result.stdout
+    assert '"HF_TOKEN"' in result.stdout
+    assert '"worker"' in result.stdout
+
+
+def test_submit_rejects_manifest_without_remote_configuration() -> None:
+    result = runner.invoke(app, ["submit", str(EXAMPLE), "--dry-run"])
+
+    assert result.exit_code == 2
+    assert "requires a remote configuration" in result.stderr
+
+
+def test_lock_writer_uses_canonical_json(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="written")
+    path = tmp_path / "lock.json"
+
+    _write_lock(path, lock)
+
+    assert path.read_text(encoding="utf-8") == (
+        json.dumps(lock.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    )

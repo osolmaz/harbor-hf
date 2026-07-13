@@ -57,12 +57,12 @@ submitted.
 
 ### Controller
 
-The controller reconciles desired runs with remote state. It starts endpoint
-inference only when work is ready, submits bounded task shards, records
-lifecycle events, and pauses unused endpoints. Provider-backed runs skip
-endpoint provisioning but retain request, quota, retry, and accounting state.
-Operations must be idempotent so a stopped controller can continue without
-duplicating completed trials.
+The submission CLI stages an immutable manifest and run lock and starts an HF
+Job. That remote Job is the controller: it starts endpoint inference only when
+work is ready, submits bounded Harbor trials to HF Sandboxes, records lifecycle
+events, and pauses the endpoint in a `finally` path. The submitting machine does
+not execute benchmark tasks. Provider-backed runs will skip endpoint
+provisioning but retain request, quota, retry, and accounting state.
 
 ### Harbor Adapter
 
@@ -157,6 +157,12 @@ endpoint leases and pauses them, covering controller termination before
 cleanup. Cleanup success is part of endpoint run completion, not an optional
 maintenance action. Provider-backed runs have no endpoint lease but still close
 worker resources and record final usage and request state.
+
+The worker verifies `status.state = paused` and `readyReplica = 0` before it
+writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may
+remain nonzero on a paused endpoint. HF Sandbox environments are killed by
+Harbor, and their idle timeout limits abandoned resources if the controller is
+terminated.
 
 ## Boundaries
 

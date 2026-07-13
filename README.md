@@ -5,9 +5,11 @@ Hugging Face infrastructure. It plans experiment matrices, manages remote
 inference and task environments, preserves complete run evidence, and publishes
 queryable results without running model inference locally.
 
-The project is in early development. The current CLI validates the initial
-experiment format and expands its model, deployment, and agent matrix. It does
-not yet create remote resources.
+The project is in early development. The CLI validates and expands experiment
+matrices and can submit one resolved matrix cell to an HF Job. The remote worker
+controls an existing Inference Endpoint, runs Harbor tasks in HF Sandboxes,
+archives evidence to an HF Bucket, and verifies that the endpoint is paused
+before declaring success.
 
 ## Install
 
@@ -33,6 +35,27 @@ uv run harbor-hf plan examples/shellbench.yaml
 `plan` performs no remote operations. It prints the resolved matrix cells and a
 digest of the requested experiment.
 
+## Submit A Remote Run
+
+Remote submission requires an endpoint binding and exact 40-character commits
+for both `harbor-hf` and Harbor. Preview the sanitized HF Job command first:
+
+```bash
+uv run harbor-hf submit experiment.yaml --dry-run
+uv run harbor-hf submit experiment.yaml
+```
+
+If a matrix dimension has more than one profile, select it explicitly with
+`--model`, `--deployment`, or `--agent`. Submission sends the manifest and
+resolved lock to an HF Job. The local machine does not execute the task or load
+the model.
+
+The Job writes evidence under
+`runs/<experiment>/<run-id>/` in the configured private HF Bucket. `_SUCCESS`
+is written only after one numeric Harbor verifier result exists and the
+Inference Endpoint reports `paused` with zero ready replicas. Failures write
+`_FAILED` after attempting the same cleanup.
+
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution
 policy. Harbor remains responsible for task execution and verification.
@@ -45,4 +68,3 @@ path to remote execution.
 ## License
 
 [Apache-2.0](LICENSE)
-

@@ -46,6 +46,12 @@ class EngineSpec(StrictModel):
     secret_names: list[str] = Field(default_factory=list)
 
 
+class EndpointRef(StrictModel):
+    namespace: str = Field(min_length=1)
+    name: ProfileId
+    served_model_name: str = Field(min_length=1)
+
+
 class DeploymentProfile(StrictModel):
     id: ProfileId
     provider: Literal["hf-inference-endpoints"] = "hf-inference-endpoints"
@@ -53,6 +59,7 @@ class DeploymentProfile(StrictModel):
     accelerator_count: int = Field(default=1, ge=1)
     region: str = Field(min_length=1)
     engine: EngineSpec
+    endpoint: EndpointRef | None = None
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
 
 
@@ -94,6 +101,35 @@ class PublishingSpec(StrictModel):
     index_dataset: str | None = None
 
 
+class RemoteJobSpec(StrictModel):
+    namespace: str = Field(min_length=1)
+    image: str = Field(
+        default="ghcr.io/astral-sh/uv:python3.12-bookworm-slim",
+        min_length=1,
+    )
+    flavor: str = Field(default="cpu-basic", min_length=1)
+    timeout_seconds: int = Field(default=10800, ge=1, le=86400)
+    token_secret_name: str = Field(default="HF_TOKEN", pattern=r"^[A-Z][A-Z0-9_]*$")
+
+
+class SourcePin(StrictModel):
+    repository: str = Field(min_length=1)
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class HarborRuntimeSpec(StrictModel):
+    source: SourcePin
+    environment: Literal["hf-sandbox"] = "hf-sandbox"
+    sandbox_flavor: str = Field(default="cpu-basic", min_length=1)
+    sandbox_idle_timeout_seconds: int = Field(default=600, ge=1, le=86400)
+
+
+class RemoteExecutionSpec(StrictModel):
+    job: RemoteJobSpec
+    worker: SourcePin
+    harbor: HarborRuntimeSpec
+
+
 class ExperimentSpec(StrictModel):
     api_version: Literal["harbor-hf/v1alpha1"]
     kind: Literal["Experiment"]
@@ -103,3 +139,4 @@ class ExperimentSpec(StrictModel):
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     artifacts: ArtifactStoreSpec
     publishing: PublishingSpec
+    remote: RemoteExecutionSpec | None = None

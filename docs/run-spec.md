@@ -38,6 +38,16 @@ artifacts:
   bucket: organization/benchmark-runs
 publishing:
   dataset: organization/terminal-bench-results
+remote:
+  job:
+    namespace: organization
+  worker:
+    repository: organization/harbor-hf
+    revision: 0123456789abcdef0123456789abcdef01234567
+  harbor:
+    source:
+      repository: harbor-framework/harbor
+      revision: 0123456789abcdef0123456789abcdef01234567
 ```
 
 Unknown fields are rejected. Use `harbor-hf validate PATH` before submission.
@@ -54,6 +64,7 @@ Unknown fields are rejected. Use `harbor-hf validate PATH` before submission.
 | `execution` | No | Attempt, concurrency, and timeout policy. |
 | `artifacts` | Yes | Private raw bucket destination. |
 | `publishing` | Yes | Result Dataset destinations. |
+| `remote` | For submission | HF Job and pinned worker runtime configuration. |
 
 ### Metadata
 
@@ -86,6 +97,11 @@ Secret values are invalid manifest content.
 Provider-specific values belong in `parameters`. They must be representable as
 JSON and are preserved in the resolved lock.
 
+An endpoint-backed deployment used for submission also has an `endpoint`
+binding with `namespace`, `name`, and the OpenAI-compatible
+`served_model_name`. The binding identifies an existing endpoint; planning does
+not inspect or resume it.
+
 Engine identity is more than `engine.name`. Resolution and submission preserve
 the engine version and build or commit, immutable image digest, full arguments,
 non-secret environment, secret names, runtime and driver versions, parser and
@@ -117,6 +133,18 @@ are in seconds.
 
 `publishing.dataset` identifies the versioned, benchmark-specific publication.
 `index_dataset` optionally identifies the global run catalog.
+
+### Remote Execution
+
+`remote.job` pins the HF Job namespace, controller image, hardware flavor,
+timeout, and secret variable name. `remote.worker` pins this package to an exact
+GitHub commit. `remote.harbor.source` likewise pins Harbor to an exact GitHub
+commit and configures the HF Sandbox flavor and idle timeout. Source revisions
+must be full lowercase 40-character Git commit IDs.
+
+Only secret names are serialized. `HF_TOKEN` is forwarded through the HF Jobs
+secret mechanism and inherited by Harbor through process environment. Its value
+is absent from commands, locks, and evidence.
 
 ## Loading And Resolution
 
