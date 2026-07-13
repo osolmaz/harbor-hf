@@ -67,8 +67,9 @@ provisioning but retain request, quota, retry, and accounting state.
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
 derived from the endpoint namespace and name. They coordinate through one
 private, namespace-level `harbor-hf-coordination` Dataset repository. A
-watchdog adds the endpoint's lease file with the repository head as the
-expected parent commit before publishing its readiness handshake. Concurrent
+submission seeds an initialization commit when that repository has no `main`
+commit yet. A watchdog adds the endpoint's lease file with the repository head
+as the expected parent commit before publishing its readiness handshake. Concurrent
 commits cannot both use the same parent; a loser rereads the new head, observes
 the lease, and exits before its controller changes endpoint state.
 

@@ -176,6 +176,7 @@ dependency; the worker verifies that capability before it resumes the endpoint.
 For endpoint-backed runs, `remote.job.namespace` must equal the selected
 endpoint namespace. Submission creates or verifies a private
 `<namespace>/harbor-hf-coordination` Dataset repository. The watchdog uses an
+initialization commit as the first parent in a new repository, then uses an
 endpoint-specific file committed against an expected parent revision as an
 atomic lease and removes it with the same compare-and-swap protocol only after
 verified cleanup.

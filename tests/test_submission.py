@@ -1,6 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
+from huggingface_hub import CommitOperationAdd
+from huggingface_hub.errors import HfHubHTTPError
 
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.runs import build_run_lock
@@ -37,14 +41,17 @@ class FakeBucketApi:
         private: bool = True,
         privacy: dict[str, bool] | None = None,
         repository_private: bool = True,
+        repository_sha: str | None = "1" * 40,
     ) -> None:
         self.private = private
         self.privacy = privacy or {}
         self.repository_private = repository_private
+        self.repository_sha = repository_sha
         self.created: list[tuple[str, dict[str, object]]] = []
         self.inspected: list[str] = []
         self.created_repositories: list[tuple[str, dict[str, object]]] = []
         self.inspected_repositories: list[tuple[str, dict[str, object]]] = []
+        self.repository_commits: list[tuple[str, list[object], dict[str, object]]] = []
 
     def create_bucket(self, bucket_id: str, **kwargs: object) -> object:
         self.created.append((bucket_id, kwargs))
@@ -61,7 +68,17 @@ class FakeBucketApi:
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object:
         self.inspected_repositories.append((repo_id, kwargs))
-        return type("RepoInfo", (), {"private": self.repository_private})()
+        return SimpleNamespace(
+            private=self.repository_private,
+            sha=self.repository_sha,
+        )
+
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object:
+        self.repository_commits.append((repo_id, operations, kwargs))
+        self.repository_sha = "2" * 40
+        return SimpleNamespace(oid=self.repository_sha)
 
 
 def test_build_submit_command_contains_only_secret_name(
@@ -227,6 +244,80 @@ def test_submit_ensures_private_coordination_repository() -> None:
             {"repo_type": "dataset", "private": True, "exist_ok": True},
         )
     ]
+
+
+def test_submit_initializes_empty_coordination_repository() -> None:
+    api = FakeBucketApi(repository_sha=None)
+
+    ensure_private_coordination_repository("osolmaz", api=api)
+
+    assert api.repository_sha == "2" * 40
+    assert len(api.repository_commits) == 1
+    repository, operations, kwargs = api.repository_commits[0]
+    assert repository == "osolmaz/harbor-hf-coordination"
+    assert kwargs == {
+        "commit_message": "chore: initialize coordination repository",
+        "repo_type": "dataset",
+        "revision": "main",
+    }
+    assert len(operations) == 1
+    operation = operations[0]
+    assert isinstance(operation, CommitOperationAdd)
+    assert operation.path_in_repo == ".harbor-hf-initialized"
+    assert operation.path_or_fileobj == b"harbor-hf coordination repository\n"
+    assert api.inspected_repositories[-1] == (
+        "osolmaz/harbor-hf-coordination",
+        {"repo_type": "dataset", "revision": "main"},
+    )
+
+
+def test_submit_accepts_concurrent_coordination_initialization() -> None:
+    class ConcurrentApi(FakeBucketApi):
+        def create_commit(
+            self, repo_id: str, operations: list[object], **kwargs: object
+        ) -> object:
+            self.repository_sha = "3" * 40
+            request = httpx.Request("POST", "https://huggingface.co/api/datasets")
+            raise HfHubHTTPError(
+                "already initialized",
+                response=httpx.Response(409, request=request),
+            )
+
+    api = ConcurrentApi(repository_sha=None)
+
+    ensure_private_coordination_repository("osolmaz", api=api)
+
+    assert api.repository_sha == "3" * 40
+
+
+def test_submit_rejects_failed_coordination_initialization() -> None:
+    class FailingApi(FakeBucketApi):
+        def create_commit(
+            self, repo_id: str, operations: list[object], **kwargs: object
+        ) -> object:
+            request = httpx.Request("POST", "https://huggingface.co/api/datasets")
+            raise HfHubHTTPError(
+                "initialization failed",
+                response=httpx.Response(500, request=request),
+            )
+
+    with pytest.raises(HfHubHTTPError, match="initialization failed"):
+        ensure_private_coordination_repository(
+            "osolmaz", api=FailingApi(repository_sha=None)
+        )
+
+
+def test_submit_rejects_initialization_without_commit_identity() -> None:
+    class MissingCommitApi(FakeBucketApi):
+        def create_commit(
+            self, repo_id: str, operations: list[object], **kwargs: object
+        ) -> object:
+            return SimpleNamespace(oid=None)
+
+    with pytest.raises(ValueError, match="has no commit identity"):
+        ensure_private_coordination_repository(
+            "osolmaz", api=MissingCommitApi(repository_sha=None)
+        )
 
 
 def test_submit_builds_default_authenticated_coordination_api(

@@ -6,6 +6,8 @@ import shlex
 from pathlib import Path
 from typing import Protocol, cast
 
+from huggingface_hub import CommitOperationAdd
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict
 
 from harbor_hf.coordination import bucket_id, coordination_repository
@@ -18,6 +20,8 @@ _GITHUB_REPOSITORY = re.compile(
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
 _JOB_INPUT_BUCKET_NAME = "jobs-artifacts"
+_COORDINATION_INITIALIZATION_PATH = ".harbor-hf-initialized"
+_COORDINATION_INITIALIZATION_PAYLOAD = b"harbor-hf coordination repository\n"
 
 
 class TextRunner(Protocol):
@@ -32,6 +36,10 @@ class BucketApi(Protocol):
     def create_repo(self, repo_id: str, **kwargs: object) -> object: ...
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
+
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object: ...
 
 
 class Submission(BaseModel):
@@ -91,7 +99,39 @@ def ensure_private_coordination_repository(
     info = api.repo_info(repository, repo_type="dataset")
     if getattr(info, "private", None) is not True:
         raise ValueError(f"coordination repository {repository} must be private")
+    if _commit_identity(info) is None:
+        _initialize_coordination_repository(repository, api)
     return repository
+
+
+def _initialize_coordination_repository(repository: str, api: BucketApi) -> None:
+    initialization_error: HfHubHTTPError | None = None
+    try:
+        api.create_commit(
+            repository,
+            [
+                CommitOperationAdd(
+                    path_in_repo=_COORDINATION_INITIALIZATION_PATH,
+                    path_or_fileobj=_COORDINATION_INITIALIZATION_PAYLOAD,
+                )
+            ],
+            commit_message="chore: initialize coordination repository",
+            repo_type="dataset",
+            revision="main",
+        )
+    except HfHubHTTPError as error:
+        initialization_error = error
+    info = api.repo_info(repository, repo_type="dataset", revision="main")
+    if _commit_identity(info) is not None:
+        return
+    if initialization_error is not None:
+        raise initialization_error
+    raise ValueError(f"coordination repository {repository} has no commit identity")
+
+
+def _commit_identity(info: object) -> str | None:
+    revision = getattr(info, "sha", None)
+    return revision if isinstance(revision, str) and revision else None
 
 
 def ensure_private_job_input_bucket(namespace: str, *, api: BucketApi) -> str:
