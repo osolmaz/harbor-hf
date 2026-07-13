@@ -100,12 +100,13 @@ class EndpointManager:
         deadline = self.monotonic() + timeout_seconds
         while True:
             snapshot = self.describe()
-            state, ready, _ = endpoint_state(snapshot)
-            if state == "running" and ready > 0:
+            state, ready, target = endpoint_state(snapshot)
+            if state == "running" and target > 0 and ready >= target:
                 return snapshot
             if self.monotonic() >= deadline:
                 raise WorkerError(
-                    f"endpoint readiness timed out in state={state!r}, ready={ready}"
+                    "endpoint readiness timed out in "
+                    f"state={state!r}, ready={ready}, target={target}"
                 )
             self.sleep(poll_seconds)
 
@@ -158,6 +159,28 @@ def endpoint_url(snapshot: Mapping[str, object]) -> str:
     if not isinstance(url, str):
         raise WorkerError("endpoint status is missing its URL")
     return url.rstrip("/")
+
+
+def endpoint_health_route(snapshot: Mapping[str, object]) -> str:
+    candidate = snapshot.get("healthRoute")
+    if not isinstance(candidate, str):
+        model = snapshot.get("model")
+        image = model.get("image") if isinstance(model, Mapping) else None
+        custom = image.get("custom") if isinstance(image, Mapping) else None
+        candidate = custom.get("healthRoute") if isinstance(custom, Mapping) else None
+    if not isinstance(candidate, str):
+        raise WorkerError("endpoint response has no valid health route")
+    route = candidate
+    parsed = urlparse(route)
+    if (
+        not route.startswith("/")
+        or parsed.scheme
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise WorkerError("endpoint response has no valid health route")
+    return route
 
 
 def build_harbor_command(
@@ -426,7 +449,7 @@ def _execute_benchmark(
     base_url = endpoint_url(snapshot)
     runtime = {
         "controller": controller_environment(lock),
-        "endpoint": probe_runtime(base_url, token),
+        "endpoint": probe_runtime(base_url, token, endpoint_health_route(snapshot)),
     }
     write_json(root / "runtime-environment.json", redact(runtime))
     append_event(events, "runtime_probed")
@@ -720,10 +743,12 @@ def controller_environment(lock: RunLock) -> dict[str, object]:
     }
 
 
-def probe_runtime(base_url: str, token: str) -> dict[str, object]:
+def probe_runtime(
+    base_url: str, token: str, health_route: str = "/health"
+) -> dict[str, object]:
     probes: dict[str, object] = {}
     for name, path in (
-        ("health", "/health"),
+        ("health", health_route),
         ("version", "/version"),
         ("models", "/v1/models"),
     ):

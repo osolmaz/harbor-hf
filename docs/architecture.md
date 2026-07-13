@@ -190,6 +190,11 @@ terminated. The idle timeout must exceed the longest uninterrupted agent or
 verifier command because an active streaming command does not necessarily
 refresh the Sandbox idle timer.
 
+Before benchmark execution, the worker requires `readyReplica` to reach the
+positive `targetReplica` count and probes the `healthRoute` reported in the
+endpoint snapshot. This prevents startup timing and custom image routing from
+changing benchmark validity.
+
 ## Boundaries
 
 - No local model loading or inference.

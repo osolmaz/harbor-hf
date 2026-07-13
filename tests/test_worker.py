@@ -27,6 +27,7 @@ from harbor_hf.worker import (
     assert_exclusive_endpoint_lease,
     build_harbor_command,
     controller_environment,
+    endpoint_health_route,
     endpoint_state,
     endpoint_url,
     launch_cleanup_watchdog,
@@ -54,6 +55,7 @@ def snapshot(state: str, ready: int) -> dict[str, object]:
             "targetReplica": 1,
             "url": "https://endpoint.example",
         },
+        "healthRoute": "/ready",
     }
 
 
@@ -180,6 +182,20 @@ def test_endpoint_waits_through_transitional_states() -> None:
     assert sleeps == [2.5, 3.5]
 
 
+def test_endpoint_waits_for_every_target_replica() -> None:
+    partial = snapshot("running", 1)
+    cast(dict[str, object], partial["status"])["targetReplica"] = 2
+    complete = snapshot("running", 2)
+    cast(dict[str, object], complete["status"])["targetReplica"] = 2
+    runner = EndpointRunner([partial, complete])
+
+    result = EndpointManager(
+        "org", "endpoint", runner, sleep=lambda _: None
+    ).wait_ready(10)
+
+    assert endpoint_state(result) == ("running", 2, 2)
+
+
 def test_endpoint_parsing_rejects_incomplete_response() -> None:
     with pytest.raises(WorkerError, match="^endpoint response has no status object$"):
         endpoint_state({})
@@ -198,6 +214,17 @@ def test_endpoint_parsing_rejects_incomplete_response() -> None:
         endpoint_url({"status": {"url": "https://endpoint.example/"}})
         == "https://endpoint.example"
     )
+    assert endpoint_health_route({"healthRoute": "/ready"}) == "/ready"
+    assert (
+        endpoint_health_route(
+            {"model": {"image": {"custom": {"healthRoute": "/status/health"}}}}
+        )
+        == "/status/health"
+    )
+    with pytest.raises(
+        WorkerError, match="^endpoint response has no valid health route$"
+    ):
+        endpoint_health_route({"healthRoute": "//other.example/ready"})
 
 
 def test_endpoint_model_must_match_lock(remote_spec: ExperimentSpec) -> None:
@@ -1638,9 +1665,10 @@ def test_worker_publishes_success_after_cleanup(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
 
-    def fake_probe(url: str, token: str) -> dict[str, object]:
+    def fake_probe(url: str, token: str, health_route: str) -> dict[str, object]:
         assert url == "https://endpoint.example"
         assert token == "test-token"
+        assert health_route == "/ready"
         return {"probes": {"health": {"http_status": 200}}}
 
     monkeypatch.setattr("harbor_hf.worker.probe_runtime", fake_probe)
@@ -1782,7 +1810,8 @@ def test_worker_rejects_incomplete_explicit_task_set(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
-        "harbor_hf.worker.probe_runtime", lambda _url, _token: {"probes": {}}
+        "harbor_hf.worker.probe_runtime",
+        lambda _url, _token, _health_route: {"probes": {}},
     )
     runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
 
@@ -1814,7 +1843,8 @@ def test_worker_failure_still_pauses_endpoint(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
-        "harbor_hf.worker.probe_runtime", lambda _url, _token: {"probes": {}}
+        "harbor_hf.worker.probe_runtime",
+        lambda _url, _token, _health_route: {"probes": {}},
     )
     runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
 
@@ -1891,7 +1921,8 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
-        "harbor_hf.worker.probe_runtime", lambda _url, _token: {"probes": {}}
+        "harbor_hf.worker.probe_runtime",
+        lambda _url, _token, _health_route: {"probes": {}},
     )
     expected_root = tmp_path / "output" / lock.artifact_prefix
 
@@ -1969,7 +2000,8 @@ def test_cleanup_failure_prevents_success_and_redacts_failure(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
-        "harbor_hf.worker.probe_runtime", lambda _url, _token: {"probes": {}}
+        "harbor_hf.worker.probe_runtime",
+        lambda _url, _token, _health_route: {"probes": {}},
     )
     runner = CleanupFailureRunner([snapshot("running", 1)])
 
@@ -2149,40 +2181,11 @@ def test_worker_rejects_lock_without_endpoint_binding(
         run_worker(remote_manifest, lock_path, tmp_path / "output")
 
 
-def test_worker_maps_custom_secret_and_refuses_existing_run_prefix(
+def test_remote_job_rejects_custom_token_name(
     remote_spec: ExperimentSpec,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import yaml
+    payload = remote_spec.model_dump(mode="json")
+    payload["remote"]["job"]["token_secret_name"] = "BENCH_TOKEN"
 
-    remote = remote_spec.remote
-    assert remote is not None
-    custom = remote_spec.model_copy(
-        update={
-            "remote": remote.model_copy(
-                update={
-                    "job": remote.job.model_copy(
-                        update={"token_secret_name": "BENCH_TOKEN"}
-                    )
-                }
-            )
-        }
-    )
-    manifest = tmp_path / "custom.yaml"
-    manifest.write_text(
-        yaml.safe_dump(custom.model_dump(mode="json", exclude_none=True)),
-        encoding="utf-8",
-    )
-    lock = build_run_lock(custom, run_id="existing")
-    lock_path = tmp_path / "lock.json"
-    _write_lock(lock_path, lock)
-    root = tmp_path / "output" / lock.artifact_prefix
-    root.mkdir(parents=True)
-    monkeypatch.setenv("BENCH_TOKEN", "custom-token")
-    monkeypatch.setenv("HF_TOKEN", "stale-token")
-
-    with pytest.raises(FileExistsError):
-        run_worker(manifest, lock_path, tmp_path / "output")
-
-    assert os.environ["HF_TOKEN"] == "custom-token"
+    with pytest.raises(ValueError, match="Input should be 'HF_TOKEN'"):
+        ExperimentSpec.model_validate(payload)

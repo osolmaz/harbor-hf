@@ -156,15 +156,17 @@ must equal `remote.harbor.source.revision`, no package version is passed, and
 
 ### Remote Execution
 
-`remote.job` pins the HF Job namespace, digest-pinned controller image, hardware flavor,
-timeout, and secret variable name. `remote.worker` pins this package to an exact
-GitHub commit. `remote.harbor.source` likewise pins Harbor to an exact GitHub
-commit and configures the HF Sandbox flavor and idle timeout. Source revisions
-must be full lowercase 40-character Git commit IDs. The controller checks out
-both revisions directly and runs them with `uv --locked`; missing or stale lock
-files fail before endpoint-backed benchmark execution begins. The pinned Harbor
-revision must expose the `hf-sandbox` optional dependency; the worker verifies
-that capability before it resumes the endpoint.
+`remote.job` pins the HF Job namespace, digest-pinned controller image, hardware
+flavor, timeout, and `HF_TOKEN` secret injection. The token secret name is fixed
+because the HF CLI can resolve it from the authenticated local credential
+without putting a token value in the command. `remote.worker` pins this package
+to an exact GitHub commit. `remote.harbor.source` likewise pins Harbor to an
+exact GitHub commit and configures the HF Sandbox flavor and idle timeout.
+Source revisions must be full lowercase 40-character Git commit IDs. The
+controller checks out both revisions directly and runs them with `uv --locked`;
+missing or stale lock files fail before endpoint-backed benchmark execution
+begins. The pinned Harbor revision must expose the `hf-sandbox` optional
+dependency; the worker verifies that capability before it resumes the endpoint.
 
 For endpoint-backed runs, `remote.job.namespace` must equal the selected
 endpoint namespace. This gives every controller and watchdog targeting that
@@ -178,6 +180,9 @@ readiness, endpoint startup, and controller cleanup. The endpoint is not resumed
 has completed its source bootstrap and published a readiness handshake.
 Endpoint readiness has its own 3,600-second allowance and does not consume or
 inherit the Harbor execution timeout.
+Readiness requires every positive `targetReplica` to be represented by a ready
+replica. The controller then probes the endpoint's reported `healthRoute`
+instead of assuming a custom image uses `/health`.
 
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without

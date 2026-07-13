@@ -63,6 +63,8 @@ The Job writes evidence under
 is written only after every requested Harbor attempt is exception-free, has
 numeric verifier results, and the Inference Endpoint reports `paused` with zero
 ready replicas. Failures write `_FAILED` after attempting the same cleanup.
+The controller waits for every target replica and probes the endpoint's reported
+health route before Harbor starts.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution

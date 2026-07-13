@@ -166,7 +166,7 @@ class RemoteJobSpec(StrictModel):
     )
     flavor: str = Field(default="cpu-basic", min_length=1)
     timeout_seconds: int = Field(default=10800, ge=1, le=85800)
-    token_secret_name: str = Field(default="HF_TOKEN", pattern=r"^[A-Z][A-Z0-9_]*$")
+    token_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
 
 
 class SourcePin(StrictModel):
