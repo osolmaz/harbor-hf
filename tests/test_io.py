@@ -107,7 +107,10 @@ def test_agent_revision_metadata_is_explicit() -> None:
         )
 
 
-@pytest.mark.parametrize("key", ["HF_TOKEN", "api-key", "PASSWORD"])
+@pytest.mark.parametrize(
+    "key",
+    ["HF_TOKEN", "api-key", "PASSWORD", "OPENAI_API_KEY", "AWS_ACCESS_KEY"],
+)
 def test_engine_environment_rejects_inline_secret_values(key: str) -> None:
     with pytest.raises(ValueError, match="must not contain inline secret values"):
         EngineSpec(
@@ -143,5 +146,13 @@ def test_serialized_parameters_reject_nested_secret_keys(
         DeploymentProfile.model_validate(deployment)
 
     agent["parameters"] = {"nested": [{"password": "credential"}]}
+    with pytest.raises(ValueError, match="agent parameters must not contain"):
+        AgentProfile.model_validate(agent)
+
+    agent["parameters"] = {"nested": {"openaiApiKey": "credential"}}
+    with pytest.raises(ValueError, match="agent parameters must not contain"):
+        AgentProfile.model_validate(agent)
+
+    agent["parameters"] = {"nested": {"openAIKey": "credential"}}
     with pytest.raises(ValueError, match="agent parameters must not contain"):
         AgentProfile.model_validate(agent)

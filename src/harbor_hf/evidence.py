@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tarfile
 import tempfile
 from collections.abc import Mapping
@@ -24,12 +25,22 @@ _SENSITIVE_KEYS = frozenset(
         "token",
     }
 )
-_SENSITIVE_SUFFIXES = ("_credential", "_password", "_secret", "_token")
+_SENSITIVE_SUFFIXES = (
+    "_access_key",
+    "_ai_key",
+    "_api_key",
+    "_credential",
+    "_password",
+    "_private_key",
+    "_secret",
+    "_token",
+)
 _STREAM_CHUNK_SIZE = 1024 * 1024
 
 
-def _is_sensitive_key(key: object) -> bool:
-    normalized = str(key).replace("-", "_").lower()
+def is_sensitive_key(key: object) -> bool:
+    words = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", str(key))
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", words).replace("-", "_").lower()
     return normalized in _SENSITIVE_KEYS or normalized.endswith(_SENSITIVE_SUFFIXES)
 
 
@@ -51,7 +62,7 @@ def append_event(path: Path, event: str, **fields: object) -> None:
 def redact(value: object) -> object:
     if isinstance(value, Mapping):
         return {
-            str(key): ("[REDACTED]" if _is_sensitive_key(key) else redact(item))
+            str(key): ("[REDACTED]" if is_sensitive_key(key) else redact(item))
             for key, item in value.items()
         }
     if isinstance(value, list):

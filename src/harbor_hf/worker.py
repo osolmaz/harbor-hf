@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import shutil
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -28,7 +29,12 @@ from harbor_hf.evidence import (
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.planner import experiment_digest
-from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
+from harbor_hf.process import (
+    CommandRunner,
+    ProcessError,
+    SubprocessRunner,
+    run_streaming,
+)
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
     endpoint_lease_label,
@@ -113,18 +119,47 @@ class EndpointManager:
     def pause_and_verify(
         self, timeout_seconds: int = 300, poll_seconds: float = 10
     ) -> dict[str, object]:
-        self.pause()
         deadline = self.monotonic() + timeout_seconds
+        pause_accepted = False
+        last_transient_error: ProcessError | None = None
+        state = "unknown"
+        ready = -1
         while True:
-            snapshot = self.describe()
-            state, ready, _ = endpoint_state(snapshot)
-            if state == "paused" and ready == 0:
+            pause_accepted, snapshot, state, ready, transient_error = self._poll_pause(
+                pause_accepted
+            )
+            last_transient_error = transient_error or last_transient_error
+            if snapshot is not None and state == "paused" and ready == 0:
                 return snapshot
             if self.monotonic() >= deadline:
+                if last_transient_error is not None:
+                    raise WorkerError(
+                        "endpoint cleanup timed out after transient provider errors: "
+                        f"{last_transient_error}"
+                    ) from last_transient_error
                 raise WorkerError(
                     f"endpoint cleanup timed out in state={state!r}, ready={ready}"
                 )
             self.sleep(poll_seconds)
+
+    def _poll_pause(
+        self, pause_accepted: bool
+    ) -> tuple[bool, dict[str, object] | None, str, int, ProcessError | None]:
+        transient_error: ProcessError | None = None
+        if not pause_accepted:
+            try:
+                self.pause()
+                pause_accepted = True
+            except ProcessError as caught:
+                transient_error = caught
+        try:
+            snapshot = self.describe()
+        except ProcessError as caught:
+            return pause_accepted, None, "unknown", -1, caught
+        state, ready, _ = endpoint_state(snapshot)
+        if state in {"pausing", "paused"}:
+            pause_accepted = True
+        return pause_accepted, snapshot, state, ready, transient_error
 
     def _command(self, operation: str) -> list[str]:
         return [
@@ -263,7 +298,37 @@ def run_worker(
         raise WorkerError(f"required secret {token_name} is not available")
     os.environ["HF_TOKEN"] = token
 
-    root = output_root / lock.artifact_prefix
+    destination = output_root / lock.artifact_prefix
+    if destination.exists():
+        raise FileExistsError(destination)
+    with tempfile.TemporaryDirectory(prefix="harbor-hf-run-") as staging:
+        return _run_staged_worker(
+            manifest_path,
+            lock,
+            Path(staging) / "run",
+            destination,
+            token,
+            runner=runner,
+            stream_runner=stream_runner,
+            source_preparer=source_preparer,
+            watchdog_launcher=watchdog_launcher,
+            lease_validator=lease_validator,
+        )
+
+
+def _run_staged_worker(
+    manifest_path: Path,
+    lock: RunLock,
+    root: Path,
+    destination: Path,
+    token: str,
+    *,
+    runner: CommandRunner | None,
+    stream_runner: Callable[..., int],
+    source_preparer: Callable[[SourcePin, Path, CommandRunner], None] | None,
+    watchdog_launcher: Callable[[RunLock, EndpointRef, str], str] | None,
+    lease_validator: Callable[[RunLock, str], None] | None,
+) -> Path:
     root.mkdir(parents=True, exist_ok=False)
     (root / "harbor-jobs").mkdir()
     shutil.copyfile(manifest_path, root / "manifest.yaml")
@@ -284,8 +349,8 @@ def run_worker(
         (lease_validator or assert_exclusive_endpoint_lease)(lock, token)
         owns_endpoint = True
         append_event(events, "endpoint_lease_acquired")
-        harbor_source = Path("/tmp/harbor-hf-sources") / (
-            f"harbor-{lock.remote.harbor.source.revision}"
+        harbor_source = (
+            root.parent / "sources" / (f"harbor-{lock.remote.harbor.source.revision}")
         )
         (source_preparer or prepare_locked_source)(
             lock.remote.harbor.source,
@@ -333,7 +398,8 @@ def run_worker(
 
     if error is None and cleanup_error is None:
         _publish_success(root, events, token)
-        return root
+        _publish_evidence(root, destination)
+        return destination
 
     failure = cleanup_error or error
     assert failure is not None, "failed run has no recorded error"
@@ -358,6 +424,7 @@ def run_worker(
             f"{failure_message}; evidence finalization failed: {finalization_message}"
         )
         raise WorkerError(message) from caught
+    _publish_evidence(root, destination)
     raise WorkerError(failure_message) from failure
 
 
@@ -429,6 +496,26 @@ def _publish_success(root: Path, events: Path, token: str) -> None:
         )
         raise WorkerError("evidence finalization failed") from caught
     (root / "_SUCCESS").write_text("\n", encoding="utf-8")
+
+
+def _publish_evidence(source: Path, destination: Path) -> None:
+    markers = [name for name in ("_FAILED", "_SUCCESS") if (source / name).is_file()]
+    if len(markers) != 1:
+        raise WorkerError("finalized evidence must have exactly one terminal marker")
+    destination.mkdir(parents=True, exist_ok=False)
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            dirs_exist_ok=True,
+            ignore=lambda _directory, names: [
+                name for name in names if name in {"_FAILED", "_SUCCESS"}
+            ],
+        )
+        shutil.copyfile(source / markers[0], destination / markers[0])
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
 
 
 def _execute_benchmark(

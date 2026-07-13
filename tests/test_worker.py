@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from harbor_hf.models import ExperimentSpec, SourcePin
-from harbor_hf.process import CommandRunner
+from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     EndpointManager,
@@ -22,6 +23,7 @@ from harbor_hf.worker import (
     _expected_trial_count,
     _finalize_evidence,
     _job_stage,
+    _publish_evidence,
     _validate_task_counts,
     _validate_trial_count,
     assert_exclusive_endpoint_lease,
@@ -871,6 +873,112 @@ def test_cleanup_timeout() -> None:
         manager.pause_and_verify(timeout_seconds=1)
 
 
+def test_cleanup_retries_transient_pause_and_describe_failures() -> None:
+    class TransientRunner:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+            self.attempts = {"pause": 0, "describe": 0}
+
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            self.commands.append(list(command))
+            operation = command[2]
+            self.attempts[operation] += 1
+            if self.attempts[operation] == 1:
+                raise ProcessError(f"transient {operation} failure")
+            return snapshot("paused", 0)
+
+        def run_text(self, command: Sequence[str]) -> str:
+            raise AssertionError(command)
+
+    runner = TransientRunner()
+    sleeps: list[float] = []
+    times = iter([0.0, 1.0])
+    manager = EndpointManager(
+        "org",
+        "endpoint",
+        runner,
+        sleep=sleeps.append,
+        monotonic=lambda: next(times),
+    )
+
+    assert endpoint_state(manager.pause_and_verify(10, poll_seconds=2)) == (
+        "paused",
+        0,
+        1,
+    )
+    assert runner.attempts == {"pause": 2, "describe": 2}
+    assert sleeps == [2]
+
+
+def test_cleanup_poll_recovers_ambiguous_pause_request() -> None:
+    class AmbiguousPauseRunner:
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            if command[2] == "pause":
+                raise ProcessError("pause response was lost")
+            return snapshot("pausing", 1)
+
+        def run_text(self, command: Sequence[str]) -> str:
+            raise AssertionError(command)
+
+    manager = EndpointManager("org", "endpoint", AmbiguousPauseRunner())
+
+    accepted, observed, state, ready, error = manager._poll_pause(False)
+
+    assert accepted is True
+    assert observed == snapshot("pausing", 1)
+    assert state == "pausing"
+    assert ready == 1
+    assert isinstance(error, ProcessError)
+    assert str(error) == "pause response was lost"
+
+
+def test_cleanup_poll_reports_transient_describe_failure() -> None:
+    class DescribeFailureRunner:
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            if command[2] == "describe":
+                raise ProcessError("describe unavailable")
+            return snapshot("pausing", 1)
+
+        def run_text(self, command: Sequence[str]) -> str:
+            raise AssertionError(command)
+
+    result = EndpointManager("org", "endpoint", DescribeFailureRunner())._poll_pause(
+        False
+    )
+
+    accepted, observed, state, ready, error = result
+    assert accepted is True
+    assert observed is None
+    assert state == "unknown"
+    assert ready == -1
+    assert isinstance(error, ProcessError)
+    assert str(error) == "describe unavailable"
+
+
+def test_cleanup_timeout_reports_last_transient_provider_error() -> None:
+    class UnavailableRunner:
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            raise ProcessError(f"{command[2]} unavailable")
+
+        def run_text(self, command: Sequence[str]) -> str:
+            raise AssertionError(command)
+
+    times = iter([0.0, 2.0])
+    manager = EndpointManager(
+        "org",
+        "endpoint",
+        UnavailableRunner(),
+        sleep=lambda _: None,
+        monotonic=lambda: next(times),
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match="cleanup timed out after transient provider errors: describe unavailable",
+    ):
+        manager.pause_and_verify(timeout_seconds=1)
+
+
 def test_harbor_command_is_pinned_and_bounded(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
@@ -1615,6 +1723,65 @@ def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
     }
 
 
+def test_publish_evidence_requires_one_terminal_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "record.json").write_text("{}\n", encoding="utf-8")
+    destination = tmp_path / "bucket" / "runs" / "run-1"
+
+    with pytest.raises(WorkerError, match="exactly one terminal marker"):
+        _publish_evidence(source, destination)
+
+    (source / "_SUCCESS").write_text("\n", encoding="utf-8")
+    (source / "_FAILED").write_text("\n", encoding="utf-8")
+    with pytest.raises(WorkerError, match="exactly one terminal marker"):
+        _publish_evidence(source, destination)
+    (source / "_FAILED").unlink()
+
+    original_copytree = shutil.copytree
+
+    def tracking_copytree(
+        copied_source: Path,
+        copied_destination: Path,
+        **kwargs: object,
+    ) -> Path:
+        options = cast(dict[str, Any], kwargs)
+        ignore = options["ignore"]
+        assert callable(ignore)
+        assert ignore(copied_source, ["record.json", "_SUCCESS"]) == ["_SUCCESS"]
+        result = original_copytree(copied_source, copied_destination, **options)
+        assert not (copied_destination / "_SUCCESS").exists()
+        return result
+
+    monkeypatch.setattr("harbor_hf.worker.shutil.copytree", tracking_copytree)
+    _publish_evidence(source, destination)
+
+    assert (destination / "record.json").read_text(encoding="utf-8") == "{}\n"
+    assert (destination / "_SUCCESS").read_text(encoding="utf-8") == "\n"
+
+
+def test_publish_evidence_removes_incomplete_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "record.json").write_text("{}\n", encoding="utf-8")
+    (source / "_FAILED").write_text("\n", encoding="utf-8")
+    destination = tmp_path / "bucket" / "runs" / "run-1"
+
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr("harbor_hf.worker.shutil.copyfile", fail_copy)
+
+    with pytest.raises(OSError, match="copy failed"):
+        _publish_evidence(source, destination)
+
+    assert not destination.exists()
+
+
 def _write_lock(path: Path, lock: RunLock) -> None:
     path.write_text(lock.model_dump_json(), encoding="utf-8")
 
@@ -1635,6 +1802,7 @@ def _successful_stream(
     assert timeout_seconds == 60
     assert command[command.index("--allow-agent-host") + 1] == "endpoint.example"
     jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+    assert any(part.startswith("harbor-hf-run-") for part in jobs_dir.parts)
     trial = jobs_dir / "job" / "trial"
     trial.mkdir(parents=True)
     (trial / "result.json").write_text(
@@ -1794,6 +1962,31 @@ def test_worker_publishes_success_after_cleanup(
     ]
 
 
+def test_worker_refuses_existing_run_prefix_before_remote_work(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="existing")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    destination = tmp_path / "output" / lock.artifact_prefix
+    destination.mkdir(parents=True)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    runner = EndpointRunner([])
+
+    with pytest.raises(FileExistsError):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+        )
+
+    assert runner.commands == []
+
+
 def test_worker_rejects_incomplete_explicit_task_set(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
@@ -1924,10 +2117,11 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
         "harbor_hf.worker.probe_runtime",
         lambda _url, _token, _health_route: {"probes": {}},
     )
-    expected_root = tmp_path / "output" / lock.artifact_prefix
+    staged_roots: list[Path] = []
 
     def fail_finalization(root: Path, token: str) -> None:
-        assert root == expected_root
+        staged_roots.append(root)
+        assert tmp_path / "output" not in root.parents
         assert token == "test-token"
         raise RuntimeError("archive test-token failed")
 
@@ -1947,17 +2141,9 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
         )
 
     root = tmp_path / "output" / lock.artifact_prefix
-    assert json.loads((root / "_FAILED").read_text()) == {
-        "error_type": "RuntimeError",
-        "message": "archive [REDACTED] failed",
-    }
-    assert not (root / "_SUCCESS").exists()
-    events = [
-        json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()
-    ]
-    assert events[-2]["event"] == "run_succeeded"
-    assert events[-1]["event"] == "evidence_finalization_failed"
-    assert events[-1]["error"] == "RuntimeError"
+    assert not root.exists()
+    assert len(staged_roots) == 1
+    assert not staged_roots[0].exists()
 
 
 def test_worker_does_not_resume_without_independent_watchdog(

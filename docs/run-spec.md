@@ -197,6 +197,14 @@ inherited by Harbor through process environment. Its value is absent from
 commands, locks, and evidence. Before archiving, secret values are redacted from
 both file contents and path components using bounded-memory streaming. Symbolic
 links are rejected before evidence is read, modified, hashed, or archived.
+Prefixed API, access, and private key names are treated as secrets, including
+camel-case and uppercase environment forms.
+
+Harbor's raw job tree is created on Job-local storage rather than the bucket
+mount. Only the finalized, scrubbed tree is copied to its immutable bucket
+prefix, and the terminal marker is copied last. If the controller is killed
+before finalization, raw sessions and logs disappear with the Job instead of
+remaining in the bucket.
 
 ## Loading And Resolution
 

@@ -65,6 +65,9 @@ numeric verifier results, and the Inference Endpoint reports `paused` with zero
 ready replicas. Failures write `_FAILED` after attempting the same cleanup.
 The controller waits for every target replica and probes the endpoint's reported
 health route before Harbor starts.
+Harbor writes raw sessions and logs only to Job-local storage. The controller
+redacts and validates that staging tree before publishing it to the bucket, and
+copies `_SUCCESS` or `_FAILED` last.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution

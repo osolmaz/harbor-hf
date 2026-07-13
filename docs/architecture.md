@@ -86,8 +86,14 @@ for incremental artifact publication. It must not patch Harbor internals.
 A private HF Storage Bucket is the complete evidence archive. Requested and
 resolved configuration, endpoint snapshots, Harbor output, trajectories,
 sessions, verifier records, logs, and checksums are written under an immutable
-run prefix. Trial archives are uploaded as trials finish. A `_SUCCESS` marker is
-written only after validation and resource cleanup.
+run prefix. Sanitized run evidence is published after validation and resource
+cleanup, and `_SUCCESS` is written only for a complete run.
+
+Raw Harbor output is staged on the controller Job's local filesystem, outside
+the bucket mount. After endpoint cleanup, the controller redacts secret values,
+rejects symbolic links, creates the archive and checksums, then copies the
+sanitized tree to a new bucket prefix. The terminal marker is copied last. A
+killed controller can therefore leave no unsanitized bucket artifacts.
 
 ### Results Publisher
 
@@ -189,6 +195,10 @@ Harbor, and their idle timeout limits abandoned resources if the controller is
 terminated. The idle timeout must exceed the longest uninterrupted agent or
 verifier command because an active streaming command does not necessarily
 refresh the Sandbox idle timer.
+
+Endpoint pause requests and status reads retry transient provider failures until
+the bounded cleanup deadline. Unexpected local errors still fail immediately,
+and an exhausted retry budget is recorded as cleanup failure.
 
 Before benchmark execution, the worker requires `readyReplica` to reach the
 positive `targetReplica` count and probes the `healthRoute` reported in the

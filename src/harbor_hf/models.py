@@ -4,30 +4,11 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from harbor_hf.evidence import is_sensitive_key
+
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
 _CONTROLLER_HEADROOM_SECONDS = 4800
-_SENSITIVE_ENVIRONMENT_KEYS = frozenset(
-    {
-        "authorization",
-        "credential",
-        "credentials",
-        "api_key",
-        "access_key",
-        "password",
-        "password_value",
-        "private_key",
-        "secret",
-        "secrets",
-        "token",
-    }
-)
-_SENSITIVE_ENVIRONMENT_SUFFIXES = (
-    "_credential",
-    "_password",
-    "_secret",
-    "_token",
-)
 
 
 class StrictModel(BaseModel):
@@ -78,7 +59,7 @@ class EngineSpec(StrictModel):
     def environment_contains_no_inline_secrets(self) -> EngineSpec:
         declared = set(self.secret_names)
         inline = [
-            key for key in self.environment if key in declared or _is_sensitive_key(key)
+            key for key in self.environment if key in declared or is_sensitive_key(key)
         ]
         if inline:
             raise ValueError(
@@ -212,17 +193,10 @@ class ExperimentSpec(StrictModel):
         return self
 
 
-def _is_sensitive_key(key: str) -> bool:
-    normalized = key.replace("-", "_").lower()
-    return normalized in _SENSITIVE_ENVIRONMENT_KEYS or normalized.endswith(
-        _SENSITIVE_ENVIRONMENT_SUFFIXES
-    )
-
-
 def _reject_sensitive_parameters(value: JsonValue, owner: str) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if _is_sensitive_key(key):
+            if is_sensitive_key(key):
                 raise ValueError(
                     f"{owner} parameters must not contain secret-like keys"
                 )
