@@ -29,11 +29,15 @@ class ExperimentPlan(BaseModel):
 
 def experiment_digest(spec: ExperimentSpec) -> str:
     canonical = json.dumps(
-        spec.model_dump(mode="json"),
+        spec.model_dump(mode="json", exclude_none=True),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def is_task_pattern(task: str) -> bool:
+    return any(character in task for character in "*?[")
 
 
 def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
@@ -45,8 +49,10 @@ def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
             spec.matrix.agents,
         )
     ]
-    task_count = (
-        None if "*" in spec.benchmark.task_names else len(spec.benchmark.task_names)
+    task_count = len(spec.benchmark.task_digests) or (
+        None
+        if any(is_task_pattern(task) for task in spec.benchmark.task_names)
+        else len(spec.benchmark.task_names)
     )
     logical_trial_count = (
         None

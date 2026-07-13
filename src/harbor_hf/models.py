@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import re
+from fnmatch import fnmatch
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from harbor_hf.evidence import is_sensitive_key
+
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+TaskName = Annotated[str, Field(min_length=1)]
+ContentDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+GitHubRepository = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^(?:https://github\.com/)?"
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+            r"[A-Za-z0-9_.-]+(?:\.git)?$"
+        )
+    ),
+]
+_CONTROLLER_HEADROOM_SECONDS = 4800
 
 
 class StrictModel(BaseModel):
@@ -18,7 +35,14 @@ class Metadata(StrictModel):
 
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
-    task_names: list[str] = Field(default_factory=lambda: ["*"])
+    task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
+    task_digests: dict[TaskName, ContentDigest] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def task_names_are_unique(self) -> BenchmarkSpec:
+        if len(self.task_names) != len(set(self.task_names)):
+            raise ValueError("benchmark task names must be unique")
+        return self
 
 
 class QuantizationSpec(StrictModel):
@@ -41,9 +65,29 @@ class ModelProfile(StrictModel):
 class EngineSpec(StrictModel):
     name: str = Field(min_length=1)
     image: str = Field(min_length=1)
+    command: list[str] = Field(default_factory=list)
     arguments: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     secret_names: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def environment_contains_no_inline_secrets(self) -> EngineSpec:
+        declared = set(self.secret_names)
+        inline = [
+            key for key in self.environment if key in declared or is_sensitive_key(key)
+        ]
+        if inline:
+            raise ValueError(
+                "engine environment must not contain inline secret values: "
+                + ", ".join(sorted(inline))
+            )
+        return self
+
+
+class EndpointRef(StrictModel):
+    namespace: str = Field(min_length=1)
+    name: ProfileId
+    served_model_name: str = Field(min_length=1)
 
 
 class DeploymentProfile(StrictModel):
@@ -53,14 +97,41 @@ class DeploymentProfile(StrictModel):
     accelerator_count: int = Field(default=1, ge=1)
     region: str = Field(min_length=1)
     engine: EngineSpec
+    endpoint: EndpointRef | None = None
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def parameters_contain_no_inline_secrets(self) -> DeploymentProfile:
+        _reject_sensitive_parameters(self.parameters, "deployment")
+        return self
 
 
 class AgentProfile(StrictModel):
     id: ProfileId
     name: str = Field(min_length=1)
     revision: str = Field(min_length=1)
+    revision_kind: Literal["package", "harbor-source"]
+    reported_version: str | None = Field(default=None, min_length=1)
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def revision_metadata_is_consistent(self) -> AgentProfile:
+        if self.revision_kind == "package" and self.reported_version is not None:
+            raise ValueError("package agents report their package revision")
+        if self.revision_kind == "harbor-source" and self.reported_version is None:
+            raise ValueError("Harbor-source agents require reported_version")
+        ambiguous_keys = [
+            key
+            for key in self.parameters
+            if not key or key != key.strip() or "=" in key
+        ]
+        if ambiguous_keys:
+            raise ValueError(
+                "agent parameter keys must not be empty, contain '=', or have "
+                "surrounding whitespace"
+            )
+        _reject_sensitive_parameters(self.parameters, "agent")
+        return self
 
 
 class MatrixSpec(StrictModel):
@@ -94,6 +165,34 @@ class PublishingSpec(StrictModel):
     index_dataset: str | None = None
 
 
+class RemoteJobSpec(StrictModel):
+    namespace: str = Field(min_length=1)
+    image: str = Field(
+        pattern=r"^.+@sha256:[0-9a-f]{64}$",
+    )
+    flavor: str = Field(default="cpu-basic", min_length=1)
+    timeout_seconds: int = Field(default=10800, ge=1, le=85800)
+    token_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
+
+
+class SourcePin(StrictModel):
+    repository: GitHubRepository
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class HarborRuntimeSpec(StrictModel):
+    source: SourcePin
+    environment: Literal["hf-sandbox"] = "hf-sandbox"
+    sandbox_flavor: str = Field(default="cpu-basic", min_length=1)
+    sandbox_idle_timeout_seconds: int = Field(default=3600, ge=1, le=86400)
+
+
+class RemoteExecutionSpec(StrictModel):
+    job: RemoteJobSpec
+    worker: SourcePin
+    harbor: HarborRuntimeSpec
+
+
 class ExperimentSpec(StrictModel):
     api_version: Literal["harbor-hf/v1alpha1"]
     kind: Literal["Experiment"]
@@ -103,3 +202,84 @@ class ExperimentSpec(StrictModel):
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     artifacts: ArtifactStoreSpec
     publishing: PublishingSpec
+    remote: RemoteExecutionSpec | None = None
+
+    @model_validator(mode="after")
+    def remote_job_has_lifecycle_headroom(self) -> ExperimentSpec:
+        if self.remote is None:
+            return self
+        _validate_remote_input_pins(self)
+        if (
+            self.remote.job.timeout_seconds
+            < self.execution.timeout_seconds + _CONTROLLER_HEADROOM_SECONDS
+        ):
+            raise ValueError(
+                "remote Job timeout must exceed execution timeout by at least "
+                f"{_CONTROLLER_HEADROOM_SECONDS} seconds"
+            )
+        if (
+            self.remote.harbor.sandbox_idle_timeout_seconds
+            > self.remote.job.timeout_seconds
+        ):
+            raise ValueError("HF Sandbox timeout must not exceed remote Job timeout")
+        return self
+
+
+def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
+    if re.fullmatch(r".+@sha256:[0-9a-f]{64}", spec.benchmark.dataset) is None:
+        raise ValueError("remote benchmark dataset must use an immutable sha256 digest")
+    _validate_task_pins(spec.benchmark)
+    if any(
+        re.fullmatch(r"[0-9a-f]{40}", model.revision) is None
+        for model in spec.matrix.models
+    ):
+        raise ValueError("remote model revisions must be full Git commit IDs")
+    if any(
+        re.fullmatch(r".+@sha256:[0-9a-f]{64}", deployment.engine.image) is None
+        for deployment in spec.matrix.deployments
+    ):
+        raise ValueError("remote serving images must be pinned by sha256 digest")
+    if any(not _is_immutable_agent_revision(agent) for agent in spec.matrix.agents):
+        raise ValueError("remote agent revisions must be immutable")
+
+
+def _validate_task_pins(benchmark: BenchmarkSpec) -> None:
+    if not benchmark.task_digests:
+        raise ValueError("remote benchmarks require resolved task digests")
+    unmatched_selections = [
+        selection
+        for selection in benchmark.task_names
+        if not any(fnmatch(task, selection) for task in benchmark.task_digests)
+    ]
+    unmatched_tasks = [
+        task
+        for task in benchmark.task_digests
+        if not any(fnmatch(task, selection) for selection in benchmark.task_names)
+    ]
+    if unmatched_selections or unmatched_tasks:
+        raise ValueError("remote task digests must exactly resolve the task selection")
+
+
+def _is_immutable_agent_revision(agent: AgentProfile) -> bool:
+    if agent.revision_kind == "harbor-source":
+        return re.fullmatch(r"[0-9a-f]{40}", agent.revision) is not None
+    return (
+        re.fullmatch(
+            r"v?[0-9]+(?:\.[0-9]+)*(?:[-+][0-9A-Za-z.-]+)?",
+            agent.revision,
+        )
+        is not None
+    )
+
+
+def _reject_sensitive_parameters(value: JsonValue, owner: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if is_sensitive_key(key):
+                raise ValueError(
+                    f"{owner} parameters must not contain secret-like keys"
+                )
+            _reject_sensitive_parameters(item, owner)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_sensitive_parameters(item, owner)

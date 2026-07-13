@@ -57,12 +57,32 @@ submitted.
 
 ### Controller
 
-The controller reconciles desired runs with remote state. It starts endpoint
-inference only when work is ready, submits bounded task shards, records
-lifecycle events, and pauses unused endpoints. Provider-backed runs skip
-endpoint provisioning but retain request, quota, retry, and accounting state.
-Operations must be idempotent so a stopped controller can continue without
-duplicating completed trials.
+The submission CLI rejects mutable dataset, task, model, image, source, and
+agent references, then stages the pinned manifest and run lock and starts an HF
+Job. That remote Job is the controller: it starts endpoint inference only when
+work is ready, submits bounded Harbor trials to HF Sandboxes, records lifecycle
+events, and pauses the endpoint in a `finally` path. The submitting machine does
+not execute benchmark tasks. Provider-backed runs will skip endpoint
+provisioning but retain request, quota, retry, and accounting state.
+
+Endpoint-backed controller and watchdog Jobs carry a deterministic label
+derived from the endpoint namespace and name. They coordinate through one
+private, namespace-level `harbor-hf-coordination` Dataset repository. A
+submission seeds an initialization commit when that repository has no `main`
+commit yet. A watchdog adds the endpoint's lease file with the repository head
+as the expected parent commit before publishing its readiness handshake. Concurrent
+commits cannot both use the same parent; a loser rereads the new head, observes
+the lease, and exits before its controller changes endpoint state.
+
+The lease file records both controller and watchdog Job IDs. It remains present
+while the watchdog observes the controller and is removed only after the
+endpoint reports `paused` with zero ready replicas. Ownership is revalidated
+at the latest repository head before a parent-checked removal commit. If
+cleanup cannot be verified, the lease remains fail-closed and blocks another
+run from inheriting an endpoint whose state is unknown.
+If publishing the readiness label returns an ambiguous provider error, the
+watchdog also retains the lease, waits for the controller to exit or time out,
+verifies endpoint pause, and only then releases ownership.
 
 ### Harbor Adapter
 
@@ -75,8 +95,24 @@ for incremental artifact publication. It must not patch Harbor internals.
 A private HF Storage Bucket is the complete evidence archive. Requested and
 resolved configuration, endpoint snapshots, Harbor output, trajectories,
 sessions, verifier records, logs, and checksums are written under an immutable
-run prefix. Trial archives are uploaded as trials finish. A `_SUCCESS` marker is
-written only after validation and resource cleanup.
+run prefix. Sanitized run evidence is published after validation and resource
+cleanup, and `_SUCCESS` is written only for a complete run. Each Harbor trial's
+task digest is read from its own `lock.json` and must match the pre-resolved task
+map in `run.lock.json`.
+The worker first adds a permanent run reservation to the private coordination
+repository with the same parent-commit compare-and-swap protocol. Duplicate run
+IDs therefore fail before source preparation, endpoint work, or failure
+publication. Equivalent Bucket URI spellings are normalized before deriving the
+reservation identity. Terminal markers are delayed only at the run root;
+marker-shaped files within Harbor task artifacts are preserved and included in
+the root checksum manifest. Submission verifies the
+artifact Bucket and implicit Job input Bucket are private before launch.
+
+Raw Harbor output is staged on the controller Job's local filesystem, outside
+the bucket mount. After endpoint cleanup, the controller redacts secret values,
+rejects symbolic links, creates the archive and checksums, then copies the
+sanitized tree to a new bucket prefix. The terminal marker is copied last. A
+killed controller can therefore leave no unsanitized bucket artifacts.
 
 ### Results Publisher
 
@@ -121,7 +157,10 @@ A resolved run lock records:
   the provider.
 
 Secret values are never recorded. Manifests store only the names of secrets
-that must be injected by the remote platform.
+that must be injected by the remote platform. Artifact finalization redacts
+secret values from both file contents and path components before checksums or
+archives are created. File content is scanned and rewritten in bounded chunks,
+and symbolic links are rejected before evidence traversal.
 
 ### Canonical Configuration Artifacts
 
@@ -138,6 +177,11 @@ The endpoint snapshot never overwrites the requested manifest or resolved lock.
 Differences between requested and effective values remain explicit and are
 published as comparison fields.
 
+Before any remote work, the controller reconstructs the selected matrix cell
+from `manifest.yaml` and compares the complete result with `run.lock.json`.
+Matching only the manifest digest is insufficient because lock fields can be
+modified independently.
+
 Runtime evidence uses a status alongside nullable values. `reported` means the
 value came from a named probe or provider response, `not_reported` means the
 remote service did not expose it, `not_applicable` means the field does not
@@ -151,12 +195,41 @@ Runs progress through `planned`, `submitted`, `provisioning`, `running`,
 `verifying`, `publishing`, and a terminal state. Every transition is an
 append-only event.
 
-For endpoint-backed runs, the controller pauses an endpoint after its last
-active shard in a `finally` path. A separate scheduled watchdog finds stale
-endpoint leases and pauses them, covering controller termination before
-cleanup. Cleanup success is part of endpoint run completion, not an optional
-maintenance action. Provider-backed runs have no endpoint lease but still close
-worker resources and record final usage and request state.
+For endpoint-backed runs, the controller first requires a paused endpoint with
+zero ready replicas, then starts a separate companion HF Job watchdog before it
+resumes the endpoint. The controller requires a readiness label written from
+inside the watchdog's monitoring process; a submitted or merely running Job is
+not sufficient. If readiness polling fails, the controller exits without
+canceling the watchdog, allowing it to observe that exit, pause the endpoint,
+and release its lease. The watchdog also pauses the endpoint after the
+controller terminates or its own deadline expires. The controller pauses the
+endpoint after its last active shard in a `finally` path, but only after its
+watchdog has acquired the endpoint lease. A controller whose watchdog cannot
+acquire the lease records skipped cleanup and never changes endpoint state.
+Cleanup success is part of endpoint run completion, not an optional maintenance
+action. Provider-backed runs have no endpoint lease but still close worker
+resources and record final usage and request state.
+
+The worker verifies `status.state = paused` and `readyReplica = 0` before it
+writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may
+remain nonzero on a paused endpoint. HF Sandbox environments are killed by
+Harbor, and their idle timeout limits abandoned resources if the controller is
+terminated. The idle timeout must exceed the longest uninterrupted agent or
+verifier command because an active streaming command does not necessarily
+refresh the Sandbox idle timer. It must also remain at or below the controller
+Job timeout, which is the outer lifecycle bound.
+
+Endpoint pause requests and status reads retry transient provider failures until
+the bounded cleanup deadline. Each endpoint CLI call is limited to 60 seconds or
+the remaining lifecycle deadline, whichever is shorter. Unexpected local errors
+still fail immediately, and an exhausted retry budget is recorded as cleanup
+failure. When execution and cleanup both fail, evidence preserves them as
+separate failures.
+
+Before benchmark execution, the worker requires `readyReplica` to reach the
+positive `targetReplica` count and probes the `healthRoute` reported in the
+endpoint snapshot. This prevents startup timing and custom image routing from
+changing benchmark validity.
 
 ## Boundaries
 
