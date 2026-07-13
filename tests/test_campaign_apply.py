@@ -30,6 +30,7 @@ from harbor_hf.campaigns import (
 from harbor_hf.control import (
     ActionReservedPayload,
     CampaignEvent,
+    CampaignSnapshot,
     CampaignSubmittedPayload,
     CancellationPayload,
     new_event,
@@ -77,6 +78,22 @@ class FakeStore:
 
     def list_campaigns(self) -> list[str]:
         return [self.lock.campaign_id]
+
+    def load_snapshot(self, campaign_id: str) -> CampaignSnapshot:
+        assert campaign_id == self.lock.campaign_id
+        return CampaignSnapshot(
+            lock=self.lock,
+            events=list(self.events),
+            request=self.request,
+            control_commit="test-control-commit",
+        )
+
+    def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool:
+        assert campaign_id == self.lock.campaign_id
+        if any(existing.event_id == event.event_id for existing in self.events):
+            return False
+        self.events.append(event)
+        return True
 
     def load_action_reservations(self, campaign_id: str) -> list[dict[str, JsonValue]]:
         assert campaign_id == self.lock.campaign_id

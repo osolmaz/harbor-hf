@@ -38,7 +38,11 @@ from harbor_hf.reconciler import (
     ReconcileContext,
     plan_reconciliation,
 )
-from harbor_hf.recovery import durable_cancellation_event, project_recovery
+from harbor_hf.recovery import (
+    durable_cancellation_event,
+    durable_shard_retry_event,
+    project_recovery,
+)
 
 NOW = datetime(2026, 7, 14, tzinfo=UTC)
 
@@ -436,6 +440,43 @@ def test_durable_cancellation_request_is_idempotent(
     assert created
     assert not created_again
     assert repeated == first
+
+
+def test_durable_shard_retry_request_skips_current_backoff(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard_id = lock.runs[0].shards[0].shard_id
+    request, created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard_id,
+        "operator retry",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+    repeated, created_again = durable_shard_retry_event(
+        lock,
+        [submitted, *failed, request],
+        shard_id,
+        "different reason",
+    )
+
+    projection, plan = plan_reconciliation(
+        lock, [submitted, *failed, request], now=NOW + timedelta(seconds=5)
+    )
+
+    assert created
+    assert not created_again
+    assert repeated == request
+    assert projection.counts.retrying == 1
+    assert [action.kind for action in plan.actions] == ["retry-shard"]
 
 
 @pytest.mark.parametrize(

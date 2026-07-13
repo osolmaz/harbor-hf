@@ -12,12 +12,21 @@ class ManifestError(ValueError):
 
 def load_experiment(path: Path) -> ExperimentSpec:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        content = path.read_bytes()
+    except OSError as error:
         raise ManifestError(f"cannot read {path}: {error}") from error
+    return load_experiment_bytes(content, source=str(path))
+
+
+def load_experiment_bytes(content: bytes, *, source: str) -> ExperimentSpec:
+    """Validate an experiment manifest read from a remote control snapshot."""
+    try:
+        raw = yaml.safe_load(content)
+    except (OSError, yaml.YAMLError) as error:
+        raise ManifestError(f"cannot read {source}: {error}") from error
 
     if not isinstance(raw, dict):
-        raise ManifestError(f"{path} must contain a YAML object")
+        raise ManifestError(f"{source} must contain a YAML object")
 
     try:
         return ExperimentSpec.model_validate(raw)

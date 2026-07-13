@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -35,6 +36,7 @@ RetryCategory = Literal[
 EventKind = Literal[
     "campaign.submitted",
     "campaign.cancel-requested",
+    "campaign.shard-retry-requested",
     "campaign.draining",
     "campaign.manual-intervention-required",
     "campaign.completed",
@@ -111,6 +113,11 @@ class CancellationPayload(FrozenModel):
     reason: str = Field(min_length=1)
 
 
+class ShardRetryPayload(FrozenModel):
+    shard_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class TerminalPayload(FrozenModel):
     summary_path: str | None = None
     summary_sha256: str | None = None
@@ -167,6 +174,7 @@ class ActionOutcomePayload(FrozenModel):
 EventPayload = (
     CampaignSubmittedPayload
     | CancellationPayload
+    | ShardRetryPayload
     | TerminalPayload
     | LifecyclePayload
     | WaveLifecyclePayload
@@ -201,6 +209,7 @@ _EXECUTION_OUTCOME_KINDS = {
 _EXACT_PAYLOAD_TYPES: dict[str, type[BaseModel]] = {
     "campaign.submitted": CampaignSubmittedPayload,
     "campaign.cancel-requested": CancellationPayload,
+    "campaign.shard-retry-requested": ShardRetryPayload,
     "execution.started": ExecutionStartedPayload,
     "spend.recorded": SpendRecordedPayload,
     "action.reserved": ActionReservedPayload,
@@ -352,10 +361,11 @@ def _apply_event(
         raise ControlError("campaign event has the wrong subject")
     if event.kind == "campaign.submitted":
         raise ControlError("campaign has multiple submission events")
-    if event.kind == "campaign.cancel-requested":
-        if status in {"draining", "manual_intervention"}:
-            return status
-        return "cancel_requested"
+    if event.kind in {
+        "campaign.cancel-requested",
+        "campaign.shard-retry-requested",
+    }:
+        return _apply_operator_request(event, status)
     if event.kind == "campaign.draining":
         return "draining"
     if event.kind == "campaign.manual-intervention-required":
@@ -364,6 +374,16 @@ def _apply_event(
         return cast(CampaignStatus, event.kind.removeprefix("campaign."))
     _apply_action_event(event, actions)
     return "active" if status == "queued" else status
+
+
+def _apply_operator_request(
+    event: CampaignEvent, status: CampaignStatus
+) -> CampaignStatus:
+    if event.kind == "campaign.shard-retry-requested":
+        return "active" if status == "queued" else status
+    if status in {"draining", "manual_intervention"}:
+        return status
+    return "cancel_requested"
 
 
 def _apply_action_event(
@@ -442,9 +462,21 @@ class CampaignStore(Protocol):
 
     def append_event(self, campaign_id: str, event: CampaignEvent) -> None: ...
 
+    def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool: ...
+
+    def load_snapshot(self, campaign_id: str) -> CampaignSnapshot: ...
+
     def reserve_action(
         self, campaign_id: str, action: Mapping[str, JsonValue], event: CampaignEvent
     ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class CampaignSnapshot:
+    lock: CampaignLock
+    events: list[CampaignEvent]
+    request: bytes
+    control_commit: str
 
 
 class HubCampaignStore:
@@ -489,6 +521,10 @@ class HubCampaignStore:
     def load_campaign(
         self, campaign_id: str
     ) -> tuple[CampaignLock, list[CampaignEvent]]:
+        snapshot = self.load_snapshot(campaign_id)
+        return snapshot.lock, snapshot.events
+
+    def load_snapshot(self, campaign_id: str) -> CampaignSnapshot:
         head = self._head()
         lock = CampaignLock.model_validate(
             self._read_json(_campaign_lock_path(campaign_id), head)
@@ -506,7 +542,12 @@ class HubCampaignStore:
         events = [
             CampaignEvent.model_validate(self._read_json(path, head)) for path in paths
         ]
-        return lock, events
+        return CampaignSnapshot(
+            lock=lock,
+            events=events,
+            request=self._read_bytes(_campaign_request_path(campaign_id), head),
+            control_commit=head,
+        )
 
     def load_request(self, campaign_id: str) -> bytes:
         head = self._head()
@@ -568,6 +609,38 @@ class HubCampaignStore:
             f"chore: record {event.kind}",
             conflict=f"event already exists: {event.event_id}",
         )
+
+    def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool:
+        """Append an event once, adopting an identical concurrent request."""
+        if event.subject_id != campaign_id:
+            raise ValueError("event subject does not match campaign")
+        path = _event_path(campaign_id, event.event_id)
+        expected = event.model_dump(mode="json")
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            if self._exists(path, head):
+                if self._read_json(path, head) != expected:
+                    raise CampaignConflict(f"event conflicts: {event.event_id}")
+                return False
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=path,
+                            path_or_fileobj=_json_bytes(expected),
+                        )
+                    ],
+                    commit_message=f"chore: record {event.kind}",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
 
     def reserve_action(
         self,

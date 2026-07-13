@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
@@ -17,6 +16,7 @@ from harbor_hf.control import (
     ExecutionStartedPayload,
     IdentifierFactory,
     RetryCategory,
+    ShardRetryPayload,
     SpendRecordedPayload,
     WaveLifecyclePayload,
     new_event,
@@ -170,7 +170,7 @@ def durable_cancellation_event(
     reason: str,
     *,
     clock: Clock = lambda: datetime.now(UTC),
-    identifier: IdentifierFactory = lambda: uuid.uuid4().hex,
+    identifier: IdentifierFactory | None = None,
 ) -> tuple[CampaignEvent, bool]:
     for event in ordered_events(events):
         if event.kind == "campaign.cancel-requested":
@@ -183,7 +183,63 @@ def durable_cancellation_event(
             producer="cli",
             payload=CancellationPayload(reason=reason),
             clock=clock,
-            identifier=identifier,
+            identifier=identifier or _cancellation_identifier(lock),
+        ),
+        True,
+    )
+
+
+def _cancellation_identifier(lock: CampaignLock) -> IdentifierFactory:
+    return lambda: hashlib.sha256(f"{lock.campaign_id}:cancel".encode()).hexdigest()[
+        :32
+    ]
+
+
+def durable_shard_retry_event(
+    lock: CampaignLock,
+    events: list[CampaignEvent],
+    shard_id: str,
+    reason: str,
+    *,
+    clock: Clock = lambda: datetime.now(UTC),
+) -> tuple[CampaignEvent, bool]:
+    """Create one immediate retry request for the shard's current execution state."""
+    projection = project_recovery(lock, events)
+    if projection.campaign.status in _CAMPAIGN_TERMINAL:
+        raise ValueError("a terminal campaign cannot be retried")
+    if projection.campaign.status in {"cancel_requested", "draining"}:
+        raise ValueError("a cancelling campaign cannot be retried")
+    shard = projection.shards.get(shard_id)
+    if shard is None:
+        raise ValueError(f"unknown campaign shard: {shard_id}")
+    eligible = [
+        projection.trials[trial_id]
+        for trial_id in shard.trial_ids
+        if projection.trials[trial_id].status == "retry_wait"
+    ]
+    if not eligible:
+        raise ValueError("shard has no retryable logical trials")
+    generation = ",".join(
+        f"{trial.trial_id}:{len(trial.executions)}" for trial in eligible
+    )
+    identifier = hashlib.sha256(
+        f"{lock.campaign_id}:{shard_id}:{generation}".encode()
+    ).hexdigest()[:32]
+    event_id = f"evt-{identifier}"
+    for event in ordered_events(events):
+        if event.event_id == event_id:
+            if event.kind != "campaign.shard-retry-requested":
+                raise ValueError("retry event identity conflicts")
+            return event, False
+    return (
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="campaign.shard-retry-requested",
+            producer="cli",
+            payload=ShardRetryPayload(shard_id=shard_id, reason=reason),
+            clock=clock,
+            identifier=lambda: identifier,
         ),
         True,
     )
@@ -200,6 +256,7 @@ def project_recovery(
     for event in ordered_events(events):
         spend += _apply_recovery_event(event, runs, shards, trials, executions, waves)
     trials = _derive_trials(lock, trials, executions)
+    trials = _apply_retry_requests(events, trials)
     shards = _derive_shards(shards, trials)
     runs = _derive_runs(runs, shards)
     counts = _counts(trials)
@@ -226,6 +283,27 @@ def project_recovery(
         cancel_requested_at=cancel_requested_at,
         terminal_decision=terminal,
     )
+
+
+def _apply_retry_requests(
+    events: list[CampaignEvent], trials: dict[str, TrialProjection]
+) -> dict[str, TrialProjection]:
+    requested_at: dict[str, datetime] = {}
+    for event in ordered_events(events):
+        if event.kind != "campaign.shard-retry-requested":
+            continue
+        payload = cast(ShardRetryPayload, event.payload)
+        requested_at[payload.shard_id] = max(
+            requested_at.get(payload.shard_id, event.observed_at), event.observed_at
+        )
+    return {
+        trial_id: (
+            trial.model_copy(update={"retry_not_before": requested_at[trial.shard_id]})
+            if trial.status == "retry_wait" and trial.shard_id in requested_at
+            else trial
+        )
+        for trial_id, trial in trials.items()
+    }
 
 
 def _apply_recovery_event(

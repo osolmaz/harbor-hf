@@ -239,6 +239,10 @@ def test_hub_store_creates_and_loads_campaign(
         b"kind: Experiment\n"
     )
     assert len(api.commits) == 1
+    snapshot = store.load_snapshot(lock.campaign_id)
+    assert snapshot.lock == lock
+    assert snapshot.request == b"kind: Experiment\n"
+    assert snapshot.control_commit == api.head
     with pytest.raises(CampaignConflict, match="campaign already exists"):
         store.create_campaign(lock, b"different", _submitted(lock))
 
@@ -326,6 +330,30 @@ def test_hub_store_appends_event_and_rejects_duplicate(
     assert event in events
     with pytest.raises(CampaignConflict, match="event already exists"):
         store.append_event(lock.campaign_id, event)
+
+
+def test_hub_store_ensures_identical_event_once(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    store = HubCampaignStore("org", api=FakeCampaignApi(tmp_path))
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        identifier=lambda: "6" * 32,
+    )
+
+    assert store.ensure_event(lock.campaign_id, event)
+    assert not store.ensure_event(lock.campaign_id, event)
+    conflicting = event.model_copy(
+        update={"payload": CancellationPayload(reason="different")}
+    )
+    with pytest.raises(CampaignConflict, match="event conflicts"):
+        store.ensure_event(lock.campaign_id, conflicting)
 
 
 def test_hub_store_reports_malformed_records(

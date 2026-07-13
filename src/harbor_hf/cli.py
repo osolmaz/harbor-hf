@@ -4,11 +4,22 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Never, cast
 
 import typer
 from httpx import HTTPError
+from huggingface_hub import HfApi, get_token
 
+from harbor_hf.automation import (
+    AutomationError,
+    AutomationRequest,
+    automation_plan,
+    install_automation,
+)
+from harbor_hf.bucket_evidence import (
+    BucketEvidenceError,
+    HubBucketEvidenceReader,
+)
 from harbor_hf.campaigns import (
     build_campaign_lock,
     build_campaign_plan,
@@ -22,12 +33,24 @@ from harbor_hf.control import (
     new_event,
     project_campaign,
 )
-from harbor_hf.coordination import CoordinationError
+from harbor_hf.coordination import CoordinationError, HubClaimStore
 from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import ExperimentSpec
+from harbor_hf.operations import (
+    cancel_campaign,
+    publish_campaign_results,
+    retry_campaign_shard,
+    verify_campaign_artifacts,
+)
 from harbor_hf.planner import build_plan
 from harbor_hf.process import ProcessError, SubprocessRunner
 from harbor_hf.reconciler import plan_reconciliation
+from harbor_hf.result_publisher import (
+    DatasetApi,
+    DatasetPublicationError,
+    HubDatasetPublisher,
+)
+from harbor_hf.results import ResultPublicationError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
@@ -39,7 +62,36 @@ app = typer.Typer(
     help="Plan and run Harbor benchmarks on Hugging Face infrastructure.",
 )
 campaign_app = typer.Typer(no_args_is_help=True, help="Plan and run campaigns.")
+artifacts_app = typer.Typer(no_args_is_help=True, help="Inspect campaign evidence.")
+results_app = typer.Typer(no_args_is_help=True, help="Publish campaign results.")
+automation_app = typer.Typer(
+    no_args_is_help=True, help="Install campaign reconciliation automation."
+)
 app.add_typer(campaign_app, name="campaign")
+app.add_typer(artifacts_app, name="artifacts")
+app.add_typer(results_app, name="results")
+app.add_typer(automation_app, name="automation")
+
+_OPERATION_ERRORS = (
+    HTTPError,
+    OSError,
+    ValueError,
+    AutomationError,
+    BucketEvidenceError,
+    ControlError,
+    CoordinationError,
+    DatasetPublicationError,
+    ResultPublicationError,
+)
+
+
+def _echo_json(value: object) -> None:
+    typer.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _exit_operation(error: Exception) -> Never:
+    typer.echo(f"Error: {error}", err=True)
+    raise typer.Exit(code=1) from error
 
 
 def _load_or_exit(path: Path) -> ExperimentSpec:
@@ -187,6 +239,152 @@ def campaign_reconcile(
     typer.echo(
         json.dumps(reconciliation.model_dump(mode="json"), indent=2, sort_keys=True)
     )
+
+
+@campaign_app.command("cancel")
+def campaign_cancel(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    reason: Annotated[str, typer.Option("--reason")] = "operator request",
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Record one durable campaign cancellation request."""
+    del output_format
+    try:
+        result = cancel_campaign(
+            HubCampaignStore(namespace),
+            campaign_id,
+            reason=reason,
+            dry_run=dry_run,
+        )
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@campaign_app.command("retry")
+def campaign_retry(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    shard_id: Annotated[str, typer.Option("--shard")],
+    reason: Annotated[str, typer.Option("--reason")] = "operator retry request",
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Request an immediate retry for retryable trials in one shard."""
+    del output_format
+    try:
+        result = retry_campaign_shard(
+            HubCampaignStore(namespace),
+            campaign_id,
+            shard_id=shard_id,
+            reason=reason,
+            dry_run=dry_run,
+        )
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@artifacts_app.command("verify")
+def artifacts_verify(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Verify publishable run evidence and every declared checksum."""
+    del output_format
+    try:
+        store = HubCampaignStore(namespace)
+        snapshot = store.load_snapshot(campaign_id)
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-") as cache:
+            reader = HubBucketEvidenceReader(Path(cache))
+            result = verify_campaign_artifacts(
+                snapshot, namespace=namespace, reader=reader
+            )
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@results_app.command("publish")
+def results_publish(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Verify and publish normalized campaign result tables."""
+    del output_format
+    try:
+        store = HubCampaignStore(namespace)
+        snapshot = store.load_snapshot(campaign_id)
+        api = HfApi()
+        publisher = None
+        if not dry_run:
+            token = get_token()
+            if token is None:
+                raise ValueError("result publication requires HF authentication")
+            publisher = HubDatasetPublisher(
+                publisher_id=f"cli-{campaign_id}",
+                leases=HubClaimStore(namespace, token),
+                api=cast(DatasetApi, api),
+            )
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-") as cache:
+            reader = HubBucketEvidenceReader(Path(cache))
+            result = publish_campaign_results(
+                snapshot,
+                namespace=namespace,
+                reader=reader,
+                publisher=publisher,
+                dry_run=dry_run,
+            )
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@automation_app.command("install")
+def automation_install(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    schedule: Annotated[str, typer.Option("--schedule")],
+    namespace: Annotated[str | None, typer.Option("--namespace")] = None,
+    suspended: Annotated[bool, typer.Option("--suspended")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Install or adopt the managed schedule and control webhook."""
+    del output_format
+    spec = _load_or_exit(manifest)
+    try:
+        if spec.remote is None:
+            raise ValueError("automation installation requires remote configuration")
+        request = AutomationRequest(
+            namespace=namespace or spec.remote.job.namespace,
+            schedule=schedule,
+            remote=spec.remote,
+            suspended=suspended,
+        )
+        if dry_run:
+            payload = {
+                **automation_plan(request).model_dump(mode="json"),
+                "installed": False,
+                "dry_run": True,
+            }
+        else:
+            token = get_token()
+            if token is None:
+                raise ValueError("automation installation requires HF authentication")
+            installation = install_automation(request, token=token)
+            payload = {
+                **installation.model_dump(mode="json"),
+                "installed": True,
+                "dry_run": False,
+            }
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(payload)
 
 
 @app.command()

@@ -9,6 +9,13 @@ from harbor_hf.campaigns import build_campaign_lock, build_campaign_plan
 from harbor_hf.cli import _write_lock, app
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.models import ExperimentSpec
+from harbor_hf.operations import (
+    ArtifactVerificationReport,
+    CampaignEventResult,
+    CampaignPublicationReport,
+    PublishedRun,
+    VerifiedRun,
+)
 from harbor_hf.process import ProcessError
 from harbor_hf.runs import build_run_lock
 
@@ -153,6 +160,151 @@ def test_campaign_reconcile_requires_dry_run() -> None:
 
     assert result.exit_code == 2
     assert "currently requires --dry-run" in result.stderr
+
+
+def test_campaign_cancel_and_retry_print_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_cancel(_store: object, campaign_id: str, **_kwargs: object) -> object:
+        calls.append(("cancel", campaign_id))
+        return CampaignEventResult(
+            campaign_id=campaign_id,
+            event_id="evt-" + "1" * 32,
+            kind="campaign.cancel-requested",
+            recorded=True,
+            dry_run=False,
+        )
+
+    def fake_retry(_store: object, campaign_id: str, **kwargs: object) -> object:
+        calls.append(("retry", str(kwargs["shard_id"])))
+        return CampaignEventResult(
+            campaign_id=campaign_id,
+            event_id="evt-" + "2" * 32,
+            kind="campaign.shard-retry-requested",
+            recorded=False,
+            dry_run=True,
+        )
+
+    monkeypatch.setattr("harbor_hf.cli.cancel_campaign", fake_cancel)
+    monkeypatch.setattr("harbor_hf.cli.retry_campaign_shard", fake_retry)
+
+    cancel = runner.invoke(
+        app, ["campaign", "cancel", "campaign-one", "--namespace", "org"]
+    )
+    retry = runner.invoke(
+        app,
+        [
+            "campaign",
+            "retry",
+            "campaign-one",
+            "--namespace",
+            "org",
+            "--shard",
+            "shard-one",
+            "--dry-run",
+        ],
+    )
+
+    assert cancel.exit_code == 0
+    assert json.loads(cancel.stdout)["recorded"] is True
+    assert retry.exit_code == 0
+    assert json.loads(retry.stdout)["dry_run"] is True
+    assert calls == [("cancel", "campaign-one"), ("retry", "shard-one")]
+
+
+def test_artifacts_verify_and_results_publish_print_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        def __init__(self, namespace: str) -> None:
+            assert namespace == "org"
+
+        def load_snapshot(self, campaign_id: str) -> object:
+            assert campaign_id == "campaign-one"
+            return object()
+
+    verified_run = VerifiedRun(
+        run_id="run-one",
+        publication_id="pub-one",
+        source_prefix="campaigns/campaign-one/runs/run-one",
+        source_checksum="sha256:" + "1" * 64,
+        row_counts={
+            "runs": 1,
+            "trials": 1,
+            "executions": 1,
+            "metrics": 1,
+            "artifacts": 0,
+        },
+    )
+    monkeypatch.setattr("harbor_hf.cli.HubCampaignStore", FakeStore)
+    monkeypatch.setattr(
+        "harbor_hf.cli.verify_campaign_artifacts",
+        lambda *_args, **_kwargs: ArtifactVerificationReport(
+            campaign_id="campaign-one",
+            artifact_bucket="org/evidence",
+            control_commit="c" * 40,
+            runs=[verified_run],
+        ),
+    )
+    monkeypatch.setattr(
+        "harbor_hf.cli.publish_campaign_results",
+        lambda *_args, **_kwargs: CampaignPublicationReport(
+            campaign_id="campaign-one",
+            control_commit="c" * 40,
+            dry_run=True,
+            runs=[
+                PublishedRun(
+                    run_id="run-one",
+                    publication_id="pub-one",
+                    result_dataset="org/results",
+                    index_dataset="org/index",
+                    published=False,
+                )
+            ],
+        ),
+    )
+
+    verify = runner.invoke(
+        app, ["artifacts", "verify", "campaign-one", "--namespace", "org"]
+    )
+    publish = runner.invoke(
+        app,
+        [
+            "results",
+            "publish",
+            "campaign-one",
+            "--namespace",
+            "org",
+            "--dry-run",
+        ],
+    )
+
+    assert verify.exit_code == 0
+    assert json.loads(verify.stdout)["verified"] is True
+    assert publish.exit_code == 0
+    assert json.loads(publish.stdout)["runs"][0]["published"] is False
+
+
+def test_automation_install_dry_run_is_secret_safe(remote_manifest: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "automation",
+            "install",
+            str(remote_manifest),
+            "--schedule",
+            "*/10 * * * *",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["installed"] is False
+    assert payload["secret_names"] == ["HF_TOKEN"]
+    assert "test-only" not in result.stdout
 
 
 def test_invalid_manifest_reports_stderr_and_exit_two(tmp_path: Path) -> None:
