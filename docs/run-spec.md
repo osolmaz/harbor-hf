@@ -110,9 +110,10 @@ binding with `namespace`, `name`, and the OpenAI-compatible
 not inspect or resume it.
 
 Engine identity is more than `engine.name`. Resolution and submission preserve
-the engine version and build or commit, immutable image digest, full arguments,
-non-secret environment, secret names, runtime and driver versions, parser and
-chat-template identity, cache precision, batching limits, and feature controls
+the engine version and build or commit, immutable image digest, container
+command, full arguments, non-secret environment, secret names, runtime and
+driver versions, parser and chat-template identity, cache precision, batching
+limits, and feature controls
 such as prefix caching, speculation or MTP, CUDA graphs, attention backend, and
 MoE backend. Values observed after startup are stored separately from requested
 values so a provider default cannot silently change the run definition.
@@ -190,10 +191,11 @@ inherit the Harbor execution timeout.
 Readiness requires every positive `targetReplica` to be represented by a ready
 replica. The controller then probes the endpoint's reported `healthRoute`
 instead of assuming a custom image uses `/health`.
-Before benchmarking, it compares the observable endpoint model, custom image,
-complete ordered serving arguments, complete non-secret environment, provider region, hardware,
-accelerator count, and declared replica limits with the resolved deployment.
-A mismatch is a run failure, not a warning.
+Before resuming and again before benchmarking, it compares the observable
+endpoint model, custom image, container command, complete ordered serving
+arguments, complete non-secret environment, provider region, hardware,
+accelerator count, and declared replica limits with the resolved deployment. A
+mismatch is a run failure, not a warning.
 
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without

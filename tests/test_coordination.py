@@ -163,9 +163,7 @@ def test_claim_release_rejects_missing_or_changed_owner(tmp_path: Path) -> None:
         store.release(path, {"controller_job_id": "controller"})
 
     store.acquire(path, {"controller_job_id": "controller"})
-    with pytest.raises(
-        CoordinationError, match="^claim ownership cannot be verified$"
-    ):
+    with pytest.raises(CoordinationError, match="^claim ownership cannot be verified$"):
         store.release(path, {"controller_job_id": "other"})
     assert path in api.files
 

@@ -61,6 +61,7 @@ class ModelProfile(StrictModel):
 class EngineSpec(StrictModel):
     name: str = Field(min_length=1)
     image: str = Field(min_length=1)
+    command: list[str] = Field(default_factory=list)
     arguments: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     secret_names: list[str] = Field(default_factory=list)

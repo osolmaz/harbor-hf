@@ -303,6 +303,11 @@ def test_endpoint_model_must_match_lock(remote_spec: ExperimentSpec) -> None:
             "endpoint image does not match the locked deployment",
         ),
         (
+            "command",
+            ["python", "-m", "different_server"],
+            "endpoint command does not match the locked deployment",
+        ),
+        (
             "args",
             ["--max-model-len", "32768"],
             "endpoint arguments do not match the locked deployment",
@@ -402,6 +407,27 @@ def test_endpoint_arguments_require_complete_ordered_identity(
         WorkerError, match="^endpoint arguments do not match the locked deployment$"
     ):
         validate_endpoint_model(build_run_lock(spec), endpoint_snapshot)
+
+
+def test_endpoint_omitted_arguments_match_an_empty_lock(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0]
+    engine = deployment.engine.model_copy(update={"arguments": []})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "deployments": [deployment.model_copy(update={"engine": engine})]
+                }
+            )
+        }
+    )
+    endpoint_snapshot = snapshot("paused", 0)
+    model = cast(dict[str, object], endpoint_snapshot["model"])
+    model.pop("args")
+
+    validate_endpoint_model(build_run_lock(spec), endpoint_snapshot)
 
 
 def test_endpoint_environment_rejects_unlocked_extra_values(
@@ -1745,6 +1771,47 @@ def test_validate_harbor_result_enforces_agent_identity(tmp_path: Path) -> None:
     }
 
 
+def test_validate_harbor_result_enforces_model_identity(tmp_path: Path) -> None:
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
+
+    def write_model(model_info: object) -> None:
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "task_name": "task",
+                    "agent_info": {
+                        "name": "openclaw",
+                        "version": "1.2.3",
+                        "model_info": model_info,
+                    },
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def validate() -> dict[str, object]:
+        return validate_harbor_result(
+            tmp_path,
+            expected_agent_name="openclaw",
+            expected_agent_version="1.2.3",
+            expected_model_provider="openai",
+            expected_model_name="/repository",
+        )
+
+    write_model({"provider": "openai", "name": "different"})
+    with pytest.raises(WorkerError, match="model identity does not match the lock"):
+        validate()
+
+    write_model(None)
+    with pytest.raises(WorkerError, match="has no model identity"):
+        validate()
+
+    write_model({"provider": "openai", "name": "/repository"})
+    assert validate()["trial_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("exception_info", "message"),
     [
@@ -2184,6 +2251,7 @@ def _successful_stream(
                 "agent_info": {
                     "name": "openclaw",
                     "version": "replace-with-package-version",
+                    "model_info": {"provider": "openai", "name": "/repository"},
                 },
                 "verifier_result": {"rewards": {"reward": 1.0}},
             }
@@ -2212,7 +2280,13 @@ def test_worker_publishes_success_after_cleanup(
         return {"probes": {"health": {"http_status": 200}}}
 
     monkeypatch.setattr("harbor_hf.worker.probe_runtime", fake_probe)
-    runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+    runner = EndpointRunner(
+        [
+            snapshot("paused", 0),
+            snapshot("running", 1),
+            snapshot("paused", 0),
+        ]
+    )
     claims = FakeClaimStore()
     readiness_timeouts: list[int] = []
     original_wait_ready = EndpointManager.wait_ready
@@ -2337,7 +2411,7 @@ def test_worker_publishes_success_after_cleanup(
             "--format",
             "json",
         ]
-        for operation in ("resume", "describe", "pause", "describe")
+        for operation in ("describe", "resume", "describe", "pause", "describe")
     ]
 
 
@@ -2389,7 +2463,9 @@ def test_worker_rejects_incomplete_explicit_task_set(
         "harbor_hf.worker.probe_runtime",
         lambda _url, _token, _health_route: {"probes": {}},
     )
-    runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+    runner = EndpointRunner(
+        [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
+    )
 
     with pytest.raises(
         WorkerError, match="^expected exactly 2 Harbor trials, found 1$"
@@ -2421,7 +2497,9 @@ def test_worker_failure_still_pauses_endpoint(
         "harbor_hf.worker.probe_runtime",
         lambda _url, _token, _health_route: {"probes": {}},
     )
-    runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+    runner = EndpointRunner(
+        [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
+    )
 
     with pytest.raises(WorkerError, match="status 7"):
         run_worker(
@@ -2508,7 +2586,9 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
         raise RuntimeError("archive test-token failed")
 
     monkeypatch.setattr("harbor_hf.worker._finalize_evidence", fail_finalization)
-    runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+    runner = EndpointRunner(
+        [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
+    )
 
     with pytest.raises(WorkerError, match="evidence finalization failed"):
         run_worker(
@@ -2555,6 +2635,38 @@ def test_worker_does_not_resume_without_independent_watchdog(
     assert runner.commands == []
 
 
+def test_worker_rejects_endpoint_drift_before_resume(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="drifted-endpoint")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    drifted = snapshot("paused", 0)
+    model = cast(dict[str, object], drifted["model"])
+    model["revision"] = "different"
+    runner = EndpointRunner([drifted, snapshot("paused", 0)])
+
+    with pytest.raises(WorkerError, match="endpoint model does not match"):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
+        )
+
+    assert [command[2] for command in runner.commands] == [
+        "describe",
+        "pause",
+        "describe",
+    ]
+
+
 def test_cleanup_failure_prevents_success_and_redacts_failure(
     remote_spec: ExperimentSpec,
     remote_manifest: Path,
@@ -2569,7 +2681,7 @@ def test_cleanup_failure_prevents_success_and_redacts_failure(
         "harbor_hf.worker.probe_runtime",
         lambda _url, _token, _health_route: {"probes": {}},
     )
-    runner = CleanupFailureRunner([snapshot("running", 1)])
+    runner = CleanupFailureRunner([snapshot("paused", 0), snapshot("running", 1)])
 
     with pytest.raises(WorkerError, match=r"^pause failed with \[REDACTED\]$"):
         run_worker(
@@ -2616,7 +2728,7 @@ def test_worker_preserves_execution_and_cleanup_failures(
         "harbor_hf.worker.probe_runtime",
         lambda _url, _token, _health_route: {"probes": {}},
     )
-    runner = CleanupFailureRunner([snapshot("running", 1)])
+    runner = CleanupFailureRunner([snapshot("paused", 0), snapshot("running", 1)])
 
     with pytest.raises(
         WorkerError,

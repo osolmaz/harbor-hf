@@ -65,10 +65,11 @@ The Job writes evidence under
 is written only after every requested Harbor attempt is exception-free, has
 finite numeric verifier results, and the Inference Endpoint reports `paused`
 with zero ready replicas. Failures write `_FAILED` after attempting the same cleanup.
-The controller waits for every target replica and probes the endpoint's reported
-health route before Harbor starts. It also verifies the endpoint's model,
-custom image, complete ordered serving arguments, complete non-secret environment, provider region,
-hardware, accelerator count, and declared scaling limits against the run lock.
+The controller verifies the endpoint's model, custom image, container command,
+complete ordered serving arguments, complete non-secret environment, provider
+region, hardware, accelerator count, and declared scaling limits while the
+endpoint is paused and again after every target replica is ready. It then probes
+the endpoint's reported health route before Harbor starts.
 Harbor writes raw sessions and logs only to Job-local storage. The controller
 redacts and validates that staging tree before publishing it to the bucket, and
 copies `_SUCCESS` or `_FAILED` last.

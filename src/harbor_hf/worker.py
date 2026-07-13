@@ -562,6 +562,11 @@ def _execute_benchmark(
     stream_runner: Callable[..., int],
     harbor_source: Path,
 ) -> None:
+    endpoint = lock.deployment.endpoint
+    if endpoint is None:
+        raise WorkerError("run lock has no endpoint binding")
+    preflight_snapshot = manager.describe()
+    validate_endpoint_model(lock, preflight_snapshot)
     append_event(events, "endpoint_resume_requested")
     manager.resume()
     snapshot = manager.wait_ready(3600)
@@ -604,6 +609,8 @@ def _execute_benchmark(
         expected_attempts_per_task=lock.attempts,
         expected_agent_name=lock.agent.name,
         expected_agent_version=_expected_agent_version(lock),
+        expected_model_provider="openai",
+        expected_model_name=endpoint.served_model_name,
     )
     write_json(root / "verification.json", verifier)
     append_event(events, "verification_validated")
@@ -885,7 +892,14 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
     observed_image = custom.get("url") if isinstance(custom, Mapping) else None
     if observed_image != lock.deployment.engine.image:
         raise WorkerError("endpoint image does not match the locked deployment")
-    observed_arguments = model.get("args")
+    observed_command = model.get("command", [])
+    if (
+        not isinstance(observed_command, list)
+        or not all(isinstance(argument, str) for argument in observed_command)
+        or observed_command != lock.deployment.engine.command
+    ):
+        raise WorkerError("endpoint command does not match the locked deployment")
+    observed_arguments = model.get("args", [])
     if (
         not isinstance(observed_arguments, list)
         or not all(isinstance(argument, str) for argument in observed_arguments)
@@ -1035,6 +1049,8 @@ def validate_harbor_result(
     expected_attempts_per_task: int | None = None,
     expected_agent_name: str | None = None,
     expected_agent_version: str | None = None,
+    expected_model_provider: str | None = None,
+    expected_model_name: str | None = None,
 ) -> dict[str, object]:
     trials: list[dict[str, object]] = []
     for path in sorted(jobs_dir.glob("*/*/result.json")):
@@ -1064,6 +1080,8 @@ def validate_harbor_result(
             task_name,
             expected_agent_name,
             expected_agent_version,
+            expected_model_provider,
+            expected_model_name,
         )
         verifier = trial.get("verifier_result")
         rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
@@ -1137,8 +1155,15 @@ def _validate_agent_identity(
     task_name: str,
     expected_name: str | None,
     expected_version: str | None,
+    expected_model_provider: str | None,
+    expected_model_name: str | None,
 ) -> None:
-    if expected_name is None and expected_version is None:
+    if (
+        expected_name is None
+        and expected_version is None
+        and expected_model_provider is None
+        and expected_model_name is None
+    ):
         return
     agent = trial.get("agent_info")
     if not isinstance(agent, Mapping):
@@ -1147,6 +1172,17 @@ def _validate_agent_identity(
         raise WorkerError(
             f"Harbor trial {task_name} agent identity does not match the lock"
         )
+    if expected_model_provider is not None or expected_model_name is not None:
+        model = agent.get("model_info")
+        if not isinstance(model, Mapping):
+            raise WorkerError(f"Harbor trial {task_name} has no model identity")
+        if (
+            model.get("provider") != expected_model_provider
+            or model.get("name") != expected_model_name
+        ):
+            raise WorkerError(
+                f"Harbor trial {task_name} model identity does not match the lock"
+            )
 
 
 def _validate_trial_count(
