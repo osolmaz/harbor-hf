@@ -11,9 +11,10 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from harbor_hf.endpoints import deployment_digest
+from harbor_hf.endpoints import deployment_digest, managed_endpoint_identity
 from harbor_hf.models import (
     AgentProfile,
+    DeploymentProfile,
     DeploymentTarget,
     EndpointRef,
     ExperimentSpec,
@@ -463,8 +464,10 @@ def build_wave_lock(
     campaign: CampaignLock,
     spec: ExperimentSpec,
     action: SubmitWaveAction,
+    *,
+    endpoint: EndpointRef | None = None,
 ) -> WaveLock:
-    """Resolve one reserved deployment wave without provisioning an endpoint."""
+    """Resolve one reserved deployment wave for an allowed endpoint identity."""
     expected_campaign = build_campaign_lock(
         build_campaign_plan(spec),
         campaign.campaign_id,
@@ -477,9 +480,16 @@ def build_wave_lock(
     selected = _selected_wave_shards(campaign, action)
     run_locks: list[WaveRunLock] = []
     target: EndpointWaveTarget | ProviderWaveTarget | None = None
+    requested_endpoint = endpoint
     for campaign_run, shards in selected:
-        configuration = build_run_lock(
+        bound_spec = _bound_wave_spec(
+            campaign,
             spec,
+            campaign_run,
+            requested_endpoint,
+        )
+        configuration = build_run_lock(
+            bound_spec,
             model_id=campaign_run.model,
             deployment_id=campaign_run.deployment,
             agent_id=campaign_run.agent,
@@ -549,6 +559,107 @@ def build_wave_lock(
         shard_ids=action.shard_ids,
         runs=run_locks,
     )
+
+
+def managed_wave_endpoint(
+    campaign: CampaignLock,
+    spec: ExperimentSpec,
+    deployment: str,
+) -> EndpointRef:
+    """Return the deterministic endpoint binding for one deployment digest."""
+    if spec.remote is None:
+        raise ValueError("managed deployment waves require remote execution")
+    matches = [run for run in campaign.runs if run.deployment_digest == deployment]
+    if not matches:
+        raise ValueError("campaign does not contain the deployment digest")
+    profile_pairs = {(run.model, run.deployment) for run in matches}
+    if len(profile_pairs) != 1:
+        raise ValueError("deployment digest resolves to conflicting profiles")
+    model_id, deployment_id = profile_pairs.pop()
+    model = next(profile for profile in spec.matrix.models if profile.id == model_id)
+    profile = next(
+        profile for profile in spec.matrix.deployments if profile.id == deployment_id
+    )
+    if isinstance(profile, ProviderTarget):
+        raise ValueError("inference provider deployments have no managed endpoint")
+    if deployment_digest(model, profile) != deployment:
+        raise ValueError("manifest deployment does not match the campaign lock")
+    identity = managed_endpoint_identity(
+        namespace=spec.remote.job.namespace,
+        campaign_id=campaign.campaign_id,
+        deployment_digest=deployment,
+    )
+    return EndpointRef(
+        namespace=identity.namespace,
+        name=identity.name,
+        served_model_name=_served_model_name(profile, model),
+    )
+
+
+def _bound_wave_spec(
+    campaign: CampaignLock,
+    spec: ExperimentSpec,
+    run: CampaignRunLock,
+    requested_endpoint: EndpointRef | None,
+) -> ExperimentSpec:
+    profile = next(
+        profile for profile in spec.matrix.deployments if profile.id == run.deployment
+    )
+    if isinstance(profile, ProviderTarget):
+        if requested_endpoint is not None:
+            raise ValueError("provider waves cannot have an endpoint binding")
+        return spec
+    resolved_endpoint = requested_endpoint or profile.endpoint
+    if resolved_endpoint is None:
+        raise ValueError(
+            "deployment wave requires a pre-existing endpoint binding or "
+            "a managed endpoint binding"
+        )
+    managed_endpoint = managed_wave_endpoint(
+        campaign,
+        spec,
+        run.deployment_digest,
+    )
+    if resolved_endpoint not in (profile.endpoint, managed_endpoint):
+        raise ValueError("deployment wave endpoint identity is not allowed")
+    return _bind_endpoint(
+        spec,
+        deployment_id=run.deployment,
+        endpoint=resolved_endpoint,
+    )
+
+
+def _bind_endpoint(
+    spec: ExperimentSpec,
+    *,
+    deployment_id: str,
+    endpoint: EndpointRef,
+) -> ExperimentSpec:
+    deployments: list[DeploymentTarget] = []
+    for profile in spec.matrix.deployments:
+        if profile.id != deployment_id:
+            deployments.append(profile)
+            continue
+        if isinstance(profile, ProviderTarget):
+            raise ValueError("inference provider deployments cannot bind endpoints")
+        deployments.append(profile.model_copy(update={"endpoint": endpoint}))
+    matrix = spec.matrix.model_copy(update={"deployments": deployments})
+    return spec.model_copy(update={"matrix": matrix})
+
+
+def _served_model_name(
+    deployment: DeploymentProfile,
+    model: ModelProfile,
+) -> str:
+    arguments = deployment.engine.arguments
+    for option in ("--served-model-name", "--model"):
+        try:
+            index = arguments.index(option)
+        except ValueError:
+            continue
+        if index + 1 < len(arguments) and arguments[index + 1]:
+            return arguments[index + 1]
+    return model.repo
 
 
 def deterministic_wave_id(action_key: str) -> str:

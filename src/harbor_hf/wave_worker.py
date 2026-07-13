@@ -203,7 +203,7 @@ def validate_wave_lock(
         shard_ids=lock.shard_ids,
     )
     try:
-        expected = build_wave_lock(campaign, spec, action)
+        expected = build_wave_lock(campaign, spec, action, endpoint=lock.endpoint)
     except ValueError as error:
         raise WorkerError(f"wave lock cannot be resolved: {error}") from error
     if lock != expected:

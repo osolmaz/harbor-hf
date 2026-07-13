@@ -11,7 +11,7 @@ import httpx
 import pytest
 from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from harbor_hf.campaigns import CampaignLock, build_campaign_lock, build_campaign_plan
 from harbor_hf.control import (
@@ -241,6 +241,39 @@ def test_hub_store_creates_and_loads_campaign(
     assert len(api.commits) == 1
     with pytest.raises(CampaignConflict, match="campaign already exists"):
         store.create_campaign(lock, b"different", _submitted(lock))
+
+
+def test_hub_store_reads_requests_lists_campaigns_and_loads_reservations(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"kind: Experiment\n", _submitted(lock))
+    reserved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="act-one",
+            action_key="key-one",
+            action_kind="submit-wave",
+            target_ids=["shard-one"],
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "2" * 32,
+    )
+    action: dict[str, JsonValue] = {
+        "action_id": "act-one",
+        "kind": "submit-wave",
+    }
+    store.reserve_action(lock.campaign_id, action, reserved)
+    api.files["campaigns/nested/invalid/campaign.lock.json"] = b"{}"
+
+    assert store.load_request(lock.campaign_id) == b"kind: Experiment\n"
+    assert store.list_campaigns() == [lock.campaign_id]
+    assert store.load_action_reservations(lock.campaign_id) == [action]
 
 
 def test_hub_store_reserves_action_atomically_and_idempotently(

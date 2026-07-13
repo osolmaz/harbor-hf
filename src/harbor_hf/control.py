@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from harbor_hf.campaigns import CampaignLock
 from harbor_hf.coordination import coordination_repository
 
 _MAX_COMMIT_ATTEMPTS = 8
+_CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 SubjectType = Literal["campaign", "run", "shard", "trial", "execution", "wave"]
 Producer = Literal["cli", "reconciler", "wave-controller", "watchdog", "publisher"]
@@ -379,11 +381,14 @@ def _apply_action_event(
     action = actions.get(payload.action_id)
     if action is None:
         raise ControlError("action outcome has no reservation")
-    if action.status != "reserved":
+    if action.status not in {"reserved", "ambiguous"}:
         raise ControlError("action has multiple outcomes")
+    outcome = cast(ActionStatus, event.kind.removeprefix("action."))
+    if action.status == "ambiguous" and outcome == "ambiguous":
+        return
     actions[payload.action_id] = action.model_copy(
         update={
-            "status": event.kind.removeprefix("action."),
+            "status": outcome,
             "message": payload.message,
             "remote_id": payload.remote_id,
         }
@@ -426,6 +431,14 @@ class CampaignStore(Protocol):
     def load_campaign(
         self, campaign_id: str
     ) -> tuple[CampaignLock, list[CampaignEvent]]: ...
+
+    def load_request(self, campaign_id: str) -> bytes: ...
+
+    def list_campaigns(self) -> list[str]: ...
+
+    def load_action_reservations(
+        self, campaign_id: str
+    ) -> list[dict[str, JsonValue]]: ...
 
     def append_event(self, campaign_id: str, event: CampaignEvent) -> None: ...
 
@@ -494,6 +507,51 @@ class HubCampaignStore:
             CampaignEvent.model_validate(self._read_json(path, head)) for path in paths
         ]
         return lock, events
+
+    def load_request(self, campaign_id: str) -> bytes:
+        head = self._head()
+        return self._read_bytes(_campaign_request_path(campaign_id), head)
+
+    def list_campaigns(self) -> list[str]:
+        head = self._head()
+        suffix = "/campaign.lock.json"
+        campaign_ids = {
+            path.removeprefix("campaigns/").removesuffix(suffix)
+            for path in self.api.list_repo_files(
+                self.repository,
+                repo_type="dataset",
+                revision=head,
+            )
+            if path.startswith("campaigns/")
+            and path.endswith(suffix)
+            and _CAMPAIGN_ID.fullmatch(
+                path.removeprefix("campaigns/").removesuffix(suffix)
+            )
+            is not None
+        }
+        return sorted(campaign_ids)
+
+    def load_action_reservations(self, campaign_id: str) -> list[dict[str, JsonValue]]:
+        head = self._head()
+        prefix = f"campaigns/{campaign_id}/reservations/"
+        paths = sorted(
+            path
+            for path in self.api.list_repo_files(
+                self.repository,
+                repo_type="dataset",
+                revision=head,
+            )
+            if path.startswith(prefix) and path.endswith(".json")
+        )
+        reservations: list[dict[str, JsonValue]] = []
+        for path in paths:
+            value = self._read_json(path, head)
+            if not isinstance(value, dict) or not all(
+                isinstance(key, str) for key in value
+            ):
+                raise ControlError(f"action reservation must be an object: {path}")
+            reservations.append(cast(dict[str, JsonValue], value))
+        return reservations
 
     def append_event(self, campaign_id: str, event: CampaignEvent) -> None:
         if event.subject_id != campaign_id:
@@ -601,14 +659,20 @@ class HubCampaignStore:
 
     def _read_json(self, path: str, revision: str) -> object:
         try:
+            return json.loads(self._read_bytes(path, revision))
+        except json.JSONDecodeError as error:
+            raise ControlError(f"control record cannot be read: {path}") from error
+
+    def _read_bytes(self, path: str, revision: str) -> bytes:
+        try:
             local_path = self.api.hf_hub_download(
                 self.repository,
                 path,
                 repo_type="dataset",
                 revision=revision,
             )
-            return json.loads(Path(local_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            return Path(local_path).read_bytes()
+        except OSError as error:
             raise ControlError(f"control record cannot be read: {path}") from error
 
 
