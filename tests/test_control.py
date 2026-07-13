@@ -20,6 +20,7 @@ from harbor_hf.control import (
     ActionReservedPayload,
     CampaignConflict,
     CampaignEvent,
+    CampaignSnapshot,
     CampaignSubmittedPayload,
     CancellationPayload,
     ControlError,
@@ -42,12 +43,16 @@ class FakeCampaignApi:
         self.files: dict[str, bytes] = {}
         self.conflicts = 0
         self.commits: list[dict[str, object]] = []
+        self.info_calls: list[tuple[str, dict[str, object]]] = []
+        self.list_calls: list[tuple[str, dict[str, object]]] = []
+        self.download_calls: list[tuple[str, str, dict[str, object]]] = []
 
     @property
     def head(self) -> str:
         return f"{self.generation:040x}"
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object:
+        self.info_calls.append((repo_id, kwargs))
         assert repo_id == "org/harbor-hf-coordination"
         assert kwargs == {"repo_type": "dataset", "revision": "main"}
         return SimpleNamespace(sha=self.head)
@@ -61,11 +66,13 @@ class FakeCampaignApi:
         return [SimpleNamespace(path=path)] if path in self.files else []
 
     def list_repo_files(self, repo_id: str, **kwargs: object) -> list[str]:
+        self.list_calls.append((repo_id, kwargs))
         assert repo_id == "org/harbor-hf-coordination"
         assert kwargs == {"repo_type": "dataset", "revision": self.head}
         return list(self.files)
 
     def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str:
+        self.download_calls.append((repo_id, filename, kwargs))
         assert repo_id == "org/harbor-hf-coordination"
         assert kwargs == {"repo_type": "dataset", "revision": self.head}
         destination = self.root / filename.replace("/", "-")
@@ -245,6 +252,70 @@ def test_hub_store_creates_and_loads_campaign(
     assert snapshot.control_commit == api.head
     with pytest.raises(CampaignConflict, match="campaign already exists"):
         store.create_campaign(lock, b"different", _submitted(lock))
+
+
+def test_hub_store_snapshot_reads_every_object_from_one_exact_revision(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    request = b"kind: Experiment\nmetadata: snapshot\n"
+    store.create_campaign(lock, request, _submitted(lock))
+    later = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "0" * 32,
+    )
+    api.files[f"campaigns/{lock.campaign_id}/events/{later.event_id}.json"] = (
+        json.dumps(later.model_dump(mode="json"), default=str).encode()
+    )
+    api.files[f"campaigns/{lock.campaign_id}/events/ignored.txt"] = b"not json"
+    api.info_calls.clear()
+    api.list_calls.clear()
+    api.download_calls.clear()
+    expected_head = api.head
+
+    snapshot = store.load_snapshot(lock.campaign_id)
+
+    repository = "org/harbor-hf-coordination"
+    revision = {"repo_type": "dataset", "revision": expected_head}
+    assert snapshot == CampaignSnapshot(
+        lock=lock,
+        events=[later, _submitted(lock)],
+        request=request,
+        control_commit=expected_head,
+    )
+    assert api.info_calls == [
+        (repository, {"repo_type": "dataset", "revision": "main"})
+    ]
+    assert api.list_calls == [(repository, revision)]
+    assert api.download_calls == [
+        (
+            repository,
+            f"campaigns/{lock.campaign_id}/campaign.lock.json",
+            revision,
+        ),
+        (
+            repository,
+            f"campaigns/{lock.campaign_id}/events/{later.event_id}.json",
+            revision,
+        ),
+        (
+            repository,
+            f"campaigns/{lock.campaign_id}/events/{_submitted(lock).event_id}.json",
+            revision,
+        ),
+        (
+            repository,
+            f"campaigns/{lock.campaign_id}/request.yaml",
+            revision,
+        ),
+    ]
 
 
 def test_hub_store_reads_requests_lists_campaigns_and_loads_reservations(

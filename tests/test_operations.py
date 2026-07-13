@@ -16,8 +16,10 @@ from harbor_hf.control import (
     ExecutionStartedPayload,
     new_event,
 )
+from harbor_hf.io import ManifestError
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.operations import (
+    AutomaticCampaignPublisher,
     cancel_campaign,
     publish_campaign_results,
     retry_campaign_shard,
@@ -45,9 +47,22 @@ class MemoryStore:
 
 
 class MemoryEvidence:
-    def __init__(self, prefix: str, files: dict[str, bytes]) -> None:
+    def __init__(
+        self,
+        prefix: str,
+        files: dict[str, bytes],
+        *,
+        interactions: list[object] | None = None,
+    ) -> None:
         self.prefix = prefix
         self.files = files
+        self.interactions = interactions
+        self.refresh_calls = 0
+
+    def refresh(self) -> None:
+        self.refresh_calls += 1
+        if self.interactions is not None:
+            self.interactions.append("refresh")
 
     def list_files(self, *, bucket: str, prefix: str) -> list[str]:
         assert bucket == "example/benchmark-runs"
@@ -61,8 +76,9 @@ class MemoryEvidence:
 
 
 class FakePublisher:
-    def __init__(self) -> None:
+    def __init__(self, *, interactions: list[object] | None = None) -> None:
         self.publications: list[ResultPublication] = []
+        self.interactions = interactions
 
     def publish(
         self,
@@ -73,6 +89,10 @@ class FakePublisher:
     ) -> PublicationResult:
         assert result_dataset == "example/shellbench-results"
         assert index_dataset == "example/benchmark-run-index"
+        if self.interactions is not None:
+            self.interactions.append(
+                ("publish", result_dataset, index_dataset, publication)
+            )
         self.publications.append(publication)
         return PublicationResult(
             publication_id=publication.tables.publication_id,
@@ -320,3 +340,141 @@ def test_verification_rejects_tampered_bucket_evidence(
 
     with pytest.raises(ResultPublicationError, match="checksum mismatch"):
         verify_campaign_artifacts(snapshot, namespace="osolmaz", reader=evidence)
+
+
+def test_automatic_publisher_creates_repositories_refreshes_then_publishes(
+    remote_spec: ExperimentSpec,
+) -> None:
+    interactions: list[object] = []
+    snapshot = _snapshot(remote_spec)
+    source = _evidence(snapshot)
+    reader = MemoryEvidence(
+        source.prefix,
+        source.files,
+        interactions=interactions,
+    )
+    publisher = FakePublisher(interactions=interactions)
+
+    class Repositories:
+        def create_repo(self, repo_id: str, **kwargs: object) -> object:
+            interactions.append(("create_repo", repo_id, kwargs))
+            return object()
+
+    report = AutomaticCampaignPublisher(
+        namespace="osolmaz",
+        store=MemoryStore(snapshot),
+        reader=reader,
+        publisher=publisher,
+        repositories=Repositories(),
+    ).publish(snapshot.lock.campaign_id)
+
+    assert report.campaign_id == snapshot.lock.campaign_id
+    assert report.control_commit == snapshot.control_commit
+    assert report.dry_run is False
+    assert len(report.runs) == 1
+    assert report.runs[0].model_dump(mode="json") == {
+        "run_id": snapshot.lock.runs[0].run_id,
+        "publication_id": publisher.publications[0].tables.publication_id,
+        "result_dataset": "example/shellbench-results",
+        "index_dataset": "example/benchmark-run-index",
+        "published": True,
+        "result_revision": "a" * 40,
+        "index_revision": "b" * 40,
+    }
+    assert interactions[:3] == [
+        (
+            "create_repo",
+            "example/shellbench-results",
+            {"repo_type": "dataset", "private": False, "exist_ok": True},
+        ),
+        (
+            "create_repo",
+            "example/benchmark-run-index",
+            {"repo_type": "dataset", "private": False, "exist_ok": True},
+        ),
+        "refresh",
+    ]
+    assert interactions[3] == (
+        "publish",
+        "example/shellbench-results",
+        "example/benchmark-run-index",
+        publisher.publications[0],
+    )
+    assert reader.refresh_calls == 1
+
+
+def test_automatic_publisher_rejects_missing_index_without_side_effects(
+    remote_spec: ExperimentSpec,
+) -> None:
+    interactions: list[object] = []
+    spec = remote_spec.model_copy(
+        update={
+            "publishing": remote_spec.publishing.model_copy(
+                update={"index_dataset": None}
+            )
+        }
+    )
+    snapshot = _snapshot(spec)
+    source = _evidence(snapshot)
+    reader = MemoryEvidence(
+        source.prefix,
+        source.files,
+        interactions=interactions,
+    )
+
+    class Repositories:
+        def create_repo(self, repo_id: str, **kwargs: object) -> object:
+            interactions.append(("create_repo", repo_id, kwargs))
+            return object()
+
+    with pytest.raises(ValueError) as captured:
+        AutomaticCampaignPublisher(
+            namespace="osolmaz",
+            store=MemoryStore(snapshot),
+            reader=reader,
+            publisher=FakePublisher(interactions=interactions),
+            repositories=Repositories(),
+        ).publish(snapshot.lock.campaign_id)
+
+    assert str(captured.value) == "campaign result publication requires index_dataset"
+    assert interactions == []
+    assert reader.refresh_calls == 0
+
+
+def test_automatic_publisher_reports_campaign_identity_for_invalid_request(
+    remote_spec: ExperimentSpec,
+) -> None:
+    interactions: list[object] = []
+    snapshot = _snapshot(remote_spec)
+    snapshot = CampaignSnapshot(
+        lock=snapshot.lock,
+        events=snapshot.events,
+        request=b"not yaml: [",
+        control_commit=snapshot.control_commit,
+    )
+    source = _evidence(snapshot)
+    reader = MemoryEvidence(
+        source.prefix,
+        source.files,
+        interactions=interactions,
+    )
+
+    class Repositories:
+        def create_repo(self, repo_id: str, **kwargs: object) -> object:
+            interactions.append(("create_repo", repo_id, kwargs))
+            return object()
+
+    with pytest.raises(ManifestError) as captured:
+        AutomaticCampaignPublisher(
+            namespace="osolmaz",
+            store=MemoryStore(snapshot),
+            reader=reader,
+            publisher=FakePublisher(interactions=interactions),
+            repositories=Repositories(),
+        ).publish(snapshot.lock.campaign_id)
+
+    assert str(captured.value).startswith(
+        "cannot read campaign campaign-one request: while parsing a flow node"
+    )
+    assert interactions == []
+    assert reader.refresh_calls == 0
