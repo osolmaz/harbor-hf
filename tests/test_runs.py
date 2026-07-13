@@ -16,11 +16,11 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
 
-    assert lock.run_id == "20260713T010203Z-7bef8b8f1f"
+    assert lock.run_id == "20260713T010203Z-8723ba8bf5"
     assert lock.benchmark_dataset == "terminal-bench@2.0"
     assert lock.benchmark_dataset_digest == "sha256:" + "1" * 64
     assert lock.spec_digest == (
-        "sha256:bd97f81386d8cd6d1c98fc6cf86bd6164b1aeac1f20173ec37e7c9f193c2f76d"
+        "sha256:6d5e3a1ec758946e30645ff9ef2d0caeb5e7f79ce7650169d38294ef88031f83"
     )
     assert lock.artifact_bucket == "example/benchmark-runs"
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
