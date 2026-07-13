@@ -33,7 +33,15 @@ from harbor_hf.reconciler import (
 )
 from harbor_hf.recovery import project_recovery
 from harbor_hf.results import EvidenceSource, build_result_tables
-from harbor_hf.wave_worker import WorkerError, run_wave_worker
+from harbor_hf.wave_worker import (
+    WorkerError,
+    _execution_id,
+    _file_digest,
+    _launch_wave_watchdog,
+    _remaining_seconds,
+    _wave_model_name,
+    run_wave_worker,
+)
 
 
 def endpoint_snapshot(state: str, ready: int) -> dict[str, object]:
@@ -1136,6 +1144,77 @@ def test_wave_recovery_rejects_invalid_terminal_trial(
     assert [command[2] for command in endpoint.commands][-2:] == [
         "pause",
         "describe",
+    ]
+
+
+@pytest.mark.parametrize("value", ["0" * 31, "0" * 33, "A" * 32, "X" * 32, "g" * 32])
+def test_execution_identifier_rejects_every_noncanonical_shape(value: str) -> None:
+    with pytest.raises(WorkerError) as captured:
+        _execution_id(lambda: value)
+
+    assert str(captured.value) == (
+        "execution identifier must be 32 lowercase hexadecimal digits"
+    )
+
+
+def test_wave_scalar_helpers_have_exact_boundary_contracts(tmp_path: Path) -> None:
+    assert _execution_id(lambda: "0123456789abcdef" * 2) == (
+        "exec-0123456789abcdef0123456789abcdef"
+    )
+    assert _remaining_seconds(10.0, lambda: 8.01) == 2
+    assert _remaining_seconds(10.0, lambda: 9.99) == 1
+    with pytest.raises(WorkerError) as captured:
+        _remaining_seconds(10.0, lambda: 10.0)
+    assert str(captured.value) == "deployment wave duration bound was reached"
+
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"wave-contract\n")
+    assert _file_digest(payload) == (
+        "sha256:8b6a391b539bf23c01dfed62246c6e04cb057e7bd5c119318589b64df6c1b413"
+    )
+
+
+def test_wave_target_and_watchdog_helpers_forward_exact_locked_identity(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "endpoint").mkdir()
+    (tmp_path / "provider").mkdir()
+    _spec, _campaign, endpoint_wave, *_paths = _wave_inputs(
+        remote_spec, tmp_path / "endpoint", attempts=1, concurrency=1
+    )
+    _provider_spec, _provider_campaign, provider_wave, *_provider_paths = (
+        _provider_wave_inputs(
+            remote_spec,
+            tmp_path / "provider",
+            attempts=1,
+            concurrency=1,
+            provider_concurrency=1,
+        )
+    )
+    assert endpoint_wave.endpoint is not None
+    calls: list[tuple[object, object, str, str]] = []
+
+    def launch(remote: object, endpoint: object, owner_id: str, token: str) -> str:
+        calls.append((remote, endpoint, owner_id, token))
+        return "watchdog-contract"
+
+    monkeypatch.setattr("harbor_hf.wave_worker.launch_cleanup_watchdog_for", launch)
+
+    assert _wave_model_name(endpoint_wave) == endpoint_wave.endpoint.served_model_name
+    assert _wave_model_name(provider_wave) == ("nvidia/Qwen3.6-35B-A3B-NVFP4:fastest")
+    assert (
+        _launch_wave_watchdog(endpoint_wave, endpoint_wave.endpoint, "secret")
+        == "watchdog-contract"
+    )
+    assert calls == [
+        (
+            endpoint_wave.remote,
+            endpoint_wave.endpoint,
+            endpoint_wave.wave_id,
+            "secret",
+        )
     ]
 
 

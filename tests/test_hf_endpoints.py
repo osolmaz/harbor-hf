@@ -15,7 +15,11 @@ from harbor_hf.endpoints import (
     EndpointProviderError,
     build_desired_endpoint,
 )
-from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter, environment_secret
+from harbor_hf.hf_endpoints import (
+    HuggingFaceEndpointAdapter,
+    _validated_snapshot,
+    environment_secret,
+)
 from harbor_hf.models import DeploymentProfile, ExperimentSpec
 
 
@@ -193,6 +197,26 @@ def test_create_maps_every_effective_field_and_resolves_secrets(
     assert "value-for-HF_TOKEN" not in snapshot.model_dump_json()
 
 
+def test_default_adapter_constructs_hf_api_with_the_exact_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[object] = []
+    api = object()
+
+    def fake_api(*, token: str | bool | None) -> object:
+        observed.append(token)
+        return api
+
+    monkeypatch.setattr("huggingface_hub.HfApi", fake_api)
+
+    adapter = HuggingFaceEndpointAdapter(token=False)
+
+    assert observed == [False]
+    assert adapter.api is api
+    assert adapter.token is False
+    assert adapter.secret_resolver is environment_secret
+
+
 def test_inspect_validates_and_normalizes_sanitized_contract(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -272,6 +296,23 @@ def test_inspect_returns_none_only_for_not_found(
     assert HuggingFaceEndpointAdapter(api=api).inspect(desired.identity) is None
 
 
+def test_inspect_forwards_an_explicit_false_token(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    api = FakeApi(Resource(_raw(desired)))
+
+    HuggingFaceEndpointAdapter(api=api, token=False).inspect(desired.identity)
+
+    assert api.calls == [
+        (
+            "inspect",
+            desired.identity.name,
+            {"namespace": "osolmaz", "token": False},
+        )
+    ]
+
+
 @pytest.mark.parametrize("status", [409, 500, 503])
 def test_ambiguous_create_http_outcomes_are_adoptable(
     remote_spec: ExperimentSpec, status: int
@@ -306,10 +347,12 @@ def test_definitive_create_failure_is_not_adopted(
     desired = _desired(remote_spec)
     api = FakeApi(Resource(_raw(desired)), errors={"create": _http_error(400)})
 
-    with pytest.raises(EndpointProviderError, match="failed: HTTP 400"):
+    with pytest.raises(EndpointProviderError) as captured:
         HuggingFaceEndpointAdapter(
             api=api, secret_resolver=lambda name: "secret"
         ).create(desired)
+
+    assert str(captured.value) == "Hugging Face endpoint create failed: HTTP 400"
 
 
 def test_pause_transport_failure_is_ambiguous(
@@ -321,8 +364,12 @@ def test_pause_transport_failure_is_ambiguous(
         errors={"pause": httpx.ConnectError("disconnected")},
     )
 
-    with pytest.raises(AmbiguousEndpointPause):
+    with pytest.raises(AmbiguousEndpointPause) as captured:
         HuggingFaceEndpointAdapter(api=api).pause(desired.identity)
+
+    assert str(captured.value) == (
+        "Hugging Face endpoint pause outcome is ambiguous before a response"
+    )
 
 
 def test_delete_not_found_is_ambiguous_and_verifiable(
@@ -343,6 +390,15 @@ def test_inspect_transport_and_server_failures_are_not_absence(
         api = FakeApi(Resource(_raw(desired)), errors={"inspect": error})
         with pytest.raises(EndpointProviderError, match="inspect failed"):
             HuggingFaceEndpointAdapter(api=api).inspect(desired.identity)
+
+
+def test_validated_snapshot_wraps_only_provider_contract_errors() -> None:
+    with pytest.raises(EndpointProviderError) as captured:
+        _validated_snapshot(Resource(raw=[]), "namespace-contract")
+
+    assert str(captured.value) == (
+        "Hugging Face endpoint response does not match the expected contract"
+    )
 
 
 @pytest.mark.parametrize(

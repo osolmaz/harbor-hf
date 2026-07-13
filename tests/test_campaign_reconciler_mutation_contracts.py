@@ -28,7 +28,12 @@ from harbor_hf.reconciler import (
     DeploymentAdmission,
     ReconcileAction,
     ReconcileContext,
+    _action_shard_ids,
+    _admission_provider,
     _assigned_shards,
+    _deployment_for_shards,
+    _run_admission,
+    _short_digest,
     plan_reconciliation,
 )
 
@@ -358,3 +363,57 @@ def test_reserved_submit_action_removes_all_assigned_shards_from_candidates(
     assert {
         shard_id for action in subsequent.actions for shard_id in action.shard_ids
     }.isdisjoint(reserved_action.shard_ids)
+
+
+def test_reconciler_identity_helpers_preserve_exact_campaign_relationships(
+    remote_spec: ExperimentSpec,
+) -> None:
+    _specification, lock = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [_submitted(lock)], now=NOW)[1].actions[0]
+    run = lock.runs[0]
+    shard = run.shards[0]
+    trial_ids = [trial.trial_id for trial in shard.trials]
+
+    assert _action_shard_ids(lock, "submit-wave", action.shard_ids) == action.shard_ids
+    assert _action_shard_ids(lock, "retry-shard", trial_ids) == [shard.shard_id]
+    assert _action_shard_ids(lock, "cleanup-wave", trial_ids) == []
+    assert _deployment_for_shards(lock, [shard.shard_id]) == run.deployment_digest
+    assert _run_admission(lock, run.deployment_digest) == run
+    assert _admission_provider(DeploymentAdmission(provider="provider-contract")) == (
+        "provider-contract"
+    )
+    assert _short_digest({"b": 2, "a": 1}) == "43258cff783fe7036d8a4303"
+    assert _short_digest({"é": "雪"}) == "7e406c0769035fe3024bc9f1"
+
+
+def test_reconciler_identity_helpers_reject_unknown_targets_with_exact_errors(
+    remote_spec: ExperimentSpec,
+) -> None:
+    _specification, lock = _campaign(remote_spec)
+
+    with pytest.raises(ValueError) as admission_error:
+        _run_admission(lock, "sha256:" + "f" * 64)
+    assert str(admission_error.value) == "unknown deployment admission target"
+
+    with pytest.raises(ValueError) as shard_error:
+        _deployment_for_shards(lock, ["unknown-shard"])
+    assert str(shard_error.value) == "action shards must belong to one deployment"
+
+    with pytest.raises(ValueError) as provider_error:
+        _admission_provider(DeploymentAdmission())
+    assert str(provider_error.value) == "deployment admission has no provider"
+
+    run = lock.runs[0]
+    inconsistent = lock.model_copy(
+        update={
+            "runs": [
+                run,
+                run.model_copy(update={"max_concurrent_requests": 99}),
+            ]
+        }
+    )
+    with pytest.raises(ValueError) as inconsistency_error:
+        _run_admission(inconsistent, run.deployment_digest)
+    assert str(inconsistency_error.value) == (
+        "deployment admission fields are inconsistent"
+    )

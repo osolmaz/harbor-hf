@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import cast
 
@@ -6,6 +8,11 @@ import pytest
 from harbor_hf.automation import (
     AutomationError,
     AutomationRequest,
+    _required_id,
+    _scheduled_job_matches,
+    _scheduled_spec_matches,
+    _webhook_matches,
+    automation_plan,
     install_automation,
     scheduled_reconciler_command,
 )
@@ -122,8 +129,10 @@ def test_installs_serial_schedule_and_dataset_webhook(
 def test_rejects_cross_namespace_automation(remote_spec: ExperimentSpec) -> None:
     request = _request(remote_spec).model_copy(update={"namespace": "other"})
 
-    with pytest.raises(AutomationError, match="namespaces must match"):
+    with pytest.raises(AutomationError) as captured:
         install_automation(request, token="test-only", api=FakeApi())
+
+    assert str(captured.value) == "automation and remote Job namespaces must match"
 
 
 @pytest.mark.parametrize("missing", ["job", "webhook"])
@@ -157,3 +166,320 @@ def test_rejects_managed_resource_drift(
 
     with pytest.raises(AutomationError, match="configuration drift"):
         install_automation(request, token="test-only", api=api)
+
+
+def test_automation_plan_exposes_the_complete_installation_contract(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec).model_copy(
+        update={"schedule": "17 */3 * * *", "suspended": True}
+    )
+
+    assert automation_plan(request).model_dump() == {
+        "namespace": "osolmaz",
+        "schedule": "17 */3 * * *",
+        "suspended": True,
+        "image": "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
+        "command": scheduled_reconciler_command(request),
+        "secret_names": ["HF_TOKEN"],
+        "control_repository": "osolmaz/harbor-hf-coordination",
+    }
+
+
+def test_install_requires_a_nonempty_token_with_exact_error(
+    remote_spec: ExperimentSpec,
+) -> None:
+    with pytest.raises(AutomationError) as captured:
+        install_automation(_request(remote_spec), token="", api=FakeApi())
+
+    assert str(captured.value) == "automation installation requires an HF token"
+
+
+def test_plan_rejects_cross_namespace_with_exact_error(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec).model_copy(update={"namespace": "other"})
+
+    with pytest.raises(AutomationError) as captured:
+        automation_plan(request)
+
+    assert str(captured.value) == "automation and remote Job namespaces must match"
+
+
+@pytest.mark.parametrize(
+    ("resource", "expected"),
+    [
+        ("job", "scheduled Job creation returned no ID"),
+        ("webhook", "webhook creation returned no ID"),
+    ],
+)
+def test_install_reports_the_exact_resource_missing_an_identifier(
+    remote_spec: ExperimentSpec, resource: str, expected: str
+) -> None:
+    class MissingIdentifierApi(FakeApi):
+        def create_scheduled_job(self, **kwargs: object) -> object:
+            created = super().create_scheduled_job(**kwargs)
+            return SimpleNamespace() if resource == "job" else created
+
+        def create_webhook(self, **kwargs: object) -> object:
+            created = super().create_webhook(**kwargs)
+            return SimpleNamespace() if resource == "webhook" else created
+
+    with pytest.raises(AutomationError) as captured:
+        install_automation(
+            _request(remote_spec), token="test-only", api=MissingIdentifierApi()
+        )
+
+    assert str(captured.value) == expected
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda job: setattr(job, "schedule", "@daily"),
+        lambda job: setattr(job, "suspend", 0),
+        lambda job: setattr(job, "concurrency", 0),
+        lambda job: setattr(job.job_spec, "docker_image", "wrong-image"),
+        lambda job: setattr(job.job_spec, "command", ["wrong-command"]),
+        lambda job: setattr(job.job_spec, "flavor", "wrong-flavor"),
+        lambda job: setattr(job.job_spec, "timeout", 1),
+        lambda job: setattr(job.job_spec, "secrets", {}),
+        lambda job: setattr(job.job_spec, "secrets", ["HF_TOKEN"]),
+    ],
+)
+def test_every_managed_schedule_field_participates_in_drift_detection(
+    remote_spec: ExperimentSpec,
+    mutate: Callable[[SimpleNamespace], None],
+) -> None:
+    api = FakeApi()
+    request = _request(remote_spec)
+    install_automation(request, token="test-only", api=api)
+    mutate(api.scheduled_jobs[0])
+
+    with pytest.raises(AutomationError) as captured:
+        install_automation(request, token="test-only", api=api)
+
+    assert str(captured.value) == (
+        "managed reconciliation schedule has configuration drift"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda webhook: setattr(
+            webhook,
+            "watched",
+            [SimpleNamespace(type="dataset", name="other/repository")],
+        ),
+        lambda webhook: setattr(
+            webhook,
+            "watched",
+            [SimpleNamespace(type="model", name="osolmaz/harbor-hf-coordination")],
+        ),
+        lambda webhook: setattr(webhook, "domains", ["repo"]),
+        lambda webhook: setattr(webhook, "disabled", 0),
+        lambda webhook: setattr(webhook.job, "docker_image", "wrong-image"),
+        lambda webhook: setattr(webhook.job, "command", ["wrong-command"]),
+    ],
+)
+def test_every_managed_webhook_field_participates_in_drift_detection(
+    remote_spec: ExperimentSpec,
+    mutate: Callable[[SimpleNamespace], None],
+) -> None:
+    api = FakeApi()
+    request = _request(remote_spec)
+    install_automation(request, token="test-only", api=api)
+    api.webhooks[0].job = deepcopy(api.webhooks[0].job)
+    mutate(api.webhooks[0])
+
+    with pytest.raises(AutomationError) as captured:
+        install_automation(request, token="test-only", api=api)
+
+    assert str(captured.value) == (
+        "managed reconciliation webhook has configuration drift"
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource", "expected"),
+    [
+        ("schedule", "multiple managed reconciliation schedules exist"),
+        ("webhook", "multiple managed reconciliation webhooks exist"),
+    ],
+)
+def test_install_rejects_multiple_managed_resources_with_exact_error(
+    remote_spec: ExperimentSpec, resource: str, expected: str
+) -> None:
+    api = FakeApi()
+    request = _request(remote_spec)
+    install_automation(request, token="test-only", api=api)
+    if resource == "schedule":
+        api.scheduled_jobs.append(deepcopy(api.scheduled_jobs[0]))
+    else:
+        api.webhooks.append(deepcopy(api.webhooks[0]))
+
+    with pytest.raises(AutomationError) as captured:
+        install_automation(request, token="test-only", api=api)
+
+    assert str(captured.value) == expected
+
+
+def test_unmanaged_provider_resources_are_ignored(
+    remote_spec: ExperimentSpec,
+) -> None:
+    class ApiWithDecoys(FakeApi):
+        def create_webhook(self, **kwargs: object) -> object:
+            self.webhook = kwargs
+            watched = cast(list[dict[str, object]], kwargs["watched"])
+            value = SimpleNamespace(
+                id="webhook-1",
+                watched=[SimpleNamespace(**item) for item in watched],
+                domains=kwargs["domains"],
+                disabled=False,
+                job=self.scheduled_jobs[-1].job_spec,
+            )
+            self.webhooks.append(value)
+            return value
+
+    api = ApiWithDecoys()
+    api.scheduled_jobs = [
+        SimpleNamespace(),
+        SimpleNamespace(job_spec=SimpleNamespace(labels=[])),
+        SimpleNamespace(
+            job_spec=SimpleNamespace(
+                labels={
+                    "harbor-hf-role": "campaign-reconciler",
+                    "harbor-hf-namespace": "other",
+                }
+            )
+        ),
+    ]
+    api.webhooks = [
+        SimpleNamespace(),
+        SimpleNamespace(job=SimpleNamespace(labels=[])),
+        SimpleNamespace(
+            job=SimpleNamespace(
+                labels={
+                    "harbor-hf-role": "other-role",
+                    "harbor-hf-namespace": "osolmaz",
+                }
+            )
+        ),
+    ]
+
+    result = install_automation(_request(remote_spec), token="test-only", api=api)
+
+    assert result.scheduled_job_created is True
+    assert result.webhook_created is True
+    assert api.job["namespace"] == "osolmaz"
+    assert api.job["secrets"] == {"HF_TOKEN": "test-only"}
+    assert api.webhook["job_id"] == "scheduled-1"
+
+
+def test_install_constructs_default_hf_client_with_the_install_token(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokens: list[str] = []
+
+    class DefaultApi(FakeApi):
+        def __init__(self, *, token: str) -> None:
+            super().__init__()
+            tokens.append(token)
+
+    monkeypatch.setattr("harbor_hf.automation.HfApi", DefaultApi)
+
+    result = install_automation(_request(remote_spec), token="default-token")
+
+    assert tokens == ["default-token"]
+    assert result.scheduled_job_id == "scheduled-1"
+    assert result.webhook_id == "webhook-1"
+
+
+def test_schedule_matching_returns_false_for_every_missing_provider_field(
+    remote_spec: ExperimentSpec,
+) -> None:
+    api = FakeApi()
+    request = _request(remote_spec)
+    install_automation(request, token="test-only", api=api)
+    valid = api.scheduled_jobs[0]
+    assert _scheduled_job_matches(valid, request) is True
+
+    missing_paths = [
+        ("job_spec",),
+        ("job_spec", "secrets"),
+        ("job_spec", "flavor"),
+        ("schedule",),
+        ("suspend",),
+        ("concurrency",),
+        ("job_spec", "docker_image"),
+        ("job_spec", "command"),
+        ("job_spec", "timeout"),
+    ]
+    for path in missing_paths:
+        candidate = deepcopy(valid)
+        owner = candidate if len(path) == 1 else candidate.job_spec
+        delattr(owner, path[-1])
+        assert _scheduled_job_matches(candidate, request) is False
+
+    enum_flavor = deepcopy(valid)
+    enum_flavor.job_spec.flavor = SimpleNamespace(value=request.remote.job.flavor)
+    assert _scheduled_job_matches(enum_flavor, request) is True
+
+
+def test_webhook_matching_handles_sparse_provider_objects_as_contract_data(
+    remote_spec: ExperimentSpec,
+) -> None:
+    api = FakeApi()
+    request = _request(remote_spec)
+    install_automation(request, token="test-only", api=api)
+    valid = api.webhooks[0]
+    assert _webhook_matches(valid, request) is True
+
+    without_disabled = deepcopy(valid)
+    del without_disabled.disabled
+    assert _webhook_matches(without_disabled, request) is True
+
+    incomplete = [
+        SimpleNamespace(),
+        SimpleNamespace(watched=[SimpleNamespace()]),
+        SimpleNamespace(
+            watched=[
+                SimpleNamespace(type="dataset", name="osolmaz/harbor-hf-coordination")
+            ]
+        ),
+        SimpleNamespace(
+            watched=[
+                SimpleNamespace(type="dataset", name="osolmaz/harbor-hf-coordination")
+            ],
+            domains=["repo.content"],
+        ),
+    ]
+    assert [_webhook_matches(value, request) for value in incomplete] == [
+        False,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_required_identifier_rejects_truthy_nonstr_values() -> None:
+    with pytest.raises(AutomationError) as captured:
+        _required_id(SimpleNamespace(id=object()), "scheduled Job")
+
+    assert str(captured.value) == "scheduled Job creation returned no ID"
+
+
+def test_scheduled_spec_matching_treats_a_missing_command_as_drift(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec)
+    incomplete = SimpleNamespace(
+        docker_image=request.remote.job.image,
+        labels={
+            "harbor-hf-role": "campaign-reconciler",
+            "harbor-hf-namespace": "osolmaz",
+        },
+    )
+
+    assert _scheduled_spec_matches(incomplete, request) is False
