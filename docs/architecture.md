@@ -18,19 +18,35 @@ experiment.yaml
       |
       v
 planner -> resolved run locks -> controller
-                                  |      |
-                         HF Endpoint   HF Jobs/Sandboxes
-                                  |      |
-                                  + Harbor trials
-                                          |
-                                private HF bucket
-                                          |
-                                   publisher job
-                                          |
-                               versioned HF Datasets
-                                          |
-                                  leaderboard Space
+                               |          |          |
+                      HF Endpoints   HF Providers   HF Jobs/Sandboxes
+                    (vLLM/llama.cpp)  (large models)       |
+                               |          |                |
+                               +----------+ Harbor trials -+
+                                              |
+                                    private HF bucket
+                                              |
+                                       publisher job
+                                              |
+                                   versioned HF Datasets
+                                              |
+                                      leaderboard Space
 ```
+
+### Deployment Strategy
+
+Inference Endpoints are the primary serving path. Engine choice is independent
+of resource type: normal experiments may deploy vLLM, llama.cpp, or another
+supported engine on separate endpoints. A Red Hat vLLM recipe and our llama.cpp
+recipe are therefore endpoint engine profiles, not different Hugging Face
+resource types. Using the Red Hat recipe does not mean routing requests through
+Hugging Face Inference Providers.
+
+Inference Providers are a secondary path for models that are too large or too
+expensive to host on a dedicated endpoint. Provider-backed runs use the same
+Harbor agent contract, but do not pretend that unreported runtime, hardware, or
+quantization details are known. Endpoint and provider profiles remain distinct
+in manifests, locks, metrics, and result tables.
 
 ### Planner
 
@@ -41,10 +57,12 @@ submitted.
 
 ### Controller
 
-The controller reconciles desired runs with remote state. It starts inference
-only when work is ready, submits bounded task shards, records lifecycle events,
-and pauses unused endpoints. Operations must be idempotent so a stopped
-controller can continue without duplicating completed trials.
+The controller reconciles desired runs with remote state. It starts endpoint
+inference only when work is ready, submits bounded task shards, records
+lifecycle events, and pauses unused endpoints. Provider-backed runs skip
+endpoint provisioning but retain request, quota, retry, and accounting state.
+Operations must be idempotent so a stopped controller can continue without
+duplicating completed trials.
 
 ### Harbor Adapter
 
@@ -88,7 +106,8 @@ A resolved run lock records:
 - Harbor, agent, tool, prompt, and skill revisions;
 - model, tokenizer, chat-template, and generation-config revisions;
 - weight format and quantization separately from activation and KV precision;
-- provider, region, hardware, replica, image, engine, and driver information;
+- resource type and, when known, provider, region, hardware, replica, image,
+  engine, and driver information;
 - context, output, batching, concurrency, retry, timeout, and sampling settings;
 - requested provider configuration and the effective configuration returned by
   the provider.
@@ -102,10 +121,12 @@ Runs progress through `planned`, `submitted`, `provisioning`, `running`,
 `verifying`, `publishing`, and a terminal state. Every transition is an
 append-only event.
 
-The controller pauses an endpoint after its last active shard in a `finally`
-path. A separate scheduled watchdog finds stale endpoint leases and pauses them,
-covering controller termination before cleanup. Cleanup success is part of run
-completion, not an optional maintenance action.
+For endpoint-backed runs, the controller pauses an endpoint after its last
+active shard in a `finally` path. A separate scheduled watchdog finds stale
+endpoint leases and pauses them, covering controller termination before
+cleanup. Cleanup success is part of endpoint run completion, not an optional
+maintenance action. Provider-backed runs have no endpoint lease but still close
+worker resources and record final usage and request state.
 
 ## Boundaries
 
@@ -115,4 +136,3 @@ completion, not an optional maintenance action.
 - No secret values in manifests, logs, locks, or artifacts.
 - No state that exists only on the submitting machine.
 - No direct writes from trial workers to shared Dataset Git repositories.
-

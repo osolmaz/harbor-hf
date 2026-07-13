@@ -86,6 +86,14 @@ Secret values are invalid manifest content.
 Provider-specific values belong in `parameters`. They must be representable as
 JSON and are preserved in the resolved lock.
 
+The current `v1alpha1` deployment shape represents Hugging Face Inference
+Endpoints. vLLM and llama.cpp are independent engine choices within that
+endpoint type. A planned discriminated Inference Providers profile will cover
+models that are too large or expensive to host on a dedicated endpoint; it will
+not require or imply a particular serving engine. Until that profile is
+implemented, provider-routed manifests are rejected rather than silently
+treated as endpoint deployments.
+
 ### Execution
 
 `attempts` counts independent logical attempts. Infrastructure retries do not

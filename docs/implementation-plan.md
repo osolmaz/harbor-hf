@@ -10,6 +10,8 @@ results without leaving paid inference resources active when unused.
 
 - Stabilize experiment, resolved-run, trial, execution, event, and artifact
   models.
+- Model endpoint deployments and provider-routed inference as distinct serving
+  target types; keep endpoint engine selection independent of target type.
 - Add explicit matrix inclusion and exclusion rules.
 - Resolve Harbor datasets and calculate task-set digests without execution.
 - Generate immutable run IDs and lock files.
@@ -22,13 +24,20 @@ two clean machines when its remote inputs have not changed.
 
 - Implement authenticated clients for HF Jobs, Storage Buckets, and Inference
   Endpoints.
+- Treat Inference Endpoints as the primary serving path and support independent
+  vLLM and llama.cpp engine profiles.
 - Add endpoint create, resume, readiness, pause, and inspection operations.
 - Capture requested and effective endpoint configuration with redaction.
 - Implement endpoint leases and an independent stale-resource watchdog.
+- Add an Inference Providers adapter for models that are too large or expensive
+  for dedicated endpoints, without assuming knowledge of hidden serving
+  internals.
 - Add dry-run cost and resource summaries.
 
 Exit criteria: mocked failure tests cover every lifecycle transition, and a
-remote smoke test always leaves its endpoint paused.
+remote smoke test for each endpoint engine always leaves its endpoint paused.
+The provider fallback passes a separate tool-use smoke test without creating an
+endpoint.
 
 ## Phase 3: Harbor Execution
 
@@ -57,7 +66,7 @@ failed or partial runs cannot appear as complete.
 
 - Split experiments into bounded shards below remote timeout limits.
 - Reconcile queued, active, failed, and completed shards idempotently.
-- Add global and per-endpoint concurrency budgets.
+- Add global, per-endpoint, and per-provider concurrency budgets.
 - Add spend limits, cancellation, backoff, and provider quota handling.
 - Measure controller recovery and endpoint idle time.
 
@@ -83,4 +92,3 @@ distinguish complete, partial, composite, and manually submitted results.
 - Building a transactional database before object-backed reconciliation proves
   insufficient.
 - Treating the leaderboard Space as an execution service.
-
