@@ -67,6 +67,7 @@ def test_campaign_schema_command_writes_json(tmp_path: Path) -> None:
     assert set(json.loads(output.read_text(encoding="utf-8"))) == {
         "campaign_plan",
         "campaign_lock",
+        "wave_lock",
     }
 
 
@@ -273,3 +274,42 @@ def test_watchdog_command_reports_verified_pause(
 
     assert result.exit_code == 0
     assert '"state": "paused"' in result.stdout
+
+
+def test_hidden_wave_worker_command_dispatches_all_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "manifest.yaml"
+    campaign = tmp_path / "campaign.lock.json"
+    wave = tmp_path / "wave.lock.json"
+    for path in (manifest, campaign, wave):
+        path.write_text("{}\n", encoding="utf-8")
+    output = tmp_path / "output"
+    calls: list[tuple[Path, Path, Path, Path]] = []
+
+    def fake_worker(
+        manifest_path: Path,
+        campaign_path: Path,
+        wave_path: Path,
+        output_root: Path,
+    ) -> Path:
+        calls.append((manifest_path, campaign_path, wave_path, output_root))
+        return output_root / "campaigns/campaign-one/waves/wave-one"
+
+    monkeypatch.setattr("harbor_hf.cli.run_wave_worker", fake_worker)
+
+    result = runner.invoke(
+        app,
+        [
+            "wave-worker",
+            str(manifest),
+            str(campaign),
+            str(wave),
+            "--output-root",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [(manifest, campaign, wave, output)]
+    assert result.stdout.strip().endswith("campaigns/campaign-one/waves/wave-one")

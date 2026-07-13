@@ -31,6 +31,7 @@ from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
+from harbor_hf.wave_worker import run_wave_worker
 from harbor_hf.worker import WorkerError, run_endpoint_watchdog, run_worker
 
 app = typer.Typer(
@@ -248,6 +249,27 @@ def worker(
     """Run one benchmark cell from inside a Hugging Face Job."""
     try:
         destination = run_worker(manifest, lock, output_root)
+    except (OSError, ValueError, WorkerError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(str(destination))
+
+
+@app.command("wave-worker", hidden=True)
+def wave_worker(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    campaign_lock: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    wave_lock: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output_root: Annotated[Path, typer.Option("--output-root", file_okay=False)],
+) -> None:
+    """Run one bounded deployment wave from inside a Hugging Face Job."""
+    try:
+        destination = run_wave_worker(
+            manifest,
+            campaign_lock,
+            wave_lock,
+            output_root,
+        )
     except (OSError, ValueError, WorkerError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error

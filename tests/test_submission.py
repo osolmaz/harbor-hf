@@ -6,12 +6,21 @@ import pytest
 from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 
+from harbor_hf.campaigns import (
+    WaveLock,
+    build_campaign_lock,
+    build_campaign_plan,
+    build_wave_lock,
+)
+from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.models import ExperimentSpec
+from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.runs import build_run_lock
 from harbor_hf.submission import (
     bucket_id,
     bucket_uri,
     build_submit_command,
+    build_submit_wave_command,
     endpoint_lease_label,
     endpoint_lease_label_for,
     ensure_private_coordination_repository,
@@ -21,6 +30,7 @@ from harbor_hf.submission import (
     locked_source_command,
     require_private_bucket,
     submit,
+    submit_wave,
 )
 
 
@@ -128,6 +138,88 @@ def test_build_submit_command_contains_only_secret_name(
         "/output",
     ]
     assert "super-secret" not in " ".join(command)
+
+
+def test_build_submit_wave_command_targets_hidden_worker(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _wave_lock(remote_spec)
+
+    command = build_submit_wave_command(
+        lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
+    )
+
+    job = lock.remote.job
+    assert command[:22] == [
+        "hf",
+        "jobs",
+        "run",
+        "--detach",
+        "--namespace",
+        job.namespace,
+        "--flavor",
+        job.flavor,
+        "--timeout",
+        f"{job.timeout_seconds}s",
+        "--secrets",
+        job.token_secret_name,
+        "--label",
+        f"harbor-hf-wave={lock.wave_id}",
+        "--label",
+        f"harbor-hf-endpoint={endpoint_lease_label_for('osolmaz', 'qwen-endpoint')}",
+        "--volume",
+        f"{tmp_path}:/input:ro",
+        "--volume",
+        "hf://buckets/osolmaz/benchmark-runs:/output:rw",
+        "--",
+        job.image,
+    ]
+    assert command[22:25] == ["bash", "-lc", command[24]]
+    assert "set -euo pipefail" in command[24]
+    assert command[25:] == [
+        "locked-source",
+        "harbor-hf",
+        "wave-worker",
+        "/input/manifest.yaml",
+        "/input/campaign.lock.json",
+        "/input/wave.lock.json",
+        "--output-root",
+        "/output",
+    ]
+    assert "test-token" not in " ".join(command)
+
+
+def test_submit_wave_parses_job_id_and_checks_private_stores(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _wave_lock(remote_spec)
+    runner = FakeRunner("Job started: 0123456789abcdef01234567\n")
+    api = FakeBucketApi()
+
+    result = submit_wave(
+        lock,
+        input_dir=tmp_path,
+        bucket=lock.artifact_bucket,
+        runner=runner,
+        bucket_api=api,
+    )
+
+    assert result.wave_id == lock.wave_id
+    assert result.job_id == "0123456789abcdef01234567"
+    assert api.inspected == ["osolmaz/jobs-artifacts", "example/benchmark-runs"]
+
+
+def _wave_lock(spec: ExperimentSpec) -> WaveLock:
+    campaign = build_campaign_lock(build_campaign_plan(spec), "campaign-one")
+    submitted = new_event(
+        subject_type="campaign",
+        subject_id=campaign.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
+    )
+    action = plan_reconciliation(campaign, [submitted])[1].actions[0]
+    return build_wave_lock(campaign, spec, action)
 
 
 def test_endpoint_lease_label_is_stable_and_bounded(

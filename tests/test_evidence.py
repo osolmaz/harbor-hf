@@ -16,6 +16,7 @@ from harbor_hf.evidence import (
     redact,
     scrub_secret,
     scrub_secret_paths,
+    verify_checksums,
     write_checksums,
     write_json,
 )
@@ -83,6 +84,24 @@ def test_checksums_include_nested_terminal_and_checksum_files(tmp_path: Path) ->
         "harbor/trial/_SUCCESS",
         "harbor/trial/checksums.json",
     }
+
+
+def test_verify_checksums_rejects_tampering_and_untracked_files(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "record.json"
+    record.write_text("{}\n", encoding="utf-8")
+    expected = write_checksums(tmp_path)
+
+    assert verify_checksums(tmp_path) == expected
+    record.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        verify_checksums(tmp_path)
+
+    record.write_text("{}\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("extra", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="does not cover exact contents"):
+        verify_checksums(tmp_path)
 
 
 def test_secret_scan_names_the_bad_artifact(tmp_path: Path) -> None:

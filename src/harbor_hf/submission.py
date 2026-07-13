@@ -10,6 +10,7 @@ from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict
 
+from harbor_hf.campaigns import WaveLock
 from harbor_hf.coordination import bucket_id, coordination_repository
 from harbor_hf.models import SourcePin
 from harbor_hf.runs import RunLock
@@ -46,6 +47,15 @@ class Submission(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     run_id: str
+    artifact_prefix: str
+    job_id: str | None
+    command: list[str]
+
+
+class WaveSubmission(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    wave_id: str
     artifact_prefix: str
     job_id: str | None
     command: list[str]
@@ -203,6 +213,52 @@ def build_submit_command(
     ]
 
 
+def build_submit_wave_command(
+    lock: WaveLock,
+    *,
+    input_dir: Path,
+    bucket: str,
+) -> list[str]:
+    job = lock.remote.job
+    return [
+        "hf",
+        "jobs",
+        "run",
+        "--detach",
+        "--namespace",
+        job.namespace,
+        "--flavor",
+        job.flavor,
+        "--timeout",
+        f"{job.timeout_seconds}s",
+        "--secrets",
+        job.token_secret_name,
+        "--label",
+        f"harbor-hf-wave={lock.wave_id}",
+        "--label",
+        (
+            "harbor-hf-endpoint="
+            f"{endpoint_lease_label_for(lock.endpoint.namespace, lock.endpoint.name)}"
+        ),
+        "--volume",
+        f"{input_dir}:/input:ro",
+        "--volume",
+        f"{bucket_uri(bucket)}:/output:rw",
+        "--",
+        job.image,
+        *locked_source_command(
+            lock.remote.worker,
+            "harbor-hf",
+            "wave-worker",
+            "/input/manifest.yaml",
+            "/input/campaign.lock.json",
+            "/input/wave.lock.json",
+            "--output-root",
+            "/output",
+        ),
+    ]
+
+
 def submit(
     lock: RunLock,
     *,
@@ -225,6 +281,34 @@ def submit(
         raise ValueError("HF Jobs submission did not return a job ID")
     return Submission(
         run_id=lock.run_id,
+        artifact_prefix=lock.artifact_prefix,
+        job_id=match.group(),
+        command=command,
+    )
+
+
+def submit_wave(
+    lock: WaveLock,
+    *,
+    input_dir: Path,
+    bucket: str,
+    runner: TextRunner,
+    bucket_api: BucketApi | None = None,
+) -> WaveSubmission:
+    if bucket_api is None:
+        from huggingface_hub import HfApi
+
+        bucket_api = cast(BucketApi, HfApi())
+    ensure_private_coordination_repository(lock.remote.job.namespace, api=bucket_api)
+    ensure_private_job_input_bucket(lock.remote.job.namespace, api=bucket_api)
+    require_private_bucket(bucket, api=bucket_api)
+    command = build_submit_wave_command(lock, input_dir=input_dir, bucket=bucket)
+    output = runner.run_text(command)
+    match = _JOB_ID.search(output)
+    if match is None:
+        raise ValueError("HF Jobs wave submission did not return a job ID")
+    return WaveSubmission(
+        wave_id=lock.wave_id,
         artifact_prefix=lock.artifact_prefix,
         job_id=match.group(),
         command=command,

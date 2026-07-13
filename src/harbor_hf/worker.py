@@ -35,7 +35,12 @@ from harbor_hf.evidence import (
     write_json,
 )
 from harbor_hf.io import load_experiment
-from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.models import (
+    EndpointRef,
+    ExperimentSpec,
+    RemoteExecutionSpec,
+    SourcePin,
+)
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import (
     CommandRunner,
@@ -45,7 +50,6 @@ from harbor_hf.process import (
 )
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
-    endpoint_lease_label,
     endpoint_lease_label_for,
     github_repository,
     locked_source_command,
@@ -244,6 +248,48 @@ def build_harbor_command(
     base_url: str,
     harbor_source: Path,
 ) -> list[str]:
+    return _build_harbor_command(
+        lock,
+        jobs_dir,
+        base_url,
+        harbor_source,
+        task_names=lock.benchmark_tasks,
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+    )
+
+
+def build_harbor_trial_command(
+    lock: RunLock,
+    jobs_dir: Path,
+    base_url: str,
+    harbor_source: Path,
+    *,
+    task_name: str,
+) -> list[str]:
+    if task_name not in lock.benchmark_task_digests:
+        raise WorkerError("wave trial is not in the resolved run task set")
+    return _build_harbor_command(
+        lock,
+        jobs_dir,
+        base_url,
+        harbor_source,
+        task_names=[task_name],
+        attempts=1,
+        concurrency=1,
+    )
+
+
+def _build_harbor_command(
+    lock: RunLock,
+    jobs_dir: Path,
+    base_url: str,
+    harbor_source: Path,
+    *,
+    task_names: Sequence[str],
+    attempts: int,
+    concurrency: int,
+) -> list[str]:
     harbor = lock.remote.harbor
     endpoint = lock.deployment.endpoint
     if endpoint is None:
@@ -262,7 +308,7 @@ def build_harbor_command(
         "--dataset",
         lock.benchmark_dataset,
         "--n-attempts",
-        str(lock.attempts),
+        str(attempts),
         "--agent",
         lock.agent.name,
         "--model",
@@ -276,16 +322,16 @@ def build_harbor_command(
         "--jobs-dir",
         str(jobs_dir),
         "--n-concurrent",
-        str(lock.concurrent_trials),
+        str(concurrency),
         "--n-concurrent-agents",
-        str(lock.concurrent_trials),
+        str(concurrency),
         "--max-retries",
         "0",
         "--allow-agent-host",
         urlparse(base_url).hostname or "",
         "--yes",
     ]
-    for task_name in lock.benchmark_tasks:
+    for task_name in task_names:
         command.extend(("--include-task-name", task_name))
     if lock.agent.revision_kind == "package":
         revision = json.dumps(lock.agent.revision, separators=(",", ":"))
@@ -567,22 +613,9 @@ def _execute_benchmark(
     stream_runner: Callable[..., int],
     harbor_source: Path,
 ) -> None:
+    base_url = resume_and_probe_endpoint(root, events, lock, manager, token)
     endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise WorkerError("run lock has no endpoint binding")
-    append_event(events, "endpoint_resume_requested")
-    manager.resume()
-    snapshot = manager.wait_ready(3600)
-    validate_endpoint_model(lock, snapshot)
-    append_event(events, "endpoint_ready", state=endpoint_state(snapshot)[0])
-    write_json(root / "endpoint.snapshot.json", redact(snapshot))
-    base_url = endpoint_url(snapshot)
-    runtime = {
-        "controller": controller_environment(lock),
-        "endpoint": probe_runtime(base_url, token, endpoint_health_route(snapshot)),
-    }
-    write_json(root / "runtime-environment.json", redact(runtime))
-    append_event(events, "runtime_probed")
+    assert endpoint is not None
 
     jobs_dir = root / "harbor-jobs"
     harbor_command = build_harbor_command(
@@ -619,6 +652,37 @@ def _execute_benchmark(
     )
     write_json(root / "verification.json", verifier)
     append_event(events, "verification_validated")
+
+
+def resume_and_probe_endpoint(
+    root: Path,
+    events: Path,
+    lock: RunLock,
+    manager: EndpointManager,
+    token: str,
+    *,
+    readiness_timeout_seconds: int = 3600,
+    compatible_locks: Sequence[RunLock] = (),
+) -> str:
+    endpoint = lock.deployment.endpoint
+    if endpoint is None:
+        raise WorkerError("run lock has no endpoint binding")
+    append_event(events, "endpoint_resume_requested")
+    manager.resume()
+    snapshot = manager.wait_ready(readiness_timeout_seconds)
+    validate_endpoint_model(lock, snapshot)
+    for compatible in compatible_locks:
+        validate_endpoint_model(compatible, snapshot)
+    append_event(events, "endpoint_ready", state=endpoint_state(snapshot)[0])
+    write_json(root / "endpoint.snapshot.json", redact(snapshot))
+    base_url = endpoint_url(snapshot)
+    runtime = {
+        "controller": controller_environment(lock),
+        "endpoint": probe_runtime(base_url, token, endpoint_health_route(snapshot)),
+    }
+    write_json(root / "runtime-environment.json", redact(runtime))
+    append_event(events, "runtime_probed")
+    return base_url
 
 
 def prepare_locked_source(
@@ -678,43 +742,59 @@ def prepare_locked_source(
 
 
 def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) -> str:
+    return launch_cleanup_watchdog_for(
+        lock.remote,
+        endpoint,
+        lock.run_id,
+        token,
+    )
+
+
+def launch_cleanup_watchdog_for(
+    remote: RemoteExecutionSpec,
+    endpoint: EndpointRef,
+    owner_id: str,
+    token: str,
+) -> str:
     from huggingface_hub import HfApi
 
     controller_job_id = os.environ.get("JOB_ID")
     if not controller_job_id:
         raise WorkerError("controller JOB_ID is required before endpoint resume")
-    job_timeout_seconds = min(lock.remote.job.timeout_seconds + 600, 86400)
+    job_timeout_seconds = min(remote.job.timeout_seconds + 600, 86400)
     command = locked_source_command(
-        lock.remote.worker,
+        remote.worker,
         "harbor-hf",
         "watchdog",
         "--controller-job-id",
         controller_job_id,
         "--controller-namespace",
-        lock.remote.job.namespace,
+        remote.job.namespace,
         "--endpoint-name",
         endpoint.name,
         "--endpoint-namespace",
         endpoint.namespace,
         "--run-id",
-        lock.run_id,
+        owner_id,
         "--token-secret-name",
-        lock.remote.job.token_secret_name,
+        remote.job.token_secret_name,
         "--timeout-seconds",
-        str(lock.remote.job.timeout_seconds),
+        str(remote.job.timeout_seconds),
     )
     api = HfApi(token=token)
     info = api.run_job(
-        image=lock.remote.job.image,
+        image=remote.job.image,
         command=command,
-        secrets={lock.remote.job.token_secret_name: token},
-        flavor=lock.remote.job.flavor,
+        secrets={remote.job.token_secret_name: token},
+        flavor=remote.job.flavor,
         timeout=job_timeout_seconds,
         labels={
-            "harbor-hf-watchdog": lock.run_id,
-            "harbor-hf-endpoint": endpoint_lease_label(lock),
+            "harbor-hf-watchdog": owner_id,
+            "harbor-hf-endpoint": endpoint_lease_label_for(
+                endpoint.namespace, endpoint.name
+            ),
         },
-        namespace=lock.remote.job.namespace,
+        namespace=remote.job.namespace,
     )
     job_id = getattr(info, "id", None)
     if not isinstance(job_id, str) or not job_id:
@@ -722,7 +802,7 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
     wait_watchdog_ready(
         api,
         job_id,
-        lock.remote.job.namespace,
+        remote.job.namespace,
         timeout_seconds=_WATCHDOG_STARTUP_TIMEOUT_SECONDS,
     )
     return job_id

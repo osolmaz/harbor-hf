@@ -6,14 +6,18 @@ import pytest
 from pydantic import ValidationError
 
 from harbor_hf.campaigns import (
+    CampaignLock,
     CampaignPlan,
     CampaignRecoveryPolicy,
+    WaveLock,
     build_campaign_lock,
     build_campaign_plan,
+    build_wave_lock,
     campaign_json_schemas,
 )
 from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import ExperimentSpec, MatrixRule
+from harbor_hf.reconciler import ReconcileAction, plan_reconciliation
 
 
 def test_builds_content_addressed_campaign_plan(remote_spec: ExperimentSpec) -> None:
@@ -184,9 +188,10 @@ def test_campaign_plan_requires_resolved_tasks(remote_spec: ExperimentSpec) -> N
 def test_exports_campaign_json_schemas() -> None:
     schemas = campaign_json_schemas()
 
-    assert set(schemas) == {"campaign_plan", "campaign_lock"}
+    assert set(schemas) == {"campaign_plan", "campaign_lock", "wave_lock"}
     assert schemas["campaign_plan"]["title"] == "CampaignPlan"
     assert schemas["campaign_lock"]["title"] == "CampaignLock"
+    assert schemas["wave_lock"]["title"] == "WaveLock"
 
 
 def test_campaign_recovery_policy_is_content_addressed_and_stable(
@@ -236,3 +241,126 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
 def test_campaign_recovery_policy_rejects_unbounded_base_delay() -> None:
     with pytest.raises(ValidationError, match="retry base seconds must not exceed"):
         CampaignRecoveryPolicy(retry_base_seconds=61, retry_max_seconds=60)
+
+
+def test_wave_lock_is_deterministic_and_bounded(remote_spec: ExperimentSpec) -> None:
+    tasks = {
+        "task-one": "sha256:" + "3" * 64,
+        "task-two": "sha256:" + "4" * 64,
+    }
+    spec = remote_spec.model_copy(
+        update={
+            "benchmark": remote_spec.benchmark.model_copy(
+                update={"task_names": ["task-*"], "task_digests": tasks}
+            ),
+            "execution": remote_spec.execution.model_copy(
+                update={"max_trials_per_shard": 1, "concurrent_trials": 2}
+            ),
+        }
+    )
+    campaign = build_campaign_lock(build_campaign_plan(spec), "campaign-one")
+    action = _wave_action(campaign)
+
+    first = build_wave_lock(campaign, spec, action)
+    second = build_wave_lock(campaign, spec, action)
+
+    assert first == second
+    assert first.wave_id == f"wave-{action.action_key}"
+    assert first.action_id == action.action_id
+    assert first.action_key == action.action_key
+    assert first.campaign_id == campaign.campaign_id
+    assert first.created_at == campaign.created_at
+    assert first.manifest_digest == campaign.manifest_digest
+    assert first.plan_digest == campaign.plan_digest
+    assert first.deployment_digest == action.deployment_digest
+    assert first.endpoint == spec.matrix.deployments[0].endpoint
+    assert first.artifact_bucket == spec.artifacts.bucket
+    assert first.artifact_prefix == (
+        f"campaigns/{campaign.campaign_id}/waves/{first.wave_id}"
+    )
+    assert first.shard_ids == action.shard_ids
+    assert first.max_shards == campaign.max_shards_per_wave
+    assert first.max_concurrent_shards == 2
+    assert first.duration_seconds == spec.execution.timeout_seconds
+    assert sum(len(run.shards) for run in first.runs) == 2
+    assert first.remote == spec.remote
+    locked_run = first.runs[0]
+    campaign_run = campaign.runs[0]
+    assert locked_run.artifact_prefix == (
+        f"campaigns/{campaign.campaign_id}/runs/{campaign_run.run_id}"
+    )
+    assert locked_run.configuration.run_id == campaign_run.run_id
+    assert locked_run.configuration.model.id == campaign_run.model
+    assert locked_run.configuration.deployment.id == campaign_run.deployment
+    assert locked_run.configuration.agent.id == campaign_run.agent
+    assert sorted(shard.shard.shard_id for shard in locked_run.shards) == sorted(
+        action.shard_ids
+    )
+    assert all(shard.run_id == campaign_run.run_id for shard in locked_run.shards)
+    assert all(
+        shard.artifact_prefix
+        == (
+            f"campaigns/{campaign.campaign_id}/runs/{campaign_run.run_id}/"
+            f"shards/{shard.shard.shard_id}"
+        )
+        for shard in locked_run.shards
+    )
+    assert WaveLock.model_config["frozen"] is True
+
+
+def test_wave_lock_rejects_tampered_or_unbound_actions(
+    remote_spec: ExperimentSpec,
+) -> None:
+    campaign = build_campaign_lock(build_campaign_plan(remote_spec), "campaign-one")
+    action = _wave_action(campaign)
+    tampered = action.model_copy(update={"action_id": "act-" + "0" * 24})
+
+    with pytest.raises(ValueError, match="identity does not match"):
+        build_wave_lock(campaign, remote_spec, tampered)
+
+    deployment = remote_spec.matrix.deployments[0].model_copy(update={"endpoint": None})
+    unbound = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [deployment]}
+            )
+        }
+    )
+    unbound_campaign = build_campaign_lock(
+        build_campaign_plan(unbound), "campaign-unbound"
+    )
+    with pytest.raises(ValueError, match="pre-existing endpoint binding"):
+        build_wave_lock(unbound_campaign, unbound, _wave_action(unbound_campaign))
+
+
+def test_wave_lock_enforces_shard_bound(remote_spec: ExperimentSpec) -> None:
+    campaign = build_campaign_lock(build_campaign_plan(remote_spec), "campaign-one")
+    run = campaign.runs[0]
+    shard_id = run.shards[0].shard_id
+    action_key = "0" * 24
+    oversized = ReconcileAction(
+        action_id=f"act-{action_key}",
+        action_key=action_key,
+        kind="submit-wave",
+        campaign_id=campaign.campaign_id,
+        deployment_digest=run.deployment_digest,
+        shard_ids=[
+            f"{shard_id}-{index}" for index in range(campaign.max_shards_per_wave + 1)
+        ],
+    )
+
+    with pytest.raises(ValueError, match="exceeds the campaign shard bound"):
+        build_wave_lock(campaign, remote_spec, oversized)
+
+
+def _wave_action(lock: CampaignLock) -> ReconcileAction:
+    from harbor_hf.control import CampaignSubmittedPayload, new_event
+
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=lock.plan_digest),
+    )
+    return plan_reconciliation(lock, [event])[1].actions[0]

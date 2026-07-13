@@ -14,10 +14,13 @@ from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import (
     AgentProfile,
     DeploymentProfile,
+    EndpointRef,
     ExperimentSpec,
     ModelProfile,
+    RemoteExecutionSpec,
 )
 from harbor_hf.planner import RunCell, experiment_digest, resolved_cells
+from harbor_hf.runs import RunLock, build_run_lock
 
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -136,6 +139,81 @@ class CampaignLock(FrozenModel):
     max_shards_per_wave: int
     recovery_policy: CampaignRecoveryPolicy
     runs: list[CampaignRunLock]
+
+
+class SubmitWaveAction(Protocol):
+    @property
+    def action_id(self) -> str: ...
+
+    @property
+    def action_key(self) -> str: ...
+
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def campaign_id(self) -> str: ...
+
+    @property
+    def deployment_digest(self) -> str: ...
+
+    @property
+    def shard_ids(self) -> list[str]: ...
+
+
+class WaveShardLock(FrozenModel):
+    artifact_prefix: str
+    run_id: str
+    shard: CampaignShardLock
+
+
+class WaveRunLock(FrozenModel):
+    artifact_prefix: str
+    configuration: RunLock
+    shards: list[WaveShardLock]
+
+
+class WaveLock(FrozenModel):
+    schema_version: Literal["harbor-hf/wave-lock/v1alpha1"] = (
+        "harbor-hf/wave-lock/v1alpha1"
+    )
+    wave_id: str
+    action_id: str
+    action_key: str
+    campaign_id: str
+    created_at: datetime
+    manifest_digest: str
+    plan_digest: str
+    deployment_digest: str
+    endpoint: EndpointRef
+    artifact_bucket: str
+    artifact_prefix: str
+    max_shards: int
+    max_concurrent_shards: int
+    duration_seconds: int
+    remote: RemoteExecutionSpec
+    shard_ids: list[str]
+    runs: list[WaveRunLock]
+
+    @model_validator(mode="after")
+    def bounds_match_contents(self) -> WaveLock:
+        shard_count = sum(len(run.shards) for run in self.runs)
+        if shard_count < 1 or shard_count > self.max_shards:
+            raise ValueError("wave shard count exceeds its locked bound")
+        observed_ids = [
+            shard.shard.shard_id for run in self.runs for shard in run.shards
+        ]
+        if (
+            len(observed_ids) != len(self.shard_ids)
+            or len(self.shard_ids) != len(set(self.shard_ids))
+            or set(observed_ids) != set(self.shard_ids)
+        ):
+            raise ValueError("wave shard IDs do not match its locked contents")
+        if self.max_concurrent_shards < 1:
+            raise ValueError("wave concurrency must be positive")
+        if self.duration_seconds < 1:
+            raise ValueError("wave duration must be positive")
+        return self
 
 
 def build_campaign_plan(
@@ -325,6 +403,141 @@ def build_campaign_lock(
     )
 
 
+def build_wave_lock(
+    campaign: CampaignLock,
+    spec: ExperimentSpec,
+    action: SubmitWaveAction,
+) -> WaveLock:
+    """Resolve one reserved deployment wave without provisioning an endpoint."""
+    expected_campaign = build_campaign_lock(
+        build_campaign_plan(spec),
+        campaign.campaign_id,
+        clock=lambda: campaign.created_at,
+    )
+    if campaign != expected_campaign:
+        raise ValueError("campaign lock does not match the resolved manifest")
+    _validate_submit_wave_action(campaign, action)
+
+    selected = _selected_wave_shards(campaign, action)
+    run_locks: list[WaveRunLock] = []
+    endpoint: EndpointRef | None = None
+    for campaign_run, shards in selected:
+        deployment_profile = next(
+            profile
+            for profile in spec.matrix.deployments
+            if profile.id == campaign_run.deployment
+        )
+        if deployment_profile.endpoint is None:
+            raise ValueError(
+                "deployment wave requires a pre-existing endpoint binding; "
+                "endpoint provisioning is outside this slice"
+            )
+        configuration = build_run_lock(
+            spec,
+            model_id=campaign_run.model,
+            deployment_id=campaign_run.deployment,
+            agent_id=campaign_run.agent,
+            run_id=campaign_run.run_id,
+            clock=lambda: campaign.created_at,
+        )
+        observed_endpoint = configuration.deployment.endpoint
+        if observed_endpoint is None:
+            raise ValueError(
+                "deployment wave requires a pre-existing endpoint binding; "
+                "endpoint provisioning is outside this slice"
+            )
+        if endpoint is not None and observed_endpoint != endpoint:
+            raise ValueError("compatible wave shards must use one exact endpoint")
+        endpoint = observed_endpoint
+        run_locks.append(
+            WaveRunLock(
+                artifact_prefix=(
+                    f"{campaign.artifact_prefix}/runs/{campaign_run.run_id}"
+                ),
+                configuration=configuration,
+                shards=[
+                    WaveShardLock(
+                        artifact_prefix=(
+                            f"{campaign.artifact_prefix}/runs/{campaign_run.run_id}/"
+                            f"shards/{shard.shard_id}"
+                        ),
+                        run_id=campaign_run.run_id,
+                        shard=shard,
+                    )
+                    for shard in shards
+                ],
+            )
+        )
+    if endpoint is None or spec.remote is None:
+        raise ValueError("deployment wave requires remote endpoint execution")
+    return WaveLock(
+        wave_id=deterministic_wave_id(action.action_key),
+        action_id=action.action_id,
+        action_key=action.action_key,
+        campaign_id=campaign.campaign_id,
+        created_at=campaign.created_at,
+        manifest_digest=campaign.manifest_digest,
+        plan_digest=campaign.plan_digest,
+        deployment_digest=action.deployment_digest,
+        endpoint=endpoint,
+        artifact_bucket=spec.artifacts.bucket,
+        artifact_prefix=(
+            f"{campaign.artifact_prefix}/waves/"
+            f"{deterministic_wave_id(action.action_key)}"
+        ),
+        max_shards=campaign.max_shards_per_wave,
+        max_concurrent_shards=spec.execution.concurrent_trials,
+        duration_seconds=spec.execution.timeout_seconds,
+        remote=spec.remote,
+        shard_ids=action.shard_ids,
+        runs=run_locks,
+    )
+
+
+def deterministic_wave_id(action_key: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{24}", action_key) is None:
+        raise ValueError("wave action key must be a 24-character hexadecimal digest")
+    return f"wave-{action_key}"
+
+
+def _validate_submit_wave_action(
+    campaign: CampaignLock, action: SubmitWaveAction
+) -> None:
+    if action.kind != "submit-wave" or action.campaign_id != campaign.campaign_id:
+        raise ValueError("wave action does not target the campaign")
+    if not action.shard_ids:
+        raise ValueError("wave action must contain at least one shard")
+    if len(action.shard_ids) != len(set(action.shard_ids)):
+        raise ValueError("wave action shard IDs must be unique")
+    if len(action.shard_ids) > campaign.max_shards_per_wave:
+        raise ValueError("wave action exceeds the campaign shard bound")
+    if (
+        re.fullmatch(r"[0-9a-f]{24}", action.action_key) is None
+        or action.action_id != f"act-{action.action_key}"
+    ):
+        raise ValueError("wave action identity does not match its immutable contents")
+
+
+def _selected_wave_shards(
+    campaign: CampaignLock, action: SubmitWaveAction
+) -> list[tuple[CampaignRunLock, list[CampaignShardLock]]]:
+    requested = set(action.shard_ids)
+    selected: list[tuple[CampaignRunLock, list[CampaignShardLock]]] = []
+    found: set[str] = set()
+    for run in campaign.runs:
+        shards = [shard for shard in run.shards if shard.shard_id in requested]
+        if not shards:
+            continue
+        if run.deployment_digest != action.deployment_digest:
+            raise ValueError("wave action mixes incompatible deployment digests")
+        selected.append((run, shards))
+        found.update(shard.shard_id for shard in shards)
+    missing = requested - found
+    if missing:
+        raise ValueError("wave action references an unknown campaign shard")
+    return selected
+
+
 def new_campaign_id(
     plan: CampaignPlan,
     *,
@@ -341,6 +554,7 @@ def campaign_json_schemas() -> dict[str, dict[str, object]]:
     return {
         "campaign_plan": CampaignPlan.model_json_schema(),
         "campaign_lock": CampaignLock.model_json_schema(),
+        "wave_lock": WaveLock.model_json_schema(),
     }
 
 
