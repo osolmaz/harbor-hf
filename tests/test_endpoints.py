@@ -29,11 +29,12 @@ from harbor_hf.endpoints import (
     require_paused_zero_ready,
     verify_exact_endpoint,
 )
-from harbor_hf.models import EndpointRef, ExperimentSpec
+from harbor_hf.models import DeploymentProfile, EndpointRef, ExperimentSpec
 
 
 def _desired(remote_spec: ExperimentSpec) -> DesiredEndpoint:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     deployment = deployment.model_copy(
         update={
             "parameters": {
@@ -243,7 +244,9 @@ def test_managed_identity_has_stable_golden_value(
 
 
 def test_rejects_unknown_endpoint_parameters(remote_spec: ExperimentSpec) -> None:
-    deployment = remote_spec.matrix.deployments[0].model_copy(
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(
         update={"parameters": {"unreported_provider_control": True}}
     )
 
@@ -257,7 +260,9 @@ def test_rejects_unknown_endpoint_parameters(remote_spec: ExperimentSpec) -> Non
 
 
 def test_rejects_noncomposite_provider_region(remote_spec: ExperimentSpec) -> None:
-    deployment = remote_spec.matrix.deployments[0].model_copy(update={"region": "aws"})
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(update={"region": "aws"})
 
     with pytest.raises(ValueError, match="vendor-region"):
         build_desired_endpoint(

@@ -19,6 +19,8 @@ from pydantic import BaseModel, ConfigDict
 from harbor_hf.campaigns import (
     CampaignLock,
     CampaignTrialLock,
+    EndpointWaveTarget,
+    ProviderWaveTarget,
     WaveLock,
     WaveRunLock,
     WaveShardLock,
@@ -38,11 +40,17 @@ from harbor_hf.evidence import (
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
+from harbor_hf.provider_models import ProviderEndpointEvidence, unavailable
+from harbor_hf.providers import (
+    HF_INFERENCE_PROVIDER_BASE_URL,
+    routed_provider_model,
+)
 from harbor_hf.runs import RunLock
 from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
     build_harbor_trial_command,
+    controller_environment,
     endpoint_state,
     launch_cleanup_watchdog_for,
     prepare_locked_source,
@@ -109,6 +117,79 @@ class ExecutionLock(FrozenModel):
     task_digest: str
     logical_attempt: int
     physical_attempt: int
+
+
+class _EndpointWaveLifecycle:
+    def __init__(
+        self,
+        lock: WaveLock,
+        wave_root: Path,
+        events: Path,
+        runner: CommandRunner,
+        token: str,
+        watchdog_launcher: WatchdogLauncher | None,
+    ) -> None:
+        if not isinstance(lock.target, EndpointWaveTarget):
+            raise TypeError("endpoint lifecycle requires an endpoint target")
+        self.lock = lock
+        self.wave_root = wave_root
+        self.events = events
+        self.token = token
+        self.launcher = watchdog_launcher or _launch_wave_watchdog
+        endpoint = lock.target.endpoint
+        self.endpoint = endpoint
+        self.manager = EndpointManager(endpoint.namespace, endpoint.name, runner)
+        self.owned = False
+
+    def prepare(self, deadline: float, monotonic: Callable[[], float]) -> str:
+        baseline = self.manager.describe()
+        for run in self.lock.runs:
+            validate_endpoint_model(run.configuration, baseline)
+        require_paused_endpoint(baseline)
+        append_event(self.events, "endpoint_baseline_validated")
+        watchdog_id = self.launcher(self.lock, self.endpoint, self.token)
+        self.owned = True
+        append_event(
+            self.events, "endpoint_lease_acquired", watchdog_job_id=watchdog_id
+        )
+        append_event(self.events, "cleanup_watchdog_started", job_id=watchdog_id)
+        readiness_timeout = min(3600, _remaining_seconds(deadline, monotonic))
+        return resume_and_probe_endpoint(
+            self.wave_root,
+            self.events,
+            self.lock.runs[0].configuration,
+            self.manager,
+            self.token,
+            readiness_timeout_seconds=readiness_timeout,
+            compatible_locks=tuple(run.configuration for run in self.lock.runs[1:]),
+        )
+
+    def cleanup(self) -> Exception | None:
+        if not self.owned:
+            append_event(
+                self.events, "endpoint_cleanup_skipped", reason="lease_not_owned"
+            )
+            return None
+        append_event(self.events, "endpoint_pause_requested")
+        try:
+            final_snapshot = self.manager.pause_and_verify()
+            state, ready, target = endpoint_state(final_snapshot)
+            write_json(self.wave_root / "endpoint.final.json", redact(final_snapshot))
+            append_event(
+                self.events,
+                "endpoint_paused",
+                state=state,
+                ready_replicas=ready,
+                target_replicas=target,
+            )
+        except Exception as error:
+            append_event(
+                self.events,
+                "endpoint_cleanup_failed",
+                error=type(error).__name__,
+            )
+            return error
+        return None
 
 
 def validate_wave_lock(
@@ -199,11 +280,20 @@ def _run_staged_wave(
     write_json(wave_root / "wave.lock.json", lock.model_dump(mode="json"))
     events = wave_root / "events.jsonl"
     append_event(events, "wave_started", wave_id=lock.wave_id)
-    manager = EndpointManager(lock.endpoint.namespace, lock.endpoint.name, runner)
-    representative = lock.runs[0].configuration
+    lifecycle = (
+        _EndpointWaveLifecycle(
+            lock,
+            wave_root,
+            events,
+            runner,
+            token,
+            watchdog_launcher,
+        )
+        if isinstance(lock.target, EndpointWaveTarget)
+        else None
+    )
     error: Exception | None = None
     cleanup_error: Exception | None = None
-    watchdog_started = False
     shard_checksums: dict[str, str] = {}
     try:
         require_executable("git")
@@ -213,26 +303,11 @@ def _run_staged_wave(
             / f"harbor-{lock.remote.harbor.source.revision}"
         )
         source_preparer(lock.remote.harbor.source, harbor_source, runner)
-        baseline = manager.describe()
-        for run in lock.runs:
-            validate_endpoint_model(run.configuration, baseline)
-        require_paused_endpoint(baseline)
-        append_event(events, "endpoint_baseline_validated")
-        launcher = watchdog_launcher or _launch_wave_watchdog
-        watchdog_id = launcher(lock, lock.endpoint, token)
-        watchdog_started = True
-        append_event(events, "endpoint_lease_acquired", watchdog_job_id=watchdog_id)
-        append_event(events, "cleanup_watchdog_started", job_id=watchdog_id)
         deadline = monotonic() + lock.duration_seconds
-        readiness_timeout = min(3600, _remaining_seconds(deadline, monotonic))
-        base_url = resume_and_probe_endpoint(
-            wave_root,
-            events,
-            representative,
-            manager,
-            token,
-            readiness_timeout_seconds=readiness_timeout,
-            compatible_locks=tuple(run.configuration for run in lock.runs[1:]),
+        base_url = (
+            lifecycle.prepare(deadline, monotonic)
+            if lifecycle is not None
+            else _prepare_provider_target(lock, wave_root, events)
         )
         shard_checksums = _execute_shards(
             manifest_path,
@@ -252,33 +327,19 @@ def _run_staged_wave(
     except Exception as caught:
         error = caught
     finally:
-        if watchdog_started:
-            append_event(events, "endpoint_pause_requested")
-            try:
-                final_snapshot = manager.pause_and_verify()
-                state, ready, target = endpoint_state(final_snapshot)
-                write_json(wave_root / "endpoint.final.json", redact(final_snapshot))
-                append_event(
-                    events,
-                    "endpoint_paused",
-                    state=state,
-                    ready_replicas=ready,
-                    target_replicas=target,
-                )
-            except Exception as caught:
-                cleanup_error = caught
-                append_event(
-                    events, "endpoint_cleanup_failed", error=type(caught).__name__
-                )
-        else:
-            append_event(events, "endpoint_cleanup_skipped", reason="lease_not_owned")
+        if lifecycle is not None:
+            cleanup_error = lifecycle.cleanup()
 
     terminal_error = error or cleanup_error
     summary: dict[str, object] = {
         "wave_id": lock.wave_id,
         "campaign_id": campaign.campaign_id,
         "shard_checksums": shard_checksums,
-        "endpoint_cleanup_verified": cleanup_error is None and watchdog_started,
+        "endpoint_cleanup_verified": (
+            cleanup_error is None and lifecycle.owned
+            if lifecycle is not None
+            else unavailable("not_applicable").model_dump(mode="json")
+        ),
     }
     if terminal_error is None:
         append_event(events, "wave_succeeded")
@@ -358,6 +419,33 @@ def _execute_shards(
     if failures:
         raise failures[0]
     return dict(sorted(results.items()))
+
+
+def _prepare_provider_target(lock: WaveLock, wave_root: Path, events: Path) -> str:
+    if not isinstance(lock.target, ProviderWaveTarget):
+        raise WorkerError("provider execution requires an Inference Provider target")
+    target = lock.target.provider
+    write_json(wave_root / "provider-target.json", target.model_dump(mode="json"))
+    write_json(
+        wave_root / "runtime-environment.json",
+        {
+            "controller": controller_environment(lock.runs[0].configuration),
+            "provider": {
+                "service": target.service,
+                "requested_model": target.model,
+                "routed_model": routed_provider_model(target),
+                "routing": target.routing.model_dump(mode="json"),
+                "endpoint": ProviderEndpointEvidence().model_dump(mode="json"),
+            },
+        },
+    )
+    append_event(
+        events,
+        "provider_target_validated",
+        service=target.service,
+        target_id=target.id,
+    )
+    return HF_INFERENCE_PROVIDER_BASE_URL
 
 
 def _execute_shard(
@@ -514,7 +602,7 @@ def _execute_trial(
             expected_agent_name=run.agent.name,
             expected_agent_version=_expected_agent_version(run),
             expected_model_provider="openai",
-            expected_model_name=wave.endpoint.served_model_name,
+            expected_model_name=_wave_model_name(wave),
         )
         write_json(execution_root / "verification.json", verifier)
         append_event(events, "execution_succeeded")
@@ -567,6 +655,12 @@ def _execute_trial(
         / "trials"
         / trial.trial_id,
     )
+
+
+def _wave_model_name(wave: WaveLock) -> str:
+    if isinstance(wave.target, EndpointWaveTarget):
+        return wave.target.endpoint.served_model_name
+    return routed_provider_model(wave.target.provider)
 
 
 def _stage_campaign_records(

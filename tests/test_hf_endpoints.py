@@ -16,7 +16,7 @@ from harbor_hf.endpoints import (
     build_desired_endpoint,
 )
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter, environment_secret
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import DeploymentProfile, ExperimentSpec
 
 
 @dataclass
@@ -51,7 +51,9 @@ class FakeApi:
 
 
 def _desired(remote_spec: ExperimentSpec) -> DesiredEndpoint:
-    deployment = remote_spec.matrix.deployments[0].model_copy(
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(
         update={
             "parameters": {
                 "min_replicas": 0,

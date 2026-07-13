@@ -10,9 +10,9 @@ from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict
 
-from harbor_hf.campaigns import WaveLock
+from harbor_hf.campaigns import EndpointWaveTarget, WaveLock
 from harbor_hf.coordination import bucket_id, coordination_repository
-from harbor_hf.models import SourcePin
+from harbor_hf.models import DeploymentProfile, EndpointRef, SourcePin
 from harbor_hf.runs import RunLock
 
 _JOB_ID = re.compile(r"[a-f0-9]{24}")
@@ -160,9 +160,7 @@ def require_private_bucket(bucket: str, *, api: BucketApi) -> str:
 
 
 def endpoint_lease_label(lock: RunLock) -> str:
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise ValueError("run lock has no endpoint binding")
+    endpoint = _endpoint_binding(lock)
     return endpoint_lease_label_for(endpoint.namespace, endpoint.name)
 
 
@@ -220,6 +218,27 @@ def build_submit_wave_command(
     bucket: str,
 ) -> list[str]:
     job = lock.remote.job
+    labels = ["--label", f"harbor-hf-wave={lock.wave_id}"]
+    if isinstance(lock.target, EndpointWaveTarget):
+        labels.extend(
+            (
+                "--label",
+                "harbor-hf-endpoint="
+                + endpoint_lease_label_for(
+                    lock.target.endpoint.namespace, lock.target.endpoint.name
+                ),
+            )
+        )
+    else:
+        labels.extend(
+            (
+                "--label",
+                "harbor-hf-provider="
+                + hashlib.sha256(lock.target.provider.service.encode()).hexdigest()[
+                    :32
+                ],
+            )
+        )
     return [
         "hf",
         "jobs",
@@ -233,13 +252,7 @@ def build_submit_wave_command(
         f"{job.timeout_seconds}s",
         "--secrets",
         job.token_secret_name,
-        "--label",
-        f"harbor-hf-wave={lock.wave_id}",
-        "--label",
-        (
-            "harbor-hf-endpoint="
-            f"{endpoint_lease_label_for(lock.endpoint.namespace, lock.endpoint.name)}"
-        ),
+        *labels,
         "--volume",
         f"{input_dir}:/input:ro",
         "--volume",
@@ -257,6 +270,13 @@ def build_submit_wave_command(
             "/output",
         ),
     ]
+
+
+def _endpoint_binding(lock: RunLock) -> EndpointRef:
+    deployment = lock.deployment
+    if not isinstance(deployment, DeploymentProfile) or deployment.endpoint is None:
+        raise ValueError("run lock has no endpoint binding")
+    return deployment.endpoint
 
 
 def submit(

@@ -10,12 +10,13 @@ from pydantic import BaseModel, ConfigDict
 
 from harbor_hf.models import (
     AgentProfile,
-    DeploymentProfile,
+    DeploymentTarget,
     ExperimentSpec,
     ModelProfile,
     RemoteExecutionSpec,
 )
 from harbor_hf.planner import experiment_digest, resolved_cells
+from harbor_hf.provider_models import ProviderTarget
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -25,7 +26,8 @@ class Clock(Protocol):
 
 
 class HasId(Protocol):
-    id: str
+    @property
+    def id(self) -> str: ...
 
 
 class RunLock(BaseModel):
@@ -41,7 +43,7 @@ class RunLock(BaseModel):
     benchmark_tasks: list[str]
     benchmark_task_digests: dict[str, str]
     model: ModelProfile
-    deployment: DeploymentProfile
+    deployment: DeploymentTarget
     agent: AgentProfile
     attempts: int
     concurrent_trials: int
@@ -74,6 +76,7 @@ def build_run_lock(
     deployment_id: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
+    allow_provider: bool = False,
     clock: Clock = lambda: datetime.now(UTC),
 ) -> RunLock:
     spec = ExperimentSpec.model_validate(spec.model_dump(mode="python"))
@@ -96,14 +99,12 @@ def build_run_lock(
         and agent.revision != spec.remote.harbor.source.revision
     ):
         raise ValueError("Harbor-source agent revision must match the Harbor source")
-    if deployment.endpoint is None:
-        raise ValueError(
-            f"deployment profile {deployment.id} requires an endpoint binding"
-        )
-    if deployment.endpoint.namespace != spec.remote.job.namespace:
-        raise ValueError(
-            "controller Job namespace must match the endpoint namespace for leasing"
-        )
+    _validate_deployment_target(
+        model,
+        deployment,
+        spec.remote,
+        allow_provider=allow_provider,
+    )
 
     created_at = clock().astimezone(UTC)
     digest = experiment_digest(spec)
@@ -141,3 +142,33 @@ def _new_run_id(name: str, digest: str, created_at: datetime) -> str:
     ).encode()
     suffix = hashlib.sha256(identity).hexdigest()[:10]
     return f"{created_at:%Y%m%dT%H%M%SZ}-{suffix}"
+
+
+def _validate_deployment_target(
+    model: ModelProfile,
+    deployment: DeploymentTarget,
+    remote: RemoteExecutionSpec,
+    *,
+    allow_provider: bool,
+) -> None:
+    if isinstance(deployment, ProviderTarget):
+        if not allow_provider:
+            raise ValueError("Inference Provider targets require campaign execution")
+        if deployment.model != model.repo:
+            raise ValueError(
+                "Inference Provider target model must match the selected model profile"
+            )
+        return
+    if deployment.endpoint is None:
+        if allow_provider:
+            raise ValueError(
+                "deployment wave requires a pre-existing endpoint binding; "
+                "endpoint provisioning is outside this slice"
+            )
+        raise ValueError(
+            f"deployment profile {deployment.id} requires an endpoint binding"
+        )
+    if deployment.endpoint.namespace != remote.job.namespace:
+        raise ValueError(
+            "controller Job namespace must match the endpoint namespace for leasing"
+        )

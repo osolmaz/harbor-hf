@@ -29,7 +29,8 @@ from harbor_hf.provider_models import (
     unavailable,
 )
 
-_CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_INFERENCE_PROVIDER_BASE_URL = "https://router.huggingface.co"
+_CHAT_COMPLETIONS_URL = f"{HF_INFERENCE_PROVIDER_BASE_URL}/v1/chat/completions"
 _REQUEST_ID_HEADERS = ("x-request-id", "x-amzn-requestid", "request-id")
 
 
@@ -349,6 +350,10 @@ def _routed_model(target: ProviderTarget) -> str:
         route.provider if isinstance(route, ExplicitProviderRoute) else route.policy
     )
     return f"{target.model}:{suffix}"
+
+
+def routed_provider_model(target: ProviderTarget) -> str:
+    return _routed_model(target)
 
 
 def _provider_message(value: _RawMessage) -> ProviderMessage:

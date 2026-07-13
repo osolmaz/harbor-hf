@@ -16,7 +16,7 @@ from harbor_hf.campaigns import (
     campaign_json_schemas,
 )
 from harbor_hf.endpoints import deployment_digest
-from harbor_hf.models import ExperimentSpec, MatrixRule
+from harbor_hf.models import DeploymentProfile, ExperimentSpec, MatrixRule
 from harbor_hf.reconciler import ReconcileAction, plan_reconciliation
 
 
@@ -273,7 +273,9 @@ def test_wave_lock_is_deterministic_and_bounded(remote_spec: ExperimentSpec) -> 
     assert first.manifest_digest == campaign.manifest_digest
     assert first.plan_digest == campaign.plan_digest
     assert first.deployment_digest == action.deployment_digest
-    assert first.endpoint == spec.matrix.deployments[0].endpoint
+    deployment = spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    assert first.endpoint == deployment.endpoint
     assert first.artifact_bucket == spec.artifacts.bucket
     assert first.artifact_prefix == (
         f"campaigns/{campaign.campaign_id}/waves/{first.wave_id}"

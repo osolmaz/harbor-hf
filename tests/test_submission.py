@@ -14,6 +14,7 @@ from harbor_hf.campaigns import (
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.models import ExperimentSpec
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.runs import build_run_lock
 from harbor_hf.submission import (
@@ -187,6 +188,27 @@ def test_build_submit_wave_command_targets_hidden_worker(
         "/output",
     ]
     assert "test-token" not in " ".join(command)
+
+
+def test_provider_wave_submission_has_no_endpoint_lease_label(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    model = remote_spec.matrix.models[0]
+    target = ProviderTarget(id="hf-provider", model=model.repo)
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(update={"deployments": [target]})
+        }
+    )
+    lock = _wave_lock(spec)
+
+    command = build_submit_wave_command(
+        lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
+    )
+    rendered = " ".join(command)
+
+    assert "harbor-hf-provider=" in rendered
+    assert "harbor-hf-endpoint=" not in rendered
 
 
 def test_submit_wave_parses_job_id_and_checks_private_stores(

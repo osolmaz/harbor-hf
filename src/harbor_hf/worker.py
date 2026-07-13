@@ -36,6 +36,7 @@ from harbor_hf.evidence import (
 )
 from harbor_hf.io import load_experiment
 from harbor_hf.models import (
+    DeploymentProfile,
     EndpointRef,
     ExperimentSpec,
     RemoteExecutionSpec,
@@ -48,6 +49,8 @@ from harbor_hf.process import (
     SubprocessRunner,
     run_streaming,
 )
+from harbor_hf.provider_models import ProviderTarget
+from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
     endpoint_lease_label_for,
@@ -280,6 +283,20 @@ def build_harbor_trial_command(
     )
 
 
+def _endpoint_binding(lock: RunLock) -> EndpointRef:
+    deployment = _endpoint_deployment(lock)
+    if deployment.endpoint is None:
+        raise WorkerError("run lock has no endpoint binding")
+    return deployment.endpoint
+
+
+def _endpoint_deployment(lock: RunLock) -> DeploymentProfile:
+    deployment = lock.deployment
+    if not isinstance(deployment, DeploymentProfile):
+        raise WorkerError("run lock is not an Inference Endpoint target")
+    return deployment
+
+
 def _build_harbor_command(
     lock: RunLock,
     jobs_dir: Path,
@@ -291,9 +308,14 @@ def _build_harbor_command(
     concurrency: int,
 ) -> list[str]:
     harbor = lock.remote.harbor
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise WorkerError("run lock has no endpoint binding")
+    deployment = lock.deployment
+    if isinstance(deployment, ProviderTarget):
+        served_model_name = routed_provider_model(deployment)
+    else:
+        endpoint = deployment.endpoint
+        if endpoint is None:
+            raise WorkerError("run lock has no endpoint binding")
+        served_model_name = endpoint.served_model_name
     command = [
         "uv",
         "run",
@@ -312,7 +334,7 @@ def _build_harbor_command(
         "--agent",
         lock.agent.name,
         "--model",
-        f"openai/{endpoint.served_model_name}",
+        f"openai/{served_model_name}",
         "--env",
         harbor.environment,
         "--environment-kwarg",
@@ -417,9 +439,7 @@ def _run_staged_worker(
     write_json(root / "run.lock.json", lock.model_dump(mode="json"))
     events = root / "events.jsonl"
     process_runner = runner or SubprocessRunner()
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise WorkerError("run lock has no endpoint binding")
+    endpoint = _endpoint_binding(lock)
     manager = EndpointManager(endpoint.namespace, endpoint.name, process_runner)
     error: Exception | None = None
     cleanup_error: Exception | None = None
@@ -614,8 +634,7 @@ def _execute_benchmark(
     harbor_source: Path,
 ) -> None:
     base_url = resume_and_probe_endpoint(root, events, lock, manager, token)
-    endpoint = lock.deployment.endpoint
-    assert endpoint is not None
+    endpoint = _endpoint_binding(lock)
 
     jobs_dir = root / "harbor-jobs"
     harbor_command = build_harbor_command(
@@ -664,9 +683,7 @@ def resume_and_probe_endpoint(
     readiness_timeout_seconds: int = 3600,
     compatible_locks: Sequence[RunLock] = (),
 ) -> str:
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise WorkerError("run lock has no endpoint binding")
+    _endpoint_binding(lock)
     append_event(events, "endpoint_resume_requested")
     manager.resume()
     snapshot = manager.wait_ready(readiness_timeout_seconds)
@@ -988,6 +1005,7 @@ def _job_stage(info: object) -> str:
 
 
 def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> None:
+    deployment = _endpoint_deployment(lock)
     model = snapshot.get("model")
     if not isinstance(model, Mapping):
         raise WorkerError("endpoint response has no model object")
@@ -1000,33 +1018,33 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
     image = model.get("image")
     custom = image.get("custom") if isinstance(image, Mapping) else None
     observed_image = custom.get("url") if isinstance(custom, Mapping) else None
-    if observed_image != lock.deployment.engine.image:
+    if observed_image != deployment.engine.image:
         raise WorkerError("endpoint image does not match the locked deployment")
     observed_command = model.get("command", [])
     if (
         not isinstance(observed_command, list)
         or not all(isinstance(argument, str) for argument in observed_command)
-        or observed_command != lock.deployment.engine.command
+        or observed_command != deployment.engine.command
     ):
         raise WorkerError("endpoint command does not match the locked deployment")
     observed_arguments = model.get("args", [])
     if (
         not isinstance(observed_arguments, list)
         or not all(isinstance(argument, str) for argument in observed_arguments)
-        or observed_arguments != lock.deployment.engine.arguments
+        or observed_arguments != deployment.engine.arguments
     ):
         raise WorkerError("endpoint arguments do not match the locked deployment")
     observed_environment = model.get("env")
     if (
         not isinstance(observed_environment, Mapping)
-        or dict(observed_environment) != lock.deployment.engine.environment
+        or dict(observed_environment) != deployment.engine.environment
     ):
         raise WorkerError("endpoint environment does not match the locked deployment")
     observed_secrets = model.get("secrets", {})
     if (
         not isinstance(observed_secrets, Mapping)
         or not all(isinstance(name, str) for name in observed_secrets)
-        or set(observed_secrets) != set(lock.deployment.engine.secret_names)
+        or set(observed_secrets) != set(deployment.engine.secret_names)
     ):
         raise WorkerError("endpoint secret names do not match the locked deployment")
     _validate_endpoint_compute(lock, snapshot)
@@ -1041,6 +1059,7 @@ def require_paused_endpoint(snapshot: Mapping[str, object]) -> None:
 
 
 def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) -> None:
+    deployment = _endpoint_deployment(lock)
     provider = snapshot.get("provider")
     compute = snapshot.get("compute")
     if not isinstance(provider, Mapping) or not isinstance(compute, Mapping):
@@ -1056,9 +1075,9 @@ def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) ->
     )
     instance_size = compute.get("instanceSize")
     if (
-        observed_region != lock.deployment.region
-        or normalized_hardware != lock.deployment.hardware
-        or instance_size != f"x{lock.deployment.accelerator_count}"
+        observed_region != deployment.region
+        or normalized_hardware != deployment.hardware
+        or instance_size != f"x{deployment.accelerator_count}"
     ):
         raise WorkerError("endpoint compute does not match the locked deployment")
     scaling = compute.get("scaling")
@@ -1069,7 +1088,7 @@ def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) ->
         "max_replicas": "maxReplica",
     }
     for parameter, field in expected_scaling.items():
-        expected = lock.deployment.parameters.get(parameter)
+        expected = deployment.parameters.get(parameter)
         if expected is not None and scaling.get(field) != expected:
             raise WorkerError("endpoint scaling does not match the locked deployment")
 

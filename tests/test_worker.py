@@ -13,7 +13,7 @@ from typing import Any, cast
 import pytest
 
 from harbor_hf.coordination import ClaimConflict, run_claim_path
-from harbor_hf.models import ExperimentSpec, SourcePin
+from harbor_hf.models import DeploymentProfile, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
@@ -393,6 +393,7 @@ def test_endpoint_arguments_require_complete_ordered_identity(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     engine = deployment.engine.model_copy(update={"arguments": ["-c", "65536"]})
     spec = remote_spec.model_copy(
         update={
@@ -417,6 +418,7 @@ def test_endpoint_omitted_arguments_match_an_empty_lock(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     engine = deployment.engine.model_copy(update={"arguments": [], "secret_names": []})
     spec = remote_spec.model_copy(
         update={
@@ -704,6 +706,7 @@ def test_launch_watchdog_requires_controller_job_before_submission(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec)
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     monkeypatch.delenv("JOB_ID", raising=False)
@@ -718,6 +721,7 @@ def test_launch_watchdog_uses_independent_hf_job(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec, run_id="watchdog-run")
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     calls: list[dict[str, object]] = []
@@ -787,6 +791,7 @@ def test_launch_watchdog_caps_timeout_and_requires_returned_id(
         }
     )
     lock = build_run_lock(capped)
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     calls: list[dict[str, object]] = []
@@ -816,6 +821,7 @@ def test_launch_watchdog_does_not_cancel_after_failed_handshake(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec)
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     inspections: list[dict[str, object]] = []

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from harbor_hf.models import (
+    DeploymentProfile,
     ExperimentSpec,
     MatrixRule,
     _validate_remote_input_pins,
@@ -15,6 +16,7 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
+    assert isinstance(lock.deployment, DeploymentProfile)
 
     assert lock.run_id == "20260713T010203Z-7bef8b8f1f"
     assert lock.benchmark_dataset == "terminal-bench@2.0"
@@ -136,6 +138,7 @@ def test_controller_and_endpoint_must_share_lease_namespace(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     endpoint = deployment.endpoint
     assert endpoint is not None
     mismatched = deployment.model_copy(
@@ -170,6 +173,7 @@ def test_remote_lock_rejects_mutable_model_revision(
 
 def test_remote_lock_rejects_mutable_serving_image(remote_spec: ExperimentSpec) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     engine = deployment.engine.model_copy(update={"image": "example/vllm:latest"})
     spec = remote_spec.model_copy(
         update={

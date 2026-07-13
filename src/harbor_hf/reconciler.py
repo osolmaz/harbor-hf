@@ -9,7 +9,7 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harbor_hf.campaigns import CampaignLock
+from harbor_hf.campaigns import CampaignLock, CampaignRunLock
 from harbor_hf.control import ActionKind, CampaignEvent
 from harbor_hf.recovery import (
     RecoveryProjection,
@@ -39,7 +39,7 @@ class FrozenModel(BaseModel):
 
 
 class DeploymentAdmission(FrozenModel):
-    provider: str = Field(default="hf-inference-endpoints", min_length=1)
+    provider: str | None = Field(default=None, min_length=1)
     estimated_wave_cost_microusd: int | None = Field(default=None, ge=0)
 
 
@@ -77,6 +77,9 @@ class ReconcileAction(FrozenModel):
     trial_ids: list[str] = Field(default_factory=list)
     target_ids: list[str] = Field(default_factory=list)
     estimated_cost_microusd: int | None = None
+    spend_cap_microusd: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
 
 
 class BlockedAction(FrozenModel):
@@ -112,6 +115,9 @@ class _Candidate(FrozenModel):
     trial_ids: list[str] = Field(default_factory=list)
     target_ids: list[str] = Field(default_factory=list)
     estimated_cost_microusd: int | None = None
+    spend_cap_microusd: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
 
 
 class _MutableUsage:
@@ -381,16 +387,17 @@ def _retry_candidates(
     blocked = []
     for shard_id, trial_ids in sorted(ready.items()):
         deployment = _deployment_for_shards(lock, [shard_id])
-        admission = _deployment(context, deployment)
+        admission = _deployment(lock, context, deployment)
         candidates.append(
             _Candidate(
                 kind="retry-shard",
                 deployment_digest=deployment,
-                provider=admission.provider,
+                provider=_admission_provider(admission),
                 shard_ids=[shard_id],
                 trial_ids=sorted(trial_ids),
                 target_ids=sorted(trial_ids),
                 estimated_cost_microusd=admission.estimated_wave_cost_microusd,
+                spend_cap_microusd=_run_admission(lock, deployment).spend_cap_microusd,
             )
         )
     for shard_id in sorted(waiting):
@@ -420,7 +427,7 @@ def _new_wave_candidates(
                 groups[run.deployment_digest].append(shard.shard_id)
     candidates = []
     for deployment_digest in sorted(groups):
-        admission = _deployment(context, deployment_digest)
+        admission = _deployment(lock, context, deployment_digest)
         shard_ids = groups[deployment_digest]
         for offset in range(0, len(shard_ids), lock.max_shards_per_wave):
             chunk = shard_ids[offset : offset + lock.max_shards_per_wave]
@@ -428,10 +435,13 @@ def _new_wave_candidates(
                 _Candidate(
                     kind="submit-wave",
                     deployment_digest=deployment_digest,
-                    provider=admission.provider,
+                    provider=_admission_provider(admission),
                     shard_ids=chunk,
                     target_ids=chunk,
                     estimated_cost_microusd=admission.estimated_wave_cost_microusd,
+                    spend_cap_microusd=_run_admission(
+                        lock, deployment_digest
+                    ).spend_cap_microusd,
                 )
             )
     return candidates
@@ -520,7 +530,15 @@ def _budget_reason(
     )
     if usage.campaigns.get(lock.campaign_id, 0) >= campaign_limit:
         return "campaign-budget"
-    cap = lock.recovery_policy.spend_cap_microusd
+    caps = [
+        cap
+        for cap in (
+            lock.recovery_policy.spend_cap_microusd,
+            candidate.spend_cap_microusd,
+        )
+        if cap is not None
+    ]
+    cap = min(caps) if caps else None
     if cap is not None and candidate.estimated_cost_microusd is None:
         return "spend-estimate-missing"
     projected = usage.spend.get(lock.campaign_id, 0) + (
@@ -563,9 +581,48 @@ def _materialize(
 
 
 def _deployment(
-    context: ReconcileContext, deployment_digest: str
+    lock: CampaignLock,
+    context: ReconcileContext,
+    deployment_digest: str,
 ) -> DeploymentAdmission:
-    return context.deployments.get(deployment_digest, DeploymentAdmission())
+    locked = _run_admission(lock, deployment_digest)
+    observed = context.deployments.get(deployment_digest)
+    if observed is None:
+        return DeploymentAdmission(provider=locked.provider or "hf-inference-endpoints")
+    return observed.model_copy(
+        update={
+            "provider": observed.provider or locked.provider or "hf-inference-endpoints"
+        }
+    )
+
+
+def _admission_provider(admission: DeploymentAdmission) -> str:
+    if admission.provider is None:
+        raise ValueError("deployment admission has no provider")
+    return admission.provider
+
+
+def _run_admission(lock: CampaignLock, deployment_digest: str) -> CampaignRunLock:
+    matches = [run for run in lock.runs if run.deployment_digest == deployment_digest]
+    if not matches:
+        raise ValueError("unknown deployment admission target")
+    first = matches[0]
+    identity = (
+        first.provider,
+        first.max_concurrent_requests,
+        first.spend_cap_microusd,
+    )
+    if any(
+        (
+            run.provider,
+            run.max_concurrent_requests,
+            run.spend_cap_microusd,
+        )
+        != identity
+        for run in matches[1:]
+    ):
+        raise ValueError("deployment admission fields are inconsistent")
+    return first
 
 
 def _deployment_for_shards(lock: CampaignLock, shard_ids: list[str]) -> str:

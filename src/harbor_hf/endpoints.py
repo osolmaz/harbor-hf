@@ -15,7 +15,7 @@ from pydantic import (
     model_validator,
 )
 
-from harbor_hf.models import DeploymentProfile, ModelProfile
+from harbor_hf.models import DeploymentProfile, DeploymentTarget, ModelProfile
 
 DeploymentDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 EndpointName = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
@@ -250,7 +250,7 @@ class EndpointSettings(FrozenModel):
 
 
 def deployment_digest(
-    model: ModelProfile, deployment: DeploymentProfile
+    model: ModelProfile, deployment: DeploymentTarget
 ) -> DeploymentDigest:
     return _digest(
         {

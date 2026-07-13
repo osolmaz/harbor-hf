@@ -4,6 +4,7 @@ import json
 import shutil
 import threading
 from collections.abc import Sequence
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -12,6 +13,7 @@ import yaml
 
 from harbor_hf.campaigns import (
     CampaignLock,
+    ProviderWaveTarget,
     WaveLock,
     build_campaign_lock,
     build_campaign_plan,
@@ -21,7 +23,12 @@ from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import verify_checksums, write_checksums
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner
-from harbor_hf.reconciler import plan_reconciliation
+from harbor_hf.provider_models import ProviderLimits, ProviderTarget
+from harbor_hf.reconciler import (
+    DeploymentAdmission,
+    ReconcileContext,
+    plan_reconciliation,
+)
 from harbor_hf.wave_worker import WorkerError, run_wave_worker
 
 
@@ -106,10 +113,14 @@ class HarborStream:
         expected_calls: int,
         exit_code: int = 0,
         synchronize: bool = False,
+        expected_base_url: str = "https://endpoint.example/v1",
+        expected_model_name: str = "/repository",
     ) -> None:
         self.task_digests = task_digests
         self.barrier = threading.Barrier(expected_calls) if synchronize else None
         self.exit_code = exit_code
+        self.expected_base_url = expected_base_url
+        self.expected_model_name = expected_model_name
         self.commands: list[list[str]] = []
         self.active = 0
         self.max_active = 0
@@ -123,7 +134,7 @@ class HarborStream:
         environment: dict[str, str],
         timeout_seconds: int,
     ) -> int:
-        assert environment["OPENAI_BASE_URL"] == "https://endpoint.example/v1"
+        assert environment["OPENAI_BASE_URL"] == self.expected_base_url
         assert timeout_seconds > 0
         with self.lock:
             self.commands.append(command)
@@ -148,7 +159,7 @@ class HarborStream:
                             "version": "2026.7.2",
                             "model_info": {
                                 "provider": "openai",
-                                "name": "/repository",
+                                "name": self.expected_model_name,
                             },
                         },
                         "verifier_result": {"rewards": {"reward": 1.0}},
@@ -375,6 +386,90 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     assert json.loads(
         (output / campaign.artifact_prefix / "campaign.lock.json").read_text()
     ) == campaign.model_dump(mode="json")
+
+
+def test_provider_wave_runs_shards_without_endpoint_lifecycle(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, campaign, wave, manifest, campaign_path, wave_path = _provider_wave_inputs(
+        remote_spec,
+        tmp_path,
+        attempts=2,
+        concurrency=4,
+        provider_concurrency=2,
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    runner = EndpointRunner([])
+    routed_model = f"{spec.matrix.models[0].repo}:fastest"
+    harbor = HarborStream(
+        spec.benchmark.task_digests,
+        expected_calls=2,
+        synchronize=True,
+        expected_base_url="https://router.huggingface.co/v1",
+        expected_model_name=routed_model,
+    )
+
+    def reject_watchdog(lock: WaveLock, endpoint: EndpointRef, token: str) -> str:
+        del lock, endpoint, token
+        raise AssertionError("provider waves must not launch an endpoint watchdog")
+
+    output = tmp_path / "output"
+    destination = run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=runner,
+        stream_runner=harbor,
+        source_preparer=prepare_source,
+        watchdog_launcher=reject_watchdog,
+        identifier=IdentifierSequence(),
+    )
+
+    assert isinstance(wave.target, ProviderWaveTarget)
+    assert wave.max_concurrent_shards == 2
+    assert wave.spend_cap_microusd == 2_500_000
+    assert runner.commands == []
+    assert harbor.max_active == 2
+    assert all(
+        command[command.index("--model") + 1] == f"openai/{routed_model}"
+        for command in harbor.commands
+    )
+    assert sorted(path.name for path in destination.iterdir()) == [
+        "_SUCCESS",
+        "checksums.json",
+        "events.jsonl",
+        "provider-target.json",
+        "runtime-environment.json",
+        "wave-summary.json",
+        "wave.lock.json",
+    ]
+    runtime = json.loads((destination / "runtime-environment.json").read_text())
+    endpoint = runtime["provider"]["endpoint"]
+    assert endpoint["endpoint_name"]["status"] == "not_applicable"
+    assert endpoint["endpoint_status"]["status"] == "not_applicable"
+    assert endpoint["ready_replicas"]["status"] == "not_applicable"
+    for field in ("region", "hardware", "engine", "precision"):
+        assert endpoint[field]["status"] == "not_reported"
+    assert _event_payloads(destination / "events.jsonl") == [
+        {"event": "wave_started", "wave_id": wave.wave_id},
+        {
+            "event": "provider_target_validated",
+            "service": "hf-inference-providers",
+            "target_id": "hf-provider",
+        },
+        {"event": "wave_succeeded"},
+    ]
+    summary = json.loads((destination / "wave-summary.json").read_text())
+    assert summary["endpoint_cleanup_verified"] == {
+        "status": "not_applicable",
+        "value": None,
+        "detail": None,
+    }
+    assert not (destination / "endpoint.snapshot.json").exists()
+    assert not (destination / "endpoint.final.json").exists()
 
 
 def test_wave_failure_still_pauses_and_publishes_failed_execution(
@@ -959,6 +1054,65 @@ def _wave_inputs(
         payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
     )
     action = plan_reconciliation(campaign, [submitted])[1].actions[0]
+    wave = build_wave_lock(campaign, spec, action)
+    manifest = root / "manifest.yaml"
+    manifest.write_text(
+        yaml.safe_dump(spec.model_dump(mode="json", exclude_none=True)),
+        encoding="utf-8",
+    )
+    campaign_path = root / "campaign.lock.json"
+    campaign_path.write_text(campaign.model_dump_json(), encoding="utf-8")
+    wave_path = root / "wave.lock.json"
+    wave_path.write_text(wave.model_dump_json(), encoding="utf-8")
+    return spec, campaign, wave, manifest, campaign_path, wave_path
+
+
+def _provider_wave_inputs(
+    remote_spec: ExperimentSpec,
+    root: Path,
+    *,
+    attempts: int,
+    concurrency: int,
+    provider_concurrency: int,
+) -> tuple[ExperimentSpec, CampaignLock, WaveLock, Path, Path, Path]:
+    model = remote_spec.matrix.models[0]
+    target = ProviderTarget(
+        id="hf-provider",
+        model=model.repo,
+        limits=ProviderLimits(
+            max_concurrent_requests=provider_concurrency,
+            max_attempts=2,
+            max_spend_usd=Decimal("2.50"),
+        ),
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(update={"deployments": [target]}),
+            "execution": remote_spec.execution.model_copy(
+                update={
+                    "attempts": attempts,
+                    "concurrent_trials": concurrency,
+                    "max_trials_per_shard": 1,
+                }
+            ),
+        }
+    )
+    campaign = build_campaign_lock(build_campaign_plan(spec), "campaign-one")
+    submitted = new_event(
+        subject_type="campaign",
+        subject_id=campaign.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
+    )
+    context = ReconcileContext(
+        deployments={
+            campaign.runs[0].deployment_digest: DeploymentAdmission(
+                estimated_wave_cost_microusd=1_000_000
+            )
+        }
+    )
+    action = plan_reconciliation(campaign, [submitted], context=context)[1].actions[0]
     wave = build_wave_lock(campaign, spec, action)
     manifest = root / "manifest.yaml"
     manifest.write_text(

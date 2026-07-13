@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from harbor_hf.evidence import is_sensitive_key
+from harbor_hf.provider_models import ProviderTarget
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
@@ -107,6 +108,9 @@ class DeploymentProfile(StrictModel):
         return self
 
 
+DeploymentTarget = DeploymentProfile | ProviderTarget
+
+
 class AgentProfile(StrictModel):
     id: ProfileId
     name: str = Field(min_length=1)
@@ -156,7 +160,7 @@ class MatrixRule(StrictModel):
 
 class MatrixSpec(StrictModel):
     models: list[ModelProfile] = Field(min_length=1)
-    deployments: list[DeploymentProfile] = Field(min_length=1)
+    deployments: list[DeploymentTarget] = Field(min_length=1)
     agents: list[AgentProfile] = Field(min_length=1)
     include: list[MatrixRule] = Field(default_factory=list)
     exclude: list[MatrixRule] = Field(default_factory=list)
@@ -271,9 +275,14 @@ def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
         for model in spec.matrix.models
     ):
         raise ValueError("remote model revisions must be full Git commit IDs")
+    endpoint_deployments = [
+        deployment
+        for deployment in spec.matrix.deployments
+        if isinstance(deployment, DeploymentProfile)
+    ]
     if any(
         re.fullmatch(r".+@sha256:[0-9a-f]{64}", deployment.engine.image) is None
-        for deployment in spec.matrix.deployments
+        for deployment in endpoint_deployments
     ):
         raise ValueError("remote serving images must be pinned by sha256 digest")
     if any(not _is_immutable_agent_revision(agent) for agent in spec.matrix.agents):

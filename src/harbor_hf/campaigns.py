@@ -5,21 +5,23 @@ import json
 import re
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from fnmatch import fnmatch
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import (
     AgentProfile,
-    DeploymentProfile,
+    DeploymentTarget,
     EndpointRef,
     ExperimentSpec,
     ModelProfile,
     RemoteExecutionSpec,
 )
 from harbor_hf.planner import RunCell, experiment_digest, resolved_cells
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import RunLock, build_run_lock
 
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -55,6 +57,13 @@ class PlannedRun(FrozenModel):
     model: str
     deployment: str
     agent: str
+    provider: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    max_concurrent_requests: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    spend_cap_microusd: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
     shards: list[PlannedShard]
 
 
@@ -123,6 +132,13 @@ class CampaignRunLock(FrozenModel):
     model: str
     deployment: str
     agent: str
+    provider: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    max_concurrent_requests: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    spend_cap_microusd: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
     shards: list[CampaignShardLock]
 
 
@@ -173,6 +189,22 @@ class WaveRunLock(FrozenModel):
     shards: list[WaveShardLock]
 
 
+class EndpointWaveTarget(FrozenModel):
+    kind: Literal["inference-endpoint"] = "inference-endpoint"
+    endpoint: EndpointRef
+
+
+class ProviderWaveTarget(FrozenModel):
+    kind: Literal["inference-provider"] = "inference-provider"
+    provider: ProviderTarget
+
+
+WaveDeploymentTarget = Annotated[
+    EndpointWaveTarget | ProviderWaveTarget,
+    Field(discriminator="kind"),
+]
+
+
 class WaveLock(FrozenModel):
     schema_version: Literal["harbor-hf/wave-lock/v1alpha1"] = (
         "harbor-hf/wave-lock/v1alpha1"
@@ -185,15 +217,30 @@ class WaveLock(FrozenModel):
     manifest_digest: str
     plan_digest: str
     deployment_digest: str
-    endpoint: EndpointRef
+    target: WaveDeploymentTarget
     artifact_bucket: str
     artifact_prefix: str
     max_shards: int
     max_concurrent_shards: int
+    spend_cap_microusd: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
     duration_seconds: int
     remote: RemoteExecutionSpec
     shard_ids: list[str]
     runs: list[WaveRunLock]
+
+    @property
+    def endpoint(self) -> EndpointRef | None:
+        if isinstance(self.target, EndpointWaveTarget):
+            return self.target.endpoint
+        return None
+
+    @property
+    def provider_target(self) -> ProviderTarget | None:
+        if isinstance(self.target, ProviderWaveTarget):
+            return self.target.provider
+        return None
 
     @model_validator(mode="after")
     def bounds_match_contents(self) -> WaveLock:
@@ -295,7 +342,7 @@ def _plan_run(
     trials: list[PlannedTrial],
     profiles: tuple[
         dict[str, ModelProfile],
-        dict[str, DeploymentProfile],
+        dict[str, DeploymentTarget],
         dict[str, AgentProfile],
     ],
 ) -> PlannedRun:
@@ -324,12 +371,18 @@ def _plan_run(
         for offset in range(0, len(trials), shard_size)
         if (chunk := trials[offset : offset + shard_size])
     ]
+    provider, max_concurrent_requests, spend_cap_microusd = _target_admission(
+        deployments[cell.deployment]
+    )
     return PlannedRun(
         cell_digest=cell_digest,
         deployment_digest=resolved_deployment_digest,
         model=cell.model,
         deployment=cell.deployment,
         agent=cell.agent,
+        provider=provider,
+        max_concurrent_requests=max_concurrent_requests,
+        spend_cap_microusd=spend_cap_microusd,
         shards=shards,
     )
 
@@ -387,6 +440,9 @@ def build_campaign_lock(
                 model=planned_run.model,
                 deployment=planned_run.deployment,
                 agent=planned_run.agent,
+                provider=planned_run.provider,
+                max_concurrent_requests=planned_run.max_concurrent_requests,
+                spend_cap_microusd=planned_run.spend_cap_microusd,
                 shards=shards,
             )
         )
@@ -420,35 +476,21 @@ def build_wave_lock(
 
     selected = _selected_wave_shards(campaign, action)
     run_locks: list[WaveRunLock] = []
-    endpoint: EndpointRef | None = None
+    target: EndpointWaveTarget | ProviderWaveTarget | None = None
     for campaign_run, shards in selected:
-        deployment_profile = next(
-            profile
-            for profile in spec.matrix.deployments
-            if profile.id == campaign_run.deployment
-        )
-        if deployment_profile.endpoint is None:
-            raise ValueError(
-                "deployment wave requires a pre-existing endpoint binding; "
-                "endpoint provisioning is outside this slice"
-            )
         configuration = build_run_lock(
             spec,
             model_id=campaign_run.model,
             deployment_id=campaign_run.deployment,
             agent_id=campaign_run.agent,
             run_id=campaign_run.run_id,
+            allow_provider=True,
             clock=lambda: campaign.created_at,
         )
-        observed_endpoint = configuration.deployment.endpoint
-        if observed_endpoint is None:
-            raise ValueError(
-                "deployment wave requires a pre-existing endpoint binding; "
-                "endpoint provisioning is outside this slice"
-            )
-        if endpoint is not None and observed_endpoint != endpoint:
-            raise ValueError("compatible wave shards must use one exact endpoint")
-        endpoint = observed_endpoint
+        observed_target = _wave_target(configuration.deployment)
+        if target is not None and observed_target != target:
+            raise ValueError("compatible wave shards must use one exact target")
+        target = observed_target
         run_locks.append(
             WaveRunLock(
                 artifact_prefix=(
@@ -468,8 +510,11 @@ def build_wave_lock(
                 ],
             )
         )
-    if endpoint is None or spec.remote is None:
-        raise ValueError("deployment wave requires remote endpoint execution")
+    if target is None or spec.remote is None:
+        raise ValueError("deployment wave requires remote execution")
+    provider_target = (
+        target.provider if isinstance(target, ProviderWaveTarget) else None
+    )
     return WaveLock(
         wave_id=deterministic_wave_id(action.action_key),
         action_id=action.action_id,
@@ -479,14 +524,26 @@ def build_wave_lock(
         manifest_digest=campaign.manifest_digest,
         plan_digest=campaign.plan_digest,
         deployment_digest=action.deployment_digest,
-        endpoint=endpoint,
+        target=target,
         artifact_bucket=spec.artifacts.bucket,
         artifact_prefix=(
             f"{campaign.artifact_prefix}/waves/"
             f"{deterministic_wave_id(action.action_key)}"
         ),
         max_shards=campaign.max_shards_per_wave,
-        max_concurrent_shards=spec.execution.concurrent_trials,
+        max_concurrent_shards=min(
+            spec.execution.concurrent_trials,
+            (
+                provider_target.limits.max_concurrent_requests
+                if provider_target is not None
+                else spec.execution.concurrent_trials
+            ),
+        ),
+        spend_cap_microusd=(
+            _usd_to_microusd(provider_target.limits.max_spend_usd)
+            if provider_target is not None
+            else None
+        ),
         duration_seconds=spec.execution.timeout_seconds,
         remote=spec.remote,
         shard_ids=action.shard_ids,
@@ -556,6 +613,35 @@ def campaign_json_schemas() -> dict[str, dict[str, object]]:
         "campaign_lock": CampaignLock.model_json_schema(),
         "wave_lock": WaveLock.model_json_schema(),
     }
+
+
+def _target_admission(
+    target: DeploymentTarget,
+) -> tuple[str | None, int | None, int | None]:
+    if isinstance(target, ProviderTarget):
+        return (
+            target.service,
+            target.limits.max_concurrent_requests,
+            _usd_to_microusd(target.limits.max_spend_usd),
+        )
+    return None, None, None
+
+
+def _wave_target(target: DeploymentTarget) -> EndpointWaveTarget | ProviderWaveTarget:
+    if isinstance(target, ProviderTarget):
+        return ProviderWaveTarget(provider=target)
+    if target.endpoint is None:
+        raise ValueError(
+            "deployment wave requires a pre-existing endpoint binding; "
+            "endpoint provisioning is outside this slice"
+        )
+    return EndpointWaveTarget(endpoint=target.endpoint)
+
+
+def _usd_to_microusd(value: Decimal | None) -> int | None:
+    if value is None:
+        return None
+    return int(value * 1_000_000)
 
 
 def _short_id(prefix: str, value: object) -> str:

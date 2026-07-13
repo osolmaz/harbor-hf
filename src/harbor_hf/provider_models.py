@@ -6,7 +6,8 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from harbor_hf.evidence import is_sensitive_key
-from harbor_hf.models import ProfileId
+
+ProviderProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 
 EvidenceStatus = Literal[
     "observed",
@@ -76,7 +77,7 @@ class ProviderLimits(FrozenModel):
 
 
 class ProviderTarget(FrozenModel):
-    id: ProfileId
+    id: ProviderProfileId
     kind: Literal["inference-provider"] = "inference-provider"
     service: Literal["hf-inference-providers"] = "hf-inference-providers"
     model: str = Field(min_length=1, pattern=r"^[^\s:]+/[^\s:]+$")
