@@ -44,6 +44,7 @@ from harbor_hf.control import (
     CampaignSubmittedPayload,
     CancellationPayload,
     LifecyclePayload,
+    WaveLifecyclePayload,
     new_event,
     project_campaign,
 )
@@ -939,6 +940,132 @@ def test_provider_reserved_submission_is_superseded_after_cancellation(
         "campaign cancellation superseded the unsubmitted wave action"
     )
     assert jobs.submissions == []
+
+
+def _cancelled_submitted_wave_events(
+    lock: CampaignLock,
+    action: ReconcileAction,
+) -> list[CampaignEvent]:
+    succeeded = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.succeeded",
+        producer="reconciler",
+        payload=ActionOutcomePayload(
+            action_id=action.action_id,
+            remote_id="0123456789abcdef01234567",
+        ),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "4" * 32,
+    )
+    cancellation = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW + timedelta(seconds=4),
+        identifier=lambda: "5" * 32,
+    )
+    return [
+        _reservation(lock, action, 2),
+        succeeded,
+        cancellation,
+        _terminal_event(lock, "trial.cancelled", sequence=6),
+    ]
+
+
+def test_provider_wave_cancellation_cleanup_closes_wave_without_endpoints(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec, target = _provider_spec(remote_spec)
+    lock, request, submitted = _campaign(spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    assert action.wave_id is not None
+    store = FakeStore(
+        lock,
+        request,
+        [submitted, *_cancelled_submitted_wave_events(lock, action)],
+    )
+    store.reservations[action.action_id] = action.model_dump(mode="json")
+    endpoints = FakeEndpoints()
+    jobs = FakeJobs()
+    jobs.adopt_on_find = True
+
+    result = _reconciler(store, endpoints, jobs, identifier_start=16).apply_campaign(
+        lock.campaign_id
+    )
+
+    assert [(applied.kind, applied.status) for applied in result.applied] == [
+        ("cancel-wave", "succeeded"),
+        ("cleanup-wave", "succeeded"),
+    ]
+    assert result.applied[1].remote_id == action.wave_id
+    assert jobs.cancellations == [("abcdef012345abcdef012345", "osolmaz")]
+    assert endpoints.inspect_calls == []
+    assert endpoints.create_calls == []
+    assert endpoints.pause_calls == []
+    closed = [event for event in store.events if event.kind == "wave.closed"]
+    assert [event.subject_id for event in closed] == [action.wave_id]
+    assert closed[0].producer == "reconciler"
+    payload = closed[0].payload
+    assert isinstance(payload, WaveLifecyclePayload)
+    assert payload.provider == target.service
+    assert payload.deployment_digest == action.deployment_digest
+    assert payload.shard_ids == action.shard_ids
+    projection, plan = plan_reconciliation(
+        lock, store.events, now=NOW + timedelta(seconds=9)
+    )
+    assert projection.waves[action.wave_id].status == "closed"
+    assert plan.terminal_decision is not None
+    assert plan.terminal_decision.status == "cancelled"
+    assert [planned.kind for planned in plan.actions] == ["publish-summary"]
+
+
+def test_cancelled_unobserved_endpoint_wave_is_durably_closed(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    assert action.wave_id is not None
+    store = FakeStore(
+        lock,
+        request,
+        [submitted, *_cancelled_submitted_wave_events(lock, action)],
+    )
+    store.reservations[action.action_id] = action.model_dump(mode="json")
+    endpoints = FakeEndpoints()
+    endpoints.present = True
+    endpoints.active = True
+    jobs = FakeJobs()
+    jobs.adopt_on_find = True
+
+    result = _reconciler(store, endpoints, jobs, identifier_start=16).apply_campaign(
+        lock.campaign_id
+    )
+
+    assert [(applied.kind, applied.status) for applied in result.applied] == [
+        ("cancel-wave", "succeeded"),
+        ("cleanup-wave", "succeeded"),
+    ]
+    assert jobs.cancellations == [("abcdef012345abcdef012345", "osolmaz")]
+    assert len(endpoints.pause_calls) == 1
+    assert endpoints.active is False
+    closed = [event for event in store.events if event.kind == "wave.closed"]
+    assert [event.subject_id for event in closed] == [action.wave_id]
+    assert closed[0].producer == "reconciler"
+    payload = closed[0].payload
+    assert isinstance(payload, WaveLifecyclePayload)
+    assert payload.provider == "hf-inference-endpoints"
+    assert payload.deployment_digest == action.deployment_digest
+    assert payload.shard_ids == action.shard_ids
+    projection, plan = plan_reconciliation(
+        lock, store.events, now=NOW + timedelta(seconds=9)
+    )
+    assert projection.waves[action.wave_id].status == "closed"
+    assert plan.terminal_decision is not None
+    assert plan.terminal_decision.status == "cancelled"
+    assert [planned.kind for planned in plan.actions] == ["publish-summary"]
 
 
 def test_completed_campaign_finalizes_publishes_and_records_terminal_in_order(

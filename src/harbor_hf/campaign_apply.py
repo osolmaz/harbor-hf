@@ -39,6 +39,7 @@ from harbor_hf.control import (
     EventKind,
     IdentifierFactory,
     TerminalPayload,
+    WaveLifecyclePayload,
     new_event,
 )
 from harbor_hf.endpoints import (
@@ -493,7 +494,7 @@ class CampaignReconciler:
         if action.kind == "cancel-wave":
             return self._cancel_wave(lock, spec, action)
         if action.kind == "cleanup-wave":
-            return self._cleanup_wave(lock, spec, action)
+            return self._cleanup_wave(lock, spec, action, projection=projection)
         if action.kind == "publish-summary":
             return self._publish_summary(lock, spec, projection, terminal_decision)
         raise ActionExecutionError(
@@ -627,12 +628,69 @@ class CampaignReconciler:
         lock: CampaignLock,
         spec: ExperimentSpec,
         action: ReconcileAction,
+        *,
+        projection: RecoveryProjection,
     ) -> str:
-        desired = _desired_endpoint(lock, spec, action)
-        snapshot = self.endpoints.inspect(desired)
-        if snapshot is not None:
-            self.endpoints.pause_and_verify(desired)
-        return desired.identity.name
+        target = _deployment_target(lock, spec, action.deployment_digest)
+        if isinstance(target, ProviderTarget):
+            remote_id = action.wave_id or f"wave-{action.action_key}"
+        else:
+            desired = _desired_endpoint(lock, spec, action)
+            if self.endpoints.inspect(desired) is not None:
+                self.endpoints.pause_and_verify(desired)
+            remote_id = desired.identity.name
+        self._record_wave_closed(lock, action, projection)
+        return remote_id
+
+    def _record_wave_closed(
+        self,
+        lock: CampaignLock,
+        action: ReconcileAction,
+        projection: RecoveryProjection,
+    ) -> None:
+        """Durably close the wave: a cancelled Job may never write Bucket markers."""
+        wave_id = action.wave_id or f"wave-{action.action_key}"
+        observed = projection.waves.get(wave_id)
+        if observed is not None and observed.status == "closed":
+            return
+        if observed is not None:
+            payload = WaveLifecyclePayload(
+                deployment_digest=observed.deployment_digest,
+                provider=observed.provider,
+                shard_ids=observed.shard_ids,
+                estimated_cost_microusd=observed.estimated_cost_microusd,
+            )
+        else:
+            payload = WaveLifecyclePayload(
+                deployment_digest=action.deployment_digest,
+                provider=_wave_provider(lock, action.deployment_digest),
+                shard_ids=action.shard_ids,
+                estimated_cost_microusd=0,
+            )
+        kinds: tuple[Literal["wave.cleaning", "wave.closed"], ...] = ("wave.closed",)
+        if observed is not None and observed.status not in {
+            "draining",
+            "cleaning",
+            "cleanup_failed",
+        }:
+            kinds = ("wave.cleaning", "wave.closed")
+        for kind in kinds:
+            observed_at = self._next_observed()
+            identity = hashlib.sha256(
+                f"{lock.campaign_id}:{wave_id}:{kind}:reconciler".encode()
+            ).hexdigest()[:32]
+            self.store.ensure_event(
+                lock.campaign_id,
+                new_event(
+                    subject_type="wave",
+                    subject_id=wave_id,
+                    kind=kind,
+                    producer="reconciler",
+                    payload=payload,
+                    clock=lambda observed_at=observed_at: observed_at,
+                    identifier=lambda identity=identity: identity,
+                ),
+            )
 
     def _find_wave(
         self,
@@ -932,6 +990,18 @@ def _profiles_for_deployment(
             "endpoint action targets an inference provider deployment"
         )
     return model, deployment
+
+
+def _wave_provider(lock: CampaignLock, deployment_digest: str) -> str:
+    provider = next(
+        (
+            run.provider
+            for run in lock.runs
+            if run.deployment_digest == deployment_digest
+        ),
+        None,
+    )
+    return provider or "hf-inference-endpoints"
 
 
 def _deployment_target(

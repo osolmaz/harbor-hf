@@ -705,7 +705,7 @@ def test_cleanup_wave_with_unresolvable_deployment_digest_fails(
     )
     assert outcome.status == "failed"
     assert outcome.message == (
-        "action deployment does not resolve to one model and deployment"
+        "action deployment does not resolve to one deployment target"
     )
     assert endpoints.inspect_calls == []
 
