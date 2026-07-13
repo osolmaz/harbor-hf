@@ -27,8 +27,12 @@ matrix:
         name: vllm
         image: ghcr.io/example/vllm@sha256:replace-with-image-digest
         arguments:
-          - --max-model-len=65536
-          - --kv-cache-dtype=fp8
+          - --model
+          - /repository
+          - --max-model-len
+          - "65536"
+          - --kv-cache-dtype
+          - fp8
         environment:
           VLLM_USE_FLASHINFER_MOE_FP4: "1"
         secret_names:
@@ -44,8 +48,12 @@ matrix:
         name: vllm
         image: ghcr.io/example/vllm@sha256:replace-with-image-digest
         arguments:
-          - --max-model-len=65536
-          - --kv-cache-dtype=fp8
+          - --model
+          - /repository
+          - --max-model-len
+          - "65536"
+          - --kv-cache-dtype
+          - fp8
         secret_names:
           - HF_TOKEN
   agents:

@@ -44,6 +44,7 @@ class RunLock(BaseModel):
     attempts: int
     concurrent_trials: int
     timeout_seconds: int
+    artifact_bucket: str
     artifact_prefix: str
     remote: RemoteExecutionSpec
 
@@ -116,6 +117,7 @@ def build_run_lock(
         attempts=spec.execution.attempts,
         concurrent_trials=spec.execution.concurrent_trials,
         timeout_seconds=spec.execution.timeout_seconds,
+        artifact_bucket=spec.artifacts.bucket,
         artifact_prefix=f"runs/{spec.metadata.name}/{resolved_id}",
         remote=spec.remote,
     )

@@ -10,7 +10,8 @@ from harbor_hf.submission import (
     build_submit_command,
     endpoint_lease_label,
     endpoint_lease_label_for,
-    ensure_private_lease_bucket,
+    ensure_private_coordination_repository,
+    ensure_private_job_input_bucket,
     github_archive,
     github_repository,
     locked_source_command,
@@ -35,11 +36,15 @@ class FakeBucketApi:
         *,
         private: bool = True,
         privacy: dict[str, bool] | None = None,
+        repository_private: bool = True,
     ) -> None:
         self.private = private
         self.privacy = privacy or {}
+        self.repository_private = repository_private
         self.created: list[tuple[str, dict[str, object]]] = []
         self.inspected: list[str] = []
+        self.created_repositories: list[tuple[str, dict[str, object]]] = []
+        self.inspected_repositories: list[tuple[str, dict[str, object]]] = []
 
     def create_bucket(self, bucket_id: str, **kwargs: object) -> object:
         self.created.append((bucket_id, kwargs))
@@ -49,6 +54,14 @@ class FakeBucketApi:
         self.inspected.append(bucket_id)
         private = self.privacy.get(bucket_id, self.private)
         return type("BucketInfo", (), {"private": private})()
+
+    def create_repo(self, repo_id: str, **kwargs: object) -> object:
+        self.created_repositories.append((repo_id, kwargs))
+        return object()
+
+    def repo_info(self, repo_id: str, **kwargs: object) -> object:
+        self.inspected_repositories.append((repo_id, kwargs))
+        return type("RepoInfo", (), {"private": self.repository_private})()
 
 
 def test_build_submit_command_contains_only_secret_name(
@@ -60,7 +73,7 @@ def test_build_submit_command_contains_only_secret_name(
         lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
     )
 
-    assert command[:24] == [
+    assert command[:22] == [
         "hf",
         "jobs",
         "run",
@@ -81,16 +94,14 @@ def test_build_submit_command_contains_only_secret_name(
         f"{tmp_path}:/input:ro",
         "--volume",
         "hf://buckets/osolmaz/benchmark-runs:/output:rw",
-        "--volume",
-        "hf://buckets/osolmaz/harbor-hf-leases:/harbor-hf-leases:rw",
         "--",
         "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
     ]
-    assert command[24:27] == ["bash", "-lc", command[26]]
-    assert "git clone --filter=blob:none --no-checkout" in command[26]
-    assert "uv run --project" in command[26]
-    assert "--locked" in command[26]
-    assert command[27:] == [
+    assert command[22:25] == ["bash", "-lc", command[24]]
+    assert "git clone --filter=blob:none --no-checkout" in command[24]
+    assert "uv run --project" in command[24]
+    assert "--locked" in command[24]
+    assert command[25:] == [
         "locked-source",
         "harbor-hf",
         "worker",
@@ -148,11 +159,17 @@ def test_submit_parses_job_id(remote_spec: ExperimentSpec, tmp_path: Path) -> No
     assert result.job_id == "0123456789abcdef01234567"
     assert runner.command is not None
     assert bucket_api.created == [
-        ("osolmaz/harbor-hf-leases", {"private": True, "exist_ok": True})
+        ("osolmaz/jobs-artifacts", {"private": True, "exist_ok": True})
     ]
     assert bucket_api.inspected == [
-        "osolmaz/harbor-hf-leases",
+        "osolmaz/jobs-artifacts",
         "osolmaz/benchmark-runs",
+    ]
+    assert bucket_api.created_repositories == [
+        (
+            "osolmaz/harbor-hf-coordination",
+            {"repo_type": "dataset", "private": True, "exist_ok": True},
+        )
     ]
 
 
@@ -176,7 +193,7 @@ def test_submit_builds_default_bucket_api(
     assert runner.command is not None
     assert f"{tmp_path}:/input:ro" in runner.command
     assert api.inspected == [
-        "osolmaz/harbor-hf-leases",
+        "osolmaz/jobs-artifacts",
         "osolmaz/benchmark-runs",
     ]
 
@@ -198,26 +215,40 @@ def test_submit_rejects_missing_job_id(
         )
 
 
-def test_submit_ensures_private_shared_lease_bucket() -> None:
+def test_submit_ensures_private_coordination_repository() -> None:
     api = FakeBucketApi()
 
-    assert ensure_private_lease_bucket("osolmaz", api=api) == (
-        "osolmaz/harbor-hf-leases"
+    assert ensure_private_coordination_repository("osolmaz", api=api) == (
+        "osolmaz/harbor-hf-coordination"
     )
-    assert api.created == [
-        ("osolmaz/harbor-hf-leases", {"private": True, "exist_ok": True})
+    assert api.created_repositories == [
+        (
+            "osolmaz/harbor-hf-coordination",
+            {"repo_type": "dataset", "private": True, "exist_ok": True},
+        )
     ]
 
 
-def test_submit_builds_default_authenticated_bucket_api(
+def test_submit_builds_default_authenticated_coordination_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     api = FakeBucketApi()
     monkeypatch.setattr("huggingface_hub.HfApi", lambda: api)
 
-    assert ensure_private_lease_bucket("osolmaz") == "osolmaz/harbor-hf-leases"
+    assert ensure_private_coordination_repository("osolmaz") == (
+        "osolmaz/harbor-hf-coordination"
+    )
+    assert len(api.created_repositories) == 1
+
+
+def test_submit_ensures_private_job_input_bucket() -> None:
+    api = FakeBucketApi()
+
+    assert ensure_private_job_input_bucket("osolmaz", api=api) == (
+        "osolmaz/jobs-artifacts"
+    )
     assert api.created == [
-        ("osolmaz/harbor-hf-leases", {"private": True, "exist_ok": True})
+        ("osolmaz/jobs-artifacts", {"private": True, "exist_ok": True})
     ]
 
 
@@ -243,15 +274,21 @@ def test_require_private_artifact_bucket_returns_normalized_id() -> None:
     assert api.inspected == ["osolmaz/benchmark-runs"]
 
 
-def test_submit_rejects_public_lease_bucket() -> None:
+def test_submit_rejects_public_coordination_repository() -> None:
     with pytest.raises(ValueError, match="must be private"):
-        ensure_private_lease_bucket("osolmaz", api=FakeBucketApi(private=False))
+        ensure_private_coordination_repository(
+            "osolmaz", api=FakeBucketApi(repository_private=False)
+        )
+
+
+def test_submit_rejects_public_job_input_bucket() -> None:
+    with pytest.raises(ValueError, match="must be private"):
+        ensure_private_job_input_bucket("osolmaz", api=FakeBucketApi(private=False))
 
 
 def test_submit_rejects_public_artifact_bucket() -> None:
     api = FakeBucketApi(
         privacy={
-            "osolmaz/harbor-hf-leases": True,
             "osolmaz/benchmark-runs": False,
         }
     )

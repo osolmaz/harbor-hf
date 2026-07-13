@@ -139,7 +139,17 @@ def test_agent_parameter_keys_are_unambiguous_for_harbor(key: str) -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["HF_TOKEN", "api-key", "PASSWORD", "OPENAI_API_KEY", "AWS_ACCESS_KEY"],
+    [
+        "HF_TOKEN",
+        "api-key",
+        "PASSWORD",
+        "OPENAI_API_KEY",
+        "AWS_ACCESS_KEY",
+        "SECRET_KEY",
+        "FOO_SECRET_KEY",
+        "APIKEY",
+        "OPENAI_APIKEY",
+    ],
 )
 def test_engine_environment_rejects_inline_secret_values(key: str) -> None:
     with pytest.raises(ValueError, match="must not contain inline secret values"):

@@ -8,6 +8,7 @@ from typing import Protocol, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from harbor_hf.coordination import coordination_repository
 from harbor_hf.models import SourcePin
 from harbor_hf.runs import RunLock
 
@@ -16,8 +17,7 @@ _GITHUB_REPOSITORY = re.compile(
     r"^(?:https://github\.com/)?"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
-_LEASE_BUCKET_NAME = "harbor-hf-leases"
-_LEASE_MOUNT_PATH = "/harbor-hf-leases"
+_JOB_INPUT_BUCKET_NAME = "jobs-artifacts"
 
 
 class TextRunner(Protocol):
@@ -28,6 +28,10 @@ class BucketApi(Protocol):
     def create_bucket(self, bucket_id: str, **kwargs: object) -> object: ...
 
     def bucket_info(self, bucket_id: str) -> object: ...
+
+    def create_repo(self, repo_id: str, **kwargs: object) -> object: ...
+
+    def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
 
 
 class Submission(BaseModel):
@@ -74,19 +78,31 @@ def bucket_id(bucket: str) -> str:
     return bucket.removeprefix("hf://buckets/").removeprefix("buckets/")
 
 
-def endpoint_lease_bucket(namespace: str) -> str:
-    return f"{namespace}/{_LEASE_BUCKET_NAME}"
-
-
-def ensure_private_lease_bucket(namespace: str, *, api: BucketApi | None = None) -> str:
+def ensure_private_coordination_repository(
+    namespace: str, *, api: BucketApi | None = None
+) -> str:
     if api is None:
         from huggingface_hub import HfApi
 
         api = cast(BucketApi, HfApi())
-    bucket = endpoint_lease_bucket(namespace)
+    repository = coordination_repository(namespace)
+    api.create_repo(
+        repository,
+        repo_type="dataset",
+        private=True,
+        exist_ok=True,
+    )
+    info = api.repo_info(repository, repo_type="dataset")
+    if getattr(info, "private", None) is not True:
+        raise ValueError(f"coordination repository {repository} must be private")
+    return repository
+
+
+def ensure_private_job_input_bucket(namespace: str, *, api: BucketApi) -> str:
+    bucket = f"{namespace}/{_JOB_INPUT_BUCKET_NAME}"
     api.create_bucket(bucket, private=True, exist_ok=True)
     if getattr(api.bucket_info(bucket), "private", None) is not True:
-        raise ValueError(f"endpoint lease bucket {bucket} must be private")
+        raise ValueError(f"Job input bucket {bucket} must be private")
     return bucket
 
 
@@ -137,8 +153,6 @@ def build_submit_command(
         f"{input_dir}:/input:ro",
         "--volume",
         f"{bucket_uri(bucket)}:/output:rw",
-        "--volume",
-        f"{bucket_uri(endpoint_lease_bucket(job.namespace))}:{_LEASE_MOUNT_PATH}:rw",
         "--",
         job.image,
         *locked_source_command(
@@ -165,7 +179,8 @@ def submit(
         from huggingface_hub import HfApi
 
         bucket_api = cast(BucketApi, HfApi())
-    ensure_private_lease_bucket(lock.remote.job.namespace, api=bucket_api)
+    ensure_private_coordination_repository(lock.remote.job.namespace, api=bucket_api)
+    ensure_private_job_input_bucket(lock.remote.job.namespace, api=bucket_api)
     require_private_bucket(bucket, api=bucket_api)
     command = build_submit_command(lock, input_dir=input_dir, bucket=bucket)
     output = runner.run_text(command)

@@ -65,18 +65,19 @@ not execute benchmark tasks. Provider-backed runs will skip endpoint
 provisioning but retain request, quota, retry, and accounting state.
 
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
-derived from the endpoint namespace and name. They also mount one private,
-namespace-level `harbor-hf-leases` Bucket. A watchdog atomically creates the
-endpoint's lease directory before publishing its readiness handshake. Because
-directory creation is exclusive, two snapshots of the Jobs API cannot elect
-two owners. A competing watchdog exits before its controller changes endpoint
-state.
+derived from the endpoint namespace and name. They coordinate through one
+private, namespace-level `harbor-hf-coordination` Dataset repository. A
+watchdog adds the endpoint's lease file with the repository head as the
+expected parent commit before publishing its readiness handshake. Concurrent
+commits cannot both use the same parent; a loser rereads the new head, observes
+the lease, and exits before its controller changes endpoint state.
 
-The lease records both controller and watchdog Job IDs. It remains present
+The lease file records both controller and watchdog Job IDs. It remains present
 while the watchdog observes the controller and is removed only after the
 endpoint reports `paused` with zero ready replicas. Ownership is revalidated
-before removal. If cleanup cannot be verified, the lease remains fail-closed
-and blocks another run from inheriting an endpoint whose state is unknown.
+at the latest repository head before a parent-checked removal commit. If
+cleanup cannot be verified, the lease remains fail-closed and blocks another
+run from inheriting an endpoint whose state is unknown.
 
 ### Harbor Adapter
 
@@ -91,11 +92,12 @@ resolved configuration, endpoint snapshots, Harbor output, trajectories,
 sessions, verifier records, logs, and checksums are written under an immutable
 run prefix. Sanitized run evidence is published after validation and resource
 cleanup, and `_SUCCESS` is written only for a complete run.
-The worker first reserves the immutable run prefix with exclusive directory
-creation. Duplicate run IDs therefore fail before source preparation, endpoint
-work, or failure publication. Terminal markers are delayed only at the run
-root; marker-shaped files within Harbor task artifacts are preserved.
-Submission verifies the artifact Bucket's privacy before it launches a Job.
+The worker first adds a permanent run reservation to the private coordination
+repository with the same parent-commit compare-and-swap protocol. Duplicate run
+IDs therefore fail before source preparation, endpoint work, or failure
+publication. Terminal markers are delayed only at the run root; marker-shaped
+files within Harbor task artifacts are preserved. Submission verifies the
+artifact Bucket and implicit Job input Bucket are private before launch.
 
 Raw Harbor output is staged on the controller Job's local filesystem, outside
 the bucket mount. After endpoint cleanup, the controller redacts secret values,

@@ -5,30 +5,28 @@ import os
 import shutil
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from harbor_hf.coordination import ClaimConflict, run_claim_path
 from harbor_hf.models import ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
-    _acquire_endpoint_lease,
-    _argument_options,
     _expected_agent_version,
     _expected_task_counts,
     _expected_trial_count,
     _finalize_evidence,
     _job_stage,
     _mark_watchdog_ready,
+    _prepare_evidence_destination,
     _publish_evidence,
-    _release_endpoint_lease,
-    _reserve_evidence,
     _validate_endpoint_compute,
     _validate_task_counts,
     _validate_trial_count,
@@ -48,6 +46,34 @@ from harbor_hf.worker import (
     validate_run_lock,
     wait_watchdog_ready,
 )
+
+
+class FakeClaimStore:
+    def __init__(self) -> None:
+        self.claims: dict[str, dict[str, str]] = {}
+        self.acquired: list[tuple[str, dict[str, str]]] = []
+        self.released: list[tuple[str, dict[str, str]]] = []
+
+    def acquire(self, path: str, owner: Mapping[str, str]) -> None:
+        if path in self.claims:
+            raise ClaimConflict(path)
+        normalized = dict(owner)
+        self.claims[path] = normalized
+        self.acquired.append((path, normalized))
+
+    def release(self, path: str, owner: Mapping[str, str]) -> None:
+        normalized = dict(owner)
+        if self.claims.get(path) != normalized:
+            raise RuntimeError("claim ownership cannot be verified")
+        del self.claims[path]
+        self.released.append((path, normalized))
+
+
+@pytest.fixture(autouse=True)
+def default_claim_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "harbor_hf.worker.HubClaimStore", lambda *_args, **_kwargs: FakeClaimStore()
+    )
 
 
 def snapshot(state: str, ready: int) -> dict[str, object]:
@@ -354,24 +380,42 @@ def test_endpoint_compute_requires_locked_deployment(
         validate_endpoint_model(build_run_lock(remote_spec), endpoint_snapshot)
 
 
-def test_argument_options_parse_effective_cli_values() -> None:
-    assert _argument_options(
-        [
-            "positional",
-            "--alpha=a=b",
-            "--flag",
-            "--value",
-            "one",
-            "ignored",
-            "--value=two",
-            "--final",
-        ]
-    ) == {
-        "--alpha": "a=b",
-        "--flag": True,
-        "--value": "two",
-        "--final": True,
-    }
+def test_endpoint_arguments_require_complete_ordered_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0]
+    engine = deployment.engine.model_copy(update={"arguments": ["-c", "65536"]})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "deployments": [deployment.model_copy(update={"engine": engine})]
+                }
+            )
+        }
+    )
+    endpoint_snapshot = snapshot("running", 1)
+    model = cast(dict[str, object], endpoint_snapshot["model"])
+    model["args"] = ["-c", "32768"]
+
+    with pytest.raises(
+        WorkerError, match="^endpoint arguments do not match the locked deployment$"
+    ):
+        validate_endpoint_model(build_run_lock(spec), endpoint_snapshot)
+
+
+def test_endpoint_environment_rejects_unlocked_extra_values(
+    remote_spec: ExperimentSpec,
+) -> None:
+    endpoint_snapshot = snapshot("running", 1)
+    model = cast(dict[str, object], endpoint_snapshot["model"])
+    environment = cast(dict[str, object], model["env"])
+    environment["UNLOCKED_SETTING"] = "1"
+
+    with pytest.raises(
+        WorkerError, match="^endpoint environment does not match the locked deployment$"
+    ):
+        validate_endpoint_model(build_run_lock(remote_spec), endpoint_snapshot)
 
 
 def test_endpoint_compute_validation_covers_complete_identity(
@@ -661,16 +705,7 @@ def test_launch_watchdog_uses_independent_hf_job(
             "harbor-hf-watchdog": "watchdog-run",
             "harbor-hf-endpoint": "d026b68a5286b3887f1e9ea13d304aed",
         },
-        "volumes": calls[0]["volumes"],
         "namespace": "osolmaz",
-    }
-    volumes = cast(list[Any], calls[0]["volumes"])
-    assert len(volumes) == 1
-    assert volumes[0].to_dict() == {
-        "type": "bucket",
-        "source": "osolmaz/harbor-hf-leases",
-        "mountPath": "/harbor-hf-leases",
-        "readOnly": False,
     }
     command = cast(list[str], calls[0]["command"])
     assert command[3:] == [
@@ -691,8 +726,6 @@ def test_launch_watchdog_uses_independent_hf_job(
         "HF_TOKEN",
         "--timeout-seconds",
         "10800",
-        "--lease-root",
-        "/harbor-hf-leases",
     ]
 
 
@@ -846,7 +879,7 @@ def test_wait_watchdog_ready_reports_timeout() -> None:
     "stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"]
 )
 def test_endpoint_watchdog_pauses_after_controller_finishes(
-    monkeypatch: pytest.MonkeyPatch, stage: str, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
     inspections: list[dict[str, object]] = []
 
@@ -861,6 +894,7 @@ def test_endpoint_watchdog_pauses_after_controller_finishes(
     monkeypatch.setenv("HF_TOKEN", "secret")
     monkeypatch.setenv("JOB_ID", "watchdog-job")
     api = FakeApi()
+    claims = FakeClaimStore()
     result = run_endpoint_watchdog(
         controller_job_id="controller",
         controller_namespace="org",
@@ -869,13 +903,15 @@ def test_endpoint_watchdog_pauses_after_controller_finishes(
         run_id="run-1",
         token_secret_name="HF_TOKEN",
         timeout_seconds=60,
-        lease_root=tmp_path / "leases",
         api=api,
+        claim_store=claims,
         runner=runner,
         monotonic=lambda: 0,
     )
 
     assert endpoint_state(result) == ("paused", 0, 1)
+    assert claims.claims == {}
+    assert len(claims.acquired) == len(claims.released) == 1
     assert inspections == [{"job_id": "controller", "namespace": "org"}]
     assert api.label_updates == [
         {
@@ -905,7 +941,6 @@ def test_endpoint_watchdog_pauses_after_controller_finishes(
 
 def test_endpoint_watchdog_survives_transient_inspection_failure(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     outcomes: list[object] = [RuntimeError("transient"), "ERROR"]
     sleeps: list[float] = []
@@ -930,8 +965,8 @@ def test_endpoint_watchdog_survives_transient_inspection_failure(
         run_id="run-1",
         token_secret_name="HF_TOKEN",
         timeout_seconds=60,
-        lease_root=tmp_path / "leases",
         api=FakeApi(),
+        claim_store=FakeClaimStore(),
         runner=runner,
         sleep=sleeps.append,
         monotonic=lambda: 0,
@@ -942,7 +977,7 @@ def test_endpoint_watchdog_survives_transient_inspection_failure(
 
 
 def test_endpoint_watchdog_releases_lease_when_readiness_update_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeApi(WatchdogApiStub):
         def update_job_labels(self, **_kwargs: object) -> object:
@@ -950,7 +985,7 @@ def test_endpoint_watchdog_releases_lease_when_readiness_update_fails(
 
     monkeypatch.setenv("HF_TOKEN", "secret")
     monkeypatch.setenv("JOB_ID", "watchdog-job")
-    lease_root = tmp_path / "leases"
+    claims = FakeClaimStore()
 
     with pytest.raises(RuntimeError, match="^label update failed$"):
         run_endpoint_watchdog(
@@ -961,15 +996,46 @@ def test_endpoint_watchdog_releases_lease_when_readiness_update_fails(
             run_id="run-1",
             token_secret_name="HF_TOKEN",
             timeout_seconds=60,
-            lease_root=lease_root,
             api=FakeApi(),
+            claim_store=claims,
         )
 
-    assert list(lease_root.iterdir()) == []
+    assert claims.claims == {}
+    assert len(claims.released) == 1
+
+
+def test_endpoint_watchdog_rejects_competing_claim_before_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setenv("JOB_ID", "watchdog-job")
+    claims = FakeClaimStore()
+    claims.acquire(
+        "endpoint-leases/aa3808503c913daab53ed1415fe04988.json",
+        {"controller_job_id": "other", "watchdog_job_id": "other"},
+    )
+    api = WatchdogApiStub()
+
+    with pytest.raises(
+        WorkerError, match="^endpoint lease is held by another watchdog$"
+    ):
+        run_endpoint_watchdog(
+            controller_job_id="controller",
+            controller_namespace="org",
+            endpoint_name="endpoint",
+            endpoint_namespace="org",
+            run_id="run-1",
+            token_secret_name="HF_TOKEN",
+            timeout_seconds=60,
+            api=api,
+            claim_store=claims,
+        )
+
+    assert api.label_updates == []
 
 
 def test_endpoint_watchdog_retains_lease_when_pause_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeApi(WatchdogApiStub):
         def inspect_job(self, **_kwargs: object) -> object:
@@ -979,7 +1045,7 @@ def test_endpoint_watchdog_retains_lease_when_pause_fails(
 
     monkeypatch.setenv("HF_TOKEN", "secret")
     monkeypatch.setenv("JOB_ID", "watchdog-job")
-    lease_root = tmp_path / "leases"
+    claims = FakeClaimStore()
 
     with pytest.raises(RuntimeError, match="^pause failed with test-token$"):
         run_endpoint_watchdog(
@@ -990,20 +1056,18 @@ def test_endpoint_watchdog_retains_lease_when_pause_fails(
             run_id="run-1",
             token_secret_name="HF_TOKEN",
             timeout_seconds=60,
-            lease_root=lease_root,
             api=FakeApi(),
+            claim_store=claims,
             runner=CleanupFailureRunner([]),
             monotonic=lambda: 0,
         )
 
-    leases = list(lease_root.iterdir())
-    assert len(leases) == 1
-    assert (leases[0] / "owner.json").is_file()
+    assert len(claims.claims) == 1
+    assert claims.released == []
 
 
 def test_endpoint_watchdog_pauses_at_deadline(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     inspections: list[str] = []
 
@@ -1029,8 +1093,8 @@ def test_endpoint_watchdog_pauses_at_deadline(
         run_id="run-1",
         token_secret_name="BENCH_TOKEN",
         timeout_seconds=2,
-        lease_root=tmp_path / "leases",
         api=FakeApi(),
+        claim_store=FakeClaimStore(),
         runner=runner,
         sleep=sleeps.append,
         monotonic=lambda: next(times),
@@ -1056,7 +1120,6 @@ def test_endpoint_watchdog_requires_configured_secret(
             run_id="run-1",
             token_secret_name="MISSING_TOKEN",
             timeout_seconds=1,
-            lease_root=Path("/unused"),
         )
 
 
@@ -1075,14 +1138,12 @@ def test_endpoint_watchdog_requires_its_job_id(
             run_id="run-1",
             token_secret_name="HF_TOKEN",
             timeout_seconds=1,
-            lease_root=Path("/unused"),
             api=WatchdogApiStub(),
         )
 
 
 def test_endpoint_watchdog_builds_authenticated_api(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     instances: list[object] = []
 
@@ -1110,7 +1171,6 @@ def test_endpoint_watchdog_builds_authenticated_api(
         run_id="run-1",
         token_secret_name="HF_TOKEN",
         timeout_seconds=1,
-        lease_root=tmp_path / "leases",
         runner=runner,
         monotonic=lambda: 0,
     )
@@ -1355,61 +1415,6 @@ def test_harbor_source_agent_uses_reported_identity_without_version_override(
     assert "version=2.0.0" not in command
     assert not any(argument.startswith("version=") for argument in command)
     assert _expected_agent_version(lock) == "2.0.0"
-
-
-def test_endpoint_lease_is_atomic_and_owner_checked(tmp_path: Path) -> None:
-    lease_root = tmp_path / "nested" / "lease-root"
-    lease = _acquire_endpoint_lease(
-        lease_root, "org", "endpoint", "controller-1", "watchdog-1"
-    )
-
-    assert lease.parent == lease_root
-    assert lease.name == "aa3808503c913daab53ed1415fe04988"
-    assert json.loads((lease / "owner.json").read_text(encoding="utf-8")) == {
-        "controller_job_id": "controller-1",
-        "watchdog_job_id": "watchdog-1",
-    }
-
-    with pytest.raises(
-        WorkerError, match="^endpoint lease is held by another watchdog$"
-    ):
-        _acquire_endpoint_lease(
-            lease_root, "org", "endpoint", "controller-2", "watchdog-2"
-        )
-    with pytest.raises(
-        WorkerError, match="^endpoint lease ownership changed before release$"
-    ):
-        _release_endpoint_lease(lease, "controller-2", "watchdog-2")
-
-    _release_endpoint_lease(lease, "controller-1", "watchdog-1")
-    assert not lease.exists()
-
-
-def test_endpoint_lease_removes_partial_acquisition(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    lease_root = tmp_path / "leases"
-
-    def fail_owner_write(_path: Path, _value: object) -> None:
-        raise OSError("owner write failed")
-
-    monkeypatch.setattr("harbor_hf.worker.write_json", fail_owner_write)
-
-    with pytest.raises(OSError, match="^owner write failed$"):
-        _acquire_endpoint_lease(lease_root, "org", "endpoint", "controller", "watchdog")
-
-    assert list(lease_root.iterdir()) == []
-
-
-def test_endpoint_lease_rejects_unverifiable_owner(tmp_path: Path) -> None:
-    lease = tmp_path / "lease"
-    lease.mkdir()
-    (lease / "owner.json").write_text("not json", encoding="utf-8")
-
-    with pytest.raises(WorkerError, match="^endpoint lease owner cannot be verified$"):
-        _release_endpoint_lease(lease, "controller", "watchdog")
-
-    assert lease.exists()
 
 
 def test_mark_watchdog_ready_publishes_complete_identity() -> None:
@@ -2089,21 +2094,23 @@ def test_publish_evidence_requires_one_terminal_marker(
         return result
 
     monkeypatch.setattr("harbor_hf.worker.shutil.copytree", tracking_copytree)
-    _reserve_evidence(destination)
+    _prepare_evidence_destination(destination)
     _publish_evidence(source, destination)
 
     assert (destination / "record.json").read_text(encoding="utf-8") == "{}\n"
     assert (destination / "_SUCCESS").read_text(encoding="utf-8") == "\n"
 
 
-def test_reserve_evidence_is_exclusive_and_creates_parents(tmp_path: Path) -> None:
+def test_prepare_evidence_destination_is_exclusive_and_creates_parents(
+    tmp_path: Path,
+) -> None:
     destination = tmp_path / "bucket" / "runs" / "experiment" / "run-1"
 
-    _reserve_evidence(destination)
+    _prepare_evidence_destination(destination)
 
     assert (destination / "_RESERVED").read_text(encoding="utf-8") == "\n"
     with pytest.raises(FileExistsError):
-        _reserve_evidence(destination)
+        _prepare_evidence_destination(destination)
 
 
 def test_publish_evidence_preserves_nested_terminal_markers(tmp_path: Path) -> None:
@@ -2115,7 +2122,7 @@ def test_publish_evidence_preserves_nested_terminal_markers(tmp_path: Path) -> N
     (nested / "_FAILED").write_text("task failure\n", encoding="utf-8")
     destination = tmp_path / "bucket" / "runs" / "run-1"
 
-    _reserve_evidence(destination)
+    _prepare_evidence_destination(destination)
     _publish_evidence(source, destination)
 
     assert (destination / "nested" / "_SUCCESS").read_text(encoding="utf-8") == (
@@ -2140,7 +2147,7 @@ def test_publish_evidence_removes_incomplete_destination(
 
     monkeypatch.setattr("harbor_hf.worker.shutil.copyfile", fail_copy)
 
-    _reserve_evidence(destination)
+    _prepare_evidence_destination(destination)
     with pytest.raises(OSError, match="copy failed"):
         _publish_evidence(source, destination)
 
@@ -2206,6 +2213,7 @@ def test_worker_publishes_success_after_cleanup(
 
     monkeypatch.setattr("harbor_hf.worker.probe_runtime", fake_probe)
     runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+    claims = FakeClaimStore()
     readiness_timeouts: list[int] = []
     original_wait_ready = EndpointManager.wait_ready
 
@@ -2225,9 +2233,13 @@ def test_worker_publishes_success_after_cleanup(
         stream_runner=_successful_stream,
         source_preparer=_prepare_source,
         watchdog_launcher=_launch_watchdog,
+        claim_store=claims,
     )
 
     assert (root / "_SUCCESS").exists()
+    assert list(claims.claims) == [
+        run_claim_path(lock.artifact_bucket, lock.artifact_prefix)
+    ]
     assert readiness_timeouts == [3600]
     assert not (root / "_FAILED").exists()
     assert json.loads((root / "verification.json").read_text()) == {
@@ -2338,17 +2350,21 @@ def test_worker_refuses_existing_run_prefix_before_remote_work(
     lock = build_run_lock(remote_spec, run_id="existing")
     lock_path = tmp_path / "lock.json"
     _write_lock(lock_path, lock)
-    destination = tmp_path / "output" / lock.artifact_prefix
-    destination.mkdir(parents=True)
     monkeypatch.setenv("HF_TOKEN", "test-token")
     runner = EndpointRunner([])
+    claims = FakeClaimStore()
+    claims.acquire(
+        run_claim_path(lock.artifact_bucket, lock.artifact_prefix),
+        {"run_id": "other"},
+    )
 
-    with pytest.raises(FileExistsError):
+    with pytest.raises(WorkerError, match="^run ID is already reserved$"):
         run_worker(
             remote_manifest,
             lock_path,
             tmp_path / "output",
             runner=runner,
+            claim_store=claims,
         )
 
     assert runner.commands == []

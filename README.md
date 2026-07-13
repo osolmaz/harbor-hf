@@ -13,10 +13,10 @@ before declaring success. Before resuming an endpoint, it starts an independent
 HF Job watchdog, waits for its readiness handshake, and then resumes the
 endpoint. The watchdog pauses the endpoint if the controller exits or is killed.
 Controllers and watchdogs targeting the same endpoint share an atomic lease in
-the namespace's private `harbor-hf-leases` Bucket. The watchdog acquires the
-lease before it advertises readiness and releases it only after verified
-endpoint cleanup. A competing watchdog fails before its controller can resume
-or pause the endpoint.
+the namespace's private `harbor-hf-coordination` Dataset repository. The
+watchdog acquires the lease with a parent-commit compare-and-swap before it
+advertises readiness and releases it only after verified endpoint cleanup. A
+competing watchdog fails before its controller can resume or pause the endpoint.
 
 ## Install
 
@@ -67,15 +67,16 @@ finite numeric verifier results, and the Inference Endpoint reports `paused`
 with zero ready replicas. Failures write `_FAILED` after attempting the same cleanup.
 The controller waits for every target replica and probes the endpoint's reported
 health route before Harbor starts. It also verifies the endpoint's model,
-custom image, serving arguments, non-secret environment, provider region,
+custom image, complete ordered serving arguments, complete non-secret environment, provider region,
 hardware, accelerator count, and declared scaling limits against the run lock.
 Harbor writes raw sessions and logs only to Job-local storage. The controller
 redacts and validates that staging tree before publishing it to the bucket, and
 copies `_SUCCESS` or `_FAILED` last.
-Submission creates or verifies the namespace-level lease Bucket and refuses to
-use it if it is public. It separately verifies that the configured artifact
-Bucket is private. Each run prefix is atomically reserved before remote work,
-so duplicate run IDs cannot overwrite or invalidate one another.
+Submission creates or verifies the namespace-level coordination repository and
+refuses to use it if it is public. It separately verifies that the configured
+artifact Bucket and the implicit `jobs-artifacts` input Bucket are private.
+Each run prefix receives a permanent compare-and-swap reservation before remote
+work, so duplicate run IDs cannot overwrite or invalidate one another.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution

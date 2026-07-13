@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
 
+from harbor_hf.coordination import (
+    ClaimConflict,
+    ClaimStore,
+    HubClaimStore,
+    endpoint_claim_path,
+    run_claim_path,
+)
 from harbor_hf.evidence import (
     append_event,
     archive_directory,
@@ -38,7 +45,6 @@ from harbor_hf.process import (
 )
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
-    endpoint_lease_bucket,
     endpoint_lease_label,
     endpoint_lease_label_for,
     github_repository,
@@ -298,6 +304,7 @@ def run_worker(
     stream_runner: Callable[..., int] = run_streaming,
     source_preparer: Callable[[SourcePin, Path, CommandRunner], None] | None = None,
     watchdog_launcher: Callable[[RunLock, EndpointRef, str], str] | None = None,
+    claim_store: ClaimStore | None = None,
 ) -> Path:
     spec = load_experiment(manifest_path)
     lock = RunLock.model_validate_json(
@@ -311,8 +318,21 @@ def run_worker(
         raise WorkerError(f"required secret {token_name} is not available")
     os.environ["HF_TOKEN"] = token
 
+    claims = claim_store or HubClaimStore(lock.remote.job.namespace, token)
+    try:
+        claims.acquire(
+            run_claim_path(lock.artifact_bucket, lock.artifact_prefix),
+            {
+                "artifact_bucket": lock.artifact_bucket,
+                "artifact_prefix": lock.artifact_prefix,
+                "run_id": lock.run_id,
+            },
+        )
+    except ClaimConflict as error:
+        raise WorkerError("run ID is already reserved") from error
+
     destination = output_root / lock.artifact_prefix
-    _reserve_evidence(destination)
+    _prepare_evidence_destination(destination)
     try:
         with tempfile.TemporaryDirectory(prefix="harbor-hf-run-") as staging:
             return _run_staged_worker(
@@ -523,7 +543,7 @@ def _publish_evidence(source: Path, destination: Path) -> None:
         raise
 
 
-def _reserve_evidence(destination: Path) -> None:
+def _prepare_evidence_destination(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.mkdir(exist_ok=False)
     try:
@@ -646,7 +666,7 @@ def prepare_locked_source(
 
 
 def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) -> str:
-    from huggingface_hub import HfApi, Volume
+    from huggingface_hub import HfApi
 
     controller_job_id = os.environ.get("JOB_ID")
     if not controller_job_id:
@@ -670,8 +690,6 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
         lock.remote.job.token_secret_name,
         "--timeout-seconds",
         str(lock.remote.job.timeout_seconds),
-        "--lease-root",
-        "/harbor-hf-leases",
     )
     api = HfApi(token=token)
     info = api.run_job(
@@ -684,14 +702,6 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
             "harbor-hf-watchdog": lock.run_id,
             "harbor-hf-endpoint": endpoint_lease_label(lock),
         },
-        volumes=[
-            Volume(
-                type="bucket",
-                source=endpoint_lease_bucket(lock.remote.job.namespace),
-                mount_path="/harbor-hf-leases",
-                read_only=False,
-            )
-        ],
         namespace=lock.remote.job.namespace,
     )
     job_id = getattr(info, "id", None)
@@ -745,8 +755,8 @@ def run_endpoint_watchdog(
     run_id: str,
     token_secret_name: str,
     timeout_seconds: int,
-    lease_root: Path,
     api: WatchdogApi | None = None,
+    claim_store: ClaimStore | None = None,
     runner: CommandRunner | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -763,8 +773,9 @@ def run_endpoint_watchdog(
     watchdog_job_id = os.environ.get("JOB_ID", "")
     if not watchdog_job_id:
         raise WorkerError("watchdog JOB_ID is required")
-    lease = _acquire_endpoint_lease(
-        lease_root,
+    claims = claim_store or HubClaimStore(controller_namespace, token)
+    claim_path, owner = _claim_endpoint(
+        claims,
         endpoint_namespace,
         endpoint_name,
         controller_job_id,
@@ -780,7 +791,7 @@ def run_endpoint_watchdog(
             run_id,
         )
     except Exception:
-        _release_endpoint_lease(lease, controller_job_id, watchdog_job_id)
+        claims.release(claim_path, owner)
         raise
     deadline = monotonic() + timeout_seconds
     terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
@@ -804,8 +815,27 @@ def run_endpoint_watchdog(
         runner or SubprocessRunner(),
     )
     snapshot = manager.pause_and_verify()
-    _release_endpoint_lease(lease, controller_job_id, watchdog_job_id)
+    claims.release(claim_path, owner)
     return snapshot
+
+
+def _claim_endpoint(
+    claims: ClaimStore,
+    endpoint_namespace: str,
+    endpoint_name: str,
+    controller_job_id: str,
+    watchdog_job_id: str,
+) -> tuple[str, dict[str, str]]:
+    claim_path = endpoint_claim_path(endpoint_namespace, endpoint_name)
+    owner = {
+        "controller_job_id": controller_job_id,
+        "watchdog_job_id": watchdog_job_id,
+    }
+    try:
+        claims.acquire(claim_path, owner)
+    except ClaimConflict as error:
+        raise WorkerError("endpoint lease is held by another watchdog") from error
+    return claim_path, owner
 
 
 def _mark_watchdog_ready(
@@ -827,50 +857,6 @@ def _mark_watchdog_ready(
         },
         namespace=controller_namespace,
     )
-
-
-def _acquire_endpoint_lease(
-    lease_root: Path,
-    endpoint_namespace: str,
-    endpoint_name: str,
-    controller_job_id: str,
-    watchdog_job_id: str,
-) -> Path:
-    lease_root.mkdir(parents=True, exist_ok=True)
-    lease = lease_root / endpoint_lease_label_for(endpoint_namespace, endpoint_name)
-    try:
-        lease.mkdir()
-    except FileExistsError as error:
-        raise WorkerError("endpoint lease is held by another watchdog") from error
-    try:
-        write_json(
-            lease / "owner.json",
-            {
-                "controller_job_id": controller_job_id,
-                "watchdog_job_id": watchdog_job_id,
-            },
-        )
-    except Exception:
-        shutil.rmtree(lease, ignore_errors=True)
-        raise
-    return lease
-
-
-def _release_endpoint_lease(
-    lease: Path, controller_job_id: str, watchdog_job_id: str
-) -> None:
-    owner_path = lease / "owner.json"
-    try:
-        owner = json.loads(owner_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise WorkerError("endpoint lease owner cannot be verified") from error
-    if owner != {
-        "controller_job_id": controller_job_id,
-        "watchdog_job_id": watchdog_job_id,
-    }:
-        raise WorkerError("endpoint lease ownership changed before release")
-    owner_path.unlink()
-    lease.rmdir()
 
 
 def _job_stage(info: object) -> str:
@@ -900,48 +886,19 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
     if observed_image != lock.deployment.engine.image:
         raise WorkerError("endpoint image does not match the locked deployment")
     observed_arguments = model.get("args")
-    if not isinstance(observed_arguments, list) or not _arguments_match(
-        lock.deployment.engine.arguments,
-        [str(argument) for argument in observed_arguments],
+    if (
+        not isinstance(observed_arguments, list)
+        or not all(isinstance(argument, str) for argument in observed_arguments)
+        or observed_arguments != lock.deployment.engine.arguments
     ):
         raise WorkerError("endpoint arguments do not match the locked deployment")
     observed_environment = model.get("env")
-    if not isinstance(observed_environment, Mapping) or any(
-        observed_environment.get(key) != value
-        for key, value in lock.deployment.engine.environment.items()
+    if (
+        not isinstance(observed_environment, Mapping)
+        or dict(observed_environment) != lock.deployment.engine.environment
     ):
         raise WorkerError("endpoint environment does not match the locked deployment")
     _validate_endpoint_compute(lock, snapshot)
-
-
-def _arguments_match(expected: list[str], observed: list[str]) -> bool:
-    expected_options = _argument_options(expected)
-    observed_options = _argument_options(observed)
-    return all(
-        observed_options.get(key) == value for key, value in expected_options.items()
-    )
-
-
-def _argument_options(arguments: list[str]) -> dict[str, str | bool]:
-    options: dict[str, str | bool] = {}
-    position = 0
-    while position < len(arguments):
-        argument = arguments[position]
-        if not argument.startswith("--"):
-            position += 1
-            continue
-        if "=" in argument:
-            name, value = argument.split("=", 1)
-            options[name] = value
-        elif position + 1 < len(arguments) and not arguments[position + 1].startswith(
-            "--"
-        ):
-            options[argument] = arguments[position + 1]
-            position += 1
-        else:
-            options[argument] = True
-        position += 1
-    return options
 
 
 def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) -> None:

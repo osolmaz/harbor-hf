@@ -33,6 +33,7 @@ _SENSITIVE_SUFFIXES = (
     "_password",
     "_private_key",
     "_secret",
+    "_secret_key",
     "_token",
 )
 _STREAM_CHUNK_SIZE = 1024 * 1024
@@ -41,7 +42,13 @@ _STREAM_CHUNK_SIZE = 1024 * 1024
 def is_sensitive_key(key: object) -> bool:
     words = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", str(key))
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", words).replace("-", "_").lower()
-    return normalized in _SENSITIVE_KEYS or normalized.endswith(_SENSITIVE_SUFFIXES)
+    collapsed = normalized.replace("_", "")
+    return (
+        normalized in _SENSITIVE_KEYS
+        or normalized.endswith(_SENSITIVE_SUFFIXES)
+        or collapsed.endswith("apikey")
+        or collapsed.endswith("secretkey")
+    )
 
 
 def write_json(path: Path, value: object) -> None:
