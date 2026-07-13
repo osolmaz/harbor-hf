@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from fnmatch import fnmatch
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import (
@@ -56,12 +56,18 @@ class PlannedRun(FrozenModel):
 
 
 class CampaignRecoveryPolicy(FrozenModel):
-    max_active_waves: int
-    max_physical_executions_per_trial: int
-    retry_base_seconds: int
-    retry_max_seconds: int
-    cancellation_grace_seconds: int
-    spend_cap_microusd: int | None = None
+    max_active_waves: int = Field(default=64, ge=1)
+    max_physical_executions_per_trial: int = Field(default=3, ge=1)
+    retry_base_seconds: int = Field(default=30, ge=1)
+    retry_max_seconds: int = Field(default=1800, ge=1)
+    cancellation_grace_seconds: int = Field(default=0, ge=0)
+    spend_cap_microusd: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def retry_backoff_is_bounded(self) -> CampaignRecoveryPolicy:
+        if self.retry_base_seconds > self.retry_max_seconds:
+            raise ValueError("retry base seconds must not exceed retry maximum")
+        return self
 
 
 class CampaignPlan(FrozenModel):
@@ -132,7 +138,12 @@ class CampaignLock(FrozenModel):
     runs: list[CampaignRunLock]
 
 
-def build_campaign_plan(spec: ExperimentSpec) -> CampaignPlan:
+def build_campaign_plan(
+    spec: ExperimentSpec,
+    *,
+    recovery_policy: CampaignRecoveryPolicy | None = None,
+) -> CampaignPlan:
+    selected_recovery_policy = recovery_policy or CampaignRecoveryPolicy()
     tasks = _resolved_tasks(spec)
     trials = [
         PlannedTrial(
@@ -162,6 +173,7 @@ def build_campaign_plan(spec: ExperimentSpec) -> CampaignPlan:
         "benchmark_dataset": spec.benchmark.dataset,
         "benchmark_dataset_digest": spec.benchmark.dataset_digest,
         "execution": spec.execution.model_dump(mode="json"),
+        "recovery_policy": selected_recovery_policy.model_dump(mode="json"),
         "artifacts": spec.artifacts.model_dump(mode="json"),
         "publishing": spec.publishing.model_dump(mode="json"),
         "remote": (
@@ -177,16 +189,7 @@ def build_campaign_plan(spec: ExperimentSpec) -> CampaignPlan:
         shard_count=sum(len(run.shards) for run in runs),
         trial_count=sum(len(shard.trials) for run in runs for shard in run.shards),
         max_shards_per_wave=spec.execution.max_shards_per_wave,
-        recovery_policy=CampaignRecoveryPolicy(
-            max_active_waves=spec.execution.max_active_waves,
-            max_physical_executions_per_trial=(
-                spec.execution.max_physical_executions_per_trial
-            ),
-            retry_base_seconds=spec.execution.retry_base_seconds,
-            retry_max_seconds=spec.execution.retry_max_seconds,
-            cancellation_grace_seconds=spec.execution.cancellation_grace_seconds,
-            spend_cap_microusd=spec.execution.spend_cap_microusd,
-        ),
+        recovery_policy=selected_recovery_policy,
         runs=runs,
     )
 

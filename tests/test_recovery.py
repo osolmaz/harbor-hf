@@ -6,7 +6,12 @@ from typing import cast
 
 import pytest
 
-from harbor_hf.campaigns import CampaignLock, build_campaign_lock, build_campaign_plan
+from harbor_hf.campaigns import (
+    CampaignLock,
+    CampaignRecoveryPolicy,
+    build_campaign_lock,
+    build_campaign_plan,
+)
 from harbor_hf.control import (
     ActionOutcomePayload,
     ActionReservedPayload,
@@ -55,20 +60,20 @@ def _campaign(
                 update={"task_names": ["task-*"], "task_digests": task_digests}
             ),
             "execution": remote_spec.execution.model_copy(
-                update={
-                    "max_trials_per_shard": max_trials_per_shard,
-                    "max_physical_executions_per_trial": (
-                        max_physical_executions_per_trial
-                    ),
-                    "retry_base_seconds": retry_base_seconds,
-                    "retry_max_seconds": retry_max_seconds,
-                    "spend_cap_microusd": spend_cap_microusd,
-                }
+                update={"max_trials_per_shard": max_trials_per_shard}
             ),
         }
     )
+    recovery_policy = CampaignRecoveryPolicy(
+        max_physical_executions_per_trial=max_physical_executions_per_trial,
+        retry_base_seconds=retry_base_seconds,
+        retry_max_seconds=retry_max_seconds,
+        spend_cap_microusd=spend_cap_microusd,
+    )
     lock = build_campaign_lock(
-        build_campaign_plan(spec), "campaign-recovery", clock=lambda: NOW
+        build_campaign_plan(spec, recovery_policy=recovery_policy),
+        "campaign-recovery",
+        clock=lambda: NOW,
     )
     submitted = _event(
         lock,
