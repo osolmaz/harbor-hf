@@ -355,6 +355,44 @@ def test_wave_lock_enforces_shard_bound(remote_spec: ExperimentSpec) -> None:
         build_wave_lock(campaign, remote_spec, oversized)
 
 
+def test_retry_wave_locks_only_trials_admitted_by_its_action(
+    remote_spec: ExperimentSpec,
+) -> None:
+    campaign = build_campaign_lock(build_campaign_plan(remote_spec), "campaign-one")
+    action = _wave_action(campaign)
+    trial_id = campaign.runs[0].shards[0].trials[0].trial_id
+
+    retry = action.model_copy(update={"kind": "retry-shard", "trial_ids": [trial_id]})
+    lock = build_wave_lock(campaign, remote_spec, retry)
+    assert lock.action_kind == "retry-shard"
+    assert lock.trial_ids == [trial_id]
+
+    with pytest.raises(ValueError, match="must admit at least one trial"):
+        build_wave_lock(
+            campaign,
+            remote_spec,
+            action.model_copy(update={"kind": "retry-shard", "trial_ids": []}),
+        )
+    with pytest.raises(ValueError, match="trial IDs must be unique"):
+        build_wave_lock(
+            campaign,
+            remote_spec,
+            retry.model_copy(update={"trial_ids": [trial_id, trial_id]}),
+        )
+    with pytest.raises(ValueError, match="outside its shards"):
+        build_wave_lock(
+            campaign,
+            remote_spec,
+            retry.model_copy(update={"trial_ids": ["trial-" + "f" * 24]}),
+        )
+    with pytest.raises(ValueError, match="cannot admit individual trials"):
+        build_wave_lock(
+            campaign,
+            remote_spec,
+            action.model_copy(update={"trial_ids": [trial_id]}),
+        )
+
+
 def _wave_action(lock: CampaignLock) -> ReconcileAction:
     from harbor_hf.control import CampaignSubmittedPayload, new_event
 

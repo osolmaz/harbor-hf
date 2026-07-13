@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from harbor_hf.campaigns import (
     CampaignLock,
@@ -102,6 +102,7 @@ class LockedSubmitWaveAction(FrozenModel):
     campaign_id: str
     deployment_digest: str
     shard_ids: list[str]
+    trial_ids: list[str] = Field(default_factory=list)
 
 
 class ExecutionLock(FrozenModel):
@@ -202,6 +203,7 @@ def validate_wave_lock(
         campaign_id=lock.campaign_id,
         deployment_digest=lock.deployment_digest,
         shard_ids=lock.shard_ids,
+        trial_ids=lock.trial_ids,
     )
     try:
         expected = build_wave_lock(campaign, spec, action, endpoint=lock.endpoint)
@@ -414,7 +416,9 @@ def _execute_shards(
         for future in as_completed(futures):
             shard_id = futures[future]
             try:
-                results[shard_id] = future.result()
+                checksum = future.result()
+                if checksum is not None:
+                    results[shard_id] = checksum
             except Exception as error:
                 failures.append(error)
     if failures:
@@ -465,7 +469,7 @@ def _execute_shard(
     identifier: IdentifierFactory,
     clock: Clock,
     monotonic: Callable[[], float],
-) -> str:
+) -> str | None:
     shard = locked_shard.shard
     shard_root = (
         campaign_root / "runs" / run.configuration.run_id / "shards" / shard.shard_id
@@ -475,41 +479,68 @@ def _execute_shard(
     events = shard_root / "events.jsonl"
     append_event(events, "shard_started", shard_id=shard.shard_id)
     trial_checksums: dict[str, str] = {}
+    failures: list[Exception] = []
+    deferred = False
+    selected_trial_ids = set(wave.trial_ids)
     for trial in shard.trials:
         destination = _trial_destination(output_root, campaign, run, trial)
         trial_root = shard_root.parent.parent / "trials" / trial.trial_id
-        if _valid_terminal_trial(
+        recovered = _valid_terminal_trial(
             destination,
             trial,
             campaign_id=campaign.campaign_id,
             wave_id=wave.wave_id,
             run_id=run.configuration.run_id,
             shard_id=shard.shard_id,
-        ):
+        )
+        if recovered:
             shutil.copytree(destination, trial_root)
             append_event(events, "trial_recovered", trial_id=trial.trial_id)
+        elif (
+            wave.action_kind == "retry-shard"
+            and trial.trial_id not in selected_trial_ids
+        ):
+            deferred = True
+            append_event(events, "trial_deferred", trial_id=trial.trial_id)
+            continue
         else:
             _prepare_trial_recovery(destination, trial_root)
-            _execute_trial(
-                manifest_path,
-                campaign,
-                wave,
-                run.configuration,
-                shard.shard_id,
-                trial,
-                trial_root,
-                output_root,
-                harbor_source,
-                base_url,
-                token,
-                stream_runner,
-                deadline,
-                identifier,
-                clock,
-                monotonic,
-            )
+            try:
+                _execute_trial(
+                    manifest_path,
+                    campaign,
+                    wave,
+                    run.configuration,
+                    shard.shard_id,
+                    trial,
+                    trial_root,
+                    output_root,
+                    harbor_source,
+                    base_url,
+                    token,
+                    stream_runner,
+                    deadline,
+                    identifier,
+                    clock,
+                    monotonic,
+                )
+            except Exception as error:
+                failures.append(error)
+                append_event(
+                    events,
+                    "trial_failed",
+                    trial_id=trial.trial_id,
+                    error_type=type(error).__name__,
+                )
+                continue
             append_event(events, "trial_completed", trial_id=trial.trial_id)
         trial_checksums[trial.trial_id] = _file_digest(trial_root / "checksums.json")
+    if failures:
+        append_event(events, "shard_failed", failed_trials=len(failures))
+        raise failures[0]
+    if deferred:
+        append_event(events, "shard_deferred")
+        return None
     summary = {
         "campaign_id": campaign.campaign_id,
         "run_id": run.configuration.run_id,

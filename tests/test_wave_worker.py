@@ -4,6 +4,7 @@ import json
 import shutil
 import threading
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -15,6 +16,7 @@ from harbor_hf.campaign_finalizer import BucketCampaignFinalizer
 from harbor_hf.campaign_observer import BucketCampaignObserver
 from harbor_hf.campaigns import (
     CampaignLock,
+    CampaignTrialLock,
     ProviderWaveTarget,
     WaveLock,
     build_campaign_lock,
@@ -35,6 +37,7 @@ from harbor_hf.recovery import project_recovery
 from harbor_hf.results import EvidenceSource, build_result_tables
 from harbor_hf.wave_worker import (
     WorkerError,
+    _execute_shard,
     _execution_id,
     _file_digest,
     _launch_wave_watchdog,
@@ -1216,6 +1219,176 @@ def test_wave_target_and_watchdog_helpers_forward_exact_locked_identity(
             "secret",
         )
     ]
+
+
+def test_shard_continues_after_one_trial_fails(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign, wave = _two_trial_wave(remote_spec)
+    run = wave.runs[0]
+    shard = run.shards[0]
+    calls: list[str] = []
+
+    def execute(*args: object, **kwargs: object) -> None:
+        del kwargs
+        trial = cast(CampaignTrialLock, args[5])
+        trial_id = trial.trial_id
+        trial_root = cast(Path, args[6])
+        calls.append(trial_id)
+        if len(calls) == 1:
+            raise WorkerError("first trial failed")
+        (trial_root / "checksums.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr("harbor_hf.wave_worker._execute_trial", execute)
+    output = tmp_path / "output"
+    campaign_root = tmp_path / "staging" / campaign.artifact_prefix
+
+    with pytest.raises(WorkerError, match="^first trial failed$"):
+        _execute_shard(
+            tmp_path / "manifest.yaml",
+            campaign,
+            wave,
+            run,
+            shard,
+            campaign_root,
+            output,
+            tmp_path / "harbor",
+            "https://endpoint.example",
+            "test-token",
+            lambda *_args, **_kwargs: 0,
+            100.0,
+            IdentifierSequence(),
+            lambda: datetime.now(UTC),
+            lambda: 0.0,
+        )
+
+    assert calls == [trial.trial_id for trial in shard.shard.trials]
+    events = _event_payloads(
+        campaign_root
+        / "runs"
+        / run.configuration.run_id
+        / "shards"
+        / shard.shard.shard_id
+        / "events.jsonl"
+    )
+    assert [event["event"] for event in events] == [
+        "shard_started",
+        "trial_failed",
+        "trial_completed",
+        "shard_failed",
+    ]
+
+
+def test_retry_shard_executes_only_admitted_trials(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign, initial = _two_trial_wave(remote_spec)
+    shard = initial.runs[0].shards[0].shard
+    selected = shard.trials[1]
+    action = (
+        plan_reconciliation(
+            campaign,
+            [
+                new_event(
+                    subject_type="campaign",
+                    subject_id=campaign.campaign_id,
+                    kind="campaign.submitted",
+                    producer="cli",
+                    payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
+                )
+            ],
+        )[1]
+        .actions[0]
+        .model_copy(update={"kind": "retry-shard", "trial_ids": [selected.trial_id]})
+    )
+    wave = build_wave_lock(campaign, _two_trial_spec(remote_spec), action)
+    run = wave.runs[0]
+    locked_shard = run.shards[0]
+    calls: list[str] = []
+
+    def execute(*args: object, **kwargs: object) -> None:
+        del kwargs
+        trial = cast(CampaignTrialLock, args[5])
+        trial_id = trial.trial_id
+        trial_root = cast(Path, args[6])
+        calls.append(trial_id)
+        (trial_root / "checksums.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr("harbor_hf.wave_worker._execute_trial", execute)
+    campaign_root = tmp_path / "staging" / campaign.artifact_prefix
+    result = _execute_shard(
+        tmp_path / "manifest.yaml",
+        campaign,
+        wave,
+        run,
+        locked_shard,
+        campaign_root,
+        tmp_path / "output",
+        tmp_path / "harbor",
+        "https://endpoint.example",
+        "test-token",
+        lambda *_args, **_kwargs: 0,
+        100.0,
+        IdentifierSequence(),
+        lambda: datetime.now(UTC),
+        lambda: 0.0,
+    )
+
+    assert result is None
+    assert calls == [selected.trial_id]
+    shard_root = (
+        campaign_root
+        / "runs"
+        / run.configuration.run_id
+        / "shards"
+        / locked_shard.shard.shard_id
+    )
+    assert not (shard_root / "_SUCCESS").exists()
+    assert [
+        event["event"] for event in _event_payloads(shard_root / "events.jsonl")
+    ] == [
+        "shard_started",
+        "trial_deferred",
+        "trial_completed",
+        "shard_deferred",
+    ]
+
+
+def _two_trial_spec(remote_spec: ExperimentSpec) -> ExperimentSpec:
+    return remote_spec.model_copy(
+        update={
+            "benchmark": remote_spec.benchmark.model_copy(
+                update={
+                    "task_names": ["task-a", "task-b"],
+                    "task_digests": {
+                        "task-a": "sha256:" + "a" * 64,
+                        "task-b": "sha256:" + "b" * 64,
+                    },
+                }
+            ),
+            "execution": remote_spec.execution.model_copy(
+                update={"attempts": 1, "max_trials_per_shard": 2}
+            ),
+        }
+    )
+
+
+def _two_trial_wave(remote_spec: ExperimentSpec) -> tuple[CampaignLock, WaveLock]:
+    spec = _two_trial_spec(remote_spec)
+    campaign = build_campaign_lock(build_campaign_plan(spec), "campaign-two-trials")
+    submitted = new_event(
+        subject_type="campaign",
+        subject_id=campaign.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
+    )
+    action = plan_reconciliation(campaign, [submitted])[1].actions[0]
+    return campaign, build_wave_lock(campaign, spec, action)
 
 
 def _wave_inputs(

@@ -177,6 +177,9 @@ class SubmitWaveAction(Protocol):
     @property
     def shard_ids(self) -> list[str]: ...
 
+    @property
+    def trial_ids(self) -> list[str]: ...
+
 
 class WaveShardLock(FrozenModel):
     artifact_prefix: str
@@ -230,6 +233,7 @@ class WaveLock(FrozenModel):
     duration_seconds: int
     remote: RemoteExecutionSpec
     shard_ids: list[str]
+    trial_ids: list[str] = Field(default_factory=list)
     runs: list[WaveRunLock]
 
     @property
@@ -258,6 +262,20 @@ class WaveLock(FrozenModel):
             or set(observed_ids) != set(self.shard_ids)
         ):
             raise ValueError("wave shard IDs do not match its locked contents")
+        locked_trial_ids = {
+            trial.trial_id
+            for run in self.runs
+            for shard in run.shards
+            for trial in shard.shard.trials
+        }
+        if len(self.trial_ids) != len(set(self.trial_ids)) or not set(
+            self.trial_ids
+        ).issubset(locked_trial_ids):
+            raise ValueError("wave trial IDs do not match its locked contents")
+        if self.action_kind == "retry-shard" and not self.trial_ids:
+            raise ValueError("retry wave requires at least one trial ID")
+        if self.action_kind == "submit-wave" and self.trial_ids:
+            raise ValueError("submit wave must not select individual trials")
         if self.max_concurrent_shards < 1:
             raise ValueError("wave concurrency must be positive")
         if self.duration_seconds < 1:
@@ -479,6 +497,14 @@ def build_wave_lock(
     _validate_submit_wave_action(campaign, action)
 
     selected = _selected_wave_shards(campaign, action)
+    selected_trial_ids = {
+        trial.trial_id
+        for _run, shards in selected
+        for shard in shards
+        for trial in shard.trials
+    }
+    if set(action.trial_ids) - selected_trial_ids:
+        raise ValueError("retry-shard action references trials outside its shards")
     run_locks: list[WaveRunLock] = []
     target: EndpointWaveTarget | ProviderWaveTarget | None = None
     requested_endpoint = endpoint
@@ -559,6 +585,7 @@ def build_wave_lock(
         duration_seconds=spec.execution.timeout_seconds,
         remote=spec.remote,
         shard_ids=action.shard_ids,
+        trial_ids=action.trial_ids,
         runs=run_locks,
     )
 
@@ -684,11 +711,21 @@ def _validate_submit_wave_action(
         raise ValueError("wave action shard IDs must be unique")
     if len(action.shard_ids) > campaign.max_shards_per_wave:
         raise ValueError("wave action exceeds the campaign shard bound")
+    _validate_action_trials(action)
     if (
         re.fullmatch(r"[0-9a-f]{24}", action.action_key) is None
         or action.action_id != f"act-{action.action_key}"
     ):
         raise ValueError("wave action identity does not match its immutable contents")
+
+
+def _validate_action_trials(action: SubmitWaveAction) -> None:
+    if len(action.trial_ids) != len(set(action.trial_ids)):
+        raise ValueError("wave action trial IDs must be unique")
+    if action.kind == "retry-shard" and not action.trial_ids:
+        raise ValueError("retry-shard action must admit at least one trial")
+    if action.kind == "submit-wave" and action.trial_ids:
+        raise ValueError("submit-wave action cannot admit individual trials")
 
 
 def _selected_wave_shards(
