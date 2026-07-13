@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from harbor_hf.io import ManifestError, load_experiment
-from harbor_hf.models import BenchmarkSpec, RemoteJobSpec
+from harbor_hf.models import AgentProfile, BenchmarkSpec, RemoteJobSpec
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
 
@@ -16,7 +16,8 @@ def test_load_example() -> None:
     assert spec.matrix.models[0].weights.format == "safetensors"
     assert spec.matrix.models[0].weights.quantization is not None
     assert spec.matrix.models[0].weights.quantization.scheme == "nvfp4"
-    assert spec.matrix.agents[0].revision == "replace-with-commit"
+    assert spec.matrix.agents[0].revision == "replace-with-package-version"
+    assert spec.matrix.agents[0].revision_kind == "package"
     assert spec.artifacts.bucket == "example/benchmark-runs"
     assert spec.publishing.dataset == "example/shellbench-results"
 
@@ -56,3 +57,21 @@ def test_benchmark_requires_distinct_nonempty_task_names(
 ) -> None:
     with pytest.raises(ValueError):
         BenchmarkSpec(dataset="dataset", task_names=task_names)
+
+
+def test_agent_revision_metadata_is_explicit() -> None:
+    with pytest.raises(ValueError, match="require reported_version"):
+        AgentProfile(
+            id="agent",
+            name="terminus-2",
+            revision="commit",
+            revision_kind="harbor-source",
+        )
+    with pytest.raises(ValueError, match="report their package revision"):
+        AgentProfile(
+            id="agent",
+            name="openclaw",
+            revision="1.0.0",
+            revision_kind="package",
+            reported_version="different",
+        )

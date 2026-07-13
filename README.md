@@ -12,6 +12,9 @@ archives evidence to an HF Bucket, and verifies that the endpoint is paused
 before declaring success. Before resuming an endpoint, it starts an independent
 HF Job watchdog, waits for its readiness handshake, and then resumes the
 endpoint. The watchdog pauses the endpoint if the controller exits or is killed.
+Controllers targeting the same endpoint are labeled as one lease group. Only
+the elected controller may start the watchdog or change endpoint state; other
+controllers fail without pausing an endpoint owned by the active run.
 
 ## Install
 

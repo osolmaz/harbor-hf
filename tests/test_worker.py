@@ -17,10 +17,12 @@ from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
+    _expected_agent_version,
     _expected_trial_count,
     _finalize_evidence,
     _job_stage,
     _validate_trial_count,
+    assert_exclusive_endpoint_lease,
     build_harbor_command,
     controller_environment,
     endpoint_state,
@@ -33,6 +35,7 @@ from harbor_hf.worker import (
     run_worker,
     validate_endpoint_model,
     validate_harbor_result,
+    validate_run_lock,
     wait_watchdog_ready,
 )
 
@@ -87,6 +90,10 @@ def _launch_watchdog(_lock: RunLock, _endpoint: object, _token: str) -> str:
     return "watchdog-job"
 
 
+def _validate_lease(_lock: RunLock, _token: str) -> None:
+    return None
+
+
 class WatchdogApiStub:
     def __init__(self) -> None:
         self.label_updates: list[dict[str, object]] = []
@@ -97,6 +104,16 @@ class WatchdogApiStub:
 
     def inspect_job(self, **_kwargs: object) -> object:
         raise AssertionError("unexpected job inspection")
+
+
+class LeaseApiStub:
+    def __init__(self, *job_ids: str) -> None:
+        self.jobs: list[object] = [SimpleNamespace(id=job_id) for job_id in job_ids]
+        self.requests: list[dict[str, object]] = []
+
+    def list_jobs(self, **kwargs: object) -> list[object]:
+        self.requests.append(kwargs)
+        return self.jobs
 
 
 def test_endpoint_lifecycle_and_status() -> None:
@@ -784,12 +801,102 @@ def test_harbor_command_is_pinned_and_bounded(
         "--include-task-name",
         "cancel-async-tasks",
         "--agent-kwarg",
-        "version=replace-with-commit",
+        "version=replace-with-package-version",
         "--agent-kwarg",
         "compaction=true",
         "--agent-kwarg",
         'thinking="off"',
     ]
+    assert _expected_agent_version(lock) == "replace-with-package-version"
+
+
+def test_harbor_source_agent_uses_reported_identity_without_version_override(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    agent = remote_spec.matrix.agents[0].model_copy(
+        update={
+            "revision": remote.harbor.source.revision,
+            "revision_kind": "harbor-source",
+            "reported_version": "2.0.0",
+        }
+    )
+    spec = remote_spec.model_copy(
+        update={"matrix": remote_spec.matrix.model_copy(update={"agents": [agent]})}
+    )
+
+    lock = build_run_lock(spec)
+    command = build_harbor_command(lock, tmp_path, "https://endpoint.example", tmp_path)
+
+    assert "version=2.0.0" not in command
+    assert not any(argument.startswith("version=") for argument in command)
+    assert _expected_agent_version(lock) == "2.0.0"
+
+
+@pytest.mark.parametrize(
+    ("job_ids", "error"),
+    [
+        (("job-2",), None),
+        (("job-2", "job-3"), None),
+        (("job-1", "job-2"), "endpoint lease is held by controller job-1"),
+        (("job-1",), "controller Job is not visible in its endpoint lease"),
+    ],
+)
+def test_endpoint_lease_elects_lowest_active_controller(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    job_ids: tuple[str, ...],
+    error: str | None,
+) -> None:
+    lock = build_run_lock(remote_spec)
+    api = LeaseApiStub(*job_ids)
+    monkeypatch.setenv("JOB_ID", "job-2")
+
+    if error is None:
+        assert_exclusive_endpoint_lease(lock, "token", api=api)
+    else:
+        with pytest.raises(WorkerError, match=f"^{error}$"):
+            assert_exclusive_endpoint_lease(lock, "token", api=api)
+
+    assert api.requests == [
+        {
+            "status": ["SCHEDULING", "RUNNING"],
+            "labels": {"harbor-hf-endpoint": "d026b68a5286b3887f1e9ea13d304aed"},
+            "namespace": "osolmaz",
+        }
+    ]
+
+
+def test_endpoint_lease_requires_controller_job_id(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("JOB_ID", raising=False)
+
+    with pytest.raises(
+        WorkerError, match="^controller JOB_ID is required for endpoint lease$"
+    ):
+        assert_exclusive_endpoint_lease(
+            build_run_lock(remote_spec), "token", api=LeaseApiStub()
+        )
+
+
+def test_endpoint_lease_builds_authenticated_hf_api(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = LeaseApiStub("job-2")
+    tokens: list[str | None] = []
+
+    def fake_hf_api(*, token: str | None = None) -> LeaseApiStub:
+        tokens.append(token)
+        return api
+
+    monkeypatch.setenv("JOB_ID", "job-2")
+    monkeypatch.setattr("huggingface_hub.HfApi", fake_hf_api)
+
+    assert_exclusive_endpoint_lease(build_run_lock(remote_spec), "secret-token")
+
+    assert tokens == ["secret-token"]
 
 
 def test_controller_environment_records_only_reproducibility_fields(
@@ -904,6 +1011,160 @@ def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
 
     with pytest.raises(WorkerError, match="^Harbor trial task failed with AgentError$"):
         validate_harbor_result(tmp_path)
+
+
+def test_validate_harbor_result_rejects_step_exception_despite_reward(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "step_results": [
+                    {"step_name": "environment_setup", "exception_info": None},
+                    {
+                        "step_name": "agent_setup",
+                        "exception_info": {"exception_type": "AgentSetupError"},
+                    },
+                ],
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match="^Harbor trial task step agent_setup failed with AgentSetupError$",
+    ):
+        validate_harbor_result(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("step", "message"),
+    [
+        (
+            {"exception_info": "failed"},
+            "Harbor trial task step 1 failed with str",
+        ),
+        (
+            {"exception_info": {}},
+            "Harbor trial task step 1 failed with an exception",
+        ),
+    ],
+)
+def test_validate_harbor_result_describes_unnamed_step_exceptions(
+    tmp_path: Path,
+    step: dict[str, object],
+    message: str,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "step_results": [step],
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match=f"^{message}$"):
+        validate_harbor_result(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("step_results", "message"),
+    [
+        ({}, "Harbor trial task step results failed with malformed result"),
+        (["bad"], "Harbor trial task step 1 failed with malformed result"),
+    ],
+)
+def test_validate_harbor_result_rejects_malformed_step_results(
+    tmp_path: Path,
+    step_results: object,
+    message: str,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "step_results": step_results,
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match=f"^{message}$"):
+        validate_harbor_result(tmp_path)
+
+
+def test_validate_harbor_result_enforces_agent_identity(tmp_path: Path) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "agent_info": {"name": "openclaw", "version": "wrong"},
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match="^Harbor trial task agent identity does not match the lock$",
+    ):
+        validate_harbor_result(
+            tmp_path,
+            expected_agent_name="openclaw",
+            expected_agent_version="1.2.3",
+        )
+
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkerError, match="has no agent identity"):
+        validate_harbor_result(
+            tmp_path,
+            expected_agent_name="openclaw",
+            expected_agent_version="1.2.3",
+        )
+
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "step_results": [{"step_name": "agent", "exception_info": None}],
+                "agent_info": {"name": "openclaw", "version": "1.2.3"},
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert validate_harbor_result(
+        tmp_path,
+        expected_agent_name="openclaw",
+        expected_agent_version="1.2.3",
+    ) == {
+        "trial_count": 1,
+        "trials": [{"task_name": "task", "rewards": {"reward": 1.0}}],
+    }
 
 
 @pytest.mark.parametrize(
@@ -1139,6 +1400,10 @@ def _successful_stream(
         json.dumps(
             {
                 "task_name": "cancel-async-tasks",
+                "agent_info": {
+                    "name": "openclaw",
+                    "version": "replace-with-package-version",
+                },
                 "verifier_result": {"rewards": {"reward": 1.0}},
             }
         ),
@@ -1175,6 +1440,7 @@ def test_worker_publishes_success_after_cleanup(
         stream_runner=_successful_stream,
         source_preparer=_prepare_source,
         watchdog_launcher=_launch_watchdog,
+        lease_validator=_validate_lease,
     )
 
     assert (root / "_SUCCESS").exists()
@@ -1229,6 +1495,7 @@ def test_worker_publishes_success_after_cleanup(
         for record in event_records
     ] == [
         {"event": "worker_started", "run_id": "successful"},
+        {"event": "endpoint_lease_acquired"},
         {"event": "cleanup_watchdog_started", "job_id": "watchdog-job"},
         {"event": "endpoint_resume_requested"},
         {"event": "endpoint_ready", "state": "running"},
@@ -1305,6 +1572,7 @@ def test_worker_rejects_incomplete_explicit_task_set(
             stream_runner=_successful_stream,
             source_preparer=_prepare_source,
             watchdog_launcher=_launch_watchdog,
+            lease_validator=_validate_lease,
         )
 
     assert [command[2] for command in runner.commands][-2:] == ["pause", "describe"]
@@ -1334,6 +1602,7 @@ def test_worker_failure_still_pauses_endpoint(
             stream_runner=lambda *_args, **_kwargs: 7,
             source_preparer=_prepare_source,
             watchdog_launcher=_launch_watchdog,
+            lease_validator=_validate_lease,
         )
 
     root = tmp_path / "output" / lock.artifact_prefix
@@ -1345,6 +1614,45 @@ def test_worker_failure_still_pauses_endpoint(
         for line in (root / "events.jsonl").read_text().splitlines()
     ]
     assert events[-2:] == ["endpoint_paused", "run_failed"]
+
+
+def test_worker_without_endpoint_lease_never_pauses_endpoint(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="lease-lost")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    runner = EndpointRunner([])
+
+    def reject_lease(_lock: RunLock, _token: str) -> None:
+        raise WorkerError("endpoint lease is held by another controller")
+
+    with pytest.raises(
+        WorkerError, match="^endpoint lease is held by another controller$"
+    ):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            lease_validator=reject_lease,
+        )
+
+    root = tmp_path / "output" / lock.artifact_prefix
+    events = [
+        json.loads(line)["event"]
+        for line in (root / "events.jsonl").read_text().splitlines()
+    ]
+    assert runner.commands == []
+    assert events == [
+        "worker_started",
+        "endpoint_cleanup_skipped",
+        "run_failed",
+    ]
 
 
 def test_worker_marks_failed_when_success_evidence_cannot_finalize(
@@ -1379,6 +1687,7 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
             stream_runner=_successful_stream,
             source_preparer=_prepare_source,
             watchdog_launcher=_launch_watchdog,
+            lease_validator=_validate_lease,
         )
 
     root = tmp_path / "output" / lock.artifact_prefix
@@ -1418,6 +1727,7 @@ def test_worker_does_not_resume_without_independent_watchdog(
             runner=runner,
             source_preparer=_prepare_source,
             watchdog_launcher=fail_watchdog,
+            lease_validator=_validate_lease,
         )
 
     assert [command[2] for command in runner.commands] == ["pause", "describe"]
@@ -1447,6 +1757,7 @@ def test_cleanup_failure_prevents_success_and_redacts_failure(
             stream_runner=_successful_stream,
             source_preparer=_prepare_source,
             watchdog_launcher=_launch_watchdog,
+            lease_validator=_validate_lease,
         )
 
     root = tmp_path / "output" / lock.artifact_prefix
@@ -1484,6 +1795,32 @@ def test_worker_rejects_mismatched_lock_before_remote_work(
         WorkerError, match="^manifest digest does not match the run lock$"
     ):
         run_worker(remote_manifest, lock_path, tmp_path / "output")
+
+
+def test_run_lock_validation_rejects_tampered_agent_metadata(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = build_run_lock(remote_spec)
+    reserved = lock.model_copy(
+        update={"agent": lock.agent.model_copy(update={"parameters": {"version": "x"}})}
+    )
+    with pytest.raises(WorkerError, match="parameter 'version' is reserved"):
+        validate_run_lock(remote_spec, reserved)
+
+    remote = remote_spec.remote
+    assert remote is not None
+    source_agent = lock.agent.model_copy(
+        update={
+            "revision": "0" * 40,
+            "revision_kind": "harbor-source",
+            "reported_version": "2.0.0",
+        }
+    )
+    source_lock = lock.model_copy(update={"agent": source_agent})
+    with pytest.raises(
+        WorkerError, match="Harbor-source agent revision must match the Harbor source"
+    ):
+        validate_run_lock(remote_spec, source_lock)
 
 
 def test_worker_requires_named_secret(

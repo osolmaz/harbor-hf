@@ -64,6 +64,13 @@ events, and pauses the endpoint in a `finally` path. The submitting machine does
 not execute benchmark tasks. Provider-backed runs will skip endpoint
 provisioning but retain request, quota, retry, and accounting state.
 
+Endpoint-backed controller Jobs carry a deterministic label derived from the
+endpoint namespace and name. Before creating a watchdog or changing endpoint
+state, a controller lists active Jobs in that label group. The lowest active Job
+ID is the sole lease holder. A controller that does not hold the lease fails
+without resuming or pausing the endpoint, so overlapping submissions cannot
+interrupt the elected run's endpoint.
+
 ### Harbor Adapter
 
 Harbor remains the only benchmark execution engine. The adapter translates a
@@ -157,9 +164,11 @@ label written from inside the watchdog's monitoring process; a submitted or
 merely running Job is not sufficient. The watchdog observes the controller Job
 and pauses the endpoint after the controller terminates or its own deadline
 expires. The controller also pauses the endpoint after its last active shard in
-a `finally` path. Cleanup success is part of endpoint run completion, not an
-optional maintenance action. Provider-backed runs have no endpoint lease but
-still close worker resources and record final usage and request state.
+a `finally` path, but only after it has acquired the endpoint lease. A controller
+that loses lease election records skipped cleanup and never changes endpoint
+state. Cleanup success is part of endpoint run completion, not an optional
+maintenance action. Provider-backed runs have no endpoint lease but still close
+worker resources and record final usage and request state.
 
 The worker verifies `status.state = paused` and `readyReplica = 0` before it
 writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may

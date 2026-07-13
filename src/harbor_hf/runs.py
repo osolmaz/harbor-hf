@@ -17,7 +17,7 @@ from harbor_hf.models import (
 )
 from harbor_hf.planner import experiment_digest
 
-_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 
 class Clock(Protocol):
@@ -81,6 +81,11 @@ def build_run_lock(
     agent = _select(spec.matrix.agents, agent_id, "agent")
     if "version" in agent.parameters:
         raise ValueError("agent parameter 'version' is reserved by the run lock")
+    if (
+        agent.revision_kind == "harbor-source"
+        and agent.revision != spec.remote.harbor.source.revision
+    ):
+        raise ValueError("Harbor-source agent revision must match the Harbor source")
     if deployment.endpoint is None:
         raise ValueError(
             f"deployment profile {deployment.id} requires an endpoint binding"
@@ -91,7 +96,7 @@ def build_run_lock(
     if run_id is not None and _RUN_ID.fullmatch(run_id) is None:
         raise ValueError(
             "run ID must be one safe path component containing only letters, "
-            "digits, dots, underscores, or hyphens"
+            "digits, dots, underscores, or hyphens, with at most 100 characters"
         )
     resolved_id = run_id or _new_run_id(spec.metadata.name, digest, created_at)
     return RunLock(

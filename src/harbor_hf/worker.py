@@ -7,7 +7,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Protocol, cast
@@ -27,7 +27,11 @@ from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.runs import RunLock
-from harbor_hf.submission import github_repository, locked_source_command
+from harbor_hf.submission import (
+    endpoint_lease_label,
+    github_repository,
+    locked_source_command,
+)
 
 _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
 _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
@@ -39,6 +43,16 @@ class WorkerError(RuntimeError):
 
 class JobInspector(Protocol):
     def inspect_job(self, *, job_id: str, namespace: str | None = None) -> object: ...
+
+
+class LeaseApi(Protocol):
+    def list_jobs(
+        self,
+        *,
+        status: list[str],
+        labels: dict[str, str],
+        namespace: str,
+    ) -> Iterable[object]: ...
 
 
 class WatchdogApi(JobInspector, Protocol):
@@ -191,7 +205,8 @@ def build_harbor_command(
     ]
     for task_name in lock.benchmark_tasks:
         command.extend(("--include-task-name", task_name))
-    command.extend(("--agent-kwarg", f"version={lock.agent.revision}"))
+    if lock.agent.revision_kind == "package":
+        command.extend(("--agent-kwarg", f"version={lock.agent.revision}"))
     for key, value in sorted(lock.agent.parameters.items()):
         rendered = json.dumps(value, separators=(",", ":"))
         command.extend(("--agent-kwarg", f"{key}={rendered}"))
@@ -207,6 +222,7 @@ def run_worker(
     stream_runner: Callable[..., int] = run_streaming,
     source_preparer: Callable[[SourcePin, Path, CommandRunner], None] | None = None,
     watchdog_launcher: Callable[[RunLock, EndpointRef, str], str] | None = None,
+    lease_validator: Callable[[RunLock, str], None] | None = None,
 ) -> Path:
     spec = load_experiment(manifest_path)
     lock = RunLock.model_validate_json(
@@ -233,10 +249,14 @@ def run_worker(
     manager = EndpointManager(endpoint.namespace, endpoint.name, process_runner)
     error: Exception | None = None
     cleanup_error: Exception | None = None
+    owns_endpoint = False
 
     append_event(events, "worker_started", run_id=lock.run_id)
     try:
         require_executable("git")
+        (lease_validator or assert_exclusive_endpoint_lease)(lock, token)
+        owns_endpoint = True
+        append_event(events, "endpoint_lease_acquired")
         harbor_source = Path("/tmp/harbor-hf-sources") / (
             f"harbor-{lock.remote.harbor.source.revision}"
         )
@@ -263,21 +283,26 @@ def run_worker(
     except Exception as caught:
         error = caught
     finally:
-        append_event(events, "endpoint_pause_requested")
-        try:
-            final_snapshot = manager.pause_and_verify()
-            state, ready, target = endpoint_state(final_snapshot)
-            write_json(root / "endpoint.final.json", redact(final_snapshot))
-            append_event(
-                events,
-                "endpoint_paused",
-                state=state,
-                ready_replicas=ready,
-                target_replicas=target,
-            )
-        except Exception as caught:
-            cleanup_error = caught
-            append_event(events, "endpoint_cleanup_failed", error=type(caught).__name__)
+        if owns_endpoint:
+            append_event(events, "endpoint_pause_requested")
+            try:
+                final_snapshot = manager.pause_and_verify()
+                state, ready, target = endpoint_state(final_snapshot)
+                write_json(root / "endpoint.final.json", redact(final_snapshot))
+                append_event(
+                    events,
+                    "endpoint_paused",
+                    state=state,
+                    ready_replicas=ready,
+                    target_replicas=target,
+                )
+            except Exception as caught:
+                cleanup_error = caught
+                append_event(
+                    events, "endpoint_cleanup_failed", error=type(caught).__name__
+                )
+        else:
+            append_event(events, "endpoint_cleanup_skipped", reason="lease_not_owned")
 
     if error is None and cleanup_error is None:
         _publish_success(root, events, token)
@@ -311,6 +336,40 @@ def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
         raise WorkerError("manifest digest does not match the run lock")
     if "version" in lock.agent.parameters:
         raise WorkerError("agent parameter 'version' is reserved by the run lock")
+    if (
+        lock.agent.revision_kind == "harbor-source"
+        and lock.agent.revision != lock.remote.harbor.source.revision
+    ):
+        raise WorkerError("Harbor-source agent revision must match the Harbor source")
+
+
+def assert_exclusive_endpoint_lease(
+    lock: RunLock,
+    token: str,
+    *,
+    api: LeaseApi | None = None,
+) -> None:
+    controller_job_id = os.environ.get("JOB_ID", "")
+    if not controller_job_id:
+        raise WorkerError("controller JOB_ID is required for endpoint lease")
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+    active_jobs = api.list_jobs(
+        status=["SCHEDULING", "RUNNING"],
+        labels={"harbor-hf-endpoint": endpoint_lease_label(lock)},
+        namespace=lock.remote.job.namespace,
+    )
+    active_ids = sorted(
+        job_id
+        for job in active_jobs
+        if isinstance((job_id := getattr(job, "id", None)), str)
+    )
+    if controller_job_id not in active_ids:
+        raise WorkerError("controller Job is not visible in its endpoint lease")
+    if active_ids[0] != controller_job_id:
+        raise WorkerError(f"endpoint lease is held by controller {active_ids[0]}")
 
 
 def _publish_success(root: Path, events: Path, token: str) -> None:
@@ -381,6 +440,8 @@ def _execute_benchmark(
     verifier = validate_harbor_result(
         jobs_dir,
         expected_trials=_expected_trial_count(lock),
+        expected_agent_name=lock.agent.name,
+        expected_agent_version=_expected_agent_version(lock),
     )
     write_json(root / "verification.json", verifier)
     append_event(events, "verification_validated")
@@ -659,8 +720,19 @@ def _expected_trial_count(lock: RunLock) -> int | None:
     return len(lock.benchmark_tasks) * lock.attempts
 
 
+def _expected_agent_version(lock: RunLock) -> str:
+    if lock.agent.revision_kind == "package":
+        return lock.agent.revision
+    assert lock.agent.reported_version is not None
+    return lock.agent.reported_version
+
+
 def validate_harbor_result(
-    jobs_dir: Path, expected_trials: int | None = 1
+    jobs_dir: Path,
+    expected_trials: int | None = 1,
+    *,
+    expected_agent_name: str | None = None,
+    expected_agent_version: str | None = None,
 ) -> dict[str, object]:
     trials: list[dict[str, object]] = []
     for path in sorted(jobs_dir.rglob("result.json")):
@@ -672,17 +744,19 @@ def validate_harbor_result(
     verified: list[dict[str, object]] = []
     for trial in trials:
         task_name = str(trial["task_name"])
-        exception = trial.get("exception_info")
-        if exception is not None:
-            exception_type = (
-                exception.get("exception_type")
-                if isinstance(exception, Mapping)
-                else type(exception).__name__
-            )
+        failure = _trial_failure(trial)
+        if failure is not None:
+            location, exception_type = failure
             raise WorkerError(
-                f"Harbor trial {task_name} failed with "
+                f"Harbor trial {task_name}{location} failed with "
                 f"{exception_type or 'an exception'}"
             )
+        _validate_agent_identity(
+            trial,
+            task_name,
+            expected_agent_name,
+            expected_agent_version,
+        )
         verifier = trial.get("verifier_result")
         rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
         if not isinstance(rewards, Mapping) or not rewards:
@@ -697,6 +771,53 @@ def validate_harbor_result(
         "trial_count": len(verified),
         "trials": verified,
     }
+
+
+def _trial_failure(trial: Mapping[str, object]) -> tuple[str, object] | None:
+    exception = trial.get("exception_info")
+    if exception is not None:
+        exception_type = (
+            exception.get("exception_type")
+            if isinstance(exception, Mapping)
+            else type(exception).__name__
+        )
+        return "", exception_type
+    steps = trial.get("step_results")
+    if steps is None:
+        return None
+    if not isinstance(steps, list):
+        return " step results", "malformed result"
+    for ordinal, step in enumerate(steps, start=1):
+        if not isinstance(step, Mapping):
+            return f" step {ordinal}", "malformed result"
+        step_exception = step.get("exception_info")
+        if step_exception is None:
+            continue
+        exception_type = (
+            step_exception.get("exception_type")
+            if isinstance(step_exception, Mapping)
+            else type(step_exception).__name__
+        )
+        step_name = step.get("step_name") or ordinal
+        return f" step {step_name}", exception_type
+    return None
+
+
+def _validate_agent_identity(
+    trial: Mapping[str, object],
+    task_name: str,
+    expected_name: str | None,
+    expected_version: str | None,
+) -> None:
+    if expected_name is None and expected_version is None:
+        return
+    agent = trial.get("agent_info")
+    if not isinstance(agent, Mapping):
+        raise WorkerError(f"Harbor trial {task_name} has no agent identity")
+    if agent.get("name") != expected_name or agent.get("version") != expected_version:
+        raise WorkerError(
+            f"Harbor trial {task_name} agent identity does not match the lock"
+        )
 
 
 def _validate_trial_count(

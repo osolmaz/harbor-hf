@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 from pathlib import Path
@@ -61,6 +62,14 @@ def bucket_uri(bucket: str) -> str:
     return f"hf://buckets/{bucket.removeprefix('buckets/')}"
 
 
+def endpoint_lease_label(lock: RunLock) -> str:
+    endpoint = lock.deployment.endpoint
+    if endpoint is None:
+        raise ValueError("run lock has no endpoint binding")
+    identity = f"{endpoint.namespace}/{endpoint.name}".encode()
+    return hashlib.sha256(identity).hexdigest()[:32]
+
+
 def build_submit_command(
     lock: RunLock,
     *,
@@ -83,6 +92,8 @@ def build_submit_command(
         job.token_secret_name,
         "--label",
         f"harbor-hf-run={lock.run_id}",
+        "--label",
+        f"harbor-hf-endpoint={endpoint_lease_label(lock)}",
         "--volume",
         f"{input_dir}:/input:ro",
         "--volume",

@@ -7,6 +7,7 @@ from harbor_hf.runs import build_run_lock
 from harbor_hf.submission import (
     bucket_uri,
     build_submit_command,
+    endpoint_lease_label,
     github_archive,
     github_repository,
     locked_source_command,
@@ -33,7 +34,7 @@ def test_build_submit_command_contains_only_secret_name(
         lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
     )
 
-    assert command[:20] == [
+    assert command[:22] == [
         "hf",
         "jobs",
         "run",
@@ -48,6 +49,8 @@ def test_build_submit_command_contains_only_secret_name(
         "HF_TOKEN",
         "--label",
         "harbor-hf-run=run-1",
+        "--label",
+        f"harbor-hf-endpoint={endpoint_lease_label(lock)}",
         "--volume",
         f"{tmp_path}:/input:ro",
         "--volume",
@@ -55,11 +58,11 @@ def test_build_submit_command_contains_only_secret_name(
         "--",
         "ghcr.io/astral-sh/uv:python3.12-bookworm",
     ]
-    assert command[20:23] == ["bash", "-lc", command[22]]
-    assert "git clone --filter=blob:none --no-checkout" in command[22]
-    assert "uv run --project" in command[22]
-    assert "--locked" in command[22]
-    assert command[23:] == [
+    assert command[22:25] == ["bash", "-lc", command[24]]
+    assert "git clone --filter=blob:none --no-checkout" in command[24]
+    assert "uv run --project" in command[24]
+    assert "--locked" in command[24]
+    assert command[25:] == [
         "locked-source",
         "harbor-hf",
         "worker",
@@ -69,6 +72,27 @@ def test_build_submit_command_contains_only_secret_name(
         "/output",
     ]
     assert "super-secret" not in " ".join(command)
+
+
+def test_endpoint_lease_label_is_stable_and_bounded(
+    remote_spec: ExperimentSpec,
+) -> None:
+    label = endpoint_lease_label(build_run_lock(remote_spec))
+
+    assert label == "d026b68a5286b3887f1e9ea13d304aed"
+    assert len(label) == 32
+
+
+def test_endpoint_lease_label_requires_endpoint_binding(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = build_run_lock(remote_spec)
+    lock = lock.model_copy(
+        update={"deployment": lock.deployment.model_copy(update={"endpoint": None})}
+    )
+
+    with pytest.raises(ValueError, match="^run lock has no endpoint binding$"):
+        endpoint_lease_label(lock)
 
 
 def test_submit_parses_job_id(remote_spec: ExperimentSpec, tmp_path: Path) -> None:

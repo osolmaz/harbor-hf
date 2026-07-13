@@ -11,9 +11,9 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
 
-    assert lock.run_id == "20260713T010203Z-c0ef9d7c35"
+    assert lock.run_id == "20260713T010203Z-075c8cba53"
     assert lock.spec_digest == (
-        "sha256:0a82012432e46a47359443164dce9b7777526b44a76bdb6161f572a5a530ab3b"
+        "sha256:dbc1b651f3f64e125b32cd4a0f59761c92bdb82a5e700161bd6191b9b0e8d8e4"
     )
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
     assert lock.deployment.endpoint is not None
@@ -31,9 +31,15 @@ def test_run_id_override_is_preserved(remote_spec: ExperimentSpec) -> None:
     assert lock.run_id == "manual-run"
 
 
+def test_run_id_accepts_hf_label_limit(remote_spec: ExperimentSpec) -> None:
+    run_id = "x" * 100
+
+    assert build_run_lock(remote_spec, run_id=run_id).run_id == run_id
+
+
 @pytest.mark.parametrize(
     "run_id",
-    ["../escape", "nested/path", "/absolute", ".", "x" * 129],
+    ["../escape", "nested/path", "/absolute", ".", "x" * 101],
 )
 def test_run_id_override_must_be_a_safe_path_component(
     remote_spec: ExperimentSpec, run_id: str
@@ -79,4 +85,22 @@ def test_agent_version_parameter_is_reserved(remote_spec: ExperimentSpec) -> Non
     )
 
     with pytest.raises(ValueError, match="parameter 'version' is reserved"):
+        build_run_lock(invalid)
+
+
+def test_harbor_source_agent_must_share_harbor_revision(
+    remote_spec: ExperimentSpec,
+) -> None:
+    agent = remote_spec.matrix.agents[0].model_copy(
+        update={
+            "revision": "0" * 40,
+            "revision_kind": "harbor-source",
+            "reported_version": "2.0.0",
+        }
+    )
+    invalid = remote_spec.model_copy(
+        update={"matrix": remote_spec.matrix.model_copy(update={"agents": [agent]})}
+    )
+
+    with pytest.raises(ValueError, match="must match the Harbor source"):
         build_run_lock(invalid)

@@ -51,7 +51,8 @@ matrix:
   agents:
     - id: openclaw
       name: openclaw
-      revision: replace-with-commit
+      revision: replace-with-package-version
+      revision_kind: package
       parameters:
         thinking: "off"
         compaction: true

@@ -33,7 +33,9 @@ matrix:
   agents:
     - id: agent
       name: terminus-2
-      revision: replace-with-immutable-revision
+      revision: 0123456789abcdef0123456789abcdef01234567
+      revision_kind: harbor-source
+      reported_version: 2.0.0
 artifacts:
   bucket: organization/benchmark-runs
 publishing:
@@ -132,6 +134,12 @@ names have a deterministic expected trial count of tasks multiplied by
 attempts. Glob selections are resolved by Harbor; the controller requires at
 least one result and validates every resulting trial for exceptions and numeric
 verifier rewards.
+
+Agent revisions declare how they are enforced. `package` passes the revision to
+an installed agent and requires Harbor to report that same version.
+`harbor-source` means the agent implementation is part of Harbor: its revision
+must equal `remote.harbor.source.revision`, no package version is passed, and
+`reported_version` records the semantic version Harbor must report.
 
 ### Artifacts
 

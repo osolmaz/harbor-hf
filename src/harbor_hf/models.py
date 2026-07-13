@@ -74,7 +74,17 @@ class AgentProfile(StrictModel):
     id: ProfileId
     name: str = Field(min_length=1)
     revision: str = Field(min_length=1)
+    revision_kind: Literal["package", "harbor-source"]
+    reported_version: str | None = Field(default=None, min_length=1)
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def revision_metadata_is_consistent(self) -> AgentProfile:
+        if self.revision_kind == "package" and self.reported_version is not None:
+            raise ValueError("package agents report their package revision")
+        if self.revision_kind == "harbor-source" and self.reported_version is None:
+            raise ValueError("Harbor-source agents require reported_version")
+        return self
 
 
 class MatrixSpec(StrictModel):
