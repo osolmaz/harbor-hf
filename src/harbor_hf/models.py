@@ -188,6 +188,7 @@ class ExecutionSpec(StrictModel):
     attempts: int = Field(default=1, ge=1)
     concurrent_trials: int = Field(default=1, ge=1)
     max_trials_per_shard: int = Field(default=64, ge=1)
+    max_shards_per_wave: int = Field(default=8, ge=1)
     timeout_seconds: int = Field(default=3600, ge=1)
 
 

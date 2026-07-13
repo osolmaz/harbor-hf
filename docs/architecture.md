@@ -65,6 +65,22 @@ events, and pauses the endpoint in a `finally` path. The submitting machine does
 not execute benchmark tasks. Provider-backed runs will skip endpoint
 provisioning but retain request, quota, retry, and accounting state.
 
+### Campaign Reconciler
+
+Campaigns are durable submissions of an immutable resolved plan. A campaign
+lock content-addresses its run cells, bounded shards, and logical trials. The
+same plan may be submitted more than once under distinct campaign IDs without
+overwriting or silently adopting an earlier measurement.
+
+The stateless reconciler reads campaign locks and append-only typed events from
+the private coordination Dataset, rebuilds projections, and derives
+deterministic actions. Action reservations and their events are committed
+atomically with the repository head as the expected parent. A repeated or
+concurrent pass adopts an existing reservation instead of duplicating a remote
+side effect. Compatible shards are grouped by a digest of their exact model and
+deployment configuration; agent differences do not force a second endpoint
+startup.
+
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
 derived from the endpoint namespace and name. They coordinate through one
 private, namespace-level `harbor-hf-coordination` Dataset repository. A

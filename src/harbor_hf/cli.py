@@ -9,11 +9,25 @@ from typing import Annotated, Literal
 import typer
 from httpx import HTTPError
 
-from harbor_hf.campaigns import build_campaign_plan, campaign_json_schemas
+from harbor_hf.campaigns import (
+    build_campaign_lock,
+    build_campaign_plan,
+    campaign_json_schemas,
+    new_campaign_id,
+)
+from harbor_hf.control import (
+    CampaignSubmittedPayload,
+    ControlError,
+    HubCampaignStore,
+    new_event,
+    project_campaign,
+)
+from harbor_hf.coordination import CoordinationError
 from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.planner import build_plan
 from harbor_hf.process import ProcessError, SubprocessRunner
+from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
@@ -89,6 +103,89 @@ def campaign_schema(
         typer.echo(rendered, nl=False)
         return
     output.write_text(rendered, encoding="utf-8")
+
+
+@campaign_app.command("submit")
+def campaign_submit(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    campaign_id: Annotated[str | None, typer.Option("--campaign-id")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Persist an immutable campaign request on Hugging Face."""
+    spec = _load_or_exit(manifest)
+    try:
+        if spec.remote is None:
+            raise ValueError("campaign submission requires a remote configuration")
+        resolved = build_campaign_plan(spec)
+        resolved_id = campaign_id or new_campaign_id(resolved)
+        lock = build_campaign_lock(resolved, resolved_id)
+        submitted = new_event(
+            subject_type="campaign",
+            subject_id=resolved_id,
+            kind="campaign.submitted",
+            producer="cli",
+            payload=CampaignSubmittedPayload(plan_digest=resolved.plan_digest),
+        )
+        if not dry_run:
+            from harbor_hf.submission import ensure_private_coordination_repository
+
+            ensure_private_coordination_repository(spec.remote.job.namespace)
+            HubCampaignStore(spec.remote.job.namespace).create_campaign(
+                lock, manifest.read_bytes(), submitted
+            )
+    except (HTTPError, OSError, ValueError, ControlError, CoordinationError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(
+        json.dumps(
+            {
+                "campaign_id": lock.campaign_id,
+                "plan_digest": lock.plan_digest,
+                "artifact_prefix": lock.artifact_prefix,
+                "stored": not dry_run,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@campaign_app.command("status")
+def campaign_status(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+) -> None:
+    """Read the durable projection of one campaign."""
+    try:
+        lock, events = HubCampaignStore(namespace).load_campaign(campaign_id)
+        projection = project_campaign(lock, events)
+    except (HTTPError, OSError, ValueError, ControlError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(projection.model_dump(mode="json"), indent=2, sort_keys=True))
+
+
+@campaign_app.command("reconcile")
+def campaign_reconcile(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Plan the next idempotent campaign actions."""
+    if not dry_run:
+        typer.echo(
+            "Error: campaign reconciliation currently requires --dry-run", err=True
+        )
+        raise typer.Exit(code=2)
+    try:
+        lock, events = HubCampaignStore(namespace).load_campaign(campaign_id)
+        _projection, reconciliation = plan_reconciliation(lock, events)
+    except (HTTPError, OSError, ValueError, ControlError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(
+        json.dumps(reconciliation.model_dump(mode="json"), indent=2, sort_keys=True)
+    )
 
 
 @app.command()

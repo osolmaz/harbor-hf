@@ -1,0 +1,333 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from huggingface_hub import CommitOperationAdd
+from huggingface_hub.errors import HfHubHTTPError
+from pydantic import ValidationError
+
+from harbor_hf.campaigns import CampaignLock, build_campaign_lock, build_campaign_plan
+from harbor_hf.control import (
+    ActionOutcomePayload,
+    ActionReservedPayload,
+    CampaignConflict,
+    CampaignEvent,
+    CampaignSubmittedPayload,
+    ControlError,
+    HubCampaignStore,
+    TerminalPayload,
+    new_event,
+    project_campaign,
+)
+from harbor_hf.models import ExperimentSpec
+
+NOW = datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC)
+
+
+class FakeCampaignApi:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.generation = 1
+        self.files: dict[str, bytes] = {}
+        self.conflicts = 0
+        self.commits: list[dict[str, object]] = []
+
+    @property
+    def head(self) -> str:
+        return f"{self.generation:040x}"
+
+    def repo_info(self, repo_id: str, **kwargs: object) -> object:
+        assert repo_id == "org/harbor-hf-coordination"
+        assert kwargs == {"repo_type": "dataset", "revision": "main"}
+        return SimpleNamespace(sha=self.head)
+
+    def get_paths_info(
+        self, repo_id: str, paths: list[str] | str, **kwargs: object
+    ) -> list[object]:
+        assert repo_id == "org/harbor-hf-coordination"
+        assert kwargs == {"repo_type": "dataset", "revision": self.head}
+        path = paths if isinstance(paths, str) else paths[0]
+        return [SimpleNamespace(path=path)] if path in self.files else []
+
+    def list_repo_files(self, repo_id: str, **kwargs: object) -> list[str]:
+        assert repo_id == "org/harbor-hf-coordination"
+        assert kwargs == {"repo_type": "dataset", "revision": self.head}
+        return list(self.files)
+
+    def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str:
+        assert repo_id == "org/harbor-hf-coordination"
+        assert kwargs == {"repo_type": "dataset", "revision": self.head}
+        destination = self.root / filename.replace("/", "-")
+        destination.write_bytes(self.files[filename])
+        return str(destination)
+
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object:
+        assert repo_id == "org/harbor-hf-coordination"
+        if self.conflicts:
+            self.conflicts -= 1
+            self.generation += 1
+            raise _http_error(409)
+        assert kwargs["parent_commit"] == self.head
+        for operation in operations:
+            assert isinstance(operation, CommitOperationAdd)
+            payload = operation.path_or_fileobj
+            assert isinstance(payload, bytes)
+            self.files[operation.path_in_repo] = payload
+        self.commits.append(kwargs)
+        self.generation += 1
+        return SimpleNamespace(oid=self.head)
+
+
+def _http_error(status: int) -> HfHubHTTPError:
+    request = httpx.Request("POST", "https://huggingface.co/api/datasets")
+    return HfHubHTTPError(
+        "commit failed", response=httpx.Response(status, request=request)
+    )
+
+
+def _lock(remote_spec: ExperimentSpec) -> CampaignLock:
+    return build_campaign_lock(
+        build_campaign_plan(remote_spec), "campaign-one", clock=lambda: NOW
+    )
+
+
+def _submitted(lock: CampaignLock) -> CampaignEvent:
+    return new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=lock.plan_digest),
+        clock=lambda: NOW,
+        identifier=lambda: "1" * 32,
+    )
+
+
+def test_event_payload_must_match_kind() -> None:
+    with pytest.raises(ValidationError, match="payload does not match"):
+        CampaignEvent(
+            event_id="evt-" + "1" * 32,
+            subject_type="campaign",
+            subject_id="campaign",
+            kind="campaign.submitted",
+            observed_at=NOW,
+            producer="cli",
+            payload=TerminalPayload(message="wrong"),
+        )
+
+
+def test_projection_tracks_reserved_and_completed_actions(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _lock(remote_spec)
+    reserved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="act-one",
+            action_key="key-one",
+            action_kind="submit-wave",
+            target_ids=[lock.runs[0].shards[0].shard_id],
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "2" * 32,
+    )
+    succeeded = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.succeeded",
+        producer="reconciler",
+        payload=ActionOutcomePayload(action_id="act-one", remote_id="job-one"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "3" * 32,
+    )
+
+    projection = project_campaign(
+        lock, [succeeded, _submitted(lock), reserved, reserved]
+    )
+
+    assert projection.status == "active"
+    assert projection.event_count == 3
+    assert projection.actions["act-one"].status == "succeeded"
+    assert projection.actions["act-one"].remote_id == "job-one"
+
+
+@pytest.mark.parametrize(
+    "events,message",
+    [
+        ([], "no submission"),
+        ("outcome", "no reservation"),
+        ("terminal", "after a terminal"),
+    ],
+)
+def test_projection_rejects_invalid_history(
+    remote_spec: ExperimentSpec, events: object, message: str
+) -> None:
+    lock = _lock(remote_spec)
+    supplied: list[CampaignEvent]
+    if events == "outcome":
+        supplied = [
+            _submitted(lock),
+            new_event(
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind="action.failed",
+                producer="reconciler",
+                payload=ActionOutcomePayload(action_id="missing"),
+                clock=lambda: NOW + timedelta(seconds=1),
+                identifier=lambda: "2" * 32,
+            ),
+        ]
+    elif events == "terminal":
+        supplied = [
+            _submitted(lock),
+            new_event(
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind="campaign.completed",
+                producer="reconciler",
+                payload=TerminalPayload(message="done"),
+                clock=lambda: NOW + timedelta(seconds=1),
+                identifier=lambda: "2" * 32,
+            ),
+            new_event(
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind="campaign.failed",
+                producer="reconciler",
+                payload=TerminalPayload(message="late"),
+                clock=lambda: NOW + timedelta(seconds=2),
+                identifier=lambda: "3" * 32,
+            ),
+        ]
+    else:
+        supplied = []
+
+    with pytest.raises(ControlError, match=message):
+        project_campaign(lock, supplied)
+
+
+def test_hub_store_creates_and_loads_campaign(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    api.conflicts = 1
+    store = HubCampaignStore("org", api=api)
+
+    store.create_campaign(lock, b"kind: Experiment\n", _submitted(lock))
+    observed_lock, events = store.load_campaign(lock.campaign_id)
+
+    assert observed_lock == lock
+    assert events == [_submitted(lock)]
+    assert api.files[f"campaigns/{lock.campaign_id}/request.yaml"] == (
+        b"kind: Experiment\n"
+    )
+    assert len(api.commits) == 1
+    with pytest.raises(CampaignConflict, match="campaign already exists"):
+        store.create_campaign(lock, b"different", _submitted(lock))
+
+
+def test_hub_store_reserves_action_atomically_and_idempotently(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="act-one",
+            action_key="key-one",
+            action_kind="submit-wave",
+            target_ids=["shard-one"],
+        ),
+        identifier=lambda: "4" * 32,
+    )
+    action = {"action_id": "act-one", "kind": "submit-wave"}
+
+    assert store.reserve_action(lock.campaign_id, action, event)
+    assert not store.reserve_action(lock.campaign_id, action, event)
+    conflicting = {"action_id": "act-one", "kind": "cancel-wave"}
+    with pytest.raises(CampaignConflict, match="content conflicts"):
+        store.reserve_action(lock.campaign_id, conflicting, event)
+
+
+def test_hub_store_appends_event_and_rejects_duplicate(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    store = HubCampaignStore("org", api=FakeCampaignApi(tmp_path))
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.failed",
+        producer="reconciler",
+        payload=TerminalPayload(message="failed"),
+        identifier=lambda: "5" * 32,
+    )
+
+    store.append_event(lock.campaign_id, event)
+    _observed_lock, events = store.load_campaign(lock.campaign_id)
+
+    assert event in events
+    with pytest.raises(CampaignConflict, match="event already exists"):
+        store.append_event(lock.campaign_id, event)
+
+
+def test_hub_store_reports_malformed_records(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    api.files[f"campaigns/{lock.campaign_id}/campaign.lock.json"] = b"not-json"
+
+    with pytest.raises(ControlError, match="cannot be read"):
+        store.load_campaign(lock.campaign_id)
+
+
+def test_hub_store_non_conflict_error_is_not_retried(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    class FailingApi(FakeCampaignApi):
+        def create_commit(
+            self, repo_id: str, operations: list[object], **kwargs: object
+        ) -> object:
+            raise _http_error(500)
+
+    lock = _lock(remote_spec)
+
+    with pytest.raises(HfHubHTTPError):
+        HubCampaignStore("org", api=FailingApi(tmp_path)).create_campaign(
+            lock, b"manifest", _submitted(lock)
+        )
+
+
+def test_hub_store_files_are_canonical_json(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    HubCampaignStore("org", api=api).create_campaign(
+        lock, b"manifest", _submitted(lock)
+    )
+    raw = api.files[f"campaigns/{lock.campaign_id}/campaign.lock.json"]
+
+    assert raw.endswith(b"\n")
+    assert json.loads(raw) == lock.model_dump(mode="json")

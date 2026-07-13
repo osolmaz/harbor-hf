@@ -58,6 +58,22 @@ task-digest map, applies matrix inclusion and exclusion rules, and prints a
 content-addressed plan that can later be submitted more than once as distinct
 campaigns.
 
+Persist a campaign request in the private coordination Dataset, then inspect or
+dry-run its next reconciliation actions:
+
+```bash
+uv run harbor-hf campaign submit experiment.yaml --dry-run
+uv run harbor-hf campaign submit experiment.yaml
+uv run harbor-hf campaign status CAMPAIGN_ID --namespace NAMESPACE
+uv run harbor-hf campaign reconcile CAMPAIGN_ID --namespace NAMESPACE --dry-run
+```
+
+Submission writes the immutable request, campaign lock, permanent reservation,
+and first typed event in one parent-checked commit. Reconciliation rebuilds
+state from append-only events and groups compatible shards by their exact model
+and deployment digest. The dry-run command does not submit Jobs or resume an
+endpoint.
+
 ## Submit A Remote Run
 
 Remote submission requires an endpoint binding and exact 40-character commits

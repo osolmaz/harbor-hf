@@ -36,8 +36,11 @@ def experiment_digest(spec: ExperimentSpec) -> str:
         if matrix.get("exclude") == []:
             matrix.pop("exclude")
     execution = payload.get("execution")
-    if isinstance(execution, dict) and execution.get("max_trials_per_shard") == 64:
-        execution.pop("max_trials_per_shard")
+    if isinstance(execution, dict):
+        if execution.get("max_trials_per_shard") == 64:
+            execution.pop("max_trials_per_shard")
+        if execution.get("max_shards_per_wave") == 8:
+            execution.pop("max_shards_per_wave")
     canonical = json.dumps(
         payload,
         sort_keys=True,

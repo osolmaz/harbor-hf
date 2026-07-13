@@ -5,7 +5,9 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
+from harbor_hf.campaigns import build_campaign_lock, build_campaign_plan
 from harbor_hf.cli import _write_lock, app
+from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.process import ProcessError
 from harbor_hf.runs import build_run_lock
@@ -66,6 +68,90 @@ def test_campaign_schema_command_writes_json(tmp_path: Path) -> None:
         "campaign_plan",
         "campaign_lock",
     }
+
+
+def test_campaign_submit_dry_run_has_no_remote_mutation(
+    remote_manifest: Path,
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "campaign",
+            "submit",
+            str(remote_manifest),
+            "--campaign-id",
+            "campaign-one",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "artifact_prefix": "campaigns/campaign-one",
+        "campaign_id": "campaign-one",
+        "plan_digest": payload["plan_digest"],
+        "stored": False,
+    }
+
+
+def test_campaign_submit_requires_remote_configuration() -> None:
+    result = runner.invoke(app, ["campaign", "submit", str(EXAMPLE), "--dry-run"])
+
+    assert result.exit_code == 1
+    assert "requires a remote configuration" in result.stderr
+
+
+def test_campaign_status_and_dry_reconcile(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = build_campaign_lock(build_campaign_plan(remote_spec), "campaign-one")
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=lock.plan_digest),
+    )
+
+    class FakeStore:
+        def __init__(self, namespace: str) -> None:
+            assert namespace == "org"
+
+        def load_campaign(self, campaign_id: str) -> tuple[object, list[object]]:
+            assert campaign_id == "campaign-one"
+            return lock, [event]
+
+    monkeypatch.setattr("harbor_hf.cli.HubCampaignStore", FakeStore)
+
+    status = runner.invoke(
+        app, ["campaign", "status", "campaign-one", "--namespace", "org"]
+    )
+    reconcile = runner.invoke(
+        app,
+        [
+            "campaign",
+            "reconcile",
+            "campaign-one",
+            "--namespace",
+            "org",
+            "--dry-run",
+        ],
+    )
+
+    assert status.exit_code == 0
+    assert json.loads(status.stdout)["status"] == "queued"
+    assert reconcile.exit_code == 0
+    assert json.loads(reconcile.stdout)["action_count"] == 1
+
+
+def test_campaign_reconcile_requires_dry_run() -> None:
+    result = runner.invoke(
+        app, ["campaign", "reconcile", "campaign", "--namespace", "org"]
+    )
+
+    assert result.exit_code == 2
+    assert "currently requires --dry-run" in result.stderr
 
 
 def test_invalid_manifest_reports_stderr_and_exit_two(tmp_path: Path) -> None:

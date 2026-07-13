@@ -139,10 +139,12 @@ treated as endpoint deployments.
 `attempts` counts independent logical attempts. Infrastructure retries do not
 consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
 `max_trials_per_shard` deterministically bounds the number of task-attempt pairs
-in one campaign shard and defaults to 64. Provider request concurrency is part
-of the deployment profile. Timeout values are in seconds. `timeout_seconds` is
-a wall-clock limit for Harbor execution; on expiry, the controller terminates
-the Harbor process group and immediately enters verified endpoint cleanup.
+in one campaign shard and defaults to 64. `max_shards_per_wave` bounds compatible
+shards assigned under one endpoint startup and defaults to 8. Provider request
+concurrency is part of the deployment profile. Timeout values are in seconds.
+`timeout_seconds` is a wall-clock limit for Harbor execution; on expiry, the
+controller terminates the Harbor process group and immediately enters verified
+endpoint cleanup.
 
 Every task selected by `benchmark.task_names` is passed to Harbor. The resolved
 `task_digests` map gives exact and glob selections a deterministic trial count.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from typing import Literal, Protocol
@@ -24,6 +25,10 @@ class Clock(Protocol):
     def __call__(self) -> datetime: ...
 
 
+class IdentifierFactory(Protocol):
+    def __call__(self) -> str: ...
+
+
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -42,6 +47,7 @@ class PlannedShard(FrozenModel):
 
 class PlannedRun(FrozenModel):
     cell_digest: str
+    deployment_digest: str
     model: str
     deployment: str
     agent: str
@@ -58,6 +64,7 @@ class CampaignPlan(FrozenModel):
     run_count: int
     shard_count: int
     trial_count: int
+    max_shards_per_wave: int
     runs: list[PlannedRun]
 
     @model_validator(mode="after")
@@ -92,6 +99,7 @@ class CampaignShardLock(FrozenModel):
 class CampaignRunLock(FrozenModel):
     run_id: str
     cell_digest: str
+    deployment_digest: str
     model: str
     deployment: str
     agent: str
@@ -108,6 +116,7 @@ class CampaignLock(FrozenModel):
     manifest_digest: str
     plan_digest: str
     artifact_prefix: str
+    max_shards_per_wave: int
     runs: list[CampaignRunLock]
 
 
@@ -154,6 +163,7 @@ def build_campaign_plan(spec: ExperimentSpec) -> CampaignPlan:
         run_count=len(runs),
         shard_count=sum(len(run.shards) for run in runs),
         trial_count=sum(len(shard.trials) for run in runs for shard in run.shards),
+        max_shards_per_wave=spec.execution.max_shards_per_wave,
         runs=runs,
     )
 
@@ -186,6 +196,12 @@ def _plan_run(
     ],
 ) -> PlannedRun:
     models, deployments, agents = profiles
+    deployment_digest = _digest(
+        {
+            "model": _dump_profile(models[cell.model]),
+            "deployment": _dump_profile(deployments[cell.deployment]),
+        }
+    )
     cell_digest = _digest(
         {
             "model": _dump_profile(models[cell.model]),
@@ -209,6 +225,7 @@ def _plan_run(
     ]
     return PlannedRun(
         cell_digest=cell_digest,
+        deployment_digest=deployment_digest,
         model=cell.model,
         deployment=cell.deployment,
         agent=cell.agent,
@@ -265,6 +282,7 @@ def build_campaign_lock(
             CampaignRunLock(
                 run_id=run_id,
                 cell_digest=planned_run.cell_digest,
+                deployment_digest=planned_run.deployment_digest,
                 model=planned_run.model,
                 deployment=planned_run.deployment,
                 agent=planned_run.agent,
@@ -278,8 +296,21 @@ def build_campaign_lock(
         manifest_digest=plan.manifest_digest,
         plan_digest=plan.plan_digest,
         artifact_prefix=f"campaigns/{campaign_id}",
+        max_shards_per_wave=plan.max_shards_per_wave,
         runs=runs,
     )
+
+
+def new_campaign_id(
+    plan: CampaignPlan,
+    *,
+    clock: Clock = lambda: datetime.now(UTC),
+    identifier: IdentifierFactory = lambda: uuid.uuid4().hex,
+) -> str:
+    created_at = clock().astimezone(UTC)
+    plan_part = plan.plan_digest.removeprefix("sha256:")[:10]
+    random_part = identifier()[:10]
+    return f"{created_at:%Y%m%dT%H%M%SZ}-{plan_part}-{random_part}"
 
 
 def campaign_json_schemas() -> dict[str, dict[str, object]]:
