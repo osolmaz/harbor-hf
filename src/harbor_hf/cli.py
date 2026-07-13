@@ -20,6 +20,12 @@ from harbor_hf.bucket_evidence import (
     BucketEvidenceError,
     HubBucketEvidenceReader,
 )
+from harbor_hf.campaign_apply import (
+    CampaignApplyError,
+    hugging_face_campaign_reconciler,
+)
+from harbor_hf.campaign_finalizer import CampaignFinalizationError
+from harbor_hf.campaign_observer import CampaignObservationError
 from harbor_hf.campaigns import (
     build_campaign_lock,
     build_campaign_plan,
@@ -77,6 +83,9 @@ _OPERATION_ERRORS = (
     OSError,
     ValueError,
     AutomationError,
+    CampaignApplyError,
+    CampaignFinalizationError,
+    CampaignObservationError,
     BucketEvidenceError,
     ControlError,
     CoordinationError,
@@ -223,22 +232,47 @@ def campaign_reconcile(
     campaign_id: Annotated[str, typer.Argument()],
     namespace: Annotated[str, typer.Option("--namespace")],
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    apply: Annotated[bool, typer.Option("--apply")] = False,
 ) -> None:
     """Plan the next idempotent campaign actions."""
-    if not dry_run:
-        typer.echo(
-            "Error: campaign reconciliation currently requires --dry-run", err=True
-        )
+    if dry_run == apply:
+        typer.echo("Error: choose exactly one of --dry-run or --apply", err=True)
         raise typer.Exit(code=2)
     try:
-        lock, events = HubCampaignStore(namespace).load_campaign(campaign_id)
-        _projection, reconciliation = plan_reconciliation(lock, events)
-    except (HTTPError, OSError, ValueError, ControlError) as error:
-        typer.echo(f"Error: {error}", err=True)
-        raise typer.Exit(code=1) from error
-    typer.echo(
-        json.dumps(reconciliation.model_dump(mode="json"), indent=2, sort_keys=True)
-    )
+        if apply:
+            result = hugging_face_campaign_reconciler(namespace).apply_campaign(
+                campaign_id
+            )
+        else:
+            lock, events = HubCampaignStore(namespace).load_campaign(campaign_id)
+            _projection, result = plan_reconciliation(lock, events)
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@campaign_app.command("reconcile-all")
+def campaign_reconcile_all(
+    namespace: Annotated[str, typer.Option("--namespace")],
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Reconcile every campaign in the namespace once."""
+    if dry_run == apply:
+        typer.echo("Error: choose exactly one of --dry-run or --apply", err=True)
+        raise typer.Exit(code=2)
+    try:
+        if apply:
+            results = hugging_face_campaign_reconciler(namespace).apply_all()
+        else:
+            store = HubCampaignStore(namespace)
+            results = [
+                plan_reconciliation(*store.load_campaign(campaign_id))[1]
+                for campaign_id in store.list_campaigns()
+            ]
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json([result.model_dump(mode="json") for result in results])
 
 
 @campaign_app.command("cancel")

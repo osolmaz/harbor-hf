@@ -11,6 +11,8 @@ from typing import cast
 import pytest
 import yaml
 
+from harbor_hf.campaign_finalizer import BucketCampaignFinalizer
+from harbor_hf.campaign_observer import BucketCampaignObserver
 from harbor_hf.campaigns import (
     CampaignLock,
     ProviderWaveTarget,
@@ -29,6 +31,8 @@ from harbor_hf.reconciler import (
     ReconcileContext,
     plan_reconciliation,
 )
+from harbor_hf.recovery import project_recovery
+from harbor_hf.results import EvidenceSource, build_result_tables
 from harbor_hf.wave_worker import WorkerError, run_wave_worker
 
 
@@ -103,6 +107,36 @@ class IdentifierSequence:
             value = self.value
             self.value += 1
         return f"{value:032x}"
+
+
+class LocalEvidence:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def list_files(self, *, bucket: str, prefix: str) -> list[str]:
+        del bucket
+        source = self.root / prefix
+        if not source.exists():
+            return []
+        return sorted(
+            str(path.relative_to(source))
+            for path in source.rglob("*")
+            if path.is_file()
+        )
+
+    def read_bytes(self, *, bucket: str, prefix: str, path: str) -> bytes:
+        del bucket
+        return (self.root / prefix / path).read_bytes()
+
+    def write_immutable(self, *, bucket: str, path: str, content: bytes) -> bool:
+        del bucket
+        destination = self.root / path
+        if destination.exists():
+            assert destination.read_bytes() == content
+            return False
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        return True
 
 
 class HarborStream:
@@ -470,6 +504,84 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     }
     assert not (destination / "endpoint.snapshot.json").exists()
     assert not (destination / "endpoint.final.json").exists()
+
+
+def test_terminal_wave_evidence_closes_and_normalizes_campaign(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=2, concurrency=2
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime",
+        lambda _url, _token, _route: {"probes": {"health": {"http_status": 200}}},
+    )
+    output = tmp_path / "output"
+    run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=EndpointRunner(
+            [
+                endpoint_snapshot("paused", 0),
+                endpoint_snapshot("running", 1),
+                endpoint_snapshot("paused", 0),
+            ]
+        ),
+        stream_runner=HarborStream(
+            spec.benchmark.task_digests, expected_calls=2, synchronize=True
+        ),
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+    submitted = new_event(
+        subject_type="campaign",
+        subject_id=campaign.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
+        clock=lambda: campaign.created_at,
+    )
+    evidence = LocalEvidence(output)
+    observed = BucketCampaignObserver(evidence).observe(campaign, spec)
+    projection = project_recovery(campaign, [submitted, *observed])
+
+    assert projection.terminal_decision is not None
+    assert projection.terminal_decision.status == "completed"
+    assert {event.kind for event in observed} >= {
+        "wave.active",
+        "wave.cleaning",
+        "wave.closed",
+        "execution.started",
+        "execution.completed",
+    }
+
+    BucketCampaignFinalizer(evidence, evidence).finalize(
+        campaign,
+        spec,
+        projection,
+        projection.terminal_decision,
+    )
+    run = campaign.runs[0]
+    tables = build_result_tables(
+        evidence,
+        EvidenceSource(
+            bucket=spec.artifacts.bucket,
+            prefix=f"{campaign.artifact_prefix}/runs/{run.run_id}",
+        ),
+        control_commit="c" * 40,
+    )
+
+    assert len(tables.runs) == 1
+    assert len(tables.trials) == 2
+    assert len(tables.executions) == 2
+    assert [metric.value for metric in tables.metrics] == [1.0, 1.0]
+    assert (output / campaign.artifact_prefix / "_SUCCESS").is_file()
 
 
 def test_wave_failure_still_pauses_and_publishes_failed_execution(

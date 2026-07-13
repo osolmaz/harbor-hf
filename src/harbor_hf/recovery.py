@@ -719,7 +719,7 @@ def _cleanup_is_complete(
     for action in campaign.actions.values():
         wave = waves.get(f"wave-{action.action_key}")
         if (
-            action.action_kind == "submit-wave"
+            action.action_kind in {"submit-wave", "retry-shard"}
             and action.status != "failed"
             and (wave is None or wave.status != "closed")
         ):

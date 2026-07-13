@@ -213,6 +213,7 @@ class WaveLock(FrozenModel):
     wave_id: str
     action_id: str
     action_key: str
+    action_kind: Literal["submit-wave", "retry-shard"] = "submit-wave"
     campaign_id: str
     created_at: datetime
     manifest_digest: str
@@ -529,6 +530,9 @@ def build_wave_lock(
         wave_id=deterministic_wave_id(action.action_key),
         action_id=action.action_id,
         action_key=action.action_key,
+        action_kind=(
+            "retry-shard" if action.kind == "retry-shard" else "submit-wave"
+        ),
         campaign_id=campaign.campaign_id,
         created_at=campaign.created_at,
         manifest_digest=campaign.manifest_digest,
@@ -671,7 +675,10 @@ def deterministic_wave_id(action_key: str) -> str:
 def _validate_submit_wave_action(
     campaign: CampaignLock, action: SubmitWaveAction
 ) -> None:
-    if action.kind != "submit-wave" or action.campaign_id != campaign.campaign_id:
+    if (
+        action.kind not in {"submit-wave", "retry-shard"}
+        or action.campaign_id != campaign.campaign_id
+    ):
         raise ValueError("wave action does not target the campaign")
     if not action.shard_ids:
         raise ValueError("wave action must contain at least one shard")

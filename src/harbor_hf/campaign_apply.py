@@ -14,6 +14,12 @@ import yaml
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
+from harbor_hf.campaign_finalizer import (
+    BucketCampaignFinalizer,
+    CampaignFinalizationError,
+    CampaignFinalizer,
+)
+from harbor_hf.campaign_observer import BucketCampaignObserver, CampaignObserver
 from harbor_hf.campaigns import (
     CampaignLock,
     WaveLock,
@@ -30,7 +36,9 @@ from harbor_hf.control import (
     CampaignEvent,
     CampaignStore,
     Clock,
+    EventKind,
     IdentifierFactory,
+    TerminalPayload,
     new_event,
 )
 from harbor_hf.endpoints import (
@@ -46,14 +54,21 @@ from harbor_hf.endpoints import (
     build_desired_endpoint,
 )
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
-from harbor_hf.models import DeploymentProfile, ExperimentSpec, ModelProfile
+from harbor_hf.models import (
+    DeploymentProfile,
+    DeploymentTarget,
+    ExperimentSpec,
+    ModelProfile,
+)
 from harbor_hf.process import ProcessError, SubprocessRunner
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.reconciler import (
     ReconcileAction,
     ReconcileContext,
     ReconcilePlan,
     plan_reconciliation,
 )
+from harbor_hf.recovery import RecoveryProjection, TerminalDecision
 from harbor_hf.submission import (
     BucketApi,
     TextRunner,
@@ -104,6 +119,9 @@ class RemoteWaveJob(FrozenModel):
     wave_id: str
     endpoint_label: str
     stage: str
+    target_label_key: Literal["harbor-hf-endpoint", "harbor-hf-provider"] = (
+        "harbor-hf-endpoint"
+    )
 
     @property
     def terminal(self) -> bool:
@@ -139,6 +157,9 @@ class WaveJobPort(Protocol):
         namespace: str,
         wave_id: str,
         endpoint_label: str,
+        target_label_key: Literal[
+            "harbor-hf-endpoint", "harbor-hf-provider"
+        ] = "harbor-hf-endpoint",
     ) -> RemoteWaveJob | None: ...
 
     def submit(
@@ -150,6 +171,10 @@ class WaveJobPort(Protocol):
     ) -> RemoteWaveJob: ...
 
     def cancel(self, job: RemoteWaveJob, *, namespace: str) -> None: ...
+
+
+class CampaignPublicationPort(Protocol):
+    def publish(self, campaign_id: str) -> object: ...
 
 
 class HfJobsApi(Protocol):
@@ -178,10 +203,13 @@ class HuggingFaceWaveJobAdapter:
         namespace: str,
         wave_id: str,
         endpoint_label: str,
+        target_label_key: Literal[
+            "harbor-hf-endpoint", "harbor-hf-provider"
+        ] = "harbor-hf-endpoint",
     ) -> RemoteWaveJob | None:
         expected = {
             "harbor-hf-wave": wave_id,
-            "harbor-hf-endpoint": endpoint_label,
+            target_label_key: endpoint_label,
         }
         try:
             resources = self.api.list_jobs(labels=expected, namespace=namespace)
@@ -242,6 +270,9 @@ class HuggingFaceWaveJobAdapter:
             job_id=submission.job_id,
             wave_id=lock.wave_id,
             endpoint_label=deployment_label,
+            target_label_key=(
+                "harbor-hf-endpoint" if endpoint is not None else "harbor-hf-provider"
+            ),
             stage="SCHEDULING",
         )
 
@@ -276,12 +307,18 @@ class CampaignReconciler:
         *,
         endpoints: EndpointApplicationPort,
         jobs: WaveJobPort,
+        observer: CampaignObserver | None = None,
+        finalizer: CampaignFinalizer | None = None,
+        result_publisher: CampaignPublicationPort | None = None,
         clock: Clock = lambda: datetime.now(UTC),
         identifier: IdentifierFactory = lambda: uuid.uuid4().hex,
     ) -> None:
         self.store = store
         self.endpoints = endpoints
         self.jobs = jobs
+        self.observer = observer
+        self.finalizer = finalizer
+        self.result_publisher = result_publisher
         self.clock = clock
         self.identifier = identifier
         self._last_observed_at: datetime | None = None
@@ -295,6 +332,13 @@ class CampaignReconciler:
         lock, events = self.store.load_campaign(campaign_id)
         request = self.store.load_request(campaign_id)
         spec = _validated_request(lock, request)
+        if self.observer is not None:
+            observed = self.observer.observe(lock, spec)
+            changed = False
+            for event in observed:
+                changed = self.store.ensure_event(campaign_id, event) or changed
+            if changed:
+                lock, events = self.store.load_campaign(campaign_id)
         self._last_observed_at = max(event.observed_at for event in events)
         projection, plan = plan_reconciliation(
             lock,
@@ -302,6 +346,20 @@ class CampaignReconciler:
             context=context,
             now=self.clock(),
         )
+        if (
+            plan.terminal_decision is not None
+            and projection.campaign.status
+            not in {"completed", "partial", "failed", "cancelled"}
+            and _summary_action_succeeded(projection)
+        ):
+            self._record_terminal(lock, plan.terminal_decision)
+            lock, events = self.store.load_campaign(campaign_id)
+            projection, plan = plan_reconciliation(
+                lock,
+                events,
+                context=context,
+                now=self.clock(),
+            )
         reservations = _validated_reservations(
             self.store.load_action_reservations(campaign_id),
             campaign_id=campaign_id,
@@ -319,6 +377,8 @@ class CampaignReconciler:
                 spec,
                 request,
                 action,
+                projection=projection,
+                terminal_decision=plan.terminal_decision,
                 allow_billable=allow_billable,
             )
             for action in selected[:limit]
@@ -368,6 +428,8 @@ class CampaignReconciler:
         request: bytes,
         action: ReconcileAction,
         *,
+        projection: RecoveryProjection,
+        terminal_decision: TerminalDecision | None,
         allow_billable: bool,
     ) -> AppliedAction:
         try:
@@ -376,6 +438,8 @@ class CampaignReconciler:
                 spec,
                 request,
                 action,
+                projection=projection,
+                terminal_decision=terminal_decision,
                 allow_billable=allow_billable,
             )
         except AmbiguousActionOutcome as error:
@@ -388,13 +452,18 @@ class CampaignReconciler:
             ValueError,
         ) as error:
             return self._record_outcome(lock, action, "failed", str(error))
-        return self._record_outcome(
+        outcome = self._record_outcome(
             lock,
             action,
             "succeeded",
             None,
             remote_id=remote_id,
         )
+        if action.kind == "publish-summary":
+            if terminal_decision is None:
+                raise CampaignApplyError("summary action has no terminal decision")
+            self._record_terminal(lock, terminal_decision)
+        return outcome
 
     def _execute(
         self,
@@ -403,9 +472,11 @@ class CampaignReconciler:
         request: bytes,
         action: ReconcileAction,
         *,
+        projection: RecoveryProjection,
+        terminal_decision: TerminalDecision | None,
         allow_billable: bool,
     ) -> str | None:
-        if action.kind == "submit-wave":
+        if action.kind in {"submit-wave", "retry-shard"}:
             return self._submit_wave(
                 lock,
                 spec,
@@ -417,9 +488,38 @@ class CampaignReconciler:
             return self._cancel_wave(lock, spec, action)
         if action.kind == "cleanup-wave":
             return self._cleanup_wave(lock, spec, action)
+        if action.kind == "publish-summary":
+            return self._publish_summary(lock, spec, projection, terminal_decision)
         raise ActionExecutionError(
             f"action execution is not supported by configured adapters: {action.kind}"
         )
+
+    def _publish_summary(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        projection: RecoveryProjection,
+        decision: TerminalDecision | None,
+    ) -> str:
+        if decision is None or self.finalizer is None:
+            raise ActionExecutionError(
+                "campaign summary finalization is not configured"
+            )
+        try:
+            self.finalizer.finalize(lock, spec, projection, decision)
+        except CampaignFinalizationError as error:
+            raise ActionExecutionError(str(error)) from error
+        if decision.status != "completed":
+            return decision.summary_path
+        if self.result_publisher is None:
+            raise ActionExecutionError("automatic result publication is not configured")
+        try:
+            self.result_publisher.publish(lock.campaign_id)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ActionExecutionError(
+                f"campaign result publication failed: {error}"
+            ) from error
+        return decision.summary_path
 
     def _submit_wave(
         self,
@@ -430,9 +530,24 @@ class CampaignReconciler:
         *,
         allow_submission: bool,
     ) -> str:
+        target = _deployment_target(lock, spec, action.deployment_digest)
+        if isinstance(target, ProviderTarget):
+            return self._submit_provider_wave(
+                lock,
+                spec,
+                request,
+                action,
+                target,
+                allow_submission=allow_submission,
+            )
         desired = _desired_endpoint(lock, spec, action)
         endpoint = managed_wave_endpoint(lock, spec, action.deployment_digest)
-        job = self._find_wave(spec, action, endpoint.name)
+        job = self._find_wave(
+            spec,
+            action,
+            target_label_key="harbor-hf-endpoint",
+            endpoint_label=endpoint_lease_label_for(endpoint.namespace, endpoint.name),
+        )
         if job is not None:
             if self.endpoints.inspect(desired) is None:
                 raise ActionExecutionError(
@@ -447,14 +562,54 @@ class CampaignReconciler:
         wave = build_wave_lock(lock, spec, action, endpoint=endpoint)
         return self.jobs.submit(wave, request=request, campaign=lock).job_id
 
+    def _submit_provider_wave(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        request: bytes,
+        action: ReconcileAction,
+        target: ProviderTarget,
+        *,
+        allow_submission: bool,
+    ) -> str:
+        label = hashlib.sha256(target.service.encode()).hexdigest()[:32]
+        job = self._find_wave(
+            spec,
+            action,
+            target_label_key="harbor-hf-provider",
+            endpoint_label=label,
+        )
+        if job is not None:
+            return job.job_id
+        if not allow_submission:
+            raise ActionExecutionError(
+                "campaign cancellation superseded the unsubmitted wave action"
+            )
+        wave = build_wave_lock(lock, spec, action)
+        return self.jobs.submit(wave, request=request, campaign=lock).job_id
+
     def _cancel_wave(
         self,
         lock: CampaignLock,
         spec: ExperimentSpec,
         action: ReconcileAction,
     ) -> str | None:
-        endpoint = managed_wave_endpoint(lock, spec, action.deployment_digest)
-        job = self._find_wave(spec, action, endpoint.name)
+        target = _deployment_target(lock, spec, action.deployment_digest)
+        if isinstance(target, ProviderTarget):
+            key: Literal["harbor-hf-endpoint", "harbor-hf-provider"] = (
+                "harbor-hf-provider"
+            )
+            label = hashlib.sha256(target.service.encode()).hexdigest()[:32]
+        else:
+            endpoint = managed_wave_endpoint(lock, spec, action.deployment_digest)
+            key = "harbor-hf-endpoint"
+            label = endpoint_lease_label_for(endpoint.namespace, endpoint.name)
+        job = self._find_wave(
+            spec,
+            action,
+            target_label_key=key,
+            endpoint_label=label,
+        )
         if job is None:
             return None
         namespace = _remote_namespace(spec)
@@ -477,15 +632,58 @@ class CampaignReconciler:
         self,
         spec: ExperimentSpec,
         action: ReconcileAction,
-        endpoint_name: str,
+        *,
+        target_label_key: Literal["harbor-hf-endpoint", "harbor-hf-provider"],
+        endpoint_label: str,
     ) -> RemoteWaveJob | None:
         wave_id = action.wave_id or f"wave-{action.action_key}"
         namespace = _remote_namespace(spec)
         return self.jobs.find_wave(
             namespace=namespace,
             wave_id=wave_id,
-            endpoint_label=endpoint_lease_label_for(namespace, endpoint_name),
+            target_label_key=target_label_key,
+            endpoint_label=endpoint_label,
         )
+
+    def _record_terminal(
+        self,
+        lock: CampaignLock,
+        decision: TerminalDecision,
+    ) -> None:
+        observed = self._next_observed()
+        kind = cast(
+            EventKind,
+            {
+                "completed": "campaign.completed",
+                "partial": "campaign.partial",
+                "failed": "campaign.failed",
+                "cancelled": "campaign.cancelled",
+            }[decision.status],
+        )
+        event = new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind=kind,
+            producer="publisher",
+            payload=TerminalPayload(
+                summary_path=decision.summary_path,
+                message=decision.reason,
+            ),
+            clock=lambda: observed,
+            identifier=lambda: hashlib.sha256(
+                (
+                    f"{lock.campaign_id}:{decision.status}:{decision.summary_path}"
+                ).encode()
+            ).hexdigest()[:32],
+        )
+        self.store.ensure_event(lock.campaign_id, event)
+
+    def _next_observed(self) -> datetime:
+        observed = self.clock().astimezone(UTC)
+        if self._last_observed_at is not None and observed <= self._last_observed_at:
+            observed = self._last_observed_at + timedelta(microseconds=1)
+        self._last_observed_at = observed
+        return observed
 
     def _record_outcome(
         self,
@@ -525,10 +723,7 @@ class CampaignReconciler:
         ],
         payload: ActionReservedPayload | ActionOutcomePayload,
     ) -> CampaignEvent:
-        observed = self.clock().astimezone(UTC)
-        if self._last_observed_at is not None and observed <= self._last_observed_at:
-            observed = self._last_observed_at + timedelta(microseconds=1)
-        self._last_observed_at = observed
+        observed = self._next_observed()
         return new_event(
             subject_type="campaign",
             subject_id=lock.campaign_id,
@@ -568,6 +763,42 @@ def hugging_face_campaign_reconciler(
         api = HfApi()
         jobs_api = jobs_api or cast(HfJobsApi, api)
         bucket_api = bucket_api or cast(BucketApi, api)
+    from huggingface_hub import HfApi, get_token
+
+    from harbor_hf.bucket_evidence import (
+        BucketEvidenceApi,
+        BucketEvidenceWriterApi,
+        HubBucketEvidenceReader,
+        HubBucketEvidenceWriter,
+    )
+    from harbor_hf.coordination import CoordinationApi, HubClaimStore
+    from harbor_hf.operations import AutomaticCampaignPublisher, DatasetRepositoryApi
+    from harbor_hf.result_publisher import DatasetApi, HubDatasetPublisher
+
+    evidence_api = HfApi()
+    reader = HubBucketEvidenceReader(
+        Path(tempfile.mkdtemp(prefix="harbor-hf-evidence-")),
+        api=cast(BucketEvidenceApi, evidence_api),
+    )
+    writer = HubBucketEvidenceWriter(api=cast(BucketEvidenceWriterApi, evidence_api))
+    result_publisher = None
+    token = get_token()
+    if token is not None:
+        result_publisher = AutomaticCampaignPublisher(
+            namespace=namespace,
+            store=store,
+            reader=reader,
+            publisher=HubDatasetPublisher(
+                publisher_id=f"reconciler-{uuid.uuid4().hex}",
+                leases=HubClaimStore(
+                    namespace,
+                    token,
+                    api=cast(CoordinationApi, evidence_api),
+                ),
+                api=cast(DatasetApi, evidence_api),
+            ),
+            repositories=cast(DatasetRepositoryApi, evidence_api),
+        )
     adapter = endpoint_adapter or HuggingFaceEndpointAdapter()
     return CampaignReconciler(
         store,
@@ -577,6 +808,9 @@ def hugging_face_campaign_reconciler(
             runner=runner or SubprocessRunner(),
             bucket_api=bucket_api,
         ),
+        observer=BucketCampaignObserver(reader),
+        finalizer=BucketCampaignFinalizer(reader, writer),
+        result_publisher=result_publisher,
     )
 
 
@@ -650,6 +884,13 @@ def _pending_actions(
     return pending
 
 
+def _summary_action_succeeded(projection: RecoveryProjection) -> bool:
+    return any(
+        action.action_kind == "publish-summary" and action.status == "succeeded"
+        for action in projection.campaign.actions.values()
+    )
+
+
 def _desired_endpoint(
     lock: CampaignLock,
     spec: ExperimentSpec,
@@ -687,6 +928,23 @@ def _profiles_for_deployment(
     return model, deployment
 
 
+def _deployment_target(
+    lock: CampaignLock,
+    spec: ExperimentSpec,
+    deployment_digest: str,
+) -> DeploymentTarget:
+    matches = [run for run in lock.runs if run.deployment_digest == deployment_digest]
+    deployment_ids = {run.deployment for run in matches}
+    if len(deployment_ids) != 1:
+        raise ActionExecutionError(
+            "action deployment does not resolve to one deployment target"
+        )
+    deployment_id = deployment_ids.pop()
+    return next(
+        profile for profile in spec.matrix.deployments if profile.id == deployment_id
+    )
+
+
 def _remote_namespace(spec: ExperimentSpec) -> str:
     if spec.remote is None:
         raise ActionExecutionError("campaign manifest has no remote execution")
@@ -716,7 +974,16 @@ def _validated_remote_job(
     return RemoteWaveJob(
         job_id=identifier,
         wave_id=expected_labels["harbor-hf-wave"],
-        endpoint_label=expected_labels["harbor-hf-endpoint"],
+        endpoint_label=next(
+            expected_labels[key]
+            for key in ("harbor-hf-endpoint", "harbor-hf-provider")
+            if key in expected_labels
+        ),
+        target_label_key=next(
+            key
+            for key in ("harbor-hf-endpoint", "harbor-hf-provider")
+            if key in expected_labels
+        ),
         stage=stage,
     )
 

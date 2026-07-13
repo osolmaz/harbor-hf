@@ -346,12 +346,16 @@ def _unobserved_wave_cancellations(
 ) -> list[_Candidate]:
     candidates: list[_Candidate] = []
     for action in projection.campaign.actions.values():
-        if action.action_kind != "submit-wave" or action.status == "failed":
+        if (
+            action.action_kind not in {"submit-wave", "retry-shard"}
+            or action.status == "failed"
+        ):
             continue
         wave_id = f"wave-{action.action_key}"
         if wave_id in known_wave_ids:
             continue
-        deployment = _deployment_for_shards(lock, action.target_ids)
+        shard_ids = _action_shard_ids(lock, action.action_kind, action.target_ids)
+        deployment = _deployment_for_shards(lock, shard_ids)
         kinds: tuple[ActionKind, ...] = (
             ("cancel-wave", "cleanup-wave") if force_cancel else ("drain-wave",)
         )
@@ -361,7 +365,7 @@ def _unobserved_wave_cancellations(
                     kind=kind,
                     deployment_digest=deployment,
                     wave_id=wave_id,
-                    shard_ids=action.target_ids,
+                    shard_ids=shard_ids,
                     target_ids=[action.action_id],
                 )
                 for kind in kinds
@@ -418,7 +422,7 @@ def _new_wave_candidates(
     projection: RecoveryProjection,
     context: ReconcileContext,
 ) -> list[_Candidate]:
-    assigned = _assigned_shards(projection)
+    assigned = _assigned_shards(lock, projection)
     groups: dict[str, list[str]] = defaultdict(list)
     for run in sorted(lock.runs, key=lambda value: value.run_id):
         for shard in sorted(run.shards, key=lambda value: value.shard_id):
@@ -447,7 +451,7 @@ def _new_wave_candidates(
     return candidates
 
 
-def _assigned_shards(projection: RecoveryProjection) -> set[str]:
+def _assigned_shards(lock: CampaignLock, projection: RecoveryProjection) -> set[str]:
     assigned = {
         shard_id for wave in projection.waves.values() for shard_id in wave.shard_ids
     }
@@ -457,8 +461,28 @@ def _assigned_shards(projection: RecoveryProjection) -> set[str]:
             action.action_kind in {"submit-wave", "retry-shard"}
             and action.status != "failed"
         ):
-            assigned.update(action.target_ids)
+            assigned.update(
+                _action_shard_ids(lock, action.action_kind, action.target_ids)
+            )
     return assigned
+
+
+def _action_shard_ids(
+    lock: CampaignLock,
+    kind: ActionKind,
+    target_ids: list[str],
+) -> list[str]:
+    if kind == "submit-wave":
+        return target_ids
+    if kind != "retry-shard":
+        return []
+    requested = set(target_ids)
+    return sorted(
+        shard.shard_id
+        for run in lock.runs
+        for shard in run.shards
+        if requested.intersection(trial.trial_id for trial in shard.trials)
+    )
 
 
 def _admit(
@@ -570,7 +594,9 @@ def _materialize(
         return None
     values = candidate.model_dump(mode="python")
     values["wave_id"] = candidate.wave_id or (
-        f"wave-{action_key}" if candidate.kind == "submit-wave" else None
+        f"wave-{action_key}"
+        if candidate.kind in {"submit-wave", "retry-shard"}
+        else None
     )
     return ReconcileAction(
         action_id=f"act-{action_key}",

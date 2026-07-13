@@ -595,8 +595,7 @@ class HubCampaignStore:
         return reservations
 
     def append_event(self, campaign_id: str, event: CampaignEvent) -> None:
-        if event.subject_id != campaign_id:
-            raise ValueError("event subject does not match campaign")
+        _validate_event_scope(campaign_id, event)
         path = _event_path(campaign_id, event.event_id)
         self._create_absent(
             path,
@@ -612,8 +611,7 @@ class HubCampaignStore:
 
     def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool:
         """Append an event once, adopting an identical concurrent request."""
-        if event.subject_id != campaign_id:
-            raise ValueError("event subject does not match campaign")
+        _validate_event_scope(campaign_id, event)
         path = _event_path(campaign_id, event.event_id)
         expected = event.model_dump(mode="json")
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
@@ -751,6 +749,13 @@ class HubCampaignStore:
 
 def _campaign_request_path(campaign_id: str) -> str:
     return f"campaigns/{campaign_id}/request.yaml"
+
+
+def _validate_event_scope(campaign_id: str, event: CampaignEvent) -> None:
+    if _CAMPAIGN_ID.fullmatch(campaign_id) is None:
+        raise ValueError("event campaign scope is invalid")
+    if event.subject_type == "campaign" and event.subject_id != campaign_id:
+        raise ValueError("campaign event subject does not match its scope")
 
 
 def _campaign_lock_path(campaign_id: str) -> str:

@@ -153,13 +153,13 @@ def test_campaign_status_and_dry_reconcile(
     assert json.loads(reconcile.stdout)["action_count"] == 1
 
 
-def test_campaign_reconcile_requires_dry_run() -> None:
+def test_campaign_reconcile_requires_an_explicit_mode() -> None:
     result = runner.invoke(
         app, ["campaign", "reconcile", "campaign", "--namespace", "org"]
     )
 
     assert result.exit_code == 2
-    assert "currently requires --dry-run" in result.stderr
+    assert "choose exactly one of --dry-run or --apply" in result.stderr
 
 
 def test_campaign_cancel_and_retry_print_json(

@@ -79,6 +79,57 @@ class ResultPublisher(Protocol):
     ) -> PublicationResult: ...
 
 
+class RefreshingEvidenceReader(EvidenceReader, Protocol):
+    def refresh(self) -> None: ...
+
+
+class DatasetRepositoryApi(Protocol):
+    def create_repo(self, repo_id: str, **kwargs: object) -> object: ...
+
+
+class AutomaticCampaignPublisher:
+    """Publish every complete run after terminal evidence is finalized."""
+
+    def __init__(
+        self,
+        *,
+        namespace: str,
+        store: CampaignEventStore,
+        reader: RefreshingEvidenceReader,
+        publisher: ResultPublisher,
+        repositories: DatasetRepositoryApi,
+    ) -> None:
+        self.namespace = namespace
+        self.store = store
+        self.reader = reader
+        self.publisher = publisher
+        self.repositories = repositories
+
+    def publish(self, campaign_id: str) -> CampaignPublicationReport:
+        snapshot = self.store.load_snapshot(campaign_id)
+        spec = load_experiment_bytes(
+            snapshot.request,
+            source=f"campaign {campaign_id} request",
+        )
+        if spec.publishing.index_dataset is None:
+            raise ValueError("campaign result publication requires index_dataset")
+        for repository in (spec.publishing.dataset, spec.publishing.index_dataset):
+            self.repositories.create_repo(
+                repository,
+                repo_type="dataset",
+                private=False,
+                exist_ok=True,
+            )
+        self.reader.refresh()
+        return publish_campaign_results(
+            snapshot,
+            namespace=self.namespace,
+            reader=self.reader,
+            publisher=self.publisher,
+            dry_run=False,
+        )
+
+
 def cancel_campaign(
     store: CampaignEventStore,
     campaign_id: str,

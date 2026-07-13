@@ -12,7 +12,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -98,7 +98,7 @@ class FrozenModel(BaseModel):
 class LockedSubmitWaveAction(FrozenModel):
     action_id: str
     action_key: str
-    kind: str = "submit-wave"
+    kind: Literal["submit-wave", "retry-shard"] = "submit-wave"
     campaign_id: str
     deployment_digest: str
     shard_ids: list[str]
@@ -198,6 +198,7 @@ def validate_wave_lock(
     action = LockedSubmitWaveAction(
         action_id=lock.action_id,
         action_key=lock.action_key,
+        kind=lock.action_kind,
         campaign_id=lock.campaign_id,
         deployment_digest=lock.deployment_digest,
         shard_ids=lock.shard_ids,

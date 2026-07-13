@@ -1294,5 +1294,5 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
         corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "463b37d47fc4882de56cc1b849f2986cb1fc3e45cc2149f780548c1233deee78"
+        "5be4f9735745028aaeca2a2d2a87a0c59189cc771127bb6a531fe60011c99698"
     )

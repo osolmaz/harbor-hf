@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Protocol, cast
@@ -23,6 +24,27 @@ class BucketEvidenceApi(Protocol):
         self,
         bucket_id: str,
         files: list[tuple[object, str | Path]],
+        **kwargs: object,
+    ) -> None: ...
+
+
+class BucketEvidenceWriterApi(Protocol):
+    def download_bucket_files(
+        self,
+        bucket_id: str,
+        files: list[tuple[object, str | Path]],
+        **kwargs: object,
+    ) -> None: ...
+
+    def get_bucket_paths_info(
+        self, bucket_id: str, paths: Iterable[str], **kwargs: object
+    ) -> Iterable[object]: ...
+
+    def batch_bucket_files(
+        self,
+        bucket_id: str,
+        *,
+        add: list[tuple[bytes, str]],
         **kwargs: object,
     ) -> None: ...
 
@@ -70,6 +92,10 @@ class HubBucketEvidenceReader:
                 f"Bucket evidence object cannot be read: {path}"
             ) from error
 
+    def refresh(self) -> None:
+        """Discard listings after another component has published new objects."""
+        self._listings.clear()
+
     def _listing(self, bucket: str, prefix: str) -> dict[str, object]:
         key = (bucket, prefix)
         cached = self._listings.get(key)
@@ -92,3 +118,37 @@ class HubBucketEvidenceReader:
             listing[relative] = item
         self._listings[key] = listing
         return listing
+
+
+class HubBucketEvidenceWriter:
+    """Create immutable Bucket objects and adopt byte-identical retries."""
+
+    def __init__(self, *, api: BucketEvidenceWriterApi | None = None) -> None:
+        self.api = api or cast(BucketEvidenceWriterApi, HfApi())
+
+    def write_immutable(self, *, bucket: str, path: str, content: bytes) -> bool:
+        normalized = bucket_id(bucket)
+        observed = list(self.api.get_bucket_paths_info(normalized, [path]))
+        if observed:
+            if len(observed) != 1 or getattr(observed[0], "path", None) != path:
+                raise BucketEvidenceError("Bucket immutable-path lookup is ambiguous")
+            with tempfile.TemporaryDirectory(prefix="harbor-hf-bucket-") as name:
+                destination = Path(name) / "object"
+                self.api.download_bucket_files(
+                    normalized,
+                    [(observed[0], destination)],
+                    raise_on_missing_files=True,
+                )
+                try:
+                    existing = destination.read_bytes()
+                except OSError as error:
+                    raise BucketEvidenceError(
+                        f"Bucket evidence object cannot be read: {path}"
+                    ) from error
+            if existing != content:
+                raise BucketEvidenceError(
+                    f"Bucket immutable evidence conflicts: {path}"
+                )
+            return False
+        self.api.batch_bucket_files(normalized, add=[(content, path)])
+        return True

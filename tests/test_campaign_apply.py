@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal, cast
 
 import pytest
 import yaml
@@ -177,12 +178,16 @@ class FakeJobs:
         namespace: str,
         wave_id: str,
         endpoint_label: str,
+        target_label_key: Literal[
+            "harbor-hf-endpoint", "harbor-hf-provider"
+        ] = "harbor-hf-endpoint",
     ) -> RemoteWaveJob | None:
         self.find_calls.append(
             {
                 "namespace": namespace,
                 "wave_id": wave_id,
                 "endpoint_label": endpoint_label,
+                "target_label_key": target_label_key,
             }
         )
         if self.find_error is not None:
@@ -194,6 +199,7 @@ class FakeJobs:
             wave_id=wave_id,
             endpoint_label=endpoint_label,
             stage="RUNNING",
+            target_label_key=target_label_key,
         )
 
     def submit(
@@ -211,6 +217,10 @@ class FakeJobs:
             wave_id=lock.wave_id,
             endpoint_label=self.find_calls[-1]["endpoint_label"],
             stage="SCHEDULING",
+            target_label_key=cast(
+                Literal["harbor-hf-endpoint", "harbor-hf-provider"],
+                self.find_calls[-1]["target_label_key"],
+            ),
         )
 
     def cancel(self, job: RemoteWaveJob, *, namespace: str) -> None:
