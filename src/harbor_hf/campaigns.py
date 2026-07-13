@@ -148,6 +148,7 @@ def build_campaign_plan(spec: ExperimentSpec) -> CampaignPlan:
         "schema_version": "harbor-hf/campaign-plan/v1alpha1",
         "experiment": spec.metadata.model_dump(mode="json"),
         "benchmark_dataset": spec.benchmark.dataset,
+        "benchmark_dataset_digest": spec.benchmark.dataset_digest,
         "execution": spec.execution.model_dump(mode="json"),
         "artifacts": spec.artifacts.model_dump(mode="json"),
         "publishing": spec.publishing.model_dump(mode="json"),

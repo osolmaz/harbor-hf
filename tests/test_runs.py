@@ -16,9 +16,11 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
 
-    assert lock.run_id == "20260713T010203Z-3e46e6d60e"
+    assert lock.run_id == "20260713T010203Z-7bef8b8f1f"
+    assert lock.benchmark_dataset == "terminal-bench@2.0"
+    assert lock.benchmark_dataset_digest == "sha256:" + "1" * 64
     assert lock.spec_digest == (
-        "sha256:f216706b982f94e0f1636655c9f76b6c2a8f2ea112e946406708dcad96571ec4"
+        "sha256:bd97f81386d8cd6d1c98fc6cf86bd6164b1aeac1f20173ec37e7c9f193c2f76d"
     )
     assert lock.artifact_bucket == "example/benchmark-runs"
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
@@ -200,14 +202,12 @@ def test_remote_lock_rejects_mutable_agent_revision(
 
 
 def test_remote_lock_rejects_unresolved_benchmark(remote_spec: ExperimentSpec) -> None:
-    benchmark = remote_spec.benchmark.model_copy(
-        update={"dataset": "terminal-bench@2.0"}
-    )
+    benchmark = remote_spec.benchmark.model_copy(update={"dataset_digest": None})
     spec = remote_spec.model_copy(update={"benchmark": benchmark})
     with pytest.raises(ValueError) as captured:
         _validate_remote_input_pins(spec)
     assert str(captured.value) == (
-        "remote benchmark dataset must use an immutable sha256 digest"
+        "remote benchmark dataset requires an immutable sha256 digest"
     )
 
     benchmark = remote_spec.benchmark.model_copy(update={"task_digests": {}})

@@ -35,6 +35,7 @@ class Metadata(StrictModel):
 
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
+    dataset_digest: ContentDigest | None = None
     task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
     task_digests: dict[TaskName, ContentDigest] = Field(default_factory=dict)
 
@@ -262,8 +263,8 @@ class ExperimentSpec(StrictModel):
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
-    if re.fullmatch(r".+@sha256:[0-9a-f]{64}", spec.benchmark.dataset) is None:
-        raise ValueError("remote benchmark dataset must use an immutable sha256 digest")
+    if spec.benchmark.dataset_digest is None:
+        raise ValueError("remote benchmark dataset requires an immutable sha256 digest")
     _validate_task_pins(spec.benchmark)
     if any(
         re.fullmatch(r"[0-9a-f]{40}", model.revision) is None

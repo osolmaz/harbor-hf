@@ -37,6 +37,7 @@ class RunLock(BaseModel):
     experiment: str
     spec_digest: str
     benchmark_dataset: str
+    benchmark_dataset_digest: str
     benchmark_tasks: list[str]
     benchmark_task_digests: dict[str, str]
     model: ModelProfile
@@ -118,6 +119,7 @@ def build_run_lock(
         experiment=spec.metadata.name,
         spec_digest=digest,
         benchmark_dataset=spec.benchmark.dataset,
+        benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
         benchmark_tasks=spec.benchmark.task_names,
         benchmark_task_digests=spec.benchmark.task_digests,
         model=model,

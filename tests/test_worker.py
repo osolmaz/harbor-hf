@@ -1460,7 +1460,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "harbor",
         "run",
         "--dataset",
-        "terminal-bench@sha256:" + "1" * 64,
+        "terminal-bench@2.0",
         "--n-attempts",
         "1",
         "--agent",

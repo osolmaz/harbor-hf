@@ -5,7 +5,8 @@ metadata:
   labels:
     purpose: serving-comparison
 benchmark:
-  dataset: shellbench@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  dataset: shellbench@1.0
+  dataset_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
   task_names:
     - "*"
   task_digests:
