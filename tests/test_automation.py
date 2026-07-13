@@ -67,9 +67,7 @@ def test_installs_serial_schedule_and_dataset_webhook(
     assert api.job["labels"] == {"harbor-hf-role": "campaign-reconciler"}
     assert api.webhook == {
         "job_id": "scheduled-1",
-        "watched": [
-            {"type": "dataset", "name": "osolmaz/harbor-hf-coordination"}
-        ],
+        "watched": [{"type": "dataset", "name": "osolmaz/harbor-hf-coordination"}],
         "domains": ["repo.content"],
     }
 
