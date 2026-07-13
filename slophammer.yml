@@ -3,12 +3,14 @@ python:
     threshold: 85
     paths:
       - src/harbor_hf
+      - space
   complexity:
     max: 8
   dry:
     max_findings: 0
     paths:
       - src/harbor_hf
+      - space
     copied_blocks:
       enabled: true
       min_tokens: 100
@@ -18,4 +20,3 @@ python:
   dependency_boundaries:
     - from: src/harbor_hf
       allow: []
-

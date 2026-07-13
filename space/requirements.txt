@@ -1,0 +1,4 @@
+gradio>=6.20,<7
+huggingface-hub>=1.22,<2
+pydantic>=2.11,<3
+pyarrow>=18,<26

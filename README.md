@@ -126,6 +126,8 @@ manifest. The [endpoint provisioning contract](docs/endpoint-provisioning.md)
 documents deterministic endpoint ownership, and the
 [result publication contract](docs/result-publication.md) freezes normalized
 Parquet schemas and the evidence-safety boundary. The
+[fully hosted Harbor Cookbook guide](docs/harbor-cookbook.md) covers campaign
+operation and result publication. The
 [implementation plan](docs/implementation-plan.md) tracks the complete path to
 remote execution.
 
