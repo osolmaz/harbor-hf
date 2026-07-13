@@ -9,6 +9,8 @@ from harbor_hf.models import (
     DeploymentProfile,
     EngineSpec,
     ExperimentSpec,
+    MatrixRule,
+    MatrixSpec,
     RemoteJobSpec,
     SourcePin,
 )
@@ -119,6 +121,19 @@ def test_benchmark_requires_distinct_nonempty_task_names(
 ) -> None:
     with pytest.raises(ValueError):
         BenchmarkSpec(dataset="dataset", task_names=task_names)
+
+
+def test_matrix_rule_requires_a_dimension() -> None:
+    with pytest.raises(ValueError, match="select at least one dimension"):
+        MatrixRule()
+
+
+def test_matrix_rules_reject_unknown_profiles(remote_spec: ExperimentSpec) -> None:
+    value = remote_spec.matrix.model_dump(mode="json")
+    value["include"] = [{"models": ["missing"]}]
+
+    with pytest.raises(ValueError, match="unknown models: missing"):
+        MatrixSpec.model_validate(value)
 
 
 def test_agent_revision_metadata_is_explicit() -> None:

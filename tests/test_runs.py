@@ -4,6 +4,7 @@ import pytest
 
 from harbor_hf.models import (
     ExperimentSpec,
+    MatrixRule,
     _validate_remote_input_pins,
     _validate_task_pins,
 )
@@ -80,6 +81,23 @@ def test_submit_requires_matrix_selection(remote_spec: ExperimentSpec) -> None:
 def test_submit_rejects_unknown_selection(remote_spec: ExperimentSpec) -> None:
     with pytest.raises(ValueError, match="unknown model profile"):
         build_run_lock(remote_spec, model_id="missing")
+
+
+def test_submit_rejects_cell_excluded_by_matrix_rules(
+    remote_spec: ExperimentSpec,
+) -> None:
+    excluded = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "exclude": [MatrixRule(models=[remote_spec.matrix.models[0].id])]
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="exclude every run cell"):
+        build_run_lock(excluded)
 
 
 def test_agent_version_parameter_is_reserved(remote_spec: ExperimentSpec) -> None:

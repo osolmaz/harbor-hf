@@ -4,11 +4,12 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from httpx import HTTPError
 
+from harbor_hf.campaigns import build_campaign_plan, campaign_json_schemas
 from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.planner import build_plan
@@ -22,6 +23,8 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Plan and run Harbor benchmarks on Hugging Face infrastructure.",
 )
+campaign_app = typer.Typer(no_args_is_help=True, help="Plan and run campaigns.")
+app.add_typer(campaign_app, name="campaign")
 
 
 def _load_or_exit(path: Path) -> ExperimentSpec:
@@ -49,6 +52,43 @@ def plan(
     """Resolve an experiment matrix without creating remote resources."""
     experiment_plan = build_plan(_load_or_exit(manifest))
     typer.echo(json.dumps(experiment_plan.model_dump(mode="json"), indent=2))
+
+
+@campaign_app.command("plan")
+def campaign_plan(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output_format: Annotated[
+        Literal["json", "text"], typer.Option("--format")
+    ] = "text",
+) -> None:
+    """Resolve an immutable campaign without creating remote resources."""
+    try:
+        resolved = build_campaign_plan(_load_or_exit(manifest))
+    except ValueError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    if output_format == "json":
+        typer.echo(
+            json.dumps(resolved.model_dump(mode="json"), indent=2, sort_keys=True)
+        )
+        return
+    typer.echo(f"Campaign plan: {resolved.experiment}")
+    typer.echo(f"Plan digest: {resolved.plan_digest}")
+    typer.echo(f"Runs: {resolved.run_count}")
+    typer.echo(f"Shards: {resolved.shard_count}")
+    typer.echo(f"Trials: {resolved.trial_count}")
+
+
+@campaign_app.command("schema")
+def campaign_schema(
+    output: Annotated[Path | None, typer.Option("--output", dir_okay=False)] = None,
+) -> None:
+    """Export the campaign plan and lock JSON Schemas."""
+    rendered = json.dumps(campaign_json_schemas(), indent=2, sort_keys=True) + "\n"
+    if output is None:
+        typer.echo(rendered, nl=False)
+        return
+    output.write_text(rendered, encoding="utf-8")
 
 
 @app.command()

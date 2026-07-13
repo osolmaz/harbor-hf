@@ -134,10 +134,31 @@ class AgentProfile(StrictModel):
         return self
 
 
+class MatrixRule(StrictModel):
+    models: list[ProfileId] = Field(default_factory=list)
+    deployments: list[ProfileId] = Field(default_factory=list)
+    agents: list[ProfileId] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def selects_at_least_one_dimension(self) -> MatrixRule:
+        if not (self.models or self.deployments or self.agents):
+            raise ValueError("matrix rules must select at least one dimension")
+        for dimension, values in (
+            ("models", self.models),
+            ("deployments", self.deployments),
+            ("agents", self.agents),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"matrix rule {dimension} must be unique")
+        return self
+
+
 class MatrixSpec(StrictModel):
     models: list[ModelProfile] = Field(min_length=1)
     deployments: list[DeploymentProfile] = Field(min_length=1)
     agents: list[AgentProfile] = Field(min_length=1)
+    include: list[MatrixRule] = Field(default_factory=list)
+    exclude: list[MatrixRule] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def profile_ids_are_unique(self) -> MatrixSpec:
@@ -147,12 +168,26 @@ class MatrixSpec(StrictModel):
                 raise ValueError(
                     "profile IDs must be unique within each matrix dimension"
                 )
+        known = {
+            "models": {profile.id for profile in self.models},
+            "deployments": {profile.id for profile in self.deployments},
+            "agents": {profile.id for profile in self.agents},
+        }
+        for rule in [*self.include, *self.exclude]:
+            for dimension in ("models", "deployments", "agents"):
+                unknown = set(getattr(rule, dimension)) - known[dimension]
+                if unknown:
+                    raise ValueError(
+                        f"matrix rule references unknown {dimension}: "
+                        + ", ".join(sorted(unknown))
+                    )
         return self
 
 
 class ExecutionSpec(StrictModel):
     attempts: int = Field(default=1, ge=1)
     concurrent_trials: int = Field(default=1, ge=1)
+    max_trials_per_shard: int = Field(default=64, ge=1)
     timeout_seconds: int = Field(default=3600, ge=1)
 
 

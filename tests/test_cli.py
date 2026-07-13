@@ -28,6 +28,46 @@ def test_plan_command() -> None:
     assert '"run_count": 2' in result.stdout
 
 
+def test_campaign_plan_command_prints_human_summary(remote_manifest: Path) -> None:
+    result = runner.invoke(app, ["campaign", "plan", str(remote_manifest)])
+
+    assert result.exit_code == 0
+    assert "Campaign plan: shellbench-qwen-hardware" in result.stdout
+    assert "Runs: 1" in result.stdout
+    assert "Shards: 1" in result.stdout
+    assert "Trials: 1" in result.stdout
+
+
+def test_campaign_plan_command_supports_json(remote_manifest: Path) -> None:
+    result = runner.invoke(
+        app, ["campaign", "plan", str(remote_manifest), "--format", "json"]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == "harbor-hf/campaign-plan/v1alpha1"
+    assert payload["run_count"] == 1
+
+
+def test_campaign_plan_reports_unresolved_tasks() -> None:
+    result = runner.invoke(app, ["campaign", "plan", str(EXAMPLE)])
+
+    assert result.exit_code == 0
+    assert "Runs: 2" in result.stdout
+
+
+def test_campaign_schema_command_writes_json(tmp_path: Path) -> None:
+    output = tmp_path / "campaign.schema.json"
+
+    result = runner.invoke(app, ["campaign", "schema", "--output", str(output)])
+
+    assert result.exit_code == 0
+    assert set(json.loads(output.read_text(encoding="utf-8"))) == {
+        "campaign_plan",
+        "campaign_lock",
+    }
+
+
 def test_invalid_manifest_reports_stderr_and_exit_two(tmp_path: Path) -> None:
     manifest = tmp_path / "invalid.yaml"
     manifest.write_text("kind: Invalid\n", encoding="utf-8")

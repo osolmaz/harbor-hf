@@ -6,7 +6,7 @@ from itertools import product
 
 from pydantic import BaseModel, ConfigDict
 
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import ExperimentSpec, MatrixRule
 
 
 class RunCell(BaseModel):
@@ -28,8 +28,18 @@ class ExperimentPlan(BaseModel):
 
 
 def experiment_digest(spec: ExperimentSpec) -> str:
+    payload = spec.model_dump(mode="json", exclude_none=True)
+    matrix = payload.get("matrix")
+    if isinstance(matrix, dict):
+        if matrix.get("include") == []:
+            matrix.pop("include")
+        if matrix.get("exclude") == []:
+            matrix.pop("exclude")
+    execution = payload.get("execution")
+    if isinstance(execution, dict) and execution.get("max_trials_per_shard") == 64:
+        execution.pop("max_trials_per_shard")
     canonical = json.dumps(
-        spec.model_dump(mode="json", exclude_none=True),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -40,15 +50,41 @@ def is_task_pattern(task: str) -> bool:
     return any(character in task for character in "*?[")
 
 
-def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
-    cells = [
+def resolved_cells(spec: ExperimentSpec) -> list[RunCell]:
+    candidates = [
         RunCell(model=model.id, deployment=deployment.id, agent=agent.id)
         for model, deployment, agent in product(
-            spec.matrix.models,
-            spec.matrix.deployments,
-            spec.matrix.agents,
+            sorted(spec.matrix.models, key=lambda profile: profile.id),
+            sorted(spec.matrix.deployments, key=lambda profile: profile.id),
+            sorted(spec.matrix.agents, key=lambda profile: profile.id),
         )
     ]
+    included = [
+        cell
+        for cell in candidates
+        if not spec.matrix.include
+        or any(_rule_matches(rule, cell) for rule in spec.matrix.include)
+    ]
+    cells = [
+        cell
+        for cell in included
+        if not any(_rule_matches(rule, cell) for rule in spec.matrix.exclude)
+    ]
+    if not cells:
+        raise ValueError("matrix rules exclude every run cell")
+    return cells
+
+
+def _rule_matches(rule: MatrixRule, cell: RunCell) -> bool:
+    return (
+        (not rule.models or cell.model in rule.models)
+        and (not rule.deployments or cell.deployment in rule.deployments)
+        and (not rule.agents or cell.agent in rule.agents)
+    )
+
+
+def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
+    cells = resolved_cells(spec)
     task_count = len(spec.benchmark.task_digests) or (
         None
         if any(is_task_pattern(task) for task in spec.benchmark.task_names)

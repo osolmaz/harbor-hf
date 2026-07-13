@@ -88,9 +88,11 @@ digest covers its instructions, environment, verifier, and other task files.
 
 ### Matrix
 
-The initial alpha format takes the Cartesian product of `models`, `deployments`,
-and `agents`. IDs must be unique within each dimension. A future format may add
-explicit inclusion and exclusion rules without changing the resolved run model.
+The initial candidate set is the Cartesian product of `models`, `deployments`,
+and `agents`. IDs must be unique within each dimension. Optional `include` rules
+keep cells that match at least one rule, then `exclude` rules remove matching
+cells. Omitted dimensions in a rule are wildcards. Rules use exact profile IDs,
+reject unknown IDs, and may not remove every cell.
 
 Remote model revisions must be full 40-character commit IDs, and serving images
 must use `@sha256:<64 hex>` content digests. `weights.format` describes the
@@ -136,10 +138,11 @@ treated as endpoint deployments.
 
 `attempts` counts independent logical attempts. Infrastructure retries do not
 consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
-provider request concurrency is part of the deployment profile. Timeout values
-are in seconds. `timeout_seconds` is a wall-clock limit for Harbor execution;
-on expiry, the controller terminates the Harbor process group and immediately
-enters verified endpoint cleanup.
+`max_trials_per_shard` deterministically bounds the number of task-attempt pairs
+in one campaign shard and defaults to 64. Provider request concurrency is part
+of the deployment profile. Timeout values are in seconds. `timeout_seconds` is
+a wall-clock limit for Harbor execution; on expiry, the controller terminates
+the Harbor process group and immediately enters verified endpoint cleanup.
 
 Every task selected by `benchmark.task_names` is passed to Harbor. The resolved
 `task_digests` map gives exact and glob selections a deterministic trial count.
@@ -242,6 +245,13 @@ computes a digest from canonical JSON. Remote validation and submission reject
 mutable dataset, task, model, serving-image, source, and agent references. The
 caller resolves them before submission; the separate lock preserves the exact
 selected matrix cell without rewriting the requested document.
+
+Campaign planning additionally sorts resolved cells and tasks, creates one
+logical trial per task and requested attempt, splits those trials into bounded
+shards, and content-addresses every cell and shard. The campaign plan digest is
+derived from resolved execution semantics; the separate manifest digest still
+identifies the exact requested document. Reordering equivalent profile lists or
+task-digest mappings therefore does not change the campaign plan digest.
 
 Every submitted run writes `manifest.yaml`, `run.lock.json`,
 `endpoint.snapshot.json`, and `runtime-environment.json`. Provider-backed runs

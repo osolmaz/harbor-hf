@@ -45,6 +45,19 @@ uv run harbor-hf plan examples/shellbench.yaml
 `plan` performs no remote operations. It prints the resolved matrix cells and a
 digest of the requested experiment.
 
+Resolve the same manifest into deterministic campaign runs, shards, and trials:
+
+```bash
+uv run harbor-hf campaign plan experiment.yaml
+uv run harbor-hf campaign plan experiment.yaml --format json
+uv run harbor-hf campaign schema --output campaign.schema.json
+```
+
+Campaign planning also performs no remote operations. It requires the complete
+task-digest map, applies matrix inclusion and exclusion rules, and prints a
+content-addressed plan that can later be submitted more than once as distinct
+campaigns.
+
 ## Submit A Remote Run
 
 Remote submission requires an endpoint binding and exact 40-character commits

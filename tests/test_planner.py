@@ -13,8 +13,8 @@ def test_builds_cartesian_plan() -> None:
     assert plan.run_count == 2
     assert plan.logical_trial_count == 2
     assert [(cell.model, cell.deployment, cell.agent) for cell in plan.cells] == [
-        ("qwen36-nvfp4", "rtx-pro-6000", "openclaw"),
         ("qwen36-nvfp4", "h200", "openclaw"),
+        ("qwen36-nvfp4", "rtx-pro-6000", "openclaw"),
     ]
 
 

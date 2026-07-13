@@ -15,7 +15,7 @@ from harbor_hf.models import (
     ModelProfile,
     RemoteExecutionSpec,
 )
-from harbor_hf.planner import experiment_digest
+from harbor_hf.planner import experiment_digest, resolved_cells
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -82,6 +82,12 @@ def build_run_lock(
     model = _select(spec.matrix.models, model_id, "model")
     deployment = _select(spec.matrix.deployments, deployment_id, "deployment")
     agent = _select(spec.matrix.agents, agent_id, "agent")
+    selected = (model.id, deployment.id, agent.id)
+    allowed = {
+        (cell.model, cell.deployment, cell.agent) for cell in resolved_cells(spec)
+    }
+    if selected not in allowed:
+        raise ValueError("selected run cell is excluded by matrix rules")
     if "version" in agent.parameters:
         raise ValueError("agent parameter 'version' is reserved by the run lock")
     if (
