@@ -35,7 +35,10 @@ def remote_spec() -> ExperimentSpec:
             ),
             "remote": RemoteExecutionSpec.model_validate(
                 {
-                    "job": {"namespace": "osolmaz"},
+                    "job": {
+                        "namespace": "osolmaz",
+                        "image": "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
+                    },
                     "worker": {
                         "repository": "osolmaz/harbor-hf",
                         "revision": "1234567890abcdef1234567890abcdef12345678",

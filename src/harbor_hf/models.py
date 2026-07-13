@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
-_CONTROLLER_HEADROOM_SECONDS = 4200
+_CONTROLLER_HEADROOM_SECONDS = 4800
 _SENSITIVE_ENVIRONMENT_KEYS = frozenset(
     {
         "authorization",
@@ -78,9 +78,7 @@ class EngineSpec(StrictModel):
     def environment_contains_no_inline_secrets(self) -> EngineSpec:
         declared = set(self.secret_names)
         inline = [
-            key
-            for key in self.environment
-            if key in declared or _is_sensitive_environment_key(key)
+            key for key in self.environment if key in declared or _is_sensitive_key(key)
         ]
         if inline:
             raise ValueError(
@@ -106,6 +104,11 @@ class DeploymentProfile(StrictModel):
     endpoint: EndpointRef | None = None
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def parameters_contain_no_inline_secrets(self) -> DeploymentProfile:
+        _reject_sensitive_parameters(self.parameters, "deployment")
+        return self
+
 
 class AgentProfile(StrictModel):
     id: ProfileId
@@ -121,6 +124,7 @@ class AgentProfile(StrictModel):
             raise ValueError("package agents report their package revision")
         if self.revision_kind == "harbor-source" and self.reported_version is None:
             raise ValueError("Harbor-source agents require reported_version")
+        _reject_sensitive_parameters(self.parameters, "agent")
         return self
 
 
@@ -158,8 +162,7 @@ class PublishingSpec(StrictModel):
 class RemoteJobSpec(StrictModel):
     namespace: str = Field(min_length=1)
     image: str = Field(
-        default="ghcr.io/astral-sh/uv:python3.12-bookworm",
-        min_length=1,
+        pattern=r"^.+@sha256:[0-9a-f]{64}$",
     )
     flavor: str = Field(default="cpu-basic", min_length=1)
     timeout_seconds: int = Field(default=10800, ge=1, le=85800)
@@ -209,8 +212,21 @@ class ExperimentSpec(StrictModel):
         return self
 
 
-def _is_sensitive_environment_key(key: str) -> bool:
+def _is_sensitive_key(key: str) -> bool:
     normalized = key.replace("-", "_").lower()
     return normalized in _SENSITIVE_ENVIRONMENT_KEYS or normalized.endswith(
         _SENSITIVE_ENVIRONMENT_SUFFIXES
     )
+
+
+def _reject_sensitive_parameters(value: JsonValue, owner: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _is_sensitive_key(key):
+                raise ValueError(
+                    f"{owner} parameters must not contain secret-like keys"
+                )
+            _reject_sensitive_parameters(item, owner)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_sensitive_parameters(item, owner)

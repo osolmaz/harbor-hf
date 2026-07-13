@@ -6,6 +6,7 @@ from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import (
     AgentProfile,
     BenchmarkSpec,
+    DeploymentProfile,
     EngineSpec,
     ExperimentSpec,
     RemoteJobSpec,
@@ -54,7 +55,11 @@ def test_reports_unreadable_path(tmp_path: Path) -> None:
 
 def test_remote_job_timeout_preserves_watchdog_cleanup_margin() -> None:
     with pytest.raises(ValueError, match="less than or equal to 85800"):
-        RemoteJobSpec(namespace="org", timeout_seconds=85801)
+        RemoteJobSpec(
+            namespace="org",
+            image="registry/controller@sha256:" + "0" * 64,
+            timeout_seconds=85801,
+        )
 
 
 def test_remote_job_timeout_reserves_controller_lifecycle_headroom(
@@ -65,10 +70,15 @@ def test_remote_job_timeout_reserves_controller_lifecycle_headroom(
     assert isinstance(remote, dict)
     job = remote["job"]
     assert isinstance(job, dict)
-    job["timeout_seconds"] = 4259
+    job["timeout_seconds"] = 4859
 
-    with pytest.raises(ValueError, match="exceed execution timeout by at least 4200"):
+    with pytest.raises(ValueError, match="exceed execution timeout by at least 4800"):
         ExperimentSpec.model_validate(value)
+
+
+def test_remote_job_image_requires_immutable_digest() -> None:
+    with pytest.raises(ValueError, match="String should match pattern"):
+        RemoteJobSpec(namespace="org", image="registry/controller:latest")
 
 
 @pytest.mark.parametrize("task_names", [[], [""], ["same", "same"]])
@@ -117,3 +127,21 @@ def test_engine_environment_allows_non_secret_runtime_controls() -> None:
     )
 
     assert engine.environment == {"VLLM_USE_FLASHINFER_MOE_FP4": "1"}
+
+
+def test_serialized_parameters_reject_nested_secret_keys(
+    remote_spec: ExperimentSpec,
+) -> None:
+    agent = remote_spec.matrix.agents[0].model_dump(mode="json")
+    agent["parameters"] = {"nested": {"api_key": "credential"}}
+    with pytest.raises(ValueError, match="agent parameters must not contain"):
+        AgentProfile.model_validate(agent)
+
+    deployment = remote_spec.matrix.deployments[0].model_dump(mode="json")
+    deployment["parameters"] = {"credentials": {"value": "credential"}}
+    with pytest.raises(ValueError, match="deployment parameters must not contain"):
+        DeploymentProfile.model_validate(deployment)
+
+    agent["parameters"] = {"nested": [{"password": "credential"}]}
+    with pytest.raises(ValueError, match="agent parameters must not contain"):
+        AgentProfile.model_validate(agent)

@@ -57,7 +57,7 @@ def test_build_submit_command_contains_only_secret_name(
         "--volume",
         "hf://buckets/osolmaz/benchmark-runs:/output:rw",
         "--",
-        "ghcr.io/astral-sh/uv:python3.12-bookworm",
+        "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
     ]
     assert command[22:25] == ["bash", "-lc", command[24]]
     assert "git clone --filter=blob:none --no-checkout" in command[24]

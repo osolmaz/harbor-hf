@@ -5,6 +5,7 @@ import os
 import platform
 import shutil
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -505,6 +506,18 @@ def prepare_locked_source(
     )
     if not (destination / "uv.lock").is_file():
         raise WorkerError("pinned source checkout has no uv.lock")
+    pyproject = destination / "pyproject.toml"
+    if not pyproject.is_file():
+        raise WorkerError("pinned Harbor checkout has no pyproject.toml")
+    document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    project = document.get("project")
+    extras = (
+        project.get("optional-dependencies") if isinstance(project, Mapping) else None
+    )
+    if not isinstance(extras, Mapping) or "hf-sandbox" not in extras:
+        raise WorkerError(
+            "pinned Harbor checkout does not provide the hf-sandbox extra"
+        )
 
 
 def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) -> str:
@@ -774,10 +787,11 @@ def validate_harbor_result(
     expected_agent_version: str | None = None,
 ) -> dict[str, object]:
     trials: list[dict[str, object]] = []
-    for path in sorted(jobs_dir.rglob("result.json")):
+    for path in sorted(jobs_dir.glob("*/*/result.json")):
         value = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(value, dict) and "task_name" in value:
-            trials.append(value)
+        if not isinstance(value, dict) or "task_name" not in value:
+            raise WorkerError("Harbor produced a malformed trial result")
+        trials.append(value)
     _validate_trial_count(trials, expected_trials)
     _validate_task_counts(
         trials,

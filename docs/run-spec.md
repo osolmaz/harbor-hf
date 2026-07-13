@@ -33,7 +33,7 @@ matrix:
   agents:
     - id: agent
       name: terminus-2
-      revision: 0123456789abcdef0123456789abcdef01234567
+      revision: bd9e606dcb99eb49de70bd741fd846cae5c7ebd1
       revision_kind: harbor-source
       reported_version: 2.0.0
 artifacts:
@@ -43,13 +43,14 @@ publishing:
 remote:
   job:
     namespace: organization
+    image: registry/controller@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   worker:
     repository: organization/harbor-hf
     revision: 0123456789abcdef0123456789abcdef01234567
   harbor:
     source:
-      repository: harbor-framework/harbor
-      revision: 0123456789abcdef0123456789abcdef01234567
+      repository: osolmaz/harbor
+      revision: bd9e606dcb99eb49de70bd741fd846cae5c7ebd1
 ```
 
 Unknown fields are rejected. Use `harbor-hf validate PATH` before submission.
@@ -98,7 +99,8 @@ Secret-like keys and keys declared in `secret_names` are rejected from
 `engine.environment`; credentials must be injected by the remote platform.
 
 Provider-specific values belong in `parameters`. They must be representable as
-JSON and are preserved in the resolved lock.
+JSON and are preserved in the resolved lock. Secret-like keys are rejected
+recursively from deployment and agent parameter mappings.
 
 An endpoint-backed deployment used for submission also has an `endpoint`
 binding with `namespace`, `name`, and the OpenAI-compatible
@@ -154,13 +156,15 @@ must equal `remote.harbor.source.revision`, no package version is passed, and
 
 ### Remote Execution
 
-`remote.job` pins the HF Job namespace, controller image, hardware flavor,
+`remote.job` pins the HF Job namespace, digest-pinned controller image, hardware flavor,
 timeout, and secret variable name. `remote.worker` pins this package to an exact
 GitHub commit. `remote.harbor.source` likewise pins Harbor to an exact GitHub
 commit and configures the HF Sandbox flavor and idle timeout. Source revisions
 must be full lowercase 40-character Git commit IDs. The controller checks out
 both revisions directly and runs them with `uv --locked`; missing or stale lock
-files fail before endpoint-backed benchmark execution begins.
+files fail before endpoint-backed benchmark execution begins. The pinned Harbor
+revision must expose the `hf-sandbox` optional dependency; the worker verifies
+that capability before it resumes the endpoint.
 
 For endpoint-backed runs, `remote.job.namespace` must equal the selected
 endpoint namespace. This gives every controller and watchdog targeting that
@@ -169,8 +173,8 @@ endpoint one shared HF Jobs namespace for lease election.
 The controller Job timeout is limited to 85,800 seconds. The remaining 600
 seconds within HF Jobs' 86,400-second maximum are reserved for watchdog startup
 and verified endpoint cleanup. It must also exceed `execution.timeout_seconds`
-by at least 4,200 seconds, reserving time for watchdog readiness, endpoint
-startup, and controller cleanup. The endpoint is not resumed until the watchdog
+by at least 4,800 seconds, reserving time for source bootstrap, watchdog
+readiness, endpoint startup, and controller cleanup. The endpoint is not resumed until the watchdog
 has completed its source bootstrap and published a readiness handshake.
 Endpoint readiness has its own 3,600-second allowance and does not consume or
 inherit the Harbor execution timeout.

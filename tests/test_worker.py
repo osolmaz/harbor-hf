@@ -239,6 +239,10 @@ def test_prepare_locked_source_checks_out_revision_and_requires_lock(
             if "checkout" in command:
                 destination.mkdir(parents=True)
                 (destination / "uv.lock").write_text("", encoding="utf-8")
+                (destination / "pyproject.toml").write_text(
+                    "[project.optional-dependencies]\nhf-sandbox = []\n",
+                    encoding="utf-8",
+                )
             return ""
 
         def run_json(self, command: Sequence[str]) -> dict[str, object]:
@@ -300,6 +304,86 @@ def test_prepare_locked_source_rejects_checkout_without_lock(
         prepare_locked_source(remote.harbor.source, destination, SourceRunner())
 
 
+def test_prepare_locked_source_requires_hf_sandbox_extra(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    destination = tmp_path / "source"
+
+    class SourceRunner:
+        def run_text(self, command: Sequence[str]) -> str:
+            if "checkout" in command:
+                destination.mkdir(parents=True)
+                (destination / "uv.lock").write_text("", encoding="utf-8")
+                (destination / "pyproject.toml").write_text(
+                    "[project.optional-dependencies]\nother = []\n",
+                    encoding="utf-8",
+                )
+            return ""
+
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            raise AssertionError(command)
+
+    with pytest.raises(
+        WorkerError,
+        match="^pinned Harbor checkout does not provide the hf-sandbox extra$",
+    ):
+        prepare_locked_source(remote.harbor.source, destination, SourceRunner())
+
+
+def test_prepare_locked_source_rejects_malformed_project_metadata(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    destination = tmp_path / "source"
+
+    class SourceRunner:
+        def run_text(self, command: Sequence[str]) -> str:
+            if "checkout" in command:
+                destination.mkdir(parents=True)
+                (destination / "uv.lock").write_text("", encoding="utf-8")
+                (destination / "pyproject.toml").write_text(
+                    "project = []\n",
+                    encoding="utf-8",
+                )
+            return ""
+
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            raise AssertionError(command)
+
+    with pytest.raises(
+        WorkerError,
+        match="^pinned Harbor checkout does not provide the hf-sandbox extra$",
+    ):
+        prepare_locked_source(remote.harbor.source, destination, SourceRunner())
+
+
+def test_prepare_locked_source_requires_pyproject(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    destination = tmp_path / "source"
+
+    class SourceRunner:
+        def run_text(self, command: Sequence[str]) -> str:
+            if "checkout" in command:
+                destination.mkdir(parents=True)
+                (destination / "uv.lock").write_text("", encoding="utf-8")
+            return ""
+
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            raise AssertionError(command)
+
+    with pytest.raises(
+        WorkerError,
+        match="^pinned Harbor checkout has no pyproject.toml$",
+    ):
+        prepare_locked_source(remote.harbor.source, destination, SourceRunner())
+
+
 def test_launch_watchdog_requires_controller_job_before_submission(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -341,7 +425,7 @@ def test_launch_watchdog_uses_independent_hf_job(
 
     assert launch_cleanup_watchdog(lock, endpoint, "secret") == "watchdog-job"
     assert calls[0] == {
-        "image": "ghcr.io/astral-sh/uv:python3.12-bookworm",
+        "image": "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
         "command": calls[0]["command"],
         "secrets": {"HF_TOKEN": "secret"},
         "flavor": "cpu-basic",
@@ -951,6 +1035,10 @@ def test_validate_harbor_result_requires_one_numeric_verifier(tmp_path: Path) ->
         "trial_count": 1,
         "trials": [{"task_name": "task", "rewards": {"reward": 0.5}}],
     }
+    nested = trial / "artifacts"
+    nested.mkdir()
+    (nested / "result.json").write_text("not json", encoding="utf-8")
+    assert validate_harbor_result(tmp_path)["trial_count"] == 1
     (trial / "result.json").write_text(
         json.dumps(
             {"task_name": "task", "verifier_result": {"rewards": {"reward": True}}}
@@ -969,8 +1057,8 @@ def test_validate_harbor_result_rejects_missing_and_multiple_trials(
         validate_harbor_result(tmp_path)
 
     for name in ("one", "two"):
-        trial = tmp_path / name
-        trial.mkdir()
+        trial = tmp_path / "job" / name
+        trial.mkdir(parents=True)
         (trial / "result.json").write_text(
             json.dumps(
                 {
@@ -987,8 +1075,8 @@ def test_validate_harbor_result_rejects_missing_and_multiple_trials(
 
 
 def test_validate_harbor_result_requires_rewards(tmp_path: Path) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     result = trial / "result.json"
     result.write_text(
         json.dumps({"task_name": "task", "verifier_result": {"rewards": {}}}),
@@ -1001,9 +1089,20 @@ def test_validate_harbor_result_requires_rewards(tmp_path: Path) -> None:
         validate_harbor_result(tmp_path)
 
 
+def test_validate_harbor_result_rejects_malformed_trial_metadata(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(WorkerError, match="^Harbor produced a malformed trial result$"):
+        validate_harbor_result(tmp_path)
+
+
 def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1022,8 +1121,8 @@ def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
 def test_validate_harbor_result_rejects_step_exception_despite_reward(
     tmp_path: Path,
 ) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1066,8 +1165,8 @@ def test_validate_harbor_result_describes_unnamed_step_exceptions(
     step: dict[str, object],
     message: str,
 ) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1095,8 +1194,8 @@ def test_validate_harbor_result_rejects_malformed_step_results(
     step_results: object,
     message: str,
 ) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1113,8 +1212,8 @@ def test_validate_harbor_result_rejects_malformed_step_results(
 
 
 def test_validate_harbor_result_enforces_agent_identity(tmp_path: Path) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1185,8 +1284,8 @@ def test_validate_harbor_result_rejects_malformed_trial_exception(
     exception_info: object,
     message: str,
 ) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1206,8 +1305,8 @@ def test_validate_harbor_result_accepts_every_expected_attempt(
     tmp_path: Path,
 ) -> None:
     for ordinal in (1, 2):
-        trial = tmp_path / str(ordinal)
-        trial.mkdir()
+        trial = tmp_path / "job" / str(ordinal)
+        trial.mkdir(parents=True)
         (trial / "result.json").write_text(
             json.dumps(
                 {
@@ -1267,8 +1366,8 @@ def test_validate_harbor_result_rejects_duplicate_in_place_of_requested_task(
     tmp_path: Path,
 ) -> None:
     for ordinal in (1, 2):
-        trial = tmp_path / str(ordinal)
-        trial.mkdir()
+        trial = tmp_path / "job" / str(ordinal)
+        trial.mkdir(parents=True)
         (trial / "result.json").write_text(
             json.dumps(
                 {
@@ -1313,8 +1412,8 @@ def test_validate_harbor_result_requires_a_wildcard_selected_trial(
 def test_validate_harbor_result_requires_every_wildcard_attempt(
     tmp_path: Path,
 ) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {
@@ -1336,8 +1435,8 @@ def test_validate_harbor_result_requires_every_wildcard_attempt(
 def test_validate_harbor_result_requires_exact_task_mixed_with_wildcard(
     tmp_path: Path,
 ) -> None:
-    trial = tmp_path / "trial"
-    trial.mkdir()
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
     (trial / "result.json").write_text(
         json.dumps(
             {

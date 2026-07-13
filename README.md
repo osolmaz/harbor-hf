@@ -43,9 +43,10 @@ digest of the requested experiment.
 ## Submit A Remote Run
 
 Remote submission requires an endpoint binding and exact 40-character commits
-for both `harbor-hf` and Harbor. Both checkouts execute with their committed
-`uv.lock` files in locked mode without development dependency groups. Preview
-the sanitized HF Job command first:
+for both `harbor-hf` and a Harbor revision that provides the `hf-sandbox`
+extra. The controller image must be pinned by SHA-256 digest. Both checkouts
+execute with their committed `uv.lock` files in locked mode without development
+dependency groups. Preview the sanitized HF Job command first:
 
 ```bash
 uv run harbor-hf submit experiment.yaml --dry-run
