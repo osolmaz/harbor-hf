@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -5,6 +7,7 @@ from pydantic import ValidationError
 
 from harbor_hf.campaigns import (
     CampaignPlan,
+    CampaignRecoveryPolicy,
     build_campaign_lock,
     build_campaign_plan,
     campaign_json_schemas,
@@ -184,3 +187,52 @@ def test_exports_campaign_json_schemas() -> None:
     assert set(schemas) == {"campaign_plan", "campaign_lock"}
     assert schemas["campaign_plan"]["title"] == "CampaignPlan"
     assert schemas["campaign_lock"]["title"] == "CampaignLock"
+
+
+def test_campaign_recovery_policy_is_content_addressed_and_stable(
+    remote_spec: ExperimentSpec,
+) -> None:
+    tasks = {f"task-{index}": f"sha256:{index:064x}" for index in range(1, 6)}
+    second_model = remote_spec.matrix.models[0].model_copy(update={"id": "model-two"})
+    spec = remote_spec.model_copy(
+        update={
+            "benchmark": remote_spec.benchmark.model_copy(
+                update={"task_names": ["task-*"], "task_digests": tasks}
+            ),
+            "matrix": remote_spec.matrix.model_copy(
+                update={"models": [remote_spec.matrix.models[0], second_model]}
+            ),
+            "execution": remote_spec.execution.model_copy(
+                update={"attempts": 2, "max_trials_per_shard": 3}
+            ),
+        }
+    )
+    policy = CampaignRecoveryPolicy(
+        max_active_waves=3,
+        max_physical_executions_per_trial=4,
+        retry_base_seconds=17,
+        retry_max_seconds=99,
+        cancellation_grace_seconds=23,
+        spend_cap_microusd=123_456,
+    )
+    default_plan = build_campaign_plan(spec)
+    plan = build_campaign_plan(spec, recovery_policy=policy)
+    lock = build_campaign_lock(
+        plan, "campaign-policy", clock=lambda: datetime(2026, 1, 2, tzinfo=UTC)
+    )
+
+    assert plan.plan_digest != default_plan.plan_digest
+    assert lock.recovery_policy == policy
+    encoded = json.dumps(
+        [plan.model_dump(mode="json"), lock.model_dump(mode="json")],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "687d4de3de0eef3af1d5b2fd0d3ba77399fc5a5de79506644d481b6befead944"
+    )
+
+
+def test_campaign_recovery_policy_rejects_unbounded_base_delay() -> None:
+    with pytest.raises(ValidationError, match="retry base seconds must not exceed"):
+        CampaignRecoveryPolicy(retry_base_seconds=61, retry_max_seconds=60)

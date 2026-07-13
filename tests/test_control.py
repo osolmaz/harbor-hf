@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import httpx
 import pytest
@@ -13,13 +15,17 @@ from pydantic import ValidationError
 
 from harbor_hf.campaigns import CampaignLock, build_campaign_lock, build_campaign_plan
 from harbor_hf.control import (
+    ActionKind,
     ActionOutcomePayload,
     ActionReservedPayload,
     CampaignConflict,
     CampaignEvent,
     CampaignSubmittedPayload,
+    CancellationPayload,
     ControlError,
+    EventKind,
     HubCampaignStore,
+    LifecyclePayload,
     TerminalPayload,
     new_event,
     project_campaign,
@@ -331,3 +337,212 @@ def test_hub_store_files_are_canonical_json(
 
     assert raw.endswith(b"\n")
     assert json.loads(raw) == lock.model_dump(mode="json")
+
+
+def test_campaign_projection_corpus_is_stable(remote_spec: ExperimentSpec) -> None:
+    lock = _lock(remote_spec)
+    submitted = _submitted(lock)
+    events: list[CampaignEvent] = [submitted]
+    outcomes = ["action.succeeded", "action.failed", "action.ambiguous"]
+    action_kinds = ["submit-wave", "cancel-wave", "publish-results"]
+    for index, (outcome, action_kind) in enumerate(
+        zip(outcomes, action_kinds, strict=True), 2
+    ):
+        action_id = f"action-{index}"
+        events.append(
+            new_event(
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind="action.reserved",
+                producer="reconciler",
+                payload=ActionReservedPayload(
+                    action_id=action_id,
+                    action_key=f"key-{index}",
+                    action_kind=cast(ActionKind, action_kind),
+                    target_ids=[f"target-{index}"],
+                ),
+                clock=lambda index=index: NOW + timedelta(seconds=index),
+                identifier=lambda index=index: f"{index:032x}",
+            )
+        )
+        events.append(
+            new_event(
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind=cast(EventKind, outcome),
+                producer="reconciler",
+                payload=ActionOutcomePayload(
+                    action_id=action_id,
+                    message=f"message-{index}",
+                    remote_id=f"remote-{index}",
+                ),
+                clock=lambda index=index: NOW + timedelta(seconds=index + 10),
+                identifier=lambda index=index: f"{index + 10:032x}",
+            )
+        )
+    active = project_campaign(lock, list(reversed(events)))
+    cancelled = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "a" * 32,
+    )
+    draining = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.draining",
+        producer="reconciler",
+        payload=LifecyclePayload(message="draining"),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "b" * 32,
+    )
+    manual = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(message="cleanup failed"),
+        clock=lambda: NOW + timedelta(seconds=4),
+        identifier=lambda: "c" * 32,
+    )
+    projections = [
+        active,
+        project_campaign(lock, [submitted, cancelled, cancelled]),
+        project_campaign(lock, [submitted, cancelled, draining, cancelled]),
+        project_campaign(lock, [submitted, cancelled, draining, manual, cancelled]),
+    ]
+    encoded = json.dumps(
+        [projection.model_dump(mode="json") for projection in projections],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "f81017cd7059729c0cdea5649fb78480a35cedb330329bb4c6177f69b71e7b4e"
+    )
+
+
+def test_control_store_commit_corpus_is_stable(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    submitted = _submitted(lock)
+    reserved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="action-one",
+            action_key="key-one",
+            action_kind="submit-wave",
+            target_ids=["shard-one"],
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "d" * 32,
+    )
+    outcome = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.succeeded",
+        producer="reconciler",
+        payload=ActionOutcomePayload(
+            action_id="action-one", message="created", remote_id="remote-one"
+        ),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "e" * 32,
+    )
+    action = {
+        "action_id": "action-one",
+        "kind": "submit-wave",
+        "targets": ["shard-one"],
+    }
+
+    store.create_campaign(lock, b"kind: Experiment\n", submitted)
+    assert store.reserve_action(lock.campaign_id, action, reserved)
+    store.append_event(lock.campaign_id, outcome)
+    observed_lock, observed_events = store.load_campaign(lock.campaign_id)
+    corpus = {
+        "files": {
+            path: payload.decode() for path, payload in sorted(api.files.items())
+        },
+        "commits": api.commits,
+        "lock": observed_lock.model_dump(mode="json"),
+        "events": [event.model_dump(mode="json") for event in observed_events],
+    }
+    encoded = json.dumps(
+        corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "c345c5b7a678b58ae50a2bbe0b471e46313487efd287e9a5280f7dc885076e00"
+    )
+
+
+def test_control_projection_rejects_each_submission_mismatch(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _lock(remote_spec)
+    submitted = _submitted(lock)
+    mismatches = [
+        submitted.model_copy(update={"kind": "campaign.cancel-requested"}),
+        submitted.model_copy(update={"subject_type": "run"}),
+        submitted.model_copy(update={"subject_id": "different-campaign"}),
+        submitted.model_copy(
+            update={
+                "payload": CampaignSubmittedPayload(plan_digest="sha256:" + "f" * 64)
+            }
+        ),
+    ]
+
+    for mismatch in mismatches:
+        with pytest.raises(ControlError) as captured:
+            project_campaign(lock, [mismatch])
+        assert (
+            str(captured.value) == "campaign submission event does not match its lock"
+        )
+    with pytest.raises(ControlError) as captured:
+        project_campaign(lock, [])
+    assert str(captured.value) == "campaign has no submission event"
+
+
+def test_action_reservation_validates_kind_and_campaign_separately(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    store = HubCampaignStore("org", api=FakeCampaignApi(tmp_path))
+    outcome = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.succeeded",
+        producer="reconciler",
+        payload=ActionOutcomePayload(action_id="action-one"),
+        clock=lambda: NOW,
+        identifier=lambda: "f" * 32,
+    )
+    reservation = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="action-one",
+            action_key="key-one",
+            action_kind="submit-wave",
+            target_ids=[],
+        ),
+        clock=lambda: NOW,
+        identifier=lambda: "e" * 32,
+    )
+
+    for invalid in [outcome, reservation.model_copy(update={"subject_id": "wrong"})]:
+        with pytest.raises(ValueError) as captured:
+            store.reserve_action(lock.campaign_id, {}, invalid)
+        assert str(captured.value) == (
+            "action reservation requires its reservation event"
+        )
