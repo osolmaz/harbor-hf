@@ -201,7 +201,7 @@ def test_streaming_runner_propagates_output_capture_failures(
 def _process_state(process_id: int) -> str | None:
     try:
         fields = Path(f"/proc/{process_id}/stat").read_text().split()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     return fields[2]
 
