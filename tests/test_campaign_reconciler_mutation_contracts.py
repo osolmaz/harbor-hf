@@ -99,7 +99,7 @@ def test_campaign_plan_lock_reconcile_and_wave_have_one_canonical_output(
     }
 
     assert _hash(corpus) == (
-        "cf1c1c96071447bf17db7f171b32dbd1701085c61e1cd346caae12bf26fc5a41"
+        "fe9084067bb3fd7ff82b1c9b676271cb206ac272fe71d83abe0c9a7fb5fed67a"
     )
 
 
@@ -107,7 +107,7 @@ def test_campaign_plan_lock_reconcile_and_wave_have_one_canonical_output(
     ("mutate", "message"),
     [
         (
-            lambda action, lock: action.model_copy(update={"kind": "retry-shard"}),
+            lambda action, lock: action.model_copy(update={"kind": "publish-results"}),
             "wave action does not target the campaign",
         ),
         (
@@ -354,7 +354,7 @@ def test_reserved_submit_action_removes_all_assigned_shards_from_candidates(
     assert _hash(corpus) == (
         "9dbcf1a546e886f0f227b7d2c106ac884a191b3a482b075c23d85de9aa331aa2"
     )
-    assert _assigned_shards(projection) == set(reserved_action.shard_ids)
+    assert _assigned_shards(lock, projection) == set(reserved_action.shard_ids)
     assert {
         shard_id for action in subsequent.actions for shard_id in action.shard_ids
     }.isdisjoint(reserved_action.shard_ids)

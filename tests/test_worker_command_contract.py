@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import DeploymentProfile, ExperimentSpec
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     WorkerError,
@@ -15,6 +15,7 @@ from harbor_hf.worker import (
 
 def _contract_lock(remote_spec: ExperimentSpec) -> RunLock:
     lock = build_run_lock(remote_spec, run_id="command-contract")
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     return lock.model_copy(

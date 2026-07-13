@@ -244,11 +244,14 @@ def _wave_events(
     marker: str,
     records: list[dict[str, object]],
 ) -> list[CampaignEvent]:
-    provider = next(
-        run.provider
-        for run in campaign.runs
-        if run.deployment_digest == wave.deployment_digest
-    ) or "hf-inference-endpoints"
+    provider = (
+        next(
+            run.provider
+            for run in campaign.runs
+            if run.deployment_digest == wave.deployment_digest
+        )
+        or "hf-inference-endpoints"
+    )
     payload = WaveLifecyclePayload(
         deployment_digest=wave.deployment_digest,
         provider=provider,

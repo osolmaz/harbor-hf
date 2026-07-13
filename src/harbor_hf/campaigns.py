@@ -530,9 +530,7 @@ def build_wave_lock(
         wave_id=deterministic_wave_id(action.action_key),
         action_id=action.action_id,
         action_key=action.action_key,
-        action_kind=(
-            "retry-shard" if action.kind == "retry-shard" else "submit-wave"
-        ),
+        action_kind=("retry-shard" if action.kind == "retry-shard" else "submit-wave"),
         campaign_id=campaign.campaign_id,
         created_at=campaign.created_at,
         manifest_digest=campaign.manifest_digest,
