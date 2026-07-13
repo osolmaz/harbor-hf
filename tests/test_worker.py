@@ -17,8 +17,10 @@ from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
+    _expected_trial_count,
     _finalize_evidence,
     _job_stage,
+    _validate_trial_count,
     build_harbor_command,
     controller_environment,
     endpoint_state,
@@ -459,7 +461,9 @@ def test_wait_watchdog_ready_polls_until_handshake() -> None:
     assert sleeps == [2]
 
 
-@pytest.mark.parametrize("stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED"])
+@pytest.mark.parametrize(
+    "stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"]
+)
 def test_wait_watchdog_ready_rejects_early_exit(stage: str) -> None:
     class FakeApi:
         def inspect_job(self, **_kwargs: object) -> object:
@@ -493,7 +497,9 @@ def test_wait_watchdog_ready_reports_timeout() -> None:
     assert sleeps == [5]
 
 
-@pytest.mark.parametrize("stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED"])
+@pytest.mark.parametrize(
+    "stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"]
+)
 def test_endpoint_watchdog_pauses_after_controller_finishes(
     monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
@@ -706,6 +712,17 @@ def test_job_stage_reads_hf_enum_value() -> None:
     assert _job_stage(info) == "COMPLETED"
 
 
+def test_job_stage_reads_hf_string_value() -> None:
+    assert _job_stage(SimpleNamespace(status=SimpleNamespace(stage="running"))) == (
+        "RUNNING"
+    )
+
+
+def test_job_stage_rejects_invalid_value() -> None:
+    with pytest.raises(WorkerError, match="^HF Job response has an invalid stage$"):
+        _job_stage(SimpleNamespace(status=SimpleNamespace(stage=3)))
+
+
 def test_cleanup_timeout() -> None:
     times = iter([0.0, 2.0])
     manager = EndpointManager(
@@ -741,8 +758,6 @@ def test_harbor_command_is_pinned_and_bounded(
         "run",
         "--dataset",
         "terminal-bench@2.0",
-        "--n-tasks",
-        "1",
         "--n-attempts",
         "1",
         "--agent",
@@ -945,6 +960,50 @@ def test_validate_harbor_result_accepts_every_expected_attempt(
     }
 
 
+def test_expected_trial_count_scales_explicit_tasks_and_attempts(
+    remote_spec: ExperimentSpec,
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(update={"task_names": ["one", "two"]})
+    execution = remote_spec.execution.model_copy(update={"attempts": 3})
+    lock = build_run_lock(
+        remote_spec.model_copy(update={"benchmark": benchmark, "execution": execution})
+    )
+
+    assert _expected_trial_count(lock) == 6
+
+
+@pytest.mark.parametrize("pattern", ["*", "shell-*", "task?", "task[12]"])
+def test_expected_trial_count_is_resolved_by_harbor_for_patterns(
+    remote_spec: ExperimentSpec, pattern: str
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(update={"task_names": [pattern]})
+    lock = build_run_lock(remote_spec.model_copy(update={"benchmark": benchmark}))
+
+    assert _expected_trial_count(lock) is None
+
+
+def test_validate_harbor_result_requires_a_wildcard_selected_trial(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(WorkerError, match="^Harbor produced no trials$"):
+        validate_harbor_result(tmp_path, expected_trials=None)
+
+
+def test_trial_count_accepts_nonempty_wildcard_results() -> None:
+    _validate_trial_count([{}], None)
+
+
+def test_trial_count_accepts_matching_explicit_results() -> None:
+    _validate_trial_count([{}], 1)
+
+
+def test_trial_count_rejects_explicit_mismatch() -> None:
+    with pytest.raises(
+        WorkerError, match="^expected exactly 1 Harbor trials, found 0$"
+    ):
+        _validate_trial_count([], 1)
+
+
 class FakeResponse:
     def __init__(self, body: bytes, status: int = 200) -> None:
         self.body = body
@@ -1059,7 +1118,11 @@ def _write_lock(path: Path, lock: RunLock) -> None:
 
 
 def _successful_stream(
-    command: Sequence[str], log_path: Path, *, environment: dict[str, str]
+    command: Sequence[str],
+    log_path: Path,
+    *,
+    environment: dict[str, str],
+    timeout_seconds: int,
 ) -> int:
     assert environment == {
         "HF_TOKEN": "test-token",
@@ -1067,6 +1130,7 @@ def _successful_stream(
         "OPENAI_BASE_URL": "https://endpoint.example/v1",
     }
     assert log_path.name == "harbor.log"
+    assert timeout_seconds == 60
     assert command[command.index("--allow-agent-host") + 1] == "endpoint.example"
     jobs_dir = Path(command[command.index("--jobs-dir") + 1])
     trial = jobs_dir / "job" / "trial"
@@ -1208,6 +1272,42 @@ def test_worker_publishes_success_after_cleanup(
         ]
         for operation in ("resume", "describe", "pause", "describe")
     ]
+
+
+def test_worker_rejects_incomplete_explicit_task_set(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"task_names": ["cancel-async-tasks", "second-task"]}
+    )
+    spec = remote_spec.model_copy(update={"benchmark": benchmark})
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(spec.model_dump_json(), encoding="utf-8")
+    lock = build_run_lock(spec, run_id="incomplete-task-set")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime", lambda _url, _token: {"probes": {}}
+    )
+    runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+
+    with pytest.raises(
+        WorkerError, match="^expected exactly 2 Harbor trials, found 1$"
+    ):
+        run_worker(
+            manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            stream_runner=_successful_stream,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
+        )
+
+    assert [command[2] for command in runner.commands][-2:] == ["pause", "describe"]
 
 
 def test_worker_failure_still_pauses_endpoint(

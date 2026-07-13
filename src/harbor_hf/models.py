@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+TaskName = Annotated[str, Field(min_length=1)]
 
 
 class StrictModel(BaseModel):
@@ -18,7 +19,13 @@ class Metadata(StrictModel):
 
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
-    task_names: list[str] = Field(default_factory=lambda: ["*"])
+    task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
+
+    @model_validator(mode="after")
+    def task_names_are_unique(self) -> BenchmarkSpec:
+        if len(self.task_names) != len(set(self.task_names)):
+            raise ValueError("benchmark task names must be unique")
+        return self
 
 
 class QuantizationSpec(StrictModel):

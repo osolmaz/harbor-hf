@@ -165,8 +165,6 @@ def build_harbor_command(
         "run",
         "--dataset",
         lock.benchmark_dataset,
-        "--n-tasks",
-        "1",
         "--n-attempts",
         str(lock.attempts),
         "--agent",
@@ -375,11 +373,15 @@ def _execute_benchmark(
             "OPENAI_API_KEY": token,
             "OPENAI_BASE_URL": f"{base_url}/v1",
         },
+        timeout_seconds=lock.timeout_seconds,
     )
     append_event(events, "harbor_finished", exit_code=exit_code)
     if exit_code != 0:
         raise WorkerError(f"Harbor exited with status {exit_code}")
-    verifier = validate_harbor_result(jobs_dir, lock.attempts)
+    verifier = validate_harbor_result(
+        jobs_dir,
+        expected_trials=_expected_trial_count(lock),
+    )
     write_json(root / "verification.json", verifier)
     append_event(events, "verification_validated")
 
@@ -492,7 +494,7 @@ def wait_watchdog_ready(
     poll_seconds: float = 5,
 ) -> None:
     deadline = monotonic() + timeout_seconds
-    terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED"}
+    terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
     while True:
         info = api.inspect_job(job_id=job_id, namespace=namespace)
         labels = getattr(info, "labels", None)
@@ -541,7 +543,7 @@ def run_endpoint_watchdog(
         namespace=controller_namespace,
     )
     deadline = monotonic() + timeout_seconds
-    terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED"}
+    terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
     while monotonic() < deadline:
         try:
             stage = _job_stage(
@@ -568,7 +570,11 @@ def _job_stage(info: object) -> str:
     from huggingface_hub import JobInfo
 
     job = cast(JobInfo, info)
-    return job.status.stage.value.upper()
+    stage = job.status.stage
+    value = getattr(stage, "value", stage)
+    if not isinstance(value, str):
+        raise WorkerError("HF Job response has an invalid stage")
+    return value.upper()
 
 
 def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> None:
@@ -645,18 +651,24 @@ def probe_runtime(base_url: str, token: str) -> dict[str, object]:
     return {"probes": probes}
 
 
+def _expected_trial_count(lock: RunLock) -> int | None:
+    if any(
+        any(character in task for character in "*?[") for task in lock.benchmark_tasks
+    ):
+        return None
+    return len(lock.benchmark_tasks) * lock.attempts
+
+
 def validate_harbor_result(
-    jobs_dir: Path, expected_trials: int = 1
+    jobs_dir: Path, expected_trials: int | None = 1
 ) -> dict[str, object]:
     trials: list[dict[str, object]] = []
     for path in sorted(jobs_dir.rglob("result.json")):
         value = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(value, dict) and "task_name" in value:
             trials.append(value)
-    if len(trials) != expected_trials:
-        raise WorkerError(
-            f"expected exactly {expected_trials} Harbor trials, found {len(trials)}"
-        )
+    _validate_trial_count(trials, expected_trials)
+
     verified: list[dict[str, object]] = []
     for trial in trials:
         task_name = str(trial["task_name"])
@@ -685,3 +697,14 @@ def validate_harbor_result(
         "trial_count": len(verified),
         "trials": verified,
     }
+
+
+def _validate_trial_count(
+    trials: list[dict[str, object]], expected_trials: int | None
+) -> None:
+    if expected_trials is None and not trials:
+        raise WorkerError("Harbor produced no trials")
+    if expected_trials is not None and len(trials) != expected_trials:
+        raise WorkerError(
+            f"expected exactly {expected_trials} Harbor trials, found {len(trials)}"
+        )

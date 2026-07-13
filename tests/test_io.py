@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from harbor_hf.io import ManifestError, load_experiment
-from harbor_hf.models import RemoteJobSpec
+from harbor_hf.models import BenchmarkSpec, RemoteJobSpec
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
 
@@ -48,3 +48,11 @@ def test_reports_unreadable_path(tmp_path: Path) -> None:
 def test_remote_job_timeout_preserves_watchdog_cleanup_margin() -> None:
     with pytest.raises(ValueError, match="less than or equal to 85800"):
         RemoteJobSpec(namespace="org", timeout_seconds=85801)
+
+
+@pytest.mark.parametrize("task_names", [[], [""], ["same", "same"]])
+def test_benchmark_requires_distinct_nonempty_task_names(
+    task_names: list[str],
+) -> None:
+    with pytest.raises(ValueError):
+        BenchmarkSpec(dataset="dataset", task_names=task_names)

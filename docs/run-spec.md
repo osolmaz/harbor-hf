@@ -123,7 +123,15 @@ treated as endpoint deployments.
 `attempts` counts independent logical attempts. Infrastructure retries do not
 consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
 provider request concurrency is part of the deployment profile. Timeout values
-are in seconds.
+are in seconds. `timeout_seconds` is a wall-clock limit for Harbor execution;
+on expiry, the controller terminates the Harbor process group and immediately
+enters verified endpoint cleanup.
+
+Every task selected by `benchmark.task_names` is passed to Harbor. Exact task
+names have a deterministic expected trial count of tasks multiplied by
+attempts. Glob selections are resolved by Harbor; the controller requires at
+least one result and validates every resulting trial for exceptions and numeric
+verifier rewards.
 
 ### Artifacts
 
