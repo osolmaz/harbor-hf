@@ -66,7 +66,11 @@ def endpoint_lease_label(lock: RunLock) -> str:
     endpoint = lock.deployment.endpoint
     if endpoint is None:
         raise ValueError("run lock has no endpoint binding")
-    identity = f"{endpoint.namespace}/{endpoint.name}".encode()
+    return endpoint_lease_label_for(endpoint.namespace, endpoint.name)
+
+
+def endpoint_lease_label_for(namespace: str, name: str) -> str:
+    identity = f"{namespace}/{name}".encode()
     return hashlib.sha256(identity).hexdigest()[:32]
 
 

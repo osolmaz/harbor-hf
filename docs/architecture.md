@@ -64,12 +64,14 @@ events, and pauses the endpoint in a `finally` path. The submitting machine does
 not execute benchmark tasks. Provider-backed runs will skip endpoint
 provisioning but retain request, quota, retry, and accounting state.
 
-Endpoint-backed controller Jobs carry a deterministic label derived from the
-endpoint namespace and name. Before creating a watchdog or changing endpoint
-state, a controller lists active Jobs in that label group. The lowest active Job
-ID is the sole lease holder. A controller that does not hold the lease fails
-without resuming or pausing the endpoint, so overlapping submissions cannot
-interrupt the elected run's endpoint.
+Endpoint-backed controller and watchdog Jobs carry a deterministic label
+derived from the endpoint namespace and name. Before creating a watchdog or
+changing endpoint state, a controller lists active Jobs in that label group.
+The lowest active Job ID is the sole lease holder. The watchdog remains in the
+same lease group until it has verified endpoint cleanup, preventing a new
+controller from taking ownership during cleanup. A controller that does not
+hold the lease fails without resuming or pausing the endpoint, so overlapping
+submissions cannot interrupt the elected run's endpoint.
 
 ### Harbor Adapter
 

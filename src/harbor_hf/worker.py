@@ -7,6 +7,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -29,6 +30,7 @@ from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.runs import RunLock
 from harbor_hf.submission import (
     endpoint_lease_label,
+    endpoint_lease_label_for,
     github_repository,
     locked_source_command,
 )
@@ -234,7 +236,7 @@ def run_worker(
     token = os.environ.get(token_name, "")
     if not token:
         raise WorkerError(f"required secret {token_name} is not available")
-    os.environ.setdefault("HF_TOKEN", token)
+    os.environ["HF_TOKEN"] = token
 
     root = output_root / lock.artifact_prefix
     root.mkdir(parents=True, exist_ok=False)
@@ -440,6 +442,7 @@ def _execute_benchmark(
     verifier = validate_harbor_result(
         jobs_dir,
         expected_trials=_expected_trial_count(lock),
+        expected_task_counts=_expected_task_counts(lock),
         expected_agent_name=lock.agent.name,
         expected_agent_version=_expected_agent_version(lock),
     )
@@ -524,7 +527,10 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
         secrets={lock.remote.job.token_secret_name: token},
         flavor=lock.remote.job.flavor,
         timeout=job_timeout_seconds,
-        labels={"harbor-hf-watchdog": lock.run_id},
+        labels={
+            "harbor-hf-watchdog": lock.run_id,
+            "harbor-hf-endpoint": endpoint_lease_label(lock),
+        },
         namespace=lock.remote.job.namespace,
     )
     job_id = getattr(info, "id", None)
@@ -587,7 +593,7 @@ def run_endpoint_watchdog(
     token = os.environ.get(token_secret_name, "")
     if not token:
         raise WorkerError(f"required secret {token_secret_name} is not available")
-    os.environ.setdefault("HF_TOKEN", token)
+    os.environ["HF_TOKEN"] = token
     if api is None:
         from huggingface_hub import HfApi
 
@@ -599,6 +605,9 @@ def run_endpoint_watchdog(
         job_id=watchdog_job_id,
         labels={
             "harbor-hf-watchdog": run_id,
+            "harbor-hf-endpoint": endpoint_lease_label_for(
+                endpoint_namespace, endpoint_name
+            ),
             _WATCHDOG_READY_LABEL: "true",
         },
         namespace=controller_namespace,
@@ -720,6 +729,12 @@ def _expected_trial_count(lock: RunLock) -> int | None:
     return len(lock.benchmark_tasks) * lock.attempts
 
 
+def _expected_task_counts(lock: RunLock) -> dict[str, int] | None:
+    if _expected_trial_count(lock) is None:
+        return None
+    return {task: lock.attempts for task in lock.benchmark_tasks}
+
+
 def _expected_agent_version(lock: RunLock) -> str:
     if lock.agent.revision_kind == "package":
         return lock.agent.revision
@@ -731,6 +746,7 @@ def validate_harbor_result(
     jobs_dir: Path,
     expected_trials: int | None = 1,
     *,
+    expected_task_counts: Mapping[str, int] | None = None,
     expected_agent_name: str | None = None,
     expected_agent_version: str | None = None,
 ) -> dict[str, object]:
@@ -740,6 +756,7 @@ def validate_harbor_result(
         if isinstance(value, dict) and "task_name" in value:
             trials.append(value)
     _validate_trial_count(trials, expected_trials)
+    _validate_task_counts(trials, expected_task_counts)
 
     verified: list[dict[str, object]] = []
     for trial in trials:
@@ -771,6 +788,18 @@ def validate_harbor_result(
         "trial_count": len(verified),
         "trials": verified,
     }
+
+
+def _validate_task_counts(
+    trials: list[dict[str, object]], expected: Mapping[str, int] | None
+) -> None:
+    if expected is None:
+        return
+    observed = Counter(str(trial["task_name"]) for trial in trials)
+    if observed != Counter(expected):
+        raise WorkerError(
+            "Harbor trial task counts do not match the requested attempts"
+        )
 
 
 def _trial_failure(trial: Mapping[str, object]) -> tuple[str, object] | None:

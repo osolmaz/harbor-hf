@@ -8,6 +8,7 @@ from harbor_hf.submission import (
     bucket_uri,
     build_submit_command,
     endpoint_lease_label,
+    endpoint_lease_label_for,
     github_archive,
     github_repository,
     locked_source_command,
@@ -81,6 +82,15 @@ def test_endpoint_lease_label_is_stable_and_bounded(
 
     assert label == "d026b68a5286b3887f1e9ea13d304aed"
     assert len(label) == 32
+
+
+def test_endpoint_lease_label_uses_complete_endpoint_identity() -> None:
+    assert endpoint_lease_label_for("org", "endpoint") == (
+        "aa3808503c913daab53ed1415fe04988"
+    )
+    assert endpoint_lease_label_for("org", "other") != endpoint_lease_label_for(
+        "other", "org"
+    )
 
 
 def test_endpoint_lease_label_requires_endpoint_binding(

@@ -18,9 +18,11 @@ from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
     _expected_agent_version,
+    _expected_task_counts,
     _expected_trial_count,
     _finalize_evidence,
     _job_stage,
+    _validate_task_counts,
     _validate_trial_count,
     assert_exclusive_endpoint_lease,
     build_harbor_command,
@@ -344,7 +346,10 @@ def test_launch_watchdog_uses_independent_hf_job(
         "secrets": {"HF_TOKEN": "secret"},
         "flavor": "cpu-basic",
         "timeout": 11400,
-        "labels": {"harbor-hf-watchdog": "watchdog-run"},
+        "labels": {
+            "harbor-hf-watchdog": "watchdog-run",
+            "harbor-hf-endpoint": "d026b68a5286b3887f1e9ea13d304aed",
+        },
         "namespace": "osolmaz",
     }
     command = cast(list[str], calls[0]["command"])
@@ -392,7 +397,7 @@ def test_launch_watchdog_caps_timeout_and_requires_returned_id(
 
         def run_job(self, **kwargs: object) -> object:
             calls.append(kwargs)
-            return SimpleNamespace(id=None)
+            return SimpleNamespace(id=123)
 
     monkeypatch.setenv("JOB_ID", "controller-job")
     monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
@@ -553,6 +558,7 @@ def test_endpoint_watchdog_pauses_after_controller_finishes(
             "job_id": "watchdog-job",
             "labels": {
                 "harbor-hf-watchdog": "run-1",
+                "harbor-hf-endpoint": "aa3808503c913daab53ed1415fe04988",
                 "harbor-hf-watchdog-ready": "true",
             },
             "namespace": "org",
@@ -603,10 +609,9 @@ def test_endpoint_watchdog_survives_transient_inspection_failure(
         runner=runner,
         sleep=sleeps.append,
         monotonic=lambda: 0,
-        poll_seconds=3,
     )
 
-    assert sleeps == [3]
+    assert sleeps == [10]
     assert outcomes == []
 
 
@@ -625,7 +630,7 @@ def test_endpoint_watchdog_pauses_at_deadline(
     times = iter([0.0, 0.0, 1.0, 2.0])
     runner = EndpointRunner([snapshot("paused", 0)])
     monkeypatch.setenv("BENCH_TOKEN", "secret")
-    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "stale-token")
     monkeypatch.setenv("JOB_ID", "watchdog-job")
 
     sleeps: list[float] = []
@@ -1231,6 +1236,7 @@ def test_expected_trial_count_scales_explicit_tasks_and_attempts(
     )
 
     assert _expected_trial_count(lock) == 6
+    assert _expected_task_counts(lock) == {"one": 3, "two": 3}
 
 
 @pytest.mark.parametrize("pattern", ["*", "shell-*", "task?", "task[12]"])
@@ -1241,6 +1247,46 @@ def test_expected_trial_count_is_resolved_by_harbor_for_patterns(
     lock = build_run_lock(remote_spec.model_copy(update={"benchmark": benchmark}))
 
     assert _expected_trial_count(lock) is None
+    assert _expected_task_counts(lock) is None
+
+
+def test_validate_harbor_result_rejects_duplicate_in_place_of_requested_task(
+    tmp_path: Path,
+) -> None:
+    for ordinal in (1, 2):
+        trial = tmp_path / str(ordinal)
+        trial.mkdir()
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "task_name": "one",
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(
+        WorkerError,
+        match="^Harbor trial task counts do not match the requested attempts$",
+    ):
+        validate_harbor_result(
+            tmp_path,
+            expected_trials=2,
+            expected_task_counts={"one": 1, "two": 1},
+        )
+
+
+def test_task_count_validation_accepts_exact_attempts() -> None:
+    trials: list[dict[str, object]] = [
+        {"task_name": "one"},
+        {"task_name": "two"},
+        {"task_name": "one"},
+        {"task_name": "two"},
+    ]
+
+    _validate_task_counts(trials, {"one": 2, "two": 2})
+    _validate_task_counts(trials, None)
 
 
 def test_validate_harbor_result_requires_a_wildcard_selected_trial(
@@ -1889,7 +1935,7 @@ def test_worker_maps_custom_secret_and_refuses_existing_run_prefix(
     root = tmp_path / "output" / lock.artifact_prefix
     root.mkdir(parents=True)
     monkeypatch.setenv("BENCH_TOKEN", "custom-token")
-    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "stale-token")
 
     with pytest.raises(FileExistsError):
         run_worker(manifest, lock_path, tmp_path / "output")
