@@ -105,6 +105,8 @@ def test_watchdog_command_reports_verified_pause(
             "endpoint",
             "--endpoint-namespace",
             "org",
+            "--run-id",
+            "run-1",
             "--token-secret-name",
             "HF_TOKEN",
             "--timeout-seconds",

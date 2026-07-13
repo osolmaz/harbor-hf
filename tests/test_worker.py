@@ -31,6 +31,7 @@ from harbor_hf.worker import (
     run_worker,
     validate_endpoint_model,
     validate_harbor_result,
+    wait_watchdog_ready,
 )
 
 
@@ -82,6 +83,18 @@ def _prepare_source(
 
 def _launch_watchdog(_lock: RunLock, _endpoint: object, _token: str) -> str:
     return "watchdog-job"
+
+
+class WatchdogApiStub:
+    def __init__(self) -> None:
+        self.label_updates: list[dict[str, object]] = []
+
+    def update_job_labels(self, **kwargs: object) -> object:
+        self.label_updates.append(kwargs)
+        return SimpleNamespace()
+
+    def inspect_job(self, **_kwargs: object) -> object:
+        raise AssertionError("unexpected job inspection")
 
 
 def test_endpoint_lifecycle_and_status() -> None:
@@ -274,7 +287,9 @@ def test_launch_watchdog_requires_controller_job_before_submission(
     assert endpoint is not None
     monkeypatch.delenv("JOB_ID", raising=False)
 
-    with pytest.raises(WorkerError, match="controller JOB_ID is required"):
+    with pytest.raises(
+        WorkerError, match="^controller JOB_ID is required before endpoint resume$"
+    ):
         launch_cleanup_watchdog(lock, endpoint, "secret")
 
 
@@ -293,6 +308,12 @@ def test_launch_watchdog_uses_independent_hf_job(
         def run_job(self, **kwargs: object) -> object:
             calls.append(kwargs)
             return SimpleNamespace(id="watchdog-job")
+
+        def inspect_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                labels={"harbor-hf-watchdog-ready": "true"},
+                status=SimpleNamespace(stage=SimpleNamespace(value="RUNNING")),
+            )
 
     monkeypatch.setenv("JOB_ID", "controller-job")
     monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
@@ -320,10 +341,12 @@ def test_launch_watchdog_uses_independent_hf_job(
         "qwen-endpoint",
         "--endpoint-namespace",
         "osolmaz",
+        "--run-id",
+        "watchdog-run",
         "--token-secret-name",
         "HF_TOKEN",
         "--timeout-seconds",
-        "11100",
+        "10800",
     ]
 
 
@@ -335,7 +358,7 @@ def test_launch_watchdog_caps_timeout_and_requires_returned_id(
     capped = remote_spec.model_copy(
         update={
             "remote": remote.model_copy(
-                update={"job": remote.job.model_copy(update={"timeout_seconds": 86400})}
+                update={"job": remote.job.model_copy(update={"timeout_seconds": 85800})}
             )
         }
     )
@@ -362,7 +385,112 @@ def test_launch_watchdog_caps_timeout_and_requires_returned_id(
 
     assert calls[0]["timeout"] == 86400
     command = cast(list[str], calls[0]["command"])
-    assert command[command.index("--timeout-seconds") + 1] == "86100"
+    assert command[command.index("--timeout-seconds") + 1] == "85800"
+
+
+def test_launch_watchdog_cancels_job_that_exits_before_handshake(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = build_run_lock(remote_spec)
+    endpoint = lock.deployment.endpoint
+    assert endpoint is not None
+    cancellations: list[dict[str, object]] = []
+    inspections: list[dict[str, object]] = []
+
+    class FakeApi:
+        def __init__(self, *, token: str) -> None:
+            assert token == "secret"
+
+        def run_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(id="watchdog-job")
+
+        def inspect_job(self, **kwargs: object) -> object:
+            inspections.append(kwargs)
+            return SimpleNamespace(
+                labels={}, status=SimpleNamespace(stage=SimpleNamespace(value="ERROR"))
+            )
+
+        def cancel_job(self, **kwargs: object) -> None:
+            cancellations.append(kwargs)
+            raise RuntimeError("cancel failed")
+
+    monkeypatch.setenv("JOB_ID", "controller-job")
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+
+    with pytest.raises(WorkerError, match="exited before readiness: ERROR"):
+        launch_cleanup_watchdog(lock, endpoint, "secret")
+
+    assert cancellations == [{"job_id": "watchdog-job", "namespace": "osolmaz"}]
+    assert inspections == [{"job_id": "watchdog-job", "namespace": "osolmaz"}]
+
+
+def test_wait_watchdog_ready_polls_until_handshake() -> None:
+    inspections: list[dict[str, object]] = []
+    results = [
+        SimpleNamespace(
+            labels={}, status=SimpleNamespace(stage=SimpleNamespace(value="RUNNING"))
+        ),
+        SimpleNamespace(
+            labels={"harbor-hf-watchdog-ready": "true"},
+            status=SimpleNamespace(stage=SimpleNamespace(value="RUNNING")),
+        ),
+    ]
+
+    class FakeApi(WatchdogApiStub):
+        def inspect_job(self, **kwargs: object) -> object:
+            inspections.append(kwargs)
+            return results.pop(0)
+
+    sleeps: list[float] = []
+    wait_watchdog_ready(
+        FakeApi(),
+        "watchdog-job",
+        "org",
+        timeout_seconds=30,
+        sleep=sleeps.append,
+        monotonic=lambda: 0,
+        poll_seconds=2,
+    )
+
+    assert inspections == [
+        {"job_id": "watchdog-job", "namespace": "org"},
+        {"job_id": "watchdog-job", "namespace": "org"},
+    ]
+    assert sleeps == [2]
+
+
+@pytest.mark.parametrize("stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED"])
+def test_wait_watchdog_ready_rejects_early_exit(stage: str) -> None:
+    class FakeApi:
+        def inspect_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                labels={}, status=SimpleNamespace(stage=SimpleNamespace(value=stage))
+            )
+
+    with pytest.raises(WorkerError, match=f"exited before readiness: {stage}"):
+        wait_watchdog_ready(FakeApi(), "watchdog-job", "org", timeout_seconds=30)
+
+
+def test_wait_watchdog_ready_reports_timeout() -> None:
+    class FakeApi:
+        def inspect_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                labels={},
+                status=SimpleNamespace(stage=SimpleNamespace(value="RUNNING")),
+            )
+
+    times = iter([0.0, 0.0, 1.0])
+    sleeps: list[float] = []
+    with pytest.raises(WorkerError, match="^cleanup watchdog readiness timed out$"):
+        wait_watchdog_ready(
+            FakeApi(),
+            "watchdog-job",
+            "org",
+            timeout_seconds=1,
+            sleep=sleeps.append,
+            monotonic=lambda: next(times),
+        )
+    assert sleeps == [5]
 
 
 @pytest.mark.parametrize("stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED"])
@@ -371,7 +499,7 @@ def test_endpoint_watchdog_pauses_after_controller_finishes(
 ) -> None:
     inspections: list[dict[str, object]] = []
 
-    class FakeApi:
+    class FakeApi(WatchdogApiStub):
         def inspect_job(self, **kwargs: object) -> object:
             inspections.append(kwargs)
             return SimpleNamespace(
@@ -380,21 +508,46 @@ def test_endpoint_watchdog_pauses_after_controller_finishes(
 
     runner = EndpointRunner([snapshot("paused", 0)])
     monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setenv("JOB_ID", "watchdog-job")
+    api = FakeApi()
     result = run_endpoint_watchdog(
         controller_job_id="controller",
         controller_namespace="org",
         endpoint_name="endpoint",
         endpoint_namespace="org",
+        run_id="run-1",
         token_secret_name="HF_TOKEN",
         timeout_seconds=60,
-        api=FakeApi(),
+        api=api,
         runner=runner,
         monotonic=lambda: 0,
     )
 
     assert endpoint_state(result) == ("paused", 0, 1)
     assert inspections == [{"job_id": "controller", "namespace": "org"}]
-    assert [command[2] for command in runner.commands] == ["pause", "describe"]
+    assert api.label_updates == [
+        {
+            "job_id": "watchdog-job",
+            "labels": {
+                "harbor-hf-watchdog": "run-1",
+                "harbor-hf-watchdog-ready": "true",
+            },
+            "namespace": "org",
+        }
+    ]
+    assert runner.commands == [
+        [
+            "hf",
+            "endpoints",
+            operation,
+            "endpoint",
+            "--namespace",
+            "org",
+            "--format",
+            "json",
+        ]
+        for operation in ("pause", "describe")
+    ]
 
 
 def test_endpoint_watchdog_survives_transient_inspection_failure(
@@ -403,7 +556,7 @@ def test_endpoint_watchdog_survives_transient_inspection_failure(
     outcomes: list[object] = [RuntimeError("transient"), "ERROR"]
     sleeps: list[float] = []
 
-    class FakeApi:
+    class FakeApi(WatchdogApiStub):
         def inspect_job(self, **_kwargs: object) -> object:
             outcome = outcomes.pop(0)
             if isinstance(outcome, Exception):
@@ -414,11 +567,13 @@ def test_endpoint_watchdog_survives_transient_inspection_failure(
 
     runner = EndpointRunner([snapshot("paused", 0)])
     monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setenv("JOB_ID", "watchdog-job")
     run_endpoint_watchdog(
         controller_job_id="controller",
         controller_namespace="org",
         endpoint_name="endpoint",
         endpoint_namespace="org",
+        run_id="run-1",
         token_secret_name="HF_TOKEN",
         timeout_seconds=60,
         api=FakeApi(),
@@ -437,7 +592,7 @@ def test_endpoint_watchdog_pauses_at_deadline(
 ) -> None:
     inspections: list[str] = []
 
-    class FakeApi:
+    class FakeApi(WatchdogApiStub):
         def inspect_job(self, **_kwargs: object) -> object:
             inspections.append("checked")
             return SimpleNamespace(
@@ -448,21 +603,26 @@ def test_endpoint_watchdog_pauses_at_deadline(
     runner = EndpointRunner([snapshot("paused", 0)])
     monkeypatch.setenv("BENCH_TOKEN", "secret")
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("JOB_ID", "watchdog-job")
 
+    sleeps: list[float] = []
     run_endpoint_watchdog(
         controller_job_id="controller",
         controller_namespace="org",
         endpoint_name="endpoint",
         endpoint_namespace="org",
+        run_id="run-1",
         token_secret_name="BENCH_TOKEN",
         timeout_seconds=2,
         api=FakeApi(),
         runner=runner,
-        sleep=lambda _seconds: None,
+        sleep=sleeps.append,
         monotonic=lambda: next(times),
+        poll_seconds=4,
     )
 
     assert inspections == ["checked", "checked"]
+    assert sleeps == [4, 4]
     assert os.environ["HF_TOKEN"] == "secret"
 
 
@@ -477,9 +637,65 @@ def test_endpoint_watchdog_requires_configured_secret(
             controller_namespace="org",
             endpoint_name="endpoint",
             endpoint_namespace="org",
+            run_id="run-1",
             token_secret_name="MISSING_TOKEN",
             timeout_seconds=1,
         )
+
+
+def test_endpoint_watchdog_requires_its_job_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.delenv("JOB_ID", raising=False)
+
+    with pytest.raises(WorkerError, match="^watchdog JOB_ID is required$"):
+        run_endpoint_watchdog(
+            controller_job_id="controller",
+            controller_namespace="org",
+            endpoint_name="endpoint",
+            endpoint_namespace="org",
+            run_id="run-1",
+            token_secret_name="HF_TOKEN",
+            timeout_seconds=1,
+            api=WatchdogApiStub(),
+        )
+
+
+def test_endpoint_watchdog_builds_authenticated_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances: list[object] = []
+
+    class FakeApi(WatchdogApiStub):
+        def __init__(self, *, token: str) -> None:
+            super().__init__()
+            assert token == "secret"
+            instances.append(self)
+
+        def inspect_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                status=SimpleNamespace(stage=SimpleNamespace(value="COMPLETED"))
+            )
+
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setenv("JOB_ID", "watchdog-job")
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+    runner = EndpointRunner([snapshot("paused", 0)])
+
+    run_endpoint_watchdog(
+        controller_job_id="controller",
+        controller_namespace="org",
+        endpoint_name="endpoint",
+        endpoint_namespace="org",
+        run_id="run-1",
+        token_secret_name="HF_TOKEN",
+        timeout_seconds=1,
+        runner=runner,
+        monotonic=lambda: 0,
+    )
+
+    assert len(instances) == 1
 
 
 def test_job_stage_reads_hf_enum_value() -> None:
@@ -518,6 +734,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "--project",
         str(source),
         "--locked",
+        "--no-dev",
         "--extra",
         "hf-sandbox",
         "harbor",

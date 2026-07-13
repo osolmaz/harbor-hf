@@ -144,6 +144,11 @@ must be full lowercase 40-character Git commit IDs. The controller checks out
 both revisions directly and runs them with `uv --locked`; missing or stale lock
 files fail before endpoint-backed benchmark execution begins.
 
+The controller Job timeout is limited to 85,800 seconds. The remaining 600
+seconds within HF Jobs' 86,400-second maximum are reserved for watchdog startup
+and verified endpoint cleanup. The endpoint is not resumed until the watchdog
+has completed its source bootstrap and published a readiness handshake.
+
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without
 resetting the Sandbox idle timer; if the timer expires first, the remote job is

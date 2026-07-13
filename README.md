@@ -10,7 +10,8 @@ matrices and can submit one resolved matrix cell to an HF Job. The remote worker
 controls an existing Inference Endpoint, runs Harbor tasks in HF Sandboxes,
 archives evidence to an HF Bucket, and verifies that the endpoint is paused
 before declaring success. Before resuming an endpoint, it starts an independent
-HF Job watchdog that pauses the endpoint if the controller exits or is killed.
+HF Job watchdog, waits for its readiness handshake, and then resumes the
+endpoint. The watchdog pauses the endpoint if the controller exits or is killed.
 
 ## Install
 
@@ -40,7 +41,8 @@ digest of the requested experiment.
 
 Remote submission requires an endpoint binding and exact 40-character commits
 for both `harbor-hf` and Harbor. Both checkouts execute with their committed
-`uv.lock` files in locked mode. Preview the sanitized HF Job command first:
+`uv.lock` files in locked mode without development dependency groups. Preview
+the sanitized HF Job command first:
 
 ```bash
 uv run harbor-hf submit experiment.yaml --dry-run

@@ -50,7 +50,7 @@ def locked_source_command(source: SourcePin, *arguments: str) -> list[str]:
         f'git clone --filter=blob:none --no-checkout {repository} "$repo_dir"\n'
         f'git -C "$repo_dir" fetch --depth 1 origin {revision}\n'
         f'git -C "$repo_dir" checkout --detach {revision}\n'
-        'exec uv run --project "$repo_dir" --locked "$@"\n'
+        'exec uv run --project "$repo_dir" --locked --no-dev "$@"\n'
     )
     return ["bash", "-lc", script, "locked-source", *arguments]
 

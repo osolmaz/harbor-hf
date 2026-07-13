@@ -79,6 +79,8 @@ def build_run_lock(
     model = _select(spec.matrix.models, model_id, "model")
     deployment = _select(spec.matrix.deployments, deployment_id, "deployment")
     agent = _select(spec.matrix.agents, agent_id, "agent")
+    if "version" in agent.parameters:
+        raise ValueError("agent parameter 'version' is reserved by the run lock")
     if deployment.endpoint is None:
         raise ValueError(
             f"deployment profile {deployment.id} requires an endpoint binding"

@@ -141,7 +141,7 @@ def test_locked_source_command_passes_arguments_after_shell_script(
         "1234567890abcdef1234567890abcdef12345678\n"
         'git -C "$repo_dir" checkout --detach '
         "1234567890abcdef1234567890abcdef12345678\n"
-        'exec uv run --project "$repo_dir" --locked "$@"\n',
+        'exec uv run --project "$repo_dir" --locked --no-dev "$@"\n',
         "locked-source",
         "harbor-hf",
         "worker",

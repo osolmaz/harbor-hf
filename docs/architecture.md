@@ -152,8 +152,10 @@ Runs progress through `planned`, `submitted`, `provisioning`, `running`,
 append-only event.
 
 For endpoint-backed runs, the controller starts a separate companion HF Job
-watchdog before it resumes the endpoint. The watchdog observes the controller
-Job and pauses the endpoint after the controller terminates or its own deadline
+watchdog before it resumes the endpoint. The controller requires a readiness
+label written from inside the watchdog's monitoring process; a submitted or
+merely running Job is not sufficient. The watchdog observes the controller Job
+and pauses the endpoint after the controller terminates or its own deadline
 expires. The controller also pauses the endpoint after its last active shard in
 a `finally` path. Cleanup success is part of endpoint run completion, not an
 optional maintenance action. Provider-backed runs have no endpoint lease but

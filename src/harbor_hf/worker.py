@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
@@ -22,11 +23,14 @@ from harbor_hf.evidence import (
     write_json,
 )
 from harbor_hf.io import load_experiment
-from harbor_hf.models import EndpointRef, SourcePin
+from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.runs import RunLock
 from harbor_hf.submission import github_repository, locked_source_command
+
+_WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
+_WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
 
 
 class WorkerError(RuntimeError):
@@ -35,6 +39,16 @@ class WorkerError(RuntimeError):
 
 class JobInspector(Protocol):
     def inspect_job(self, *, job_id: str, namespace: str | None = None) -> object: ...
+
+
+class WatchdogApi(JobInspector, Protocol):
+    def update_job_labels(
+        self,
+        *,
+        job_id: str,
+        labels: dict[str, str],
+        namespace: str | None = None,
+    ) -> object: ...
 
 
 class EndpointManager:
@@ -144,6 +158,7 @@ def build_harbor_command(
         "--project",
         str(harbor_source),
         "--locked",
+        "--no-dev",
         "--extra",
         "hf-sandbox",
         "harbor",
@@ -199,8 +214,7 @@ def run_worker(
     lock = RunLock.model_validate_json(
         lock_path.read_text(encoding="utf-8")  # pragma: no mutate
     )
-    if lock.spec_digest != experiment_digest(spec):
-        raise WorkerError("manifest digest does not match the run lock")
+    validate_run_lock(spec, lock)
 
     token_name = lock.remote.job.token_secret_name
     token = os.environ.get(token_name, "")
@@ -292,6 +306,13 @@ def run_worker(
         message = f"{failure_message}; evidence finalization failed: {caught}"
         raise WorkerError(message) from caught
     raise WorkerError(failure_message) from failure
+
+
+def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
+    if lock.spec_digest != experiment_digest(spec):
+        raise WorkerError("manifest digest does not match the run lock")
+    if "version" in lock.agent.parameters:
+        raise WorkerError("agent parameter 'version' is reserved by the run lock")
 
 
 def _publish_success(root: Path, events: Path, token: str) -> None:
@@ -414,7 +435,6 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
     if not controller_job_id:
         raise WorkerError("controller JOB_ID is required before endpoint resume")
     job_timeout_seconds = min(lock.remote.job.timeout_seconds + 600, 86400)
-    watchdog_timeout_seconds = job_timeout_seconds - 300
     command = locked_source_command(
         lock.remote.worker,
         "harbor-hf",
@@ -427,12 +447,15 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
         endpoint.name,
         "--endpoint-namespace",
         endpoint.namespace,
+        "--run-id",
+        lock.run_id,
         "--token-secret-name",
         lock.remote.job.token_secret_name,
         "--timeout-seconds",
-        str(watchdog_timeout_seconds),
+        str(lock.remote.job.timeout_seconds),
     )
-    info = HfApi(token=token).run_job(
+    api = HfApi(token=token)
+    info = api.run_job(
         image=lock.remote.job.image,
         command=command,
         secrets={lock.remote.job.token_secret_name: token},
@@ -444,7 +467,43 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
     job_id = getattr(info, "id", None)
     if not isinstance(job_id, str) or not job_id:
         raise WorkerError("cleanup watchdog submission returned no job ID")
+    try:
+        wait_watchdog_ready(
+            api,
+            job_id,
+            lock.remote.job.namespace,
+            timeout_seconds=_WATCHDOG_STARTUP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        with suppress(Exception):
+            api.cancel_job(job_id=job_id, namespace=lock.remote.job.namespace)
+        raise
     return job_id
+
+
+def wait_watchdog_ready(
+    api: JobInspector,
+    job_id: str,
+    namespace: str,
+    *,
+    timeout_seconds: int,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    poll_seconds: float = 5,
+) -> None:
+    deadline = monotonic() + timeout_seconds
+    terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED"}
+    while True:
+        info = api.inspect_job(job_id=job_id, namespace=namespace)
+        labels = getattr(info, "labels", None)
+        if isinstance(labels, Mapping) and labels.get(_WATCHDOG_READY_LABEL) == "true":
+            return
+        stage = _job_stage(info)
+        if stage in terminal:
+            raise WorkerError(f"cleanup watchdog exited before readiness: {stage}")
+        if monotonic() >= deadline:
+            raise WorkerError("cleanup watchdog readiness timed out")
+        sleep(poll_seconds)
 
 
 def run_endpoint_watchdog(
@@ -453,9 +512,10 @@ def run_endpoint_watchdog(
     controller_namespace: str,
     endpoint_name: str,
     endpoint_namespace: str,
+    run_id: str,
     token_secret_name: str,
     timeout_seconds: int,
-    api: JobInspector | None = None,
+    api: WatchdogApi | None = None,
     runner: CommandRunner | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -469,6 +529,17 @@ def run_endpoint_watchdog(
         from huggingface_hub import HfApi
 
         api = HfApi(token=token)
+    watchdog_job_id = os.environ.get("JOB_ID", "")
+    if not watchdog_job_id:
+        raise WorkerError("watchdog JOB_ID is required")
+    api.update_job_labels(
+        job_id=watchdog_job_id,
+        labels={
+            "harbor-hf-watchdog": run_id,
+            _WATCHDOG_READY_LABEL: "true",
+        },
+        namespace=controller_namespace,
+    )
     deadline = monotonic() + timeout_seconds
     terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED"}
     while monotonic() < deadline:

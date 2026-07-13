@@ -122,6 +122,7 @@ def watchdog(
     controller_namespace: Annotated[str, typer.Option("--controller-namespace")],
     endpoint_name: Annotated[str, typer.Option("--endpoint-name")],
     endpoint_namespace: Annotated[str, typer.Option("--endpoint-namespace")],
+    run_id: Annotated[str, typer.Option("--run-id")],
     token_secret_name: Annotated[str, typer.Option("--token-secret-name")],
     timeout_seconds: Annotated[int, typer.Option("--timeout-seconds", min=1)],
 ) -> None:
@@ -132,6 +133,7 @@ def watchdog(
             controller_namespace=controller_namespace,
             endpoint_name=endpoint_name,
             endpoint_namespace=endpoint_namespace,
+            run_id=run_id,
             token_secret_name=token_secret_name,
             timeout_seconds=timeout_seconds,
         )

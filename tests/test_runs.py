@@ -68,3 +68,15 @@ def test_submit_requires_matrix_selection(remote_spec: ExperimentSpec) -> None:
 def test_submit_rejects_unknown_selection(remote_spec: ExperimentSpec) -> None:
     with pytest.raises(ValueError, match="unknown model profile"):
         build_run_lock(remote_spec, model_id="missing")
+
+
+def test_agent_version_parameter_is_reserved(remote_spec: ExperimentSpec) -> None:
+    agent = remote_spec.matrix.agents[0].model_copy(
+        update={"parameters": {"version": "different"}}
+    )
+    invalid = remote_spec.model_copy(
+        update={"matrix": remote_spec.matrix.model_copy(update={"agents": [agent]})}
+    )
+
+    with pytest.raises(ValueError, match="parameter 'version' is reserved"):
+        build_run_lock(invalid)

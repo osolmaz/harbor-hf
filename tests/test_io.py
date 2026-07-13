@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from harbor_hf.io import ManifestError, load_experiment
+from harbor_hf.models import RemoteJobSpec
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
 
@@ -42,3 +43,8 @@ def test_reports_unreadable_path(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestError, match=f"cannot read {manifest}"):
         load_experiment(manifest)
+
+
+def test_remote_job_timeout_preserves_watchdog_cleanup_margin() -> None:
+    with pytest.raises(ValueError, match="less than or equal to 85800"):
+        RemoteJobSpec(namespace="org", timeout_seconds=85801)
