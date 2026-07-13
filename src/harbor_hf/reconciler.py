@@ -10,7 +10,7 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from harbor_hf.campaigns import CampaignLock, CampaignRunLock
-from harbor_hf.control import ActionKind, CampaignEvent
+from harbor_hf.control import ActionKind, ActionProjection, CampaignEvent
 from harbor_hf.recovery import (
     RecoveryProjection,
     TerminalDecision,
@@ -452,19 +452,45 @@ def _new_wave_candidates(
 
 
 def _assigned_shards(lock: CampaignLock, projection: RecoveryProjection) -> set[str]:
-    assigned = {
-        shard_id for wave in projection.waves.values() for shard_id in wave.shard_ids
-    }
+    assigned: set[str] = set()
+    for wave in projection.waves.values():
+        if wave.status != "closed":
+            assigned.update(wave.shard_ids)
+            continue
+        # A closed wave keeps a shard assigned only while it left terminal or
+        # retryable execution evidence; untouched shards return to the pool.
+        assigned.update(
+            shard_id
+            for shard_id in wave.shard_ids
+            if _shard_has_execution_evidence(projection, shard_id)
+        )
     assigned.update(execution.shard_id for execution in projection.executions.values())
     for action in projection.campaign.actions.values():
-        if (
-            action.action_kind in {"submit-wave", "retry-shard"}
-            and action.status != "failed"
-        ):
+        if action.action_kind in {
+            "submit-wave",
+            "retry-shard",
+        } and not _action_is_spent(projection, action):
             assigned.update(
                 _action_shard_ids(lock, action.action_kind, action.target_ids)
             )
     return assigned
+
+
+def _shard_has_execution_evidence(
+    projection: RecoveryProjection, shard_id: str
+) -> bool:
+    return any(
+        projection.trials[trial_id].executions
+        or projection.trials[trial_id].status != "planned"
+        for trial_id in projection.shards[shard_id].trial_ids
+    )
+
+
+def _action_is_spent(projection: RecoveryProjection, action: ActionProjection) -> bool:
+    if action.status == "failed":
+        return True
+    wave = projection.waves.get(f"wave-{action.action_key}")
+    return wave is not None and wave.status == "closed"
 
 
 def _action_shard_ids(
@@ -581,14 +607,14 @@ def _materialize(
     retries = sum(
         action.action_kind == candidate.kind
         and action.target_ids == candidate.target_ids
-        and action.status == "failed"
+        and _action_is_spent(projection, action)
         for action in projection.campaign.actions.values()
     )
     value = candidate.model_dump(mode="json")
     value.update({"campaign_id": lock.campaign_id, "action_retry": retries})
     action_key = _short_digest(value)
     if any(
-        action.action_key == action_key and action.status != "failed"
+        action.action_key == action_key and not _action_is_spent(projection, action)
         for action in projection.campaign.actions.values()
     ):
         return None

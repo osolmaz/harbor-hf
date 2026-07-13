@@ -1042,8 +1042,10 @@ def test_closed_wave_releases_all_admission_scopes(
 
     _projection, plan = plan_reconciliation(lock, events, context=context)
 
+    # The closed wave frees one admission slot, so one of the two pending
+    # shards (including the one released by the closed wave) is admitted.
     assert [action.kind for action in plan.actions] == ["submit-wave"]
-    assert plan.blocked == []
+    assert [blocked.reason for blocked in plan.blocked] == ["global-budget"]
 
 
 def test_cancellation_adopts_unobserved_reserved_wave(
