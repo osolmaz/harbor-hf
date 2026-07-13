@@ -384,6 +384,16 @@ def validate_harbor_result(jobs_dir: Path) -> dict[str, object]:
             trials.append(value)
     if len(trials) != 1:
         raise WorkerError(f"expected exactly one Harbor trial, found {len(trials)}")
+    exception = trials[0].get("exception_info")
+    if exception is not None:
+        exception_type = (
+            exception.get("exception_type")
+            if isinstance(exception, Mapping)
+            else type(exception).__name__
+        )
+        raise WorkerError(
+            f"Harbor trial failed with {exception_type or 'an exception'}"
+        )
     verifier = trials[0].get("verifier_result")
     rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
     if not isinstance(rewards, Mapping) or not rewards:

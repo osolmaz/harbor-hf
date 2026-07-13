@@ -329,6 +329,24 @@ def test_validate_harbor_result_requires_rewards(tmp_path: Path) -> None:
         validate_harbor_result(tmp_path)
 
 
+def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "exception_info": {"exception_type": "AgentError"},
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match="^Harbor trial failed with AgentError$"):
+        validate_harbor_result(tmp_path)
+
+
 class FakeResponse:
     def __init__(self, body: bytes, status: int = 200) -> None:
         self.body = body
