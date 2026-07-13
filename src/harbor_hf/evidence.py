@@ -88,7 +88,7 @@ def write_checksums(root: Path) -> dict[str, str]:
     checksums = {
         str(path.relative_to(root)): _sha256(path)
         for path in _evidence_paths(root)
-        if path.is_file() and path.name not in excluded
+        if path.is_file() and str(path.relative_to(root)) not in excluded
     }
     write_json(root / "checksums.json", checksums)
     return checksums

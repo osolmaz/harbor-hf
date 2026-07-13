@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -98,6 +99,21 @@ def test_submit_reports_malformed_job_output_without_traceback(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr == "Error: HF Jobs submission did not return a job ID\n"
+
+
+def test_submit_reports_hub_failure_without_traceback(
+    remote_manifest: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise httpx.ConnectError("Hub unavailable")
+
+    monkeypatch.setattr("harbor_hf.cli.submit_job", fail)
+
+    result = runner.invoke(app, ["submit", str(remote_manifest)])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "Error: Hub unavailable\n"
 
 
 def test_watchdog_command_reports_verified_pause(

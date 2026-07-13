@@ -287,7 +287,8 @@ def build_harbor_command(
     for task_name in lock.benchmark_tasks:
         command.extend(("--include-task-name", task_name))
     if lock.agent.revision_kind == "package":
-        command.extend(("--agent-kwarg", f"version={lock.agent.revision}"))
+        revision = json.dumps(lock.agent.revision, separators=(",", ":"))
+        command.extend(("--agent-kwarg", f"version={revision}"))
     for key, value in sorted(lock.agent.parameters.items()):
         rendered = json.dumps(value, separators=(",", ":"))
         command.extend(("--agent-kwarg", f"{key}={rendered}"))
@@ -792,18 +793,14 @@ def run_endpoint_watchdog(
         controller_job_id,
         watchdog_job_id,
     )
-    try:
-        _mark_watchdog_ready(
-            api,
-            watchdog_job_id,
-            controller_namespace,
-            endpoint_namespace,
-            endpoint_name,
-            run_id,
-        )
-    except Exception:
-        claims.release(claim_path, owner)
-        raise
+    readiness_error = _watchdog_readiness_error(
+        api,
+        watchdog_job_id,
+        controller_namespace,
+        endpoint_namespace,
+        endpoint_name,
+        run_id,
+    )
     deadline = monotonic() + timeout_seconds
     terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
     while monotonic() < deadline:
@@ -827,7 +824,33 @@ def run_endpoint_watchdog(
     )
     snapshot = manager.pause_and_verify()
     claims.release(claim_path, owner)
+    if readiness_error is not None:
+        raise WorkerError(
+            "cleanup watchdog could not confirm its readiness label"
+        ) from readiness_error
     return snapshot
+
+
+def _watchdog_readiness_error(
+    api: WatchdogApi,
+    watchdog_job_id: str,
+    controller_namespace: str,
+    endpoint_namespace: str,
+    endpoint_name: str,
+    run_id: str,
+) -> Exception | None:
+    try:
+        _mark_watchdog_ready(
+            api,
+            watchdog_job_id,
+            controller_namespace,
+            endpoint_namespace,
+            endpoint_name,
+            run_id,
+        )
+    except Exception as error:
+        return error
+    return None
 
 
 def _claim_endpoint(

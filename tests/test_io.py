@@ -77,6 +77,20 @@ def test_remote_job_timeout_reserves_controller_lifecycle_headroom(
         ExperimentSpec.model_validate(value)
 
 
+def test_sandbox_timeout_cannot_outlive_controller_job(
+    remote_spec: ExperimentSpec,
+) -> None:
+    value = remote_spec.model_dump(mode="json")
+    remote = value["remote"]
+    assert isinstance(remote, dict)
+    harbor = remote["harbor"]
+    assert isinstance(harbor, dict)
+    harbor["sandbox_idle_timeout_seconds"] = 10801
+
+    with pytest.raises(ValueError, match="must not exceed remote Job timeout"):
+        ExperimentSpec.model_validate(value)
+
+
 def test_remote_job_image_requires_immutable_digest() -> None:
     with pytest.raises(ValueError, match="String should match pattern"):
         RemoteJobSpec(namespace="org", image="registry/controller:latest")

@@ -30,6 +30,7 @@ from harbor_hf.worker import (
     _validate_endpoint_compute,
     _validate_task_counts,
     _validate_trial_count,
+    _watchdog_readiness_error,
     build_harbor_command,
     controller_environment,
     endpoint_health_route,
@@ -1070,18 +1071,26 @@ def test_endpoint_watchdog_survives_transient_inspection_failure(
     assert outcomes == []
 
 
-def test_endpoint_watchdog_releases_lease_when_readiness_update_fails(
+def test_endpoint_watchdog_retains_lease_until_pause_when_readiness_update_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeApi(WatchdogApiStub):
         def update_job_labels(self, **_kwargs: object) -> object:
             raise RuntimeError("label update failed")
 
+        def inspect_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                status=SimpleNamespace(stage=SimpleNamespace(value="COMPLETED"))
+            )
+
     monkeypatch.setenv("HF_TOKEN", "secret")
     monkeypatch.setenv("JOB_ID", "watchdog-job")
     claims = FakeClaimStore()
+    runner = EndpointRunner([snapshot("paused", 0)])
 
-    with pytest.raises(RuntimeError, match="^label update failed$"):
+    with pytest.raises(
+        WorkerError, match="^cleanup watchdog could not confirm its readiness label$"
+    ) as captured:
         run_endpoint_watchdog(
             controller_job_id="controller",
             controller_namespace="org",
@@ -1092,10 +1101,14 @@ def test_endpoint_watchdog_releases_lease_when_readiness_update_fails(
             timeout_seconds=60,
             api=FakeApi(),
             claim_store=claims,
+            runner=runner,
+            monotonic=lambda: 0,
         )
 
+    assert isinstance(captured.value.__cause__, RuntimeError)
     assert claims.claims == {}
     assert len(claims.released) == 1
+    assert [command[2] for command in runner.commands] == ["pause", "describe"]
 
 
 def test_endpoint_watchdog_rejects_competing_claim_before_readiness(
@@ -1478,7 +1491,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "--include-task-name",
         "cancel-async-tasks",
         "--agent-kwarg",
-        "version=replace-with-package-version",
+        'version="replace-with-package-version"',
         "--agent-kwarg",
         "compaction=true",
         "--agent-kwarg",
@@ -1511,6 +1524,22 @@ def test_harbor_source_agent_uses_reported_identity_without_version_override(
     assert _expected_agent_version(lock) == "2.0.0"
 
 
+def test_package_agent_version_is_serialized_as_a_string(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    agent = remote_spec.matrix.agents[0].model_copy(update={"revision": "1"})
+    spec = remote_spec.model_copy(
+        update={"matrix": remote_spec.matrix.model_copy(update={"agents": [agent]})}
+    )
+
+    command = build_harbor_command(
+        build_run_lock(spec), tmp_path, "https://endpoint.example", tmp_path
+    )
+
+    assert 'version="1"' in command
+    assert "version=1" not in command
+
+
 def test_mark_watchdog_ready_publishes_complete_identity() -> None:
     api = WatchdogApiStub()
 
@@ -1523,6 +1552,32 @@ def test_mark_watchdog_ready_publishes_complete_identity() -> None:
         "run-1",
     )
 
+    assert api.label_updates == [
+        {
+            "job_id": "watchdog-job",
+            "labels": {
+                "harbor-hf-watchdog": "run-1",
+                "harbor-hf-endpoint": "89d80c87fed8e87c598b0c6ddc685e46",
+                "harbor-hf-watchdog-ready": "true",
+            },
+            "namespace": "controller-namespace",
+        }
+    ]
+
+
+def test_watchdog_readiness_helper_forwards_complete_identity() -> None:
+    api = WatchdogApiStub()
+
+    error = _watchdog_readiness_error(
+        api,
+        "watchdog-job",
+        "controller-namespace",
+        "endpoint-namespace",
+        "endpoint-name",
+        "run-1",
+    )
+
+    assert error is None
     assert api.label_updates == [
         {
             "job_id": "watchdog-job",

@@ -50,8 +50,12 @@ def endpoint_claim_path(namespace: str, name: str) -> str:
     return f"endpoint-leases/{identity}.json"
 
 
+def bucket_id(bucket: str) -> str:
+    return bucket.removeprefix("hf://buckets/").removeprefix("buckets/")
+
+
 def run_claim_path(artifact_bucket: str, artifact_prefix: str) -> str:
-    target = f"{artifact_bucket}/{artifact_prefix}".encode()
+    target = f"{bucket_id(artifact_bucket)}/{artifact_prefix}".encode()
     identity = hashlib.sha256(target).hexdigest()
     return f"run-reservations/{identity}.json"
 

@@ -78,6 +78,9 @@ endpoint reports `paused` with zero ready replicas. Ownership is revalidated
 at the latest repository head before a parent-checked removal commit. If
 cleanup cannot be verified, the lease remains fail-closed and blocks another
 run from inheriting an endpoint whose state is unknown.
+If publishing the readiness label returns an ambiguous provider error, the
+watchdog also retains the lease, waits for the controller to exit or time out,
+verifies endpoint pause, and only then releases ownership.
 
 ### Harbor Adapter
 
@@ -95,8 +98,10 @@ cleanup, and `_SUCCESS` is written only for a complete run.
 The worker first adds a permanent run reservation to the private coordination
 repository with the same parent-commit compare-and-swap protocol. Duplicate run
 IDs therefore fail before source preparation, endpoint work, or failure
-publication. Terminal markers are delayed only at the run root; marker-shaped
-files within Harbor task artifacts are preserved. Submission verifies the
+publication. Equivalent Bucket URI spellings are normalized before deriving the
+reservation identity. Terminal markers are delayed only at the run root;
+marker-shaped files within Harbor task artifacts are preserved and included in
+the root checksum manifest. Submission verifies the
 artifact Bucket and implicit Job input Bucket are private before launch.
 
 Raw Harbor output is staged on the controller Job's local filesystem, outside
@@ -207,7 +212,8 @@ remain nonzero on a paused endpoint. HF Sandbox environments are killed by
 Harbor, and their idle timeout limits abandoned resources if the controller is
 terminated. The idle timeout must exceed the longest uninterrupted agent or
 verifier command because an active streaming command does not necessarily
-refresh the Sandbox idle timer.
+refresh the Sandbox idle timer. It must also remain at or below the controller
+Job timeout, which is the outer lifecycle bound.
 
 Endpoint pause requests and status reads retry transient provider failures until
 the bounded cleanup deadline. Each endpoint CLI call is limited to 60 seconds or

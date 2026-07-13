@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from httpx import HTTPError
 
 from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import ExperimentSpec
@@ -95,7 +96,7 @@ def submit(
                     bucket=spec.artifacts.bucket,
                     runner=SubprocessRunner(),
                 )
-            except (ProcessError, ValueError) as error:
+            except (HTTPError, ProcessError, ValueError) as error:
                 typer.echo(f"Error: {error}", err=True)
                 raise typer.Exit(code=1) from error
     typer.echo(json.dumps(result.model_dump(mode="json"), indent=2))

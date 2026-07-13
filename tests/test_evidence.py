@@ -55,7 +55,9 @@ def test_redact_removes_nested_sensitive_values() -> None:
 
 def test_checksums_cover_regular_evidence(tmp_path: Path) -> None:
     (tmp_path / "record.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "checksums.json").write_text("{}\n", encoding="utf-8")
     (tmp_path / "_SUCCESS").write_text("\n", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
 
     checksums = write_checksums(tmp_path)
 
@@ -64,6 +66,21 @@ def test_checksums_cover_regular_evidence(tmp_path: Path) -> None:
         "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
     )
     assert json.loads((tmp_path / "checksums.json").read_text()) == checksums
+
+
+def test_checksums_include_nested_terminal_and_checksum_files(tmp_path: Path) -> None:
+    nested = tmp_path / "harbor" / "trial"
+    nested.mkdir(parents=True)
+    for name in ("checksums.json", "_SUCCESS", "_FAILED"):
+        (nested / name).write_text(f"{name}\n", encoding="utf-8")
+
+    checksums = write_checksums(tmp_path)
+
+    assert set(checksums) == {
+        "harbor/trial/_FAILED",
+        "harbor/trial/_SUCCESS",
+        "harbor/trial/checksums.json",
+    }
 
 
 def test_secret_scan_names_the_bad_artifact(tmp_path: Path) -> None:

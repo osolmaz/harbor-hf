@@ -202,15 +202,21 @@ class ExperimentSpec(StrictModel):
 
     @model_validator(mode="after")
     def remote_job_has_lifecycle_headroom(self) -> ExperimentSpec:
+        if self.remote is None:
+            return self
         if (
-            self.remote is not None
-            and self.remote.job.timeout_seconds
+            self.remote.job.timeout_seconds
             < self.execution.timeout_seconds + _CONTROLLER_HEADROOM_SECONDS
         ):
             raise ValueError(
                 "remote Job timeout must exceed execution timeout by at least "
                 f"{_CONTROLLER_HEADROOM_SECONDS} seconds"
             )
+        if (
+            self.remote.harbor.sandbox_idle_timeout_seconds
+            > self.remote.job.timeout_seconds
+        ):
+            raise ValueError("HF Sandbox timeout must not exceed remote Job timeout")
         return self
 
 

@@ -282,6 +282,7 @@ name = "harbor-hf"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -301,6 +302,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.23.0" },
     { name = "huggingface-hub", specifier = ">=1.22.0" },
     { name = "pydantic", specifier = ">=2.11.7" },
     { name = "pyyaml", specifier = ">=6.0.2" },

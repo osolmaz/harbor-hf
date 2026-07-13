@@ -8,7 +8,7 @@ from typing import Protocol, cast
 
 from pydantic import BaseModel, ConfigDict
 
-from harbor_hf.coordination import coordination_repository
+from harbor_hf.coordination import bucket_id, coordination_repository
 from harbor_hf.models import SourcePin
 from harbor_hf.runs import RunLock
 
@@ -72,10 +72,6 @@ def bucket_uri(bucket: str) -> str:
     if bucket.startswith("hf://buckets/"):
         return bucket
     return f"hf://buckets/{bucket.removeprefix('buckets/')}"
-
-
-def bucket_id(bucket: str) -> str:
-    return bucket.removeprefix("hf://buckets/").removeprefix("buckets/")
 
 
 def ensure_private_coordination_repository(

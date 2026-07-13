@@ -117,6 +117,15 @@ def test_claim_paths_are_stable_and_namespaced() -> None:
     assert path != run_claim_path("org/other", "runs/experiment/run-1")
 
 
+def test_run_claim_path_canonicalizes_bucket_references() -> None:
+    expected = run_claim_path("org/bucket", "runs/experiment/run-1")
+
+    assert run_claim_path("buckets/org/bucket", "runs/experiment/run-1") == expected
+    assert (
+        run_claim_path("hf://buckets/org/bucket", "runs/experiment/run-1") == expected
+    )
+
+
 def test_claim_acquisition_retries_parent_conflict_and_rejects_duplicate(
     tmp_path: Path,
 ) -> None:

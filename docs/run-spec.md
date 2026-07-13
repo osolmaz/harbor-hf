@@ -202,8 +202,9 @@ The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without
 resetting the Sandbox idle timer; if the timer expires first, the remote job is
 terminated mid-command. The default is 3,600 seconds. Set it above the
-benchmark's agent timeout while keeping the controller Job timeout as the
-outer bound.
+benchmark's agent timeout, but never above the controller Job timeout. Manifest
+validation enforces that upper bound so an abandoned Sandbox cannot outlive the
+controller's configured lifecycle.
 
 Only secret names are serialized. The configured token is forwarded through the
 HF Jobs secret mechanism to the controller and its cleanup watchdog, then
@@ -216,7 +217,9 @@ camel-case and uppercase environment forms.
 
 Harbor's raw job tree is created on Job-local storage rather than the bucket
 mount. Before remote work, the worker creates a permanent run reservation with
-a parent-commit compare-and-swap in the private coordination repository. Only
+a parent-commit compare-and-swap in the private coordination repository. Bucket
+references are canonicalized before deriving the reservation, so equivalent
+URI spellings cannot reserve the same destination independently. Only
 the finalized, scrubbed tree is copied to its reserved Bucket prefix, and the
 root terminal marker is copied last. Nested task markers are preserved. If the
 controller is killed before finalization, raw sessions and logs disappear with
