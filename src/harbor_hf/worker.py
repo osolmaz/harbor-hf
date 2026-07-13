@@ -12,7 +12,6 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
@@ -389,6 +388,10 @@ def _run_staged_worker(
             harbor_source,
             process_runner,
         )
+        baseline = manager.describe()
+        validate_endpoint_model(lock, baseline)
+        require_paused_endpoint(baseline)
+        append_event(events, "endpoint_baseline_validated")
         watchdog_id = (watchdog_launcher or launch_cleanup_watchdog)(
             lock,
             endpoint,
@@ -565,8 +568,6 @@ def _execute_benchmark(
     endpoint = lock.deployment.endpoint
     if endpoint is None:
         raise WorkerError("run lock has no endpoint binding")
-    preflight_snapshot = manager.describe()
-    validate_endpoint_model(lock, preflight_snapshot)
     append_event(events, "endpoint_resume_requested")
     manager.resume()
     snapshot = manager.wait_ready(3600)
@@ -714,17 +715,12 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
     job_id = getattr(info, "id", None)
     if not isinstance(job_id, str) or not job_id:
         raise WorkerError("cleanup watchdog submission returned no job ID")
-    try:
-        wait_watchdog_ready(
-            api,
-            job_id,
-            lock.remote.job.namespace,
-            timeout_seconds=_WATCHDOG_STARTUP_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        with suppress(Exception):
-            api.cancel_job(job_id=job_id, namespace=lock.remote.job.namespace)
-        raise
+    wait_watchdog_ready(
+        api,
+        job_id,
+        lock.remote.job.namespace,
+        timeout_seconds=_WATCHDOG_STARTUP_TIMEOUT_SECONDS,
+    )
     return job_id
 
 
@@ -741,7 +737,15 @@ def wait_watchdog_ready(
     deadline = monotonic() + timeout_seconds
     terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED", "DELETED"}
     while True:
-        info = api.inspect_job(job_id=job_id, namespace=namespace)
+        try:
+            info = api.inspect_job(job_id=job_id, namespace=namespace)
+        except Exception as error:
+            if monotonic() >= deadline:
+                raise WorkerError(
+                    "cleanup watchdog readiness timed out after provider errors"
+                ) from error
+            sleep(poll_seconds)
+            continue
         stage = _job_stage(info)
         if stage in terminal:
             raise WorkerError(f"cleanup watchdog exited before readiness: {stage}")
@@ -912,7 +916,22 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
         or dict(observed_environment) != lock.deployment.engine.environment
     ):
         raise WorkerError("endpoint environment does not match the locked deployment")
+    observed_secrets = model.get("secrets", {})
+    if (
+        not isinstance(observed_secrets, Mapping)
+        or not all(isinstance(name, str) for name in observed_secrets)
+        or set(observed_secrets) != set(lock.deployment.engine.secret_names)
+    ):
+        raise WorkerError("endpoint secret names do not match the locked deployment")
     _validate_endpoint_compute(lock, snapshot)
+
+
+def require_paused_endpoint(snapshot: Mapping[str, object]) -> None:
+    state, ready, _ = endpoint_state(snapshot)
+    if state != "paused" or ready != 0:
+        raise WorkerError(
+            "endpoint must be paused with zero ready replicas before ownership"
+        )
 
 
 def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) -> None:

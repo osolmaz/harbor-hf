@@ -191,11 +191,12 @@ inherit the Harbor execution timeout.
 Readiness requires every positive `targetReplica` to be represented by a ready
 replica. The controller then probes the endpoint's reported `healthRoute`
 instead of assuming a custom image uses `/health`.
-Before resuming and again before benchmarking, it compares the observable
-endpoint model, custom image, container command, complete ordered serving
-arguments, complete non-secret environment, provider region, hardware,
-accelerator count, and declared replica limits with the resolved deployment. A
-mismatch is a run failure, not a warning.
+Before starting the watchdog, the controller requires a paused endpoint with
+zero ready replicas. Before resuming and again before benchmarking, it compares
+the observable endpoint model, custom image, container command, complete
+ordered serving arguments, complete non-secret environment, secret key names,
+provider region, hardware, accelerator count, and declared replica limits with
+the resolved deployment. A mismatch is a run failure, not a warning.
 
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without

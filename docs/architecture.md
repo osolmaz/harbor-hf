@@ -186,18 +186,20 @@ Runs progress through `planned`, `submitted`, `provisioning`, `running`,
 `verifying`, `publishing`, and a terminal state. Every transition is an
 append-only event.
 
-For endpoint-backed runs, the controller starts a separate companion HF Job
-watchdog before it resumes the endpoint. The controller requires a readiness
-label written from inside the watchdog's monitoring process; a submitted or
-merely running Job is not sufficient. The watchdog observes the controller Job
-and pauses the endpoint after the controller terminates or its own deadline
-expires. The controller also pauses the endpoint after its last active shard in
-a `finally` path, but only after its watchdog has acquired the endpoint lease. A
-controller whose watchdog cannot acquire the lease records skipped cleanup and
-never changes endpoint state. Cleanup success is part of endpoint run
-completion, not an optional maintenance action. Provider-backed runs have no
-endpoint lease but still close worker resources and record final usage and
-request state.
+For endpoint-backed runs, the controller first requires a paused endpoint with
+zero ready replicas, then starts a separate companion HF Job watchdog before it
+resumes the endpoint. The controller requires a readiness label written from
+inside the watchdog's monitoring process; a submitted or merely running Job is
+not sufficient. If readiness polling fails, the controller exits without
+canceling the watchdog, allowing it to observe that exit, pause the endpoint,
+and release its lease. The watchdog also pauses the endpoint after the
+controller terminates or its own deadline expires. The controller pauses the
+endpoint after its last active shard in a `finally` path, but only after its
+watchdog has acquired the endpoint lease. A controller whose watchdog cannot
+acquire the lease records skipped cleanup and never changes endpoint state.
+Cleanup success is part of endpoint run completion, not an optional maintenance
+action. Provider-backed runs have no endpoint lease but still close worker
+resources and record final usage and request state.
 
 The worker verifies `status.state = paused` and `readyReplica = 0` before it
 writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may

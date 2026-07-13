@@ -39,6 +39,7 @@ from harbor_hf.worker import (
     prepare_locked_source,
     probe_runtime,
     require_executable,
+    require_paused_endpoint,
     run_endpoint_watchdog,
     run_worker,
     validate_endpoint_model,
@@ -95,6 +96,7 @@ def snapshot(state: str, ready: int) -> dict[str, object]:
                 "fp8",
             ],
             "env": {"VLLM_USE_FLASHINFER_MOE_FP4": "1"},
+            "secrets": {"HF_TOKEN": "[REDACTED]"},
         },
         "provider": {"vendor": "aws", "region": "us-east-1"},
         "compute": {
@@ -329,6 +331,11 @@ def test_endpoint_model_must_match_lock(remote_spec: ExperimentSpec) -> None:
             {"VLLM_USE_FLASHINFER_MOE_FP4": "0"},
             "endpoint environment does not match the locked deployment",
         ),
+        (
+            "secrets",
+            {"OTHER_TOKEN": "[redacted]"},
+            "endpoint secret names do not match the locked deployment",
+        ),
     ],
 )
 def test_endpoint_model_requires_locked_serving_configuration(
@@ -413,7 +420,7 @@ def test_endpoint_omitted_arguments_match_an_empty_lock(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
-    engine = deployment.engine.model_copy(update={"arguments": []})
+    engine = deployment.engine.model_copy(update={"arguments": [], "secret_names": []})
     spec = remote_spec.model_copy(
         update={
             "matrix": remote_spec.matrix.model_copy(
@@ -426,6 +433,7 @@ def test_endpoint_omitted_arguments_match_an_empty_lock(
     endpoint_snapshot = snapshot("paused", 0)
     model = cast(dict[str, object], endpoint_snapshot["model"])
     model.pop("args")
+    model.pop("secrets")
 
     validate_endpoint_model(build_run_lock(spec), endpoint_snapshot)
 
@@ -484,6 +492,20 @@ def test_endpoint_compute_validation_covers_complete_identity(
         WorkerError, match="^endpoint scaling does not match the locked deployment$"
     ):
         _validate_endpoint_compute(lock, wrong_maximum)
+
+
+@pytest.mark.parametrize(
+    ("state", "ready"),
+    [("running", 1), ("paused", 1), ("initializing", 0)],
+)
+def test_endpoint_baseline_requires_verified_pause(state: str, ready: int) -> None:
+    with pytest.raises(
+        WorkerError,
+        match="^endpoint must be paused with zero ready replicas before ownership$",
+    ):
+        require_paused_endpoint(snapshot(state, ready))
+
+    require_paused_endpoint(snapshot("paused", 0))
 
 
 def test_controller_requires_git(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -793,13 +815,12 @@ def test_launch_watchdog_caps_timeout_and_requires_returned_id(
     assert command[command.index("--timeout-seconds") + 1] == "85800"
 
 
-def test_launch_watchdog_cancels_job_that_exits_before_handshake(
+def test_launch_watchdog_does_not_cancel_after_failed_handshake(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
-    cancellations: list[dict[str, object]] = []
     inspections: list[dict[str, object]] = []
 
     class FakeApi:
@@ -815,17 +836,12 @@ def test_launch_watchdog_cancels_job_that_exits_before_handshake(
                 labels={}, status=SimpleNamespace(stage=SimpleNamespace(value="ERROR"))
             )
 
-        def cancel_job(self, **kwargs: object) -> None:
-            cancellations.append(kwargs)
-            raise RuntimeError("cancel failed")
-
     monkeypatch.setenv("JOB_ID", "controller-job")
     monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
 
     with pytest.raises(WorkerError, match="exited before readiness: ERROR"):
         launch_cleanup_watchdog(lock, endpoint, "secret")
 
-    assert cancellations == [{"job_id": "watchdog-job", "namespace": "osolmaz"}]
     assert inspections == [{"job_id": "watchdog-job", "namespace": "osolmaz"}]
 
 
@@ -899,6 +915,58 @@ def test_wait_watchdog_ready_reports_timeout() -> None:
             monotonic=lambda: next(times),
         )
     assert sleeps == [5]
+
+
+def test_wait_watchdog_ready_retries_provider_errors() -> None:
+    calls = 0
+
+    class FakeApi:
+        def inspect_job(self, **_kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary provider error")
+            return SimpleNamespace(
+                labels={"harbor-hf-watchdog-ready": "true"},
+                status=SimpleNamespace(stage=SimpleNamespace(value="RUNNING")),
+            )
+
+    sleeps: list[float] = []
+    wait_watchdog_ready(
+        FakeApi(),
+        "watchdog-job",
+        "org",
+        timeout_seconds=30,
+        sleep=sleeps.append,
+        monotonic=lambda: 0,
+    )
+
+    assert calls == 2
+    assert sleeps == [5]
+
+
+def test_wait_watchdog_ready_bounds_provider_errors_at_deadline() -> None:
+    provider_error = RuntimeError("temporary provider error")
+
+    class FakeApi:
+        def inspect_job(self, **_kwargs: object) -> object:
+            raise provider_error
+
+    times = iter([0.0, 1.0])
+    with pytest.raises(
+        WorkerError,
+        match="^cleanup watchdog readiness timed out after provider errors$",
+    ) as captured:
+        wait_watchdog_ready(
+            FakeApi(),
+            "watchdog-job",
+            "org",
+            timeout_seconds=1,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(times),
+        )
+
+    assert captured.value.__cause__ is provider_error
 
 
 @pytest.mark.parametrize(
@@ -2335,8 +2403,10 @@ def test_worker_publishes_success_after_cleanup(
     assert json.loads((root / "run.lock.json").read_text()) == lock.model_dump(
         mode="json"
     )
-    assert json.loads((root / "endpoint.snapshot.json").read_text()) == snapshot(
-        "running", 1
+    expected_snapshot = snapshot("running", 1)
+    cast(dict[str, object], expected_snapshot["model"])["secrets"] = "[REDACTED]"
+    assert json.loads((root / "endpoint.snapshot.json").read_text()) == (
+        expected_snapshot
     )
     runtime = json.loads((root / "runtime-environment.json").read_text())
     assert set(runtime) == {"controller", "endpoint"}
@@ -2366,6 +2436,7 @@ def test_worker_publishes_success_after_cleanup(
         for record in event_records
     ] == [
         {"event": "worker_started", "run_id": "successful"},
+        {"event": "endpoint_baseline_validated"},
         {
             "event": "endpoint_lease_acquired",
             "watchdog_job_id": "watchdog-job",
@@ -2533,7 +2604,7 @@ def test_worker_without_endpoint_lease_never_pauses_endpoint(
     lock_path = tmp_path / "lock.json"
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
-    runner = EndpointRunner([])
+    runner = EndpointRunner([snapshot("paused", 0)])
 
     def reject_lease(_lock: RunLock, _endpoint: object, _token: str) -> str:
         raise WorkerError("endpoint lease is held by another watchdog")
@@ -2555,9 +2626,10 @@ def test_worker_without_endpoint_lease_never_pauses_endpoint(
         json.loads(line)["event"]
         for line in (root / "events.jsonl").read_text().splitlines()
     ]
-    assert runner.commands == []
+    assert [command[2] for command in runner.commands] == ["describe"]
     assert events == [
         "worker_started",
+        "endpoint_baseline_validated",
         "endpoint_cleanup_skipped",
         "run_failed",
     ]
@@ -2617,7 +2689,7 @@ def test_worker_does_not_resume_without_independent_watchdog(
     lock_path = tmp_path / "lock.json"
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
-    runner = EndpointRunner([])
+    runner = EndpointRunner([snapshot("paused", 0)])
 
     def fail_watchdog(_lock: RunLock, _endpoint: object, _token: str) -> str:
         raise WorkerError("watchdog unavailable")
@@ -2632,7 +2704,7 @@ def test_worker_does_not_resume_without_independent_watchdog(
             watchdog_launcher=fail_watchdog,
         )
 
-    assert runner.commands == []
+    assert [command[2] for command in runner.commands] == ["describe"]
 
 
 def test_worker_rejects_endpoint_drift_before_resume(
@@ -2660,11 +2732,42 @@ def test_worker_rejects_endpoint_drift_before_resume(
             watchdog_launcher=_launch_watchdog,
         )
 
-    assert [command[2] for command in runner.commands] == [
-        "describe",
-        "pause",
-        "describe",
-    ]
+    assert [command[2] for command in runner.commands] == ["describe"]
+
+
+def test_worker_rejects_live_endpoint_before_watchdog_start(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="live-endpoint")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    runner = EndpointRunner([snapshot("running", 1)])
+    watchdog_calls = 0
+
+    def launch_watchdog(_lock: RunLock, _endpoint: object, _token: str) -> str:
+        nonlocal watchdog_calls
+        watchdog_calls += 1
+        return "watchdog-job"
+
+    with pytest.raises(
+        WorkerError,
+        match="^endpoint must be paused with zero ready replicas before ownership$",
+    ):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            source_preparer=_prepare_source,
+            watchdog_launcher=launch_watchdog,
+        )
+
+    assert watchdog_calls == 0
+    assert [command[2] for command in runner.commands] == ["describe"]
 
 
 def test_cleanup_failure_prevents_success_and_redacts_failure(

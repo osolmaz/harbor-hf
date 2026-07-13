@@ -9,9 +9,10 @@ The project is in early development. The CLI validates and expands experiment
 matrices and can submit one resolved matrix cell to an HF Job. The remote worker
 controls an existing Inference Endpoint, runs Harbor tasks in HF Sandboxes,
 archives evidence to an HF Bucket, and verifies that the endpoint is paused
-before declaring success. Before resuming an endpoint, it starts an independent
-HF Job watchdog, waits for its readiness handshake, and then resumes the
-endpoint. The watchdog pauses the endpoint if the controller exits or is killed.
+before declaring success. It refuses lifecycle ownership unless the endpoint
+starts paused with zero ready replicas. It then starts an independent HF Job
+watchdog, waits for its readiness handshake, and resumes the endpoint. The
+watchdog pauses the endpoint if the controller exits or is killed.
 Controllers and watchdogs targeting the same endpoint share an atomic lease in
 the namespace's private `harbor-hf-coordination` Dataset repository. The
 watchdog acquires the lease with a parent-commit compare-and-swap before it
