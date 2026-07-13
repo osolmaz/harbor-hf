@@ -83,11 +83,7 @@ def snapshot(state: str, ready: int) -> dict[str, object]:
         "model": {
             "repository": "nvidia/Qwen3.6-35B-A3B-NVFP4",
             "revision": "0123456789abcdef0123456789abcdef01234567",
-            "image": {
-                "custom": {
-                    "url": "ghcr.io/example/vllm@sha256:replace-with-image-digest"
-                }
-            },
+            "image": {"custom": {"url": "ghcr.io/example/vllm@sha256:" + "0" * 64}},
             "args": [
                 "--model",
                 "/repository",
@@ -1464,7 +1460,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "harbor",
         "run",
         "--dataset",
-        "terminal-bench@2.0",
+        "terminal-bench@sha256:" + "1" * 64,
         "--n-attempts",
         "1",
         "--agent",
@@ -1491,13 +1487,13 @@ def test_harbor_command_is_pinned_and_bounded(
         "--include-task-name",
         "cancel-async-tasks",
         "--agent-kwarg",
-        'version="replace-with-package-version"',
+        'version="2026.7.2"',
         "--agent-kwarg",
         "compaction=true",
         "--agent-kwarg",
         'thinking="off"',
     ]
-    assert _expected_agent_version(lock) == "replace-with-package-version"
+    assert _expected_agent_version(lock) == "2026.7.2"
 
 
 def test_harbor_source_agent_uses_reported_identity_without_version_override(
@@ -1720,6 +1716,70 @@ def test_validate_harbor_result_rejects_malformed_trial_metadata(
 
     with pytest.raises(WorkerError, match="^Harbor produced a malformed trial result$"):
         validate_harbor_result(tmp_path)
+
+
+@pytest.mark.parametrize("task_name", [None, 3, "", " "])
+def test_validate_harbor_result_rejects_non_string_or_empty_task_name(
+    tmp_path: Path, task_name: object
+) -> None:
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": task_name,
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match="^Harbor produced a malformed trial result$"):
+        validate_harbor_result(
+            tmp_path, expected_trials=None, expected_task_names=("*",)
+        )
+
+
+def test_validate_harbor_result_requires_matching_trial_task_digest(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "job" / "trial"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "task",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    expected = {"task": "sha256:" + "3" * 64}
+
+    with pytest.raises(WorkerError, match="is not in the resolved task set"):
+        validate_harbor_result(
+            tmp_path,
+            expected_task_digests={"other": "sha256:" + "3" * 64},
+        )
+
+    with pytest.raises(WorkerError, match="has no valid task lock"):
+        validate_harbor_result(tmp_path, expected_task_digests=expected)
+
+    (trial / "lock.json").write_text(
+        json.dumps({"task": {"digest": "sha256:" + "4" * 64}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkerError, match="task digest does not match"):
+        validate_harbor_result(tmp_path, expected_task_digests=expected)
+
+    (trial / "lock.json").write_text(
+        json.dumps({"task": {"digest": expected["task"]}}),
+        encoding="utf-8",
+    )
+    assert (
+        validate_harbor_result(tmp_path, expected_task_digests=expected)["trial_count"]
+        == 1
+    )
 
 
 def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
@@ -1992,7 +2052,15 @@ def test_validate_harbor_result_accepts_every_expected_attempt(
 def test_expected_trial_count_scales_explicit_tasks_and_attempts(
     remote_spec: ExperimentSpec,
 ) -> None:
-    benchmark = remote_spec.benchmark.model_copy(update={"task_names": ["one", "two"]})
+    benchmark = remote_spec.benchmark.model_copy(
+        update={
+            "task_names": ["one", "two"],
+            "task_digests": {
+                "one": "sha256:" + "3" * 64,
+                "two": "sha256:" + "4" * 64,
+            },
+        }
+    )
     execution = remote_spec.execution.model_copy(update={"attempts": 3})
     lock = build_run_lock(
         remote_spec.model_copy(update={"benchmark": benchmark, "execution": execution})
@@ -2002,27 +2070,46 @@ def test_expected_trial_count_scales_explicit_tasks_and_attempts(
     assert _expected_task_counts(lock) == {"one": 3, "two": 3}
 
 
-@pytest.mark.parametrize("pattern", ["*", "shell-*", "task?", "task[12]"])
-def test_expected_trial_count_is_resolved_by_harbor_for_patterns(
-    remote_spec: ExperimentSpec, pattern: str
+@pytest.mark.parametrize(
+    ("pattern", "resolved_task"),
+    [
+        ("*", "selected"),
+        ("shell-*", "shell-one"),
+        ("task?", "task1"),
+        ("task[12]", "task2"),
+    ],
+)
+def test_expected_trial_count_uses_resolved_tasks_for_patterns(
+    remote_spec: ExperimentSpec, pattern: str, resolved_task: str
 ) -> None:
-    benchmark = remote_spec.benchmark.model_copy(update={"task_names": [pattern]})
+    benchmark = remote_spec.benchmark.model_copy(
+        update={
+            "task_names": [pattern],
+            "task_digests": {resolved_task: "sha256:" + "3" * 64},
+        }
+    )
     lock = build_run_lock(remote_spec.model_copy(update={"benchmark": benchmark}))
 
-    assert _expected_trial_count(lock) is None
-    assert _expected_task_counts(lock) == {}
+    assert _expected_trial_count(lock) == 1
+    assert _expected_task_counts(lock) == {resolved_task: 1}
 
 
 def test_expected_task_counts_preserve_exact_tasks_mixed_with_patterns(
     remote_spec: ExperimentSpec,
 ) -> None:
     benchmark = remote_spec.benchmark.model_copy(
-        update={"task_names": ["exact-task", "shell-*"]}
+        update={
+            "task_names": ["exact-task", "shell-*"],
+            "task_digests": {
+                "exact-task": "sha256:" + "3" * 64,
+                "shell-selected": "sha256:" + "4" * 64,
+            },
+        }
     )
     lock = build_run_lock(remote_spec.model_copy(update={"benchmark": benchmark}))
 
-    assert _expected_trial_count(lock) is None
-    assert _expected_task_counts(lock) == {"exact-task": 1}
+    assert _expected_trial_count(lock) == 2
+    assert _expected_task_counts(lock) == {"exact-task": 1, "shell-selected": 1}
 
 
 def test_validate_harbor_result_rejects_duplicate_in_place_of_requested_task(
@@ -2424,12 +2511,16 @@ def _successful_stream(
                 "task_name": "cancel-async-tasks",
                 "agent_info": {
                     "name": "openclaw",
-                    "version": "replace-with-package-version",
+                    "version": "2026.7.2",
                     "model_info": {"provider": "openai", "name": "/repository"},
                 },
                 "verifier_result": {"rewards": {"reward": 1.0}},
             }
         ),
+        encoding="utf-8",
+    )
+    (trial / "lock.json").write_text(
+        json.dumps({"task": {"digest": "sha256:" + "2" * 64}}),
         encoding="utf-8",
     )
     log_path.write_text("completed test-token\n", encoding="utf-8")
@@ -2571,6 +2662,7 @@ def test_worker_publishes_success_after_cleanup(
         "endpoint.snapshot.json",
         "events.jsonl",
         "harbor-jobs/job/trial/result.json",
+        "harbor-jobs/job/trial/lock.json",
         "harbor.log",
         "manifest.yaml",
         "run.lock.json",
@@ -2627,7 +2719,13 @@ def test_worker_rejects_incomplete_explicit_task_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     benchmark = remote_spec.benchmark.model_copy(
-        update={"task_names": ["cancel-async-tasks", "second-task"]}
+        update={
+            "task_names": ["cancel-async-tasks", "second-task"],
+            "task_digests": {
+                "cancel-async-tasks": "sha256:" + "2" * 64,
+                "second-task": "sha256:" + "3" * 64,
+            },
+        }
     )
     spec = remote_spec.model_copy(update={"benchmark": benchmark})
     manifest = tmp_path / "manifest.yaml"

@@ -25,8 +25,9 @@ def remote_spec() -> ExperimentSpec:
         update={
             "benchmark": spec.benchmark.model_copy(
                 update={
-                    "dataset": "terminal-bench@2.0",
+                    "dataset": "terminal-bench@sha256:" + "1" * 64,
                     "task_names": ["cancel-async-tasks"],
+                    "task_digests": {"cancel-async-tasks": "sha256:" + "2" * 64},
                 }
             ),
             "matrix": spec.matrix.model_copy(update={"deployments": [deployment]}),

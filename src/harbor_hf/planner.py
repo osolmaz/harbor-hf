@@ -49,7 +49,7 @@ def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
             spec.matrix.agents,
         )
     ]
-    task_count = (
+    task_count = len(spec.benchmark.task_digests) or (
         None
         if any(is_task_pattern(task) for task in spec.benchmark.task_names)
         else len(spec.benchmark.task_names)

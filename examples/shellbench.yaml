@@ -5,9 +5,11 @@ metadata:
   labels:
     purpose: serving-comparison
 benchmark:
-  dataset: shellbench@public-115
+  dataset: shellbench@sha256:0000000000000000000000000000000000000000000000000000000000000000
   task_names:
     - "*"
+  task_digests:
+    replace-with-resolved-task-name: sha256:0000000000000000000000000000000000000000000000000000000000000000
 matrix:
   models:
     - id: qwen36-nvfp4
@@ -25,7 +27,7 @@ matrix:
       region: aws-us-east-1
       engine:
         name: vllm
-        image: ghcr.io/example/vllm@sha256:replace-with-image-digest
+        image: ghcr.io/example/vllm@sha256:0000000000000000000000000000000000000000000000000000000000000000
         arguments:
           - --model
           - /repository
@@ -46,7 +48,7 @@ matrix:
       region: aws-us-east-1
       engine:
         name: vllm
-        image: ghcr.io/example/vllm@sha256:replace-with-image-digest
+        image: ghcr.io/example/vllm@sha256:0000000000000000000000000000000000000000000000000000000000000000
         arguments:
           - --model
           - /repository
@@ -59,7 +61,7 @@ matrix:
   agents:
     - id: openclaw
       name: openclaw
-      revision: replace-with-package-version
+      revision: 2026.7.2
       revision_kind: package
       parameters:
         thinking: "off"

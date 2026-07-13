@@ -57,7 +57,8 @@ submitted.
 
 ### Controller
 
-The submission CLI stages an immutable manifest and run lock and starts an HF
+The submission CLI rejects mutable dataset, task, model, image, source, and
+agent references, then stages the pinned manifest and run lock and starts an HF
 Job. That remote Job is the controller: it starts endpoint inference only when
 work is ready, submits bounded Harbor trials to HF Sandboxes, records lifecycle
 events, and pauses the endpoint in a `finally` path. The submitting machine does
@@ -95,7 +96,9 @@ A private HF Storage Bucket is the complete evidence archive. Requested and
 resolved configuration, endpoint snapshots, Harbor output, trajectories,
 sessions, verifier records, logs, and checksums are written under an immutable
 run prefix. Sanitized run evidence is published after validation and resource
-cleanup, and `_SUCCESS` is written only for a complete run.
+cleanup, and `_SUCCESS` is written only for a complete run. Each Harbor trial's
+task digest is read from its own `lock.json` and must match the pre-resolved task
+map in `run.lock.json`.
 The worker first adds a permanent run reservation to the private coordination
 repository with the same parent-commit compare-and-swap protocol. Duplicate run
 IDs therefore fail before source preparation, endpoint work, or failure

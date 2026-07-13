@@ -2,7 +2,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import (
+    ExperimentSpec,
+    _validate_remote_input_pins,
+    _validate_task_pins,
+)
 from harbor_hf.runs import build_run_lock
 
 NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
@@ -11,15 +15,16 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
 
-    assert lock.run_id == "20260713T010203Z-b650110073"
+    assert lock.run_id == "20260713T010203Z-3e46e6d60e"
     assert lock.spec_digest == (
-        "sha256:d4b81a15613bd4c10283ecbd95e69168b8dbf5c927a37418e76e389028aeff7f"
+        "sha256:f216706b982f94e0f1636655c9f76b6c2a8f2ea112e946406708dcad96571ec4"
     )
     assert lock.artifact_bucket == "example/benchmark-runs"
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
     assert lock.deployment.endpoint is not None
     assert lock.deployment.endpoint.name == "qwen-endpoint"
     assert lock.benchmark_tasks == ["cancel-async-tasks"]
+    assert lock.benchmark_task_digests == {"cancel-async-tasks": "sha256:" + "2" * 64}
     assert lock.created_at == NOW
     assert lock.attempts == 1
     assert lock.concurrent_trials == 1
@@ -126,3 +131,100 @@ def test_controller_and_endpoint_must_share_lease_namespace(
 
     with pytest.raises(ValueError, match="namespace must match"):
         build_run_lock(spec)
+
+
+def test_remote_lock_rejects_mutable_model_revision(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0].model_copy(update={"revision": "main"})
+    spec = remote_spec.model_copy(
+        update={"matrix": remote_spec.matrix.model_copy(update={"models": [model]})}
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _validate_remote_input_pins(spec)
+    assert str(captured.value) == "remote model revisions must be full Git commit IDs"
+    with pytest.raises(ValueError, match="model revisions must be full Git commit IDs"):
+        build_run_lock(spec)
+
+
+def test_remote_lock_rejects_mutable_serving_image(remote_spec: ExperimentSpec) -> None:
+    deployment = remote_spec.matrix.deployments[0]
+    engine = deployment.engine.model_copy(update={"image": "example/vllm:latest"})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "deployments": [deployment.model_copy(update={"engine": engine})]
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _validate_remote_input_pins(spec)
+    assert (
+        str(captured.value) == "remote serving images must be pinned by sha256 digest"
+    )
+
+
+def test_remote_lock_rejects_mutable_agent_revision(
+    remote_spec: ExperimentSpec,
+) -> None:
+    agent = remote_spec.matrix.agents[0].model_copy(update={"revision": "latest"})
+    spec = remote_spec.model_copy(
+        update={"matrix": remote_spec.matrix.model_copy(update={"agents": [agent]})}
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _validate_remote_input_pins(spec)
+    assert str(captured.value) == "remote agent revisions must be immutable"
+
+
+def test_remote_lock_rejects_unresolved_benchmark(remote_spec: ExperimentSpec) -> None:
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"dataset": "terminal-bench@2.0"}
+    )
+    spec = remote_spec.model_copy(update={"benchmark": benchmark})
+    with pytest.raises(ValueError) as captured:
+        _validate_remote_input_pins(spec)
+    assert str(captured.value) == (
+        "remote benchmark dataset must use an immutable sha256 digest"
+    )
+
+    benchmark = remote_spec.benchmark.model_copy(update={"task_digests": {}})
+    with pytest.raises(ValueError) as captured:
+        _validate_task_pins(benchmark)
+    assert str(captured.value) == "remote benchmarks require resolved task digests"
+
+
+@pytest.mark.parametrize(
+    ("task_names", "task_digests"),
+    [
+        (
+            ["cancel-async-tasks", "missing-*"],
+            {"cancel-async-tasks": "sha256:" + "2" * 64},
+        ),
+        (
+            ["cancel-async-tasks"],
+            {
+                "cancel-async-tasks": "sha256:" + "2" * 64,
+                "unexpected-task": "sha256:" + "3" * 64,
+            },
+        ),
+    ],
+)
+def test_remote_task_pins_reject_each_inexact_selection_direction(
+    remote_spec: ExperimentSpec,
+    task_names: list[str],
+    task_digests: dict[str, str],
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"task_names": task_names, "task_digests": task_digests}
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _validate_task_pins(benchmark)
+    assert str(captured.value) == (
+        "remote task digests must exactly resolve the task selection"
+    )

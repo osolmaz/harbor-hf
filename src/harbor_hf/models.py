@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from fnmatch import fnmatch
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -8,6 +10,7 @@ from harbor_hf.evidence import is_sensitive_key
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
+ContentDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 GitHubRepository = Annotated[
     str,
     Field(
@@ -33,6 +36,7 @@ class Metadata(StrictModel):
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
     task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
+    task_digests: dict[TaskName, ContentDigest] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def task_names_are_unique(self) -> BenchmarkSpec:
@@ -204,6 +208,7 @@ class ExperimentSpec(StrictModel):
     def remote_job_has_lifecycle_headroom(self) -> ExperimentSpec:
         if self.remote is None:
             return self
+        _validate_remote_input_pins(self)
         if (
             self.remote.job.timeout_seconds
             < self.execution.timeout_seconds + _CONTROLLER_HEADROOM_SECONDS
@@ -218,6 +223,53 @@ class ExperimentSpec(StrictModel):
         ):
             raise ValueError("HF Sandbox timeout must not exceed remote Job timeout")
         return self
+
+
+def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
+    if re.fullmatch(r".+@sha256:[0-9a-f]{64}", spec.benchmark.dataset) is None:
+        raise ValueError("remote benchmark dataset must use an immutable sha256 digest")
+    _validate_task_pins(spec.benchmark)
+    if any(
+        re.fullmatch(r"[0-9a-f]{40}", model.revision) is None
+        for model in spec.matrix.models
+    ):
+        raise ValueError("remote model revisions must be full Git commit IDs")
+    if any(
+        re.fullmatch(r".+@sha256:[0-9a-f]{64}", deployment.engine.image) is None
+        for deployment in spec.matrix.deployments
+    ):
+        raise ValueError("remote serving images must be pinned by sha256 digest")
+    if any(not _is_immutable_agent_revision(agent) for agent in spec.matrix.agents):
+        raise ValueError("remote agent revisions must be immutable")
+
+
+def _validate_task_pins(benchmark: BenchmarkSpec) -> None:
+    if not benchmark.task_digests:
+        raise ValueError("remote benchmarks require resolved task digests")
+    unmatched_selections = [
+        selection
+        for selection in benchmark.task_names
+        if not any(fnmatch(task, selection) for task in benchmark.task_digests)
+    ]
+    unmatched_tasks = [
+        task
+        for task in benchmark.task_digests
+        if not any(fnmatch(task, selection) for selection in benchmark.task_names)
+    ]
+    if unmatched_selections or unmatched_tasks:
+        raise ValueError("remote task digests must exactly resolve the task selection")
+
+
+def _is_immutable_agent_revision(agent: AgentProfile) -> bool:
+    if agent.revision_kind == "harbor-source":
+        return re.fullmatch(r"[0-9a-f]{40}", agent.revision) is not None
+    return (
+        re.fullmatch(
+            r"v?[0-9]+(?:\.[0-9]+)*(?:[-+][0-9A-Za-z.-]+)?",
+            agent.revision,
+        )
+        is not None
+    )
 
 
 def _reject_sensitive_parameters(value: JsonValue, owner: str) -> None:

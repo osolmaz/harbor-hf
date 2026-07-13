@@ -36,7 +36,7 @@ from harbor_hf.evidence import (
 )
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
-from harbor_hf.planner import experiment_digest, is_task_pattern
+from harbor_hf.planner import experiment_digest
 from harbor_hf.process import (
     CommandRunner,
     ProcessError,
@@ -611,6 +611,7 @@ def _execute_benchmark(
         expected_task_counts=_expected_task_counts(lock),
         expected_attempts_per_task=lock.attempts,
         expected_task_names=lock.benchmark_tasks,
+        expected_task_digests=lock.benchmark_task_digests,
         expected_agent_name=lock.agent.name,
         expected_agent_version=_expected_agent_version(lock),
         expected_model_provider="openai",
@@ -1064,18 +1065,12 @@ def probe_runtime(
     return {"probes": probes}
 
 
-def _expected_trial_count(lock: RunLock) -> int | None:
-    if any(is_task_pattern(task) for task in lock.benchmark_tasks):
-        return None
-    return len(lock.benchmark_tasks) * lock.attempts
+def _expected_trial_count(lock: RunLock) -> int:
+    return len(lock.benchmark_task_digests) * lock.attempts
 
 
-def _expected_task_counts(lock: RunLock) -> dict[str, int] | None:
-    return {
-        task: lock.attempts
-        for task in lock.benchmark_tasks
-        if not is_task_pattern(task)  # pragma: no mutate
-    }
+def _expected_task_counts(lock: RunLock) -> dict[str, int]:
+    return {task: lock.attempts for task in lock.benchmark_task_digests}
 
 
 def _expected_agent_version(lock: RunLock) -> str:
@@ -1092,6 +1087,7 @@ def validate_harbor_result(
     expected_task_counts: Mapping[str, int] | None = None,
     expected_attempts_per_task: int | None = None,
     expected_task_names: Sequence[str] | None = None,
+    expected_task_digests: Mapping[str, str] | None = None,
     expected_agent_name: str | None = None,
     expected_agent_version: str | None = None,
     expected_model_provider: str | None = None,
@@ -1100,8 +1096,13 @@ def validate_harbor_result(
     trials: list[dict[str, object]] = []
     for path in sorted(jobs_dir.glob("*/*/result.json")):
         value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or "task_name" not in value:
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("task_name"), str)
+            or not value["task_name"].strip()
+        ):
             raise WorkerError("Harbor produced a malformed trial result")
+        _validate_trial_task_digest(path, value["task_name"], expected_task_digests)
         trials.append(value)
     _validate_trial_count(trials, expected_trials)
     _validate_task_counts(
@@ -1147,6 +1148,28 @@ def validate_harbor_result(
         "trial_count": len(verified),
         "trials": verified,
     }
+
+
+def _validate_trial_task_digest(
+    result_path: Path,
+    task_name: str,
+    expected: Mapping[str, str] | None,
+) -> None:
+    if expected is None:
+        return
+    expected_digest = expected.get(task_name)
+    if expected_digest is None:
+        raise WorkerError(f"Harbor trial {task_name} is not in the resolved task set")
+    lock_path = result_path.with_name("lock.json")
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkerError(f"Harbor trial {task_name} has no valid task lock") from error
+    task = lock.get("task") if isinstance(lock, Mapping) else None
+    if not isinstance(task, Mapping) or task.get("digest") != expected_digest:
+        raise WorkerError(
+            f"Harbor trial {task_name} task digest does not match the lock"
+        )
 
 
 def _validate_task_counts(

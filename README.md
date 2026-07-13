@@ -49,7 +49,11 @@ digest of the requested experiment.
 
 Remote submission requires an endpoint binding and exact 40-character commits
 for both `harbor-hf` and a Harbor revision that provides the `hf-sandbox`
-extra. The controller image must be pinned by SHA-256 digest. Both checkouts
+extra. The model revision must also be a full commit, serving and controller
+images must be pinned by SHA-256 digest, package agents must use exact versions,
+and the benchmark must include a digest-pinned dataset plus its complete
+resolved task digest map. Mutable references are rejected before submission.
+Both checkouts
 execute with their committed `uv.lock` files in locked mode without development
 dependency groups. Preview the sanitized HF Job command first:
 
@@ -65,9 +69,10 @@ the model.
 
 The Job writes evidence under
 `runs/<experiment>/<run-id>/` in the configured private HF Bucket. `_SUCCESS`
-is written only after every requested Harbor attempt is exception-free, has
-finite numeric verifier results, and the Inference Endpoint reports `paused`
-with zero ready replicas. Failures write `_FAILED` after attempting the same cleanup.
+is written only after every requested Harbor attempt is exception-free, has the
+expected task content digest and finite numeric verifier results, and the
+Inference Endpoint reports `paused` with zero ready replicas. Failures write
+`_FAILED` after attempting the same cleanup.
 The controller verifies the endpoint's model, custom image, container command,
 complete ordered serving arguments, complete non-secret environment, secret
 names, provider region, hardware, accelerator count, and declared scaling

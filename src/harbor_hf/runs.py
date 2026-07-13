@@ -38,6 +38,7 @@ class RunLock(BaseModel):
     spec_digest: str
     benchmark_dataset: str
     benchmark_tasks: list[str]
+    benchmark_task_digests: dict[str, str]
     model: ModelProfile
     deployment: DeploymentProfile
     agent: AgentProfile
@@ -74,6 +75,7 @@ def build_run_lock(
     run_id: str | None = None,
     clock: Clock = lambda: datetime.now(UTC),
 ) -> RunLock:
+    spec = ExperimentSpec.model_validate(spec.model_dump(mode="python"))
     if spec.remote is None:
         raise ValueError("submit requires a remote configuration")
 
@@ -111,6 +113,7 @@ def build_run_lock(
         spec_digest=digest,
         benchmark_dataset=spec.benchmark.dataset,
         benchmark_tasks=spec.benchmark.task_names,
+        benchmark_task_digests=spec.benchmark.task_digests,
         model=model,
         deployment=deployment,
         agent=agent,

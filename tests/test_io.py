@@ -24,7 +24,7 @@ def test_load_example() -> None:
     assert spec.matrix.models[0].weights.format == "safetensors"
     assert spec.matrix.models[0].weights.quantization is not None
     assert spec.matrix.models[0].weights.quantization.scheme == "nvfp4"
-    assert spec.matrix.agents[0].revision == "replace-with-package-version"
+    assert spec.matrix.agents[0].revision == "2026.7.2"
     assert spec.matrix.agents[0].revision_kind == "package"
     assert spec.artifacts.bucket == "example/benchmark-runs"
     assert spec.publishing.dataset == "example/shellbench-results"
