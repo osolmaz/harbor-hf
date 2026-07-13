@@ -287,6 +287,61 @@ def test_artifacts_verify_and_results_publish_print_json(
     assert json.loads(publish.stdout)["runs"][0]["published"] is False
 
 
+def test_results_publish_uses_repository_creating_recovery_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interactions: list[object] = []
+
+    class FakeStore:
+        def __init__(self, namespace: str) -> None:
+            assert namespace == "org"
+
+    class FakeAutomaticPublisher:
+        def __init__(self, **kwargs: object) -> None:
+            interactions.append(("repositories", kwargs["repositories"]))
+
+        def publish(self, campaign_id: str) -> CampaignPublicationReport:
+            interactions.append(("publish", campaign_id))
+            return CampaignPublicationReport(
+                campaign_id=campaign_id,
+                control_commit="c" * 40,
+                dry_run=False,
+                runs=[
+                    PublishedRun(
+                        run_id="run-one",
+                        publication_id="pub-one",
+                        result_dataset="org/results",
+                        index_dataset="org/index",
+                        published=True,
+                        result_revision="a" * 40,
+                        index_revision="b" * 40,
+                    )
+                ],
+            )
+
+    api = object()
+    monkeypatch.setattr("harbor_hf.cli.HubCampaignStore", FakeStore)
+    monkeypatch.setattr("harbor_hf.cli.HfApi", lambda: api)
+    monkeypatch.setattr("harbor_hf.cli.get_token", lambda: "test-token")
+    monkeypatch.setattr("harbor_hf.cli.HubClaimStore", lambda *_args: object())
+    monkeypatch.setattr("harbor_hf.cli.HubDatasetPublisher", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        "harbor_hf.cli.AutomaticCampaignPublisher", FakeAutomaticPublisher
+    )
+
+    result = runner.invoke(
+        app,
+        ["results", "publish", "campaign-one", "--namespace", "org"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["runs"][0]["published"] is True
+    assert interactions == [
+        ("repositories", api),
+        ("publish", "campaign-one"),
+    ]
+
+
 def test_automation_install_dry_run_is_secret_safe(remote_manifest: Path) -> None:
     result = runner.invoke(
         app,

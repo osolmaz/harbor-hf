@@ -399,7 +399,6 @@ def build_result_tables(
             source,
             source_checksum,
             lock_checksum,
-            control_commit,
         ),
         "run_id": summary.run.run_id,
         "source_bucket": source.bucket,
@@ -730,7 +729,6 @@ def _publication_id(
     source: EvidenceSource,
     source_checksum: str,
     lock_checksum: str,
-    control_commit: str,
 ) -> str:
     value = {
         "run_id": run_id,
@@ -738,7 +736,6 @@ def _publication_id(
         "source_prefix": source.prefix,
         "source_checksum": source_checksum,
         "run_lock_sha256": lock_checksum,
-        "control_commit": control_commit,
     }
     return f"pub-{_digest(value).removeprefix('sha256:')[:32]}"
 

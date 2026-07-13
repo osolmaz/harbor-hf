@@ -43,6 +43,8 @@ from harbor_hf.coordination import CoordinationError, HubClaimStore
 from harbor_hf.io import ManifestError, load_experiment
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.operations import (
+    AutomaticCampaignPublisher,
+    DatasetRepositoryApi,
     cancel_campaign,
     publish_campaign_results,
     retry_campaign_shard,
@@ -353,27 +355,32 @@ def results_publish(
     del output_format
     try:
         store = HubCampaignStore(namespace)
-        snapshot = store.load_snapshot(campaign_id)
         api = HfApi()
-        publisher = None
-        if not dry_run:
-            token = get_token()
-            if token is None:
-                raise ValueError("result publication requires HF authentication")
-            publisher = HubDatasetPublisher(
-                publisher_id=f"cli-{campaign_id}",
-                leases=HubClaimStore(namespace, token),
-                api=cast(DatasetApi, api),
-            )
         with tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-") as cache:
             reader = HubBucketEvidenceReader(Path(cache))
-            result = publish_campaign_results(
-                snapshot,
-                namespace=namespace,
-                reader=reader,
-                publisher=publisher,
-                dry_run=dry_run,
-            )
+            if dry_run:
+                result = publish_campaign_results(
+                    store.load_snapshot(campaign_id),
+                    namespace=namespace,
+                    reader=reader,
+                    publisher=None,
+                    dry_run=True,
+                )
+            else:
+                token = get_token()
+                if token is None:
+                    raise ValueError("result publication requires HF authentication")
+                result = AutomaticCampaignPublisher(
+                    namespace=namespace,
+                    store=store,
+                    reader=reader,
+                    publisher=HubDatasetPublisher(
+                        publisher_id=f"cli-{campaign_id}",
+                        leases=HubClaimStore(namespace, token),
+                        api=cast(DatasetApi, api),
+                    ),
+                    repositories=cast(DatasetRepositoryApi, api),
+                ).publish(campaign_id)
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
     _echo_json(result.model_dump(mode="json"))

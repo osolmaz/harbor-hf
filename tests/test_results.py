@@ -262,6 +262,17 @@ def test_builds_deterministic_traceable_rows_and_parquet(
         assert SHELLBENCH_TASK not in item.content
 
 
+def test_publication_identity_is_stable_across_later_control_events(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    before = build_result_tables(evidence, source, control_commit="a" * 40)
+    after = build_result_tables(evidence, source, control_commit="b" * 40)
+
+    assert before.publication_id == after.publication_id
+    assert before.runs[0].control_commit == "a" * 40
+    assert after.runs[0].control_commit == "b" * 40
+
+
 def test_global_index_is_discovery_only(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
