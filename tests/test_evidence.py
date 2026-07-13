@@ -1,11 +1,15 @@
 import json
 import tarfile
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, BinaryIO
 
 import pytest
 
 from harbor_hf.evidence import (
+    _file_contains,
+    _scrub_file,
     append_event,
     archive_directory,
     assert_secret_absent,
@@ -97,6 +101,93 @@ def test_secret_path_redaction_rejects_collision(tmp_path: Path) -> None:
 
 def test_empty_secret_changes_no_paths(tmp_path: Path) -> None:
     assert scrub_secret_paths(tmp_path, "") == 0
+
+
+def test_evidence_operations_reject_symlinks(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("secret-value", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "link").symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="^symbolic links are not allowed"):
+        scrub_secret(root, "secret-value")
+    with pytest.raises(RuntimeError, match="^symbolic links are not allowed"):
+        archive_directory(root, tmp_path / "archive.tar.gz")
+
+    assert outside.read_text(encoding="utf-8") == "secret-value"
+
+
+def test_secret_scrubbing_streams_across_chunk_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "log.txt"
+    path.write_bytes(b"abcsecret-value-1secret-value-tail")
+    monkeypatch.setattr("harbor_hf.evidence._STREAM_CHUNK_SIZE", 4)
+
+    assert scrub_secret(tmp_path, "secret-value") == ["log.txt"]
+    assert path.read_bytes() == b"abc[REDACTED]-1[REDACTED]-tail"
+    assert_secret_absent(tmp_path, "secret-value")
+
+
+def test_bounded_stream_helpers_report_changed_and_unchanged_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "log.txt"
+    path.write_bytes(b"abcsecret-value-tail")
+    monkeypatch.setattr("harbor_hf.evidence._STREAM_CHUNK_SIZE", 4)
+
+    assert _file_contains(path, b"secret-value") is True
+    assert _file_contains(path, b"XXXXa") is False
+    assert _scrub_file(path, b"secret-value") is True
+    assert path.read_bytes() == b"abc[REDACTED]-tail"
+    assert _scrub_file(path, b"missing") is False
+
+
+def test_stream_helpers_use_bounded_reads_and_private_temporary_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "log.txt"
+    path.write_bytes(b"abcdef")
+    read_sizes: list[int] = []
+    prefixes: list[str | None] = []
+    original_open: Any = Path.open
+    original_mkstemp = tempfile.mkstemp
+
+    class TrackingReader:
+        def __init__(self, stream: BinaryIO) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> "TrackingReader":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.stream.close()
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return self.stream.read(size)
+
+    def tracking_open(
+        value: Path, mode: str = "r", *args: object, **kwargs: object
+    ) -> object:
+        stream = original_open(value, mode, *args, **kwargs)
+        if value == path and mode == "rb":
+            return TrackingReader(stream)
+        return stream
+
+    def tracking_mkstemp(*, prefix: str | None, dir: Path) -> tuple[int, str]:
+        prefixes.append(prefix)
+        return original_mkstemp(prefix=prefix, dir=dir)
+
+    monkeypatch.setattr("harbor_hf.evidence._STREAM_CHUNK_SIZE", 2)
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr("harbor_hf.evidence.tempfile.mkstemp", tracking_mkstemp)
+
+    assert _file_contains(path, b"missing") is False
+    assert _scrub_file(path, b"missing") is False
+    assert set(read_sizes) == {2}
+    assert prefixes == [".harbor-hf-redact-"]
 
 
 def test_json_and_event_writers_create_nested_canonical_records(

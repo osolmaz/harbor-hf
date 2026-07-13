@@ -133,8 +133,8 @@ Every task selected by `benchmark.task_names` is passed to Harbor. Exact task
 names have a deterministic expected trial count of tasks multiplied by
 attempts. Glob selections are resolved by Harbor; the controller requires at
 least one result, requires every observed task to contain the configured number
-of attempts, and validates every resulting trial for exceptions and numeric
-verifier rewards.
+of attempts, preserves required counts for exact names mixed with globs, and
+validates every resulting trial for exceptions and numeric verifier rewards.
 
 Agent revisions declare how they are enforced. `package` passes the revision to
 an installed agent and requires Harbor to report that same version.
@@ -171,6 +171,8 @@ and verified endpoint cleanup. It must also exceed `execution.timeout_seconds`
 by at least 4,200 seconds, reserving time for watchdog readiness, endpoint
 startup, and controller cleanup. The endpoint is not resumed until the watchdog
 has completed its source bootstrap and published a readiness handshake.
+Endpoint readiness has its own 3,600-second allowance and does not consume or
+inherit the Harbor execution timeout.
 
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
 verifier command. A command can keep one streaming SDK request open without
@@ -183,7 +185,8 @@ Only secret names are serialized. The configured token is forwarded through the
 HF Jobs secret mechanism to the controller and its cleanup watchdog, then
 inherited by Harbor through process environment. Its value is absent from
 commands, locks, and evidence. Before archiving, secret values are redacted from
-both file contents and path components.
+both file contents and path components using bounded-memory streaming. Symbolic
+links are rejected before evidence is read, modified, hashed, or archived.
 
 ## Loading And Resolution
 

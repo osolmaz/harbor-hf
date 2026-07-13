@@ -418,7 +418,7 @@ def _execute_benchmark(
 ) -> None:
     append_event(events, "endpoint_resume_requested")
     manager.resume()
-    snapshot = manager.wait_ready(min(lock.timeout_seconds, 3600))
+    snapshot = manager.wait_ready(3600)
     validate_endpoint_model(lock, snapshot)
     append_event(events, "endpoint_ready", state=endpoint_state(snapshot)[0])
     write_json(root / "endpoint.snapshot.json", redact(snapshot))
@@ -750,9 +750,11 @@ def _expected_trial_count(lock: RunLock) -> int | None:
 
 
 def _expected_task_counts(lock: RunLock) -> dict[str, int] | None:
-    if _expected_trial_count(lock) is None:
-        return None
-    return {task: lock.attempts for task in lock.benchmark_tasks}
+    return {
+        task: lock.attempts
+        for task in lock.benchmark_tasks
+        if not any(character in task for character in "*?[")  # pragma: no mutate
+    }
 
 
 def _expected_agent_version(lock: RunLock) -> str:
@@ -821,10 +823,9 @@ def _validate_task_counts(
     attempts_per_observed_task: int | None = None,
 ) -> None:
     observed = Counter(str(trial["task_name"]) for trial in trials)
-    if expected is not None:
-        valid = observed == Counter(expected)
-    else:
-        valid = attempts_per_observed_task is None or all(
+    valid = all(observed[task] == count for task, count in (expected or {}).items())
+    if attempts_per_observed_task is not None:
+        valid = valid and all(
             count == attempts_per_observed_task for count in observed.values()
         )
     if not valid:

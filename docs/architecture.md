@@ -134,7 +134,8 @@ A resolved run lock records:
 Secret values are never recorded. Manifests store only the names of secrets
 that must be injected by the remote platform. Artifact finalization redacts
 secret values from both file contents and path components before checksums or
-archives are created.
+archives are created. File content is scanned and rewritten in bounded chunks,
+and symbolic links are rejected before evidence traversal.
 
 ### Canonical Configuration Artifacts
 

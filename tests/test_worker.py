@@ -1247,7 +1247,19 @@ def test_expected_trial_count_is_resolved_by_harbor_for_patterns(
     lock = build_run_lock(remote_spec.model_copy(update={"benchmark": benchmark}))
 
     assert _expected_trial_count(lock) is None
-    assert _expected_task_counts(lock) is None
+    assert _expected_task_counts(lock) == {}
+
+
+def test_expected_task_counts_preserve_exact_tasks_mixed_with_patterns(
+    remote_spec: ExperimentSpec,
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"task_names": ["exact-task", "shell-*"]}
+    )
+    lock = build_run_lock(remote_spec.model_copy(update={"benchmark": benchmark}))
+
+    assert _expected_trial_count(lock) is None
+    assert _expected_task_counts(lock) == {"exact-task": 1}
 
 
 def test_validate_harbor_result_rejects_duplicate_in_place_of_requested_task(
@@ -1286,6 +1298,7 @@ def test_task_count_validation_accepts_exact_attempts() -> None:
     ]
 
     _validate_task_counts(trials, {"one": 2, "two": 2})
+    _validate_task_counts(trials, {"one": 2, "two": 2}, 2)
     _validate_task_counts(trials, None)
 
 
@@ -1316,6 +1329,30 @@ def test_validate_harbor_result_requires_every_wildcard_attempt(
             tmp_path,
             expected_trials=None,
             expected_attempts_per_task=2,
+        )
+
+
+def test_validate_harbor_result_requires_exact_task_mixed_with_wildcard(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "shell-selected",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match="task counts do not match"):
+        validate_harbor_result(
+            tmp_path,
+            expected_trials=None,
+            expected_task_counts={"exact-task": 1},
+            expected_attempts_per_task=1,
         )
 
 
@@ -1508,6 +1545,16 @@ def test_worker_publishes_success_after_cleanup(
 
     monkeypatch.setattr("harbor_hf.worker.probe_runtime", fake_probe)
     runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+    readiness_timeouts: list[int] = []
+    original_wait_ready = EndpointManager.wait_ready
+
+    def record_wait_ready(
+        manager: EndpointManager, timeout_seconds: int, poll_seconds: float = 15
+    ) -> dict[str, object]:
+        readiness_timeouts.append(timeout_seconds)
+        return original_wait_ready(manager, timeout_seconds, poll_seconds)
+
+    monkeypatch.setattr(EndpointManager, "wait_ready", record_wait_ready)
 
     root = run_worker(
         remote_manifest,
@@ -1521,6 +1568,7 @@ def test_worker_publishes_success_after_cleanup(
     )
 
     assert (root / "_SUCCESS").exists()
+    assert readiness_timeouts == [3600]
     assert not (root / "_FAILED").exists()
     assert json.loads((root / "verification.json").read_text()) == {
         "trial_count": 1,
