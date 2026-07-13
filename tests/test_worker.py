@@ -1296,6 +1296,29 @@ def test_validate_harbor_result_requires_a_wildcard_selected_trial(
         validate_harbor_result(tmp_path, expected_trials=None)
 
 
+def test_validate_harbor_result_requires_every_wildcard_attempt(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "task_name": "selected-task",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError, match="task counts do not match"):
+        validate_harbor_result(
+            tmp_path,
+            expected_trials=None,
+            expected_attempts_per_task=2,
+        )
+
+
 def test_trial_count_accepts_nonempty_wildcard_results() -> None:
     _validate_trial_count([{}], None)
 
@@ -1402,21 +1425,29 @@ def test_runtime_probe_requires_healthy_endpoint(
 def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
     jobs = tmp_path / "harbor-jobs"
     jobs.mkdir()
-    (jobs / "log.txt").write_text("contains test-token", encoding="utf-8")
+    (jobs / "test-token.log").write_text("contains test-token", encoding="utf-8")
     (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
 
     _finalize_evidence(tmp_path, "test-token")
 
-    assert (jobs / "log.txt").read_text() == "contains [REDACTED]"
-    event = json.loads((tmp_path / "events.jsonl").read_text())
-    assert event["event"] == "secrets_redacted"
-    assert event["files"] == ["harbor-jobs/log.txt"]
+    assert (jobs / "[REDACTED].log").read_text() == "contains [REDACTED]"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "secret_paths_redacted",
+        "secrets_redacted",
+    ]
+    assert events[0]["count"] == 1
+    assert events[1]["files"] == ["harbor-jobs/[REDACTED].log"]
     assert (tmp_path / "artifacts.tar.gz").exists()
+    assert b"test-token" not in (tmp_path / "artifacts.tar.gz").read_bytes()
     checksums = json.loads((tmp_path / "checksums.json").read_text())
     assert set(checksums) == {
         "artifacts.tar.gz",
         "events.jsonl",
-        "harbor-jobs/log.txt",
+        "harbor-jobs/[REDACTED].log",
     }
 
 
@@ -1850,7 +1881,10 @@ def test_run_lock_validation_rejects_tampered_agent_metadata(
     reserved = lock.model_copy(
         update={"agent": lock.agent.model_copy(update={"parameters": {"version": "x"}})}
     )
-    with pytest.raises(WorkerError, match="parameter 'version' is reserved"):
+    with pytest.raises(
+        WorkerError,
+        match="^run lock fields do not match the resolved manifest cell$",
+    ):
         validate_run_lock(remote_spec, reserved)
 
     remote = remote_spec.remote
@@ -1864,9 +1898,72 @@ def test_run_lock_validation_rejects_tampered_agent_metadata(
     )
     source_lock = lock.model_copy(update={"agent": source_agent})
     with pytest.raises(
-        WorkerError, match="Harbor-source agent revision must match the Harbor source"
+        WorkerError,
+        match="^run lock fields do not match the resolved manifest cell$",
     ):
         validate_run_lock(remote_spec, source_lock)
+
+
+def test_run_lock_validation_reconstructs_selected_matrix_cell(
+    remote_spec: ExperimentSpec,
+) -> None:
+    models = [
+        remote_spec.matrix.models[0],
+        remote_spec.matrix.models[0].model_copy(update={"id": "second-model"}),
+    ]
+    deployments = [
+        remote_spec.matrix.deployments[0],
+        remote_spec.matrix.deployments[0].model_copy(
+            update={"id": "second-deployment"}
+        ),
+    ]
+    agents = [
+        remote_spec.matrix.agents[0],
+        remote_spec.matrix.agents[0].model_copy(update={"id": "second-agent"}),
+    ]
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "models": models,
+                    "deployments": deployments,
+                    "agents": agents,
+                }
+            )
+        }
+    )
+    lock = build_run_lock(
+        spec,
+        model_id="second-model",
+        deployment_id="second-deployment",
+        agent_id="second-agent",
+        run_id="selected-cell",
+    )
+
+    validate_run_lock(spec, lock)
+
+
+def test_run_lock_validation_reports_digest_and_resolution_errors(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = build_run_lock(remote_spec)
+    bad_digest = lock.model_copy(update={"spec_digest": "sha256:" + "0" * 64})
+    with pytest.raises(
+        WorkerError, match="^manifest digest does not match the run lock$"
+    ):
+        validate_run_lock(remote_spec, bad_digest)
+
+    unknown_model = lock.model_copy(
+        update={"model": lock.model.model_copy(update={"id": "unknown-model"})}
+    )
+    with pytest.raises(
+        WorkerError,
+        match=(
+            "^run lock cannot be resolved from manifest: "
+            "unknown model profile: unknown-model$"
+        ),
+    ):
+        validate_run_lock(remote_spec, unknown_model)
 
 
 def test_worker_requires_named_secret(
@@ -1900,7 +1997,7 @@ def test_worker_rejects_lock_without_endpoint_binding(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
 
-    with pytest.raises(WorkerError, match="^run lock has no endpoint binding$"):
+    with pytest.raises(WorkerError, match="^run lock fields do not match"):
         run_worker(remote_manifest, lock_path, tmp_path / "output")
 
 

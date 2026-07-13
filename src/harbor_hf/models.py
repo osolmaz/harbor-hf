@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
+_CONTROLLER_HEADROOM_SECONDS = 4200
 
 
 class StrictModel(BaseModel):
@@ -157,3 +158,16 @@ class ExperimentSpec(StrictModel):
     artifacts: ArtifactStoreSpec
     publishing: PublishingSpec
     remote: RemoteExecutionSpec | None = None
+
+    @model_validator(mode="after")
+    def remote_job_has_lifecycle_headroom(self) -> ExperimentSpec:
+        if (
+            self.remote is not None
+            and self.remote.job.timeout_seconds
+            < self.execution.timeout_seconds + _CONTROLLER_HEADROOM_SECONDS
+        ):
+            raise ValueError(
+                "remote Job timeout must exceed execution timeout by at least "
+                f"{_CONTROLLER_HEADROOM_SECONDS} seconds"
+            )
+        return self

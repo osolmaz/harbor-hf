@@ -77,9 +77,27 @@ def assert_secret_absent(root: Path, secret: str) -> None:
         return
     needle = secret.encode()
     for path in root.rglob("*"):
+        if secret in str(path.relative_to(root)):
+            raise RuntimeError("secret value found in artifact path")
         if path.is_file() and path.read_bytes().find(needle) >= 0:
             relative = path.relative_to(root)
             raise RuntimeError(f"secret value found in artifact {relative}")
+
+
+def scrub_secret_paths(root: Path, secret: str) -> int:
+    if not secret:
+        return 0
+    changed = 0
+    paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+    for path in paths:
+        if secret not in path.name:
+            continue
+        destination = path.with_name(path.name.replace(secret, "[REDACTED]"))
+        if destination.exists():
+            raise RuntimeError("secret path redaction would overwrite an artifact")
+        path.rename(destination)
+        changed += 1
+    return changed
 
 
 def scrub_secret(root: Path, secret: str) -> list[str]:

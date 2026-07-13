@@ -132,7 +132,8 @@ enters verified endpoint cleanup.
 Every task selected by `benchmark.task_names` is passed to Harbor. Exact task
 names have a deterministic expected trial count of tasks multiplied by
 attempts. Glob selections are resolved by Harbor; the controller requires at
-least one result and validates every resulting trial for exceptions and numeric
+least one result, requires every observed task to contain the configured number
+of attempts, and validates every resulting trial for exceptions and numeric
 verifier rewards.
 
 Agent revisions declare how they are enforced. `package` passes the revision to
@@ -160,9 +161,15 @@ must be full lowercase 40-character Git commit IDs. The controller checks out
 both revisions directly and runs them with `uv --locked`; missing or stale lock
 files fail before endpoint-backed benchmark execution begins.
 
+For endpoint-backed runs, `remote.job.namespace` must equal the selected
+endpoint namespace. This gives every controller and watchdog targeting that
+endpoint one shared HF Jobs namespace for lease election.
+
 The controller Job timeout is limited to 85,800 seconds. The remaining 600
 seconds within HF Jobs' 86,400-second maximum are reserved for watchdog startup
-and verified endpoint cleanup. The endpoint is not resumed until the watchdog
+and verified endpoint cleanup. It must also exceed `execution.timeout_seconds`
+by at least 4,200 seconds, reserving time for watchdog readiness, endpoint
+startup, and controller cleanup. The endpoint is not resumed until the watchdog
 has completed its source bootstrap and published a readiness handshake.
 
 The HF Sandbox idle timeout must exceed the longest uninterrupted agent or
@@ -175,7 +182,8 @@ outer bound.
 Only secret names are serialized. The configured token is forwarded through the
 HF Jobs secret mechanism to the controller and its cleanup watchdog, then
 inherited by Harbor through process environment. Its value is absent from
-commands, locks, and evidence.
+commands, locks, and evidence. Before archiving, secret values are redacted from
+both file contents and path components.
 
 ## Loading And Resolution
 
@@ -189,6 +197,10 @@ Every submitted run writes `manifest.yaml`, `run.lock.json`,
 must mark hidden details as `not_reported`; failed collection is `unknown`, and
 irrelevant fields are `not_applicable`. These statuses accompany null values
 rather than being stored as fake version or hardware strings.
+
+Before remote work, the worker reconstructs the selected matrix cell from the
+manifest and compares every field with the submitted run lock. A matching
+manifest digest alone is not sufficient.
 
 ## Not Covered
 

@@ -104,3 +104,24 @@ def test_harbor_source_agent_must_share_harbor_revision(
 
     with pytest.raises(ValueError, match="must match the Harbor source"):
         build_run_lock(invalid)
+
+
+def test_controller_and_endpoint_must_share_lease_namespace(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0]
+    endpoint = deployment.endpoint
+    assert endpoint is not None
+    mismatched = deployment.model_copy(
+        update={"endpoint": endpoint.model_copy(update={"namespace": "other"})}
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [mismatched]}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="namespace must match"):
+        build_run_lock(spec)

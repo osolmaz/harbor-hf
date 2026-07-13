@@ -11,6 +11,7 @@ from harbor_hf.evidence import (
     assert_secret_absent,
     redact,
     scrub_secret,
+    scrub_secret_paths,
     write_checksums,
     write_json,
 )
@@ -56,6 +57,48 @@ def test_secret_scan_names_the_bad_artifact(tmp_path: Path) -> None:
     assert "[REDACTED]" in (tmp_path / "log.txt").read_text()
 
 
+def test_secret_path_components_are_redacted_deepest_first(tmp_path: Path) -> None:
+    directory = tmp_path / "secret-value-directory"
+    directory.mkdir()
+    (directory / "secret-value.log").write_text("safe", encoding="utf-8")
+    (tmp_path / "zzz-unrelated.log").write_text("safe", encoding="utf-8")
+
+    assert scrub_secret_paths(tmp_path, "secret-value") == 2
+
+    redacted = tmp_path / "[REDACTED]-directory" / "[REDACTED].log"
+    assert redacted.read_text(encoding="utf-8") == "safe"
+    assert_secret_absent(tmp_path, "secret-value")
+
+
+def test_secret_scan_rejects_path_before_content(tmp_path: Path) -> None:
+    (tmp_path / "secret-value.log").write_text("safe", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="^secret value found in artifact path$"):
+        assert_secret_absent(tmp_path, "secret-value")
+
+
+def test_secret_scan_detects_content_at_first_byte(tmp_path: Path) -> None:
+    (tmp_path / "log.txt").write_text("secret-value suffix", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="artifact log.txt"):
+        assert_secret_absent(tmp_path, "secret-value")
+
+
+def test_secret_path_redaction_rejects_collision(tmp_path: Path) -> None:
+    (tmp_path / "secret-value.log").write_text("one", encoding="utf-8")
+    (tmp_path / "[REDACTED].log").write_text("two", encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="^secret path redaction would overwrite an artifact$",
+    ):
+        scrub_secret_paths(tmp_path, "secret-value")
+
+
+def test_empty_secret_changes_no_paths(tmp_path: Path) -> None:
+    assert scrub_secret_paths(tmp_path, "") == 0
+
+
 def test_json_and_event_writers_create_nested_canonical_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -88,6 +131,7 @@ def test_archive_and_empty_secret_operations(tmp_path: Path) -> None:
     archive_directory(source, destination)
     assert_secret_absent(source, "")
     assert scrub_secret(source, "") == []
+    assert scrub_secret_paths(source, "") == 0
     assert scrub_secret(source, "missing") == []
 
     with tarfile.open(destination, "r:gz") as archive:

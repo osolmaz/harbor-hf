@@ -29,7 +29,7 @@ class HasId(Protocol):
 
 
 class RunLock(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: str = "harbor-hf/run-lock/v1alpha1"
     run_id: str
@@ -89,6 +89,10 @@ def build_run_lock(
     if deployment.endpoint is None:
         raise ValueError(
             f"deployment profile {deployment.id} requires an endpoint binding"
+        )
+    if deployment.endpoint.namespace != spec.remote.job.namespace:
+        raise ValueError(
+            "controller Job namespace must match the endpoint namespace for leasing"
         )
 
     created_at = clock().astimezone(UTC)

@@ -20,6 +20,7 @@ from harbor_hf.evidence import (
     assert_secret_absent,
     redact,
     scrub_secret,
+    scrub_secret_paths,
     write_checksums,
     write_json,
 )
@@ -27,7 +28,7 @@ from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
-from harbor_hf.runs import RunLock
+from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
     endpoint_lease_label,
     endpoint_lease_label_for,
@@ -328,7 +329,10 @@ def run_worker(
     try:
         _finalize_evidence(root, token)
     except Exception as caught:
-        message = f"{failure_message}; evidence finalization failed: {caught}"
+        finalization_message = str(caught).replace(token, "[REDACTED]")
+        message = (
+            f"{failure_message}; evidence finalization failed: {finalization_message}"
+        )
         raise WorkerError(message) from caught
     raise WorkerError(failure_message) from failure
 
@@ -336,13 +340,21 @@ def run_worker(
 def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
     if lock.spec_digest != experiment_digest(spec):
         raise WorkerError("manifest digest does not match the run lock")
-    if "version" in lock.agent.parameters:
-        raise WorkerError("agent parameter 'version' is reserved by the run lock")
-    if (
-        lock.agent.revision_kind == "harbor-source"
-        and lock.agent.revision != lock.remote.harbor.source.revision
-    ):
-        raise WorkerError("Harbor-source agent revision must match the Harbor source")
+    try:
+        expected = build_run_lock(
+            spec,
+            model_id=lock.model.id,
+            deployment_id=lock.deployment.id,
+            agent_id=lock.agent.id,
+            run_id=lock.run_id,
+            clock=lambda: lock.created_at,
+        )
+    except ValueError as error:
+        raise WorkerError(
+            f"run lock cannot be resolved from manifest: {error}"
+        ) from error
+    if lock != expected:
+        raise WorkerError("run lock fields do not match the resolved manifest cell")
 
 
 def assert_exclusive_endpoint_lease(
@@ -443,6 +455,7 @@ def _execute_benchmark(
         jobs_dir,
         expected_trials=_expected_trial_count(lock),
         expected_task_counts=_expected_task_counts(lock),
+        expected_attempts_per_task=lock.attempts,
         expected_agent_name=lock.agent.name,
         expected_agent_version=_expected_agent_version(lock),
     )
@@ -665,6 +678,13 @@ def require_executable(name: str) -> None:
 
 
 def _finalize_evidence(root: Path, token: str) -> None:
+    redacted_paths = scrub_secret_paths(root, token)
+    if redacted_paths:
+        append_event(
+            root / "events.jsonl",
+            "secret_paths_redacted",
+            count=redacted_paths,
+        )
     scrubbed = scrub_secret(root, token)
     if scrubbed:
         append_event(root / "events.jsonl", "secrets_redacted", files=scrubbed)
@@ -747,6 +767,7 @@ def validate_harbor_result(
     expected_trials: int | None = 1,
     *,
     expected_task_counts: Mapping[str, int] | None = None,
+    expected_attempts_per_task: int | None = None,
     expected_agent_name: str | None = None,
     expected_agent_version: str | None = None,
 ) -> dict[str, object]:
@@ -756,7 +777,11 @@ def validate_harbor_result(
         if isinstance(value, dict) and "task_name" in value:
             trials.append(value)
     _validate_trial_count(trials, expected_trials)
-    _validate_task_counts(trials, expected_task_counts)
+    _validate_task_counts(
+        trials,
+        expected_task_counts,
+        expected_attempts_per_task,
+    )
 
     verified: list[dict[str, object]] = []
     for trial in trials:
@@ -791,12 +816,18 @@ def validate_harbor_result(
 
 
 def _validate_task_counts(
-    trials: list[dict[str, object]], expected: Mapping[str, int] | None
+    trials: list[dict[str, object]],
+    expected: Mapping[str, int] | None,
+    attempts_per_observed_task: int | None = None,
 ) -> None:
-    if expected is None:
-        return
     observed = Counter(str(trial["task_name"]) for trial in trials)
-    if observed != Counter(expected):
+    if expected is not None:
+        valid = observed == Counter(expected)
+    else:
+        valid = attempts_per_observed_task is None or all(
+            count == attempts_per_observed_task for count in observed.values()
+        )
+    if not valid:
         raise WorkerError(
             "Harbor trial task counts do not match the requested attempts"
         )

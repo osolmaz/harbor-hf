@@ -72,6 +72,8 @@ same lease group until it has verified endpoint cleanup, preventing a new
 controller from taking ownership during cleanup. A controller that does not
 hold the lease fails without resuming or pausing the endpoint, so overlapping
 submissions cannot interrupt the elected run's endpoint.
+Controllers and watchdogs must run in the endpoint namespace so every
+contender queries the same lease scope.
 
 ### Harbor Adapter
 
@@ -130,7 +132,9 @@ A resolved run lock records:
   the provider.
 
 Secret values are never recorded. Manifests store only the names of secrets
-that must be injected by the remote platform.
+that must be injected by the remote platform. Artifact finalization redacts
+secret values from both file contents and path components before checksums or
+archives are created.
 
 ### Canonical Configuration Artifacts
 
@@ -146,6 +150,11 @@ Each run preserves four separate configuration records:
 The endpoint snapshot never overwrites the requested manifest or resolved lock.
 Differences between requested and effective values remain explicit and are
 published as comparison fields.
+
+Before any remote work, the controller reconstructs the selected matrix cell
+from `manifest.yaml` and compares the complete result with `run.lock.json`.
+Matching only the manifest digest is insufficient because lock fields can be
+modified independently.
 
 Runtime evidence uses a status alongside nullable values. `reported` means the
 value came from a named probe or provider response, `not_reported` means the

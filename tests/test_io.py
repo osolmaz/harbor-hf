@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 
 from harbor_hf.io import ManifestError, load_experiment
-from harbor_hf.models import AgentProfile, BenchmarkSpec, RemoteJobSpec
+from harbor_hf.models import (
+    AgentProfile,
+    BenchmarkSpec,
+    ExperimentSpec,
+    RemoteJobSpec,
+)
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
 
@@ -49,6 +54,20 @@ def test_reports_unreadable_path(tmp_path: Path) -> None:
 def test_remote_job_timeout_preserves_watchdog_cleanup_margin() -> None:
     with pytest.raises(ValueError, match="less than or equal to 85800"):
         RemoteJobSpec(namespace="org", timeout_seconds=85801)
+
+
+def test_remote_job_timeout_reserves_controller_lifecycle_headroom(
+    remote_spec: ExperimentSpec,
+) -> None:
+    value = remote_spec.model_dump(mode="json")
+    remote = value["remote"]
+    assert isinstance(remote, dict)
+    job = remote["job"]
+    assert isinstance(job, dict)
+    job["timeout_seconds"] = 4259
+
+    with pytest.raises(ValueError, match="exceed execution timeout by at least 4200"):
+        ExperimentSpec.model_validate(value)
 
 
 @pytest.mark.parametrize("task_names", [[], [""], ["same", "same"]])
