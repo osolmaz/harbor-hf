@@ -49,6 +49,7 @@ def _campaign(
     max_physical_executions_per_trial: int = 3,
     retry_base_seconds: int = 10,
     retry_max_seconds: int = 60,
+    cancellation_grace_seconds: int = 0,
     spend_cap_microusd: int | None = None,
 ) -> tuple[CampaignLock, CampaignEvent]:
     task_digests = {
@@ -68,6 +69,7 @@ def _campaign(
         max_physical_executions_per_trial=max_physical_executions_per_trial,
         retry_base_seconds=retry_base_seconds,
         retry_max_seconds=retry_max_seconds,
+        cancellation_grace_seconds=cancellation_grace_seconds,
         spend_cap_microusd=spend_cap_microusd,
     )
     lock = build_campaign_lock(
@@ -361,6 +363,38 @@ def test_active_execution_is_cancelled_before_wave_cleanup(
     ]
 
 
+def test_cancellation_grace_drains_before_force_cancelling(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, cancellation_grace_seconds=60)
+    started = _execution_events(
+        lock, 4, execution_id="execution-one", attempt=1, category=None
+    )[0]
+    events = [
+        submitted,
+        _cancel_event(lock),
+        _wave_event(lock, 3, "active"),
+        started,
+    ]
+
+    projection, draining = plan_reconciliation(
+        lock, events, now=NOW + timedelta(seconds=30)
+    )
+
+    assert projection.cancel_requested_at == NOW + timedelta(seconds=2)
+    assert [action.kind for action in draining.actions] == ["drain-wave"]
+
+    _projection, forced = plan_reconciliation(
+        lock, events, now=NOW + timedelta(seconds=62)
+    )
+
+    assert [action.kind for action in forced.actions[:3]] == [
+        "cancel-execution",
+        "cancel-wave",
+        "cleanup-wave",
+    ]
+
+
 def test_cleanup_failure_requires_manual_intervention(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -448,6 +482,17 @@ def test_all_admission_budgets_are_hard_limits(
 
     assert plan.actions == []
     assert plan.blocked[0].reason == reason
+
+
+def test_spend_cap_fails_closed_without_deployment_estimate(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, spend_cap_microusd=1_000)
+
+    _projection, plan = plan_reconciliation(lock, [submitted])
+
+    assert plan.actions == []
+    assert plan.blocked[0].reason == "spend-estimate-missing"
 
 
 def test_cleanup_bypasses_budgets_and_action_limit_before_billable_work(

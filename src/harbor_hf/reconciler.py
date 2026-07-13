@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,7 +40,7 @@ class FrozenModel(BaseModel):
 
 class DeploymentAdmission(FrozenModel):
     provider: str = Field(default="hf-inference-endpoints", min_length=1)
-    estimated_wave_cost_microusd: int = Field(default=0, ge=0)
+    estimated_wave_cost_microusd: int | None = Field(default=None, ge=0)
 
 
 class AdmissionLimits(FrozenModel):
@@ -75,7 +76,7 @@ class ReconcileAction(FrozenModel):
     shard_ids: list[str] = Field(default_factory=list)
     trial_ids: list[str] = Field(default_factory=list)
     target_ids: list[str] = Field(default_factory=list)
-    estimated_cost_microusd: int = 0
+    estimated_cost_microusd: int | None = None
 
 
 class BlockedAction(FrozenModel):
@@ -88,6 +89,7 @@ class BlockedAction(FrozenModel):
         "provider-budget",
         "campaign-budget",
         "spend-cap",
+        "spend-estimate-missing",
         "backoff",
     ]
 
@@ -109,7 +111,7 @@ class _Candidate(FrozenModel):
     shard_ids: list[str] = Field(default_factory=list)
     trial_ids: list[str] = Field(default_factory=list)
     target_ids: list[str] = Field(default_factory=list)
-    estimated_cost_microusd: int = 0
+    estimated_cost_microusd: int | None = None
 
 
 class _MutableUsage:
@@ -147,8 +149,8 @@ class _MutableUsage:
             self.providers.get(candidate.provider, 0) + 1
         )
         self.campaigns[campaign_id] = self.campaigns.get(campaign_id, 0) + 1
-        self.spend[campaign_id] = (
-            self.spend.get(campaign_id, 0) + candidate.estimated_cost_microusd
+        self.spend[campaign_id] = self.spend.get(campaign_id, 0) + (
+            candidate.estimated_cost_microusd or 0
         )
 
 
@@ -161,7 +163,8 @@ def plan_reconciliation(
 ) -> tuple[RecoveryProjection, ReconcilePlan]:
     projection = project_recovery(lock, events)
     observed_context = context or ReconcileContext()
-    observed_now = (now or datetime.now(UTC)).astimezone(UTC)
+    requested_now = (now or datetime.now(UTC)).astimezone(UTC)
+    observed_now = max(requested_now, projection.campaign.last_observed_at)
     if projection.campaign.status in {"completed", "partial", "failed", "cancelled"}:
         return projection, _plan(lock, projection, [], [], projection.terminal_decision)
 
@@ -203,7 +206,7 @@ def _candidates(
     context: ReconcileContext,
     now: datetime,
 ) -> tuple[list[_Candidate], list[BlockedAction]]:
-    candidates = _cleanup_candidates(lock, projection)
+    candidates = _cleanup_candidates(lock, projection, now)
     blocked: list[BlockedAction] = []
     cancelling = projection.campaign.status in {
         "cancel_requested",
@@ -226,7 +229,7 @@ def _candidates(
 
 
 def _cleanup_candidates(
-    lock: CampaignLock, projection: RecoveryProjection
+    lock: CampaignLock, projection: RecoveryProjection, now: datetime
 ) -> list[_Candidate]:
     candidates: list[_Candidate] = []
     cancelling = projection.campaign.status in {
@@ -234,17 +237,32 @@ def _cleanup_candidates(
         "draining",
         "manual_intervention",
     }
-    if cancelling:
+    force_cancel = _cancellation_grace_elapsed(lock, projection, now)
+    if cancelling and force_cancel:
         candidates.extend(_execution_cancellations(projection))
     known_wave_ids: set[str] = set()
     for wave in projection.waves.values():
         known_wave_ids.add(wave.wave_id)
-        candidates.extend(_wave_cleanup(wave, projection, cancelling))
+        candidates.extend(_wave_cleanup(wave, projection, cancelling, force_cancel))
     if cancelling:
         candidates.extend(
-            _unobserved_wave_cancellations(lock, projection, known_wave_ids)
+            _unobserved_wave_cancellations(
+                lock, projection, known_wave_ids, force_cancel
+            )
         )
     return candidates
+
+
+def _cancellation_grace_elapsed(
+    lock: CampaignLock, projection: RecoveryProjection, now: datetime
+) -> bool:
+    requested_at = projection.cancel_requested_at
+    if requested_at is None:
+        return False
+    deadline = requested_at + timedelta(
+        seconds=lock.recovery_policy.cancellation_grace_seconds
+    )
+    return now >= deadline
 
 
 def _execution_cancellations(projection: RecoveryProjection) -> list[_Candidate]:
@@ -262,7 +280,10 @@ def _execution_cancellations(projection: RecoveryProjection) -> list[_Candidate]
 
 
 def _wave_cleanup(
-    observed: WaveProjection, projection: RecoveryProjection, cancelling: bool
+    observed: WaveProjection,
+    projection: RecoveryProjection,
+    cancelling: bool,
+    force_cancel: bool,
 ) -> list[_Candidate]:
     def candidate(kind: ActionKind) -> _Candidate:
         return _Candidate(
@@ -279,7 +300,7 @@ def _wave_cleanup(
     if observed.status == "cleanup_failed":
         return [candidate("manual-intervention")]
     if cancelling:
-        return [candidate("cancel-wave"), candidate("cleanup-wave")]
+        return _cancellation_wave_actions(observed, projection, force_cancel, candidate)
     terminal = all(
         projection.shards[shard_id].status
         in {"complete", "invalid", "failed_infrastructure", "cancelled"}
@@ -292,10 +313,30 @@ def _wave_cleanup(
     return []
 
 
+def _cancellation_wave_actions(
+    observed: WaveProjection,
+    projection: RecoveryProjection,
+    force_cancel: bool,
+    candidate: Callable[[ActionKind], _Candidate],
+) -> list[_Candidate]:
+    if force_cancel:
+        return [candidate("cancel-wave"), candidate("cleanup-wave")]
+    active_execution = any(
+        execution.wave_id == observed.wave_id and execution.status == "active"
+        for execution in projection.executions.values()
+    )
+    if active_execution:
+        return [candidate("drain-wave")]
+    if observed.status in {"draining", "cleaning"}:
+        return [candidate("cleanup-wave")]
+    return [candidate("drain-wave")]
+
+
 def _unobserved_wave_cancellations(
     lock: CampaignLock,
     projection: RecoveryProjection,
     known_wave_ids: set[str],
+    force_cancel: bool,
 ) -> list[_Candidate]:
     candidates: list[_Candidate] = []
     for action in projection.campaign.actions.values():
@@ -305,6 +346,9 @@ def _unobserved_wave_cancellations(
         if wave_id in known_wave_ids:
             continue
         deployment = _deployment_for_shards(lock, action.target_ids)
+        kinds: tuple[ActionKind, ...] = (
+            ("cancel-wave", "cleanup-wave") if force_cancel else ("drain-wave",)
+        )
         candidates.extend(
             [
                 _Candidate(
@@ -314,7 +358,7 @@ def _unobserved_wave_cancellations(
                     shard_ids=action.target_ids,
                     target_ids=[action.action_id],
                 )
-                for kind in ("cancel-wave", "cleanup-wave")
+                for kind in kinds
             ]
         )
     return candidates
@@ -457,6 +501,7 @@ def _budget_reason(
         "provider-budget",
         "campaign-budget",
         "spend-cap",
+        "spend-estimate-missing",
     ]
     | None
 ):
@@ -476,7 +521,11 @@ def _budget_reason(
     if usage.campaigns.get(lock.campaign_id, 0) >= campaign_limit:
         return "campaign-budget"
     cap = lock.recovery_policy.spend_cap_microusd
-    projected = usage.spend.get(lock.campaign_id, 0) + candidate.estimated_cost_microusd
+    if cap is not None and candidate.estimated_cost_microusd is None:
+        return "spend-estimate-missing"
+    projected = usage.spend.get(lock.campaign_id, 0) + (
+        candidate.estimated_cost_microusd or 0
+    )
     if cap is not None and projected > cap:
         return "spend-cap"
     return None

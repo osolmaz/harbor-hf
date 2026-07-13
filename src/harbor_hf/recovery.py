@@ -156,6 +156,7 @@ class RecoveryProjection(FrozenModel):
     waves: dict[str, WaveProjection]
     spend_microusd: int
     counts: ProjectionCounts
+    cancel_requested_at: datetime | None = None
     terminal_decision: TerminalDecision | None = None
 
     @property
@@ -205,6 +206,14 @@ def project_recovery(
     if campaign.status == "queued" and (executions or waves):
         campaign = campaign.model_copy(update={"status": "active"})
     terminal = _terminal_decision(lock, campaign, trials, waves, counts)
+    cancel_requested_at = next(
+        (
+            event.observed_at
+            for event in ordered_events(events)
+            if event.kind == "campaign.cancel-requested"
+        ),
+        None,
+    )
     return RecoveryProjection(
         campaign=campaign,
         runs=runs,
@@ -214,6 +223,7 @@ def project_recovery(
         waves=waves,
         spend_microusd=spend,
         counts=counts,
+        cancel_requested_at=cancel_requested_at,
         terminal_decision=terminal,
     )
 
