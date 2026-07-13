@@ -1,0 +1,487 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+from pydantic import ValidationError
+
+from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveRunLock
+from harbor_hf.evidence import write_checksums
+from harbor_hf.runs import RunLock
+from harbor_hf.wave_worker import (
+    ExecutionLock,
+    LockedSubmitWaveAction,
+    WorkerError,
+    _expected_agent_version,
+    _file_digest,
+    _prepare_trial_recovery,
+    _publish_digest_sidecar,
+    _publish_immutable_file,
+    _publish_unit,
+    _reject_terminal_wave,
+    _remaining_seconds,
+    _trial_destination,
+    _valid_terminal_trial,
+    _validate_execution_identity,
+)
+
+IDENTITY = {
+    "campaign_id": "campaign-1",
+    "wave_id": "wave-1",
+    "run_id": "run-1",
+    "shard_id": "shard-1",
+}
+
+
+def _expected_trial() -> CampaignTrialLock:
+    return CampaignTrialLock(
+        trial_id="trial-1",
+        trial_digest="d" * 64,
+        task_name="task-a",
+        task_digest="t" * 64,
+        logical_attempt=1,
+    )
+
+
+def _execution_lock(expected: CampaignTrialLock, execution_id: str) -> ExecutionLock:
+    return ExecutionLock(
+        execution_id=execution_id,
+        created_at=datetime(2026, 7, 14, tzinfo=UTC),
+        campaign_id=IDENTITY["campaign_id"],
+        wave_id=IDENTITY["wave_id"],
+        run_id=IDENTITY["run_id"],
+        shard_id=IDENTITY["shard_id"],
+        trial_id=expected.trial_id,
+        task_name=expected.task_name,
+        task_digest=expected.task_digest,
+        logical_attempt=expected.logical_attempt,
+        physical_attempt=1,
+    )
+
+
+def _terminal_trial(root: Path) -> tuple[Path, CampaignTrialLock, Path]:
+    expected = _expected_trial()
+    trial = root / "trial"
+    execution_id = "exec-" + "0" * 32
+    execution = trial / "executions" / execution_id
+    execution.mkdir(parents=True)
+    (execution / "execution.lock.json").write_text(
+        _execution_lock(expected, execution_id).model_dump_json(), encoding="utf-8"
+    )
+    (execution / "harbor.log").write_text("completed\n", encoding="utf-8")
+    (execution / "_SUCCESS").write_text("\n", encoding="utf-8")
+    write_checksums(execution)
+    (trial / "trial.lock.json").write_text(
+        json.dumps(expected.model_dump(mode="json")), encoding="utf-8"
+    )
+    (trial / "trial-summary.json").write_text(
+        json.dumps(
+            {
+                "trial_id": expected.trial_id,
+                "execution_id": execution_id,
+                "execution_checksum": _file_digest(execution / "checksums.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trial / "_SUCCESS").write_text("\n", encoding="utf-8")
+    write_checksums(trial)
+    return trial, expected, execution
+
+
+def _rewrite_summary(trial: Path, **updates: object) -> None:
+    summary_path = trial / "trial-summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.update(updates)
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    write_checksums(trial)
+
+
+def test_valid_terminal_trial_accepts_exact_success_evidence(tmp_path: Path) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    assert _valid_terminal_trial(trial, expected, **IDENTITY) is True
+
+
+def test_valid_terminal_trial_returns_false_without_evidence(tmp_path: Path) -> None:
+    expected = _expected_trial()
+    assert _valid_terminal_trial(tmp_path / "missing", expected, **IDENTITY) is False
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "unrelated.txt").write_text("x", encoding="utf-8")
+    assert _valid_terminal_trial(empty, expected, **IDENTITY) is False
+    marker_dir = tmp_path / "marker-dir"
+    (marker_dir / "_SUCCESS").mkdir(parents=True)
+    assert _valid_terminal_trial(marker_dir, expected, **IDENTITY) is False
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [["_FAILED"], ["_CANCELLED"], ["_SUCCESS", "_FAILED"], ["_SUCCESS", "_CANCELLED"]],
+)
+def test_valid_terminal_trial_rejects_non_success_markers(
+    tmp_path: Path, markers: list[str]
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    for marker in markers:
+        (trial / marker).write_text("\n", encoding="utf-8")
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, _expected_trial(), **IDENTITY)
+    assert str(captured.value) == "terminal trial evidence is not a valid success"
+
+
+@pytest.mark.parametrize("field", ["campaign_id", "wave_id", "run_id", "shard_id"])
+def test_valid_terminal_trial_rejects_each_identity_mismatch(
+    tmp_path: Path, field: str
+) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    identity = dict(IDENTITY, **{field: "other"})
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **identity)
+    assert str(captured.value) == (
+        "terminal execution identity does not match its trial"
+    )
+
+
+def test_valid_terminal_trial_rejects_mismatched_trial_lock(tmp_path: Path) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    tampered = expected.model_copy(update={"trial_digest": "e" * 64})
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, tampered, **IDENTITY)
+    assert str(captured.value) == "terminal trial lock does not match the wave"
+
+
+def test_valid_terminal_trial_rejects_summary_without_execution_id(
+    tmp_path: Path,
+) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    _rewrite_summary(trial, execution_id=5)
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **IDENTITY)
+    assert str(captured.value) == "terminal trial summary has no execution identity"
+
+
+def test_valid_terminal_trial_rejects_wrong_summary_trial_id(tmp_path: Path) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    _rewrite_summary(trial, trial_id="trial-wrong")
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **IDENTITY)
+    assert str(captured.value) == (
+        "terminal trial summary has the wrong trial identity"
+    )
+
+
+def test_valid_terminal_trial_rejects_unsuccessful_execution(tmp_path: Path) -> None:
+    trial, expected, execution = _terminal_trial(tmp_path)
+    (execution / "_SUCCESS").unlink()
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **IDENTITY)
+    assert str(captured.value) == "terminal trial execution is not successful"
+
+
+def test_valid_terminal_trial_rejects_wrong_child_checksum(tmp_path: Path) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    _rewrite_summary(trial, execution_checksum="sha256:" + "0" * 64)
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **IDENTITY)
+    assert str(captured.value) == (
+        "terminal trial summary has the wrong child checksum"
+    )
+
+
+def test_valid_terminal_trial_wraps_checksum_corruption(tmp_path: Path) -> None:
+    trial, expected, execution = _terminal_trial(tmp_path)
+    (execution / "harbor.log").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **IDENTITY)
+    assert str(captured.value) == "terminal trial evidence failed checksum validation"
+
+
+def test_valid_terminal_trial_wraps_missing_summary(tmp_path: Path) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    (trial / "trial-summary.json").unlink()
+
+    with pytest.raises(WorkerError) as captured:
+        _valid_terminal_trial(trial, expected, **IDENTITY)
+    assert str(captured.value) == "terminal trial evidence failed checksum validation"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "execution_id",
+        "campaign_id",
+        "wave_id",
+        "run_id",
+        "shard_id",
+        "trial_id",
+        "task_name",
+        "task_digest",
+        "logical_attempt",
+    ],
+)
+def test_execution_identity_rejects_each_field_mismatch(field: str) -> None:
+    expected = _expected_trial()
+    execution_id = "exec-" + "1" * 32
+    lock = _execution_lock(expected, execution_id)
+    tampered = lock.model_copy(
+        update={field: 99 if field == "logical_attempt" else "other"}
+    )
+
+    with pytest.raises(WorkerError) as captured:
+        _validate_execution_identity(tampered, execution_id, expected, **IDENTITY)
+    assert str(captured.value) == (
+        "terminal execution identity does not match its trial"
+    )
+
+    _validate_execution_identity(lock, execution_id, expected, **IDENTITY)
+
+
+def test_execution_identity_ignores_physical_attempt() -> None:
+    expected = _expected_trial()
+    execution_id = "exec-" + "1" * 32
+    lock = _execution_lock(expected, execution_id).model_copy(
+        update={"physical_attempt": 7}
+    )
+    _validate_execution_identity(lock, execution_id, expected, **IDENTITY)
+
+
+def test_publish_immutable_file_copies_exact_bytes_once(tmp_path: Path) -> None:
+    source = tmp_path / "source.json"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "nested" / "deep" / "destination.json"
+
+    _publish_immutable_file(source, destination)
+    assert destination.read_bytes() == b"payload"
+    assert [path.name for path in destination.parent.iterdir()] == ["destination.json"]
+
+    _publish_immutable_file(source, destination)
+    assert destination.read_bytes() == b"payload"
+
+    source.write_bytes(b"different")
+    with pytest.raises(WorkerError) as captured:
+        _publish_immutable_file(source, destination)
+    assert str(captured.value) == (
+        f"evidence path already has different contents: {destination}"
+    )
+    assert destination.read_bytes() == b"payload"
+    assert [path.name for path in destination.parent.iterdir()] == ["destination.json"]
+
+
+def test_publish_digest_sidecar_writes_exact_digest_line(tmp_path: Path) -> None:
+    source = tmp_path / "campaign.lock.json"
+    source.write_bytes(b"wave-contract\n")
+    destination = tmp_path / "published"
+
+    _publish_digest_sidecar(source, destination)
+
+    sidecar = tmp_path / "campaign.lock.json.sha256"
+    expected = (
+        "sha256:8b6a391b539bf23c01dfed62246c6e04cb057e7bd5c119318589b64df6c1b413\n"
+    )
+    assert sidecar.read_text(encoding="utf-8") == expected
+    assert (destination / "campaign.lock.json.sha256").read_text(
+        encoding="utf-8"
+    ) == expected
+
+
+def _finalized_unit(root: Path, marker: str) -> Path:
+    source = root / "unit"
+    (source / "nested").mkdir(parents=True)
+    (source / "top.json").write_text("{}", encoding="utf-8")
+    (source / "nested" / "inner.log").write_text("log\n", encoding="utf-8")
+    write_checksums(source)
+    (source / marker).write_text("\n", encoding="utf-8")
+    return source
+
+
+def test_publish_unit_publishes_all_files_and_marker(tmp_path: Path) -> None:
+    source = _finalized_unit(tmp_path, "_SUCCESS")
+    destination = tmp_path / "published"
+
+    _publish_unit(source, destination)
+
+    published = sorted(
+        str(path.relative_to(destination))
+        for path in destination.rglob("*")
+        if path.is_file()
+    )
+    assert published == [
+        "_SUCCESS",
+        "checksums.json",
+        "nested/inner.log",
+        "top.json",
+    ]
+    assert (destination / "_SUCCESS").read_text(encoding="utf-8") == "\n"
+    assert (destination / "nested" / "inner.log").read_text(encoding="utf-8") == "log\n"
+
+
+def test_publish_unit_requires_exactly_one_marker(tmp_path: Path) -> None:
+    unmarked = tmp_path / "unmarked"
+    unmarked.mkdir()
+    write_checksums(unmarked)
+    with pytest.raises(WorkerError) as captured:
+        _publish_unit(unmarked, tmp_path / "out-a")
+    assert str(captured.value) == (
+        "finalized wave evidence must have one terminal marker"
+    )
+
+    double = _finalized_unit(tmp_path, "_SUCCESS")
+    (double / "_FAILED").write_text("\n", encoding="utf-8")
+    with pytest.raises(WorkerError) as captured:
+        _publish_unit(double, tmp_path / "out-b")
+    assert str(captured.value) == (
+        "finalized wave evidence must have one terminal marker"
+    )
+
+
+def test_publish_unit_rejects_corrupted_source(tmp_path: Path) -> None:
+    source = _finalized_unit(tmp_path, "_FAILED")
+    (source / "top.json").write_text('{"tampered": true}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        _publish_unit(source, tmp_path / "published")
+    assert not (tmp_path / "published" / "_FAILED").exists()
+
+
+@pytest.mark.parametrize("marker", ["_SUCCESS", "_FAILED", "_CANCELLED"])
+def test_reject_terminal_wave_raises_for_each_marker(
+    tmp_path: Path, marker: str
+) -> None:
+    destination = tmp_path / "wave"
+    destination.mkdir()
+    (destination / marker).write_text("\n", encoding="utf-8")
+
+    with pytest.raises(WorkerError) as captured:
+        _reject_terminal_wave(destination)
+    assert str(captured.value) == "deployment wave already has terminal evidence"
+
+
+def test_reject_terminal_wave_allows_fresh_destinations(tmp_path: Path) -> None:
+    _reject_terminal_wave(tmp_path / "missing")
+    partial = tmp_path / "partial"
+    (partial / "_SUCCESS").mkdir(parents=True)
+    (partial / "events.jsonl").write_text("", encoding="utf-8")
+    _reject_terminal_wave(partial)
+
+
+@pytest.mark.parametrize("marker", ["_SUCCESS", "_FAILED", "_CANCELLED"])
+def test_prepare_trial_recovery_refuses_terminal_destination(
+    tmp_path: Path, marker: str
+) -> None:
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    (destination / marker).write_text("\n", encoding="utf-8")
+
+    with pytest.raises(WorkerError) as captured:
+        _prepare_trial_recovery(destination, tmp_path / "trial")
+    assert str(captured.value) == "terminal trial evidence cannot be overwritten"
+    assert not (tmp_path / "trial").exists()
+
+
+def test_prepare_trial_recovery_copies_prior_executions(tmp_path: Path) -> None:
+    destination = tmp_path / "destination"
+    executions = destination / "executions" / "exec-prior"
+    executions.mkdir(parents=True)
+    (executions / "harbor.log").write_text("prior\n", encoding="utf-8")
+    trial_root = tmp_path / "trial"
+
+    _prepare_trial_recovery(destination, trial_root)
+
+    assert (trial_root / "executions" / "exec-prior" / "harbor.log").read_text(
+        encoding="utf-8"
+    ) == "prior\n"
+
+
+def test_prepare_trial_recovery_creates_empty_trial_root(tmp_path: Path) -> None:
+    trial_root = tmp_path / "trial"
+    _prepare_trial_recovery(tmp_path / "missing", trial_root)
+
+    assert trial_root.is_dir()
+    assert list(trial_root.iterdir()) == []
+
+
+def test_trial_destination_builds_exact_path(tmp_path: Path) -> None:
+    campaign = cast(CampaignLock, SimpleNamespace(artifact_prefix="campaigns/c1"))
+    run = cast(
+        WaveRunLock,
+        SimpleNamespace(configuration=SimpleNamespace(run_id="run-9")),
+    )
+    trial = cast(CampaignTrialLock, SimpleNamespace(trial_id="trial-9"))
+
+    assert _trial_destination(tmp_path, campaign, run, trial) == (
+        tmp_path / "campaigns/c1" / "runs" / "run-9" / "trials" / "trial-9"
+    )
+
+
+def test_expected_agent_version_uses_locked_revision_kind() -> None:
+    package = cast(
+        RunLock,
+        SimpleNamespace(
+            agent=SimpleNamespace(
+                revision_kind="package",
+                revision="2026.7.2",
+                reported_version=None,
+            )
+        ),
+    )
+    assert _expected_agent_version(package) == "2026.7.2"
+
+    source = cast(
+        RunLock,
+        SimpleNamespace(
+            agent=SimpleNamespace(
+                revision_kind="harbor-source",
+                revision="a" * 40,
+                reported_version="2026.7.9",
+            )
+        ),
+    )
+    assert _expected_agent_version(source) == "2026.7.9"
+
+
+def test_remaining_seconds_rounds_up_and_enforces_floor() -> None:
+    assert _remaining_seconds(10.0, lambda: 7.5) == 3
+    assert _remaining_seconds(10.0, lambda: 7.0) == 3
+    assert _remaining_seconds(3601.0, lambda: 0.0) == 3601
+    with pytest.raises(WorkerError) as captured:
+        _remaining_seconds(10.0, lambda: 10.5)
+    assert str(captured.value) == "deployment wave duration bound was reached"
+
+
+def test_execution_lock_schema_and_action_defaults() -> None:
+    expected = _expected_trial()
+    lock = _execution_lock(expected, "exec-" + "2" * 32)
+    assert lock.schema_version == "harbor-hf/execution-lock/v1alpha1"
+
+    action = LockedSubmitWaveAction(
+        action_id="action-1",
+        action_key="key-1",
+        campaign_id="campaign-1",
+        deployment_digest="digest-1",
+        shard_ids=["shard-1"],
+    )
+    assert action.kind == "submit-wave"
+    with pytest.raises(ValidationError):
+        LockedSubmitWaveAction.model_validate(
+            {
+                "action_id": "action-1",
+                "action_key": "key-1",
+                "campaign_id": "campaign-1",
+                "deployment_digest": "digest-1",
+                "shard_ids": ["shard-1"],
+                "unexpected": "extra",
+            }
+        )
