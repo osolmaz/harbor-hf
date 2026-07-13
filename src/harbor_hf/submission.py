@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from harbor_hf.models import SourcePin
 from harbor_hf.runs import RunLock
 
 _JOB_ID = re.compile(r"[a-f0-9]{24}")
+_GITHUB_REPOSITORY = re.compile(
+    r"^(?:https://github\.com/)?"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
 
 
 class TextRunner(Protocol):
@@ -25,12 +31,28 @@ class Submission(BaseModel):
 
 
 def github_archive(repository: str, revision: str) -> str:
-    normalized = repository.removesuffix(".git").rstrip("/")
-    if normalized.startswith("https://github.com/"):
-        normalized = normalized.removeprefix("https://github.com/")
-    if normalized.count("/") != 1 or ":" in normalized:
+    return f"{github_repository(repository)}/archive/{revision}.zip"
+
+
+def github_repository(repository: str) -> str:
+    match = _GITHUB_REPOSITORY.fullmatch(repository)
+    if match is None:
         raise ValueError("source repository must be a GitHub owner/name or HTTPS URL")
-    return f"https://github.com/{normalized}/archive/{revision}.zip"
+    return f"https://github.com/{match['owner']}/{match['name']}"
+
+
+def locked_source_command(source: SourcePin, *arguments: str) -> list[str]:
+    repository = shlex.quote(github_repository(source.repository))
+    revision = shlex.quote(source.revision)
+    script = (
+        "set -euo pipefail\n"
+        "repo_dir=$(mktemp -d)\n"
+        f'git clone --filter=blob:none --no-checkout {repository} "$repo_dir"\n'
+        f'git -C "$repo_dir" fetch --depth 1 origin {revision}\n'
+        f'git -C "$repo_dir" checkout --detach {revision}\n'
+        'exec uv run --project "$repo_dir" --locked "$@"\n'
+    )
+    return ["bash", "-lc", script, "locked-source", *arguments]
 
 
 def bucket_uri(bucket: str) -> str:
@@ -46,9 +68,6 @@ def build_submit_command(
     bucket: str,
 ) -> list[str]:
     job = lock.remote.job
-    worker_archive = github_archive(
-        lock.remote.worker.repository, lock.remote.worker.revision
-    )
     return [
         "hf",
         "jobs",
@@ -68,16 +87,17 @@ def build_submit_command(
         f"{input_dir}:/input:ro",
         "--volume",
         f"{bucket_uri(bucket)}:/output:rw",
+        "--",
         job.image,
-        "uvx",
-        "--from",
-        worker_archive,
-        "harbor-hf",
-        "worker",
-        "/input/manifest.yaml",
-        "/input/run.lock.json",
-        "--output-root",
-        "/output",
+        *locked_source_command(
+            lock.remote.worker,
+            "harbor-hf",
+            "worker",
+            "/input/manifest.yaml",
+            "/input/run.lock.json",
+            "--output-root",
+            "/output",
+        ),
     ]
 
 

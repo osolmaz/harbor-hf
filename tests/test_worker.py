@@ -6,22 +6,28 @@ import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import ExperimentSpec, SourcePin
+from harbor_hf.process import CommandRunner
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     EndpointManager,
     WorkerError,
     _finalize_evidence,
+    _job_stage,
     build_harbor_command,
     controller_environment,
     endpoint_state,
     endpoint_url,
+    launch_cleanup_watchdog,
+    prepare_locked_source,
     probe_runtime,
     require_executable,
+    run_endpoint_watchdog,
     run_worker,
     validate_endpoint_model,
     validate_harbor_result,
@@ -65,6 +71,17 @@ class CleanupFailureRunner(EndpointRunner):
             self.commands.append(list(command))
             raise RuntimeError("pause failed with test-token")
         return super().run_json(command)
+
+
+def _prepare_source(
+    _source: SourcePin, destination: Path, _runner: CommandRunner
+) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "uv.lock").write_text("", encoding="utf-8")
+
+
+def _launch_watchdog(_lock: RunLock, _endpoint: object, _token: str) -> str:
+    return "watchdog-job"
 
 
 def test_endpoint_lifecycle_and_status() -> None:
@@ -172,6 +189,307 @@ def test_controller_requires_git(monkeypatch: pytest.MonkeyPatch) -> None:
         require_executable("git")
 
 
+def test_prepare_locked_source_checks_out_revision_and_requires_lock(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    destination = tmp_path / "nested" / "sources" / "source"
+
+    class SourceRunner:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+
+        def run_text(self, command: Sequence[str]) -> str:
+            self.commands.append(list(command))
+            if "checkout" in command:
+                destination.mkdir(parents=True)
+                (destination / "uv.lock").write_text("", encoding="utf-8")
+            return ""
+
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            raise AssertionError(command)
+
+    runner = SourceRunner()
+    prepare_locked_source(remote.harbor.source, destination, runner)
+
+    assert [command[1] for command in runner.commands] == ["clone", "-C", "-C"]
+    assert runner.commands == [
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            "https://github.com/harbor-framework/harbor",
+            str(destination),
+        ],
+        [
+            "git",
+            "-C",
+            str(destination),
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            remote.harbor.source.revision,
+        ],
+        [
+            "git",
+            "-C",
+            str(destination),
+            "checkout",
+            "--detach",
+            remote.harbor.source.revision,
+        ],
+    ]
+
+    with pytest.raises(WorkerError, match="source checkout already exists"):
+        prepare_locked_source(remote.harbor.source, destination, runner)
+
+
+def test_prepare_locked_source_rejects_checkout_without_lock(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    destination = tmp_path / "source"
+
+    class SourceRunner:
+        def run_text(self, command: Sequence[str]) -> str:
+            destination.mkdir(parents=True, exist_ok=True)
+            return ""
+
+        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+            raise AssertionError(command)
+
+    with pytest.raises(WorkerError, match="pinned source checkout has no uv.lock"):
+        prepare_locked_source(remote.harbor.source, destination, SourceRunner())
+
+
+def test_launch_watchdog_requires_controller_job_before_submission(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = build_run_lock(remote_spec)
+    endpoint = lock.deployment.endpoint
+    assert endpoint is not None
+    monkeypatch.delenv("JOB_ID", raising=False)
+
+    with pytest.raises(WorkerError, match="controller JOB_ID is required"):
+        launch_cleanup_watchdog(lock, endpoint, "secret")
+
+
+def test_launch_watchdog_uses_independent_hf_job(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="watchdog-run")
+    endpoint = lock.deployment.endpoint
+    assert endpoint is not None
+    calls: list[dict[str, object]] = []
+
+    class FakeApi:
+        def __init__(self, *, token: str) -> None:
+            assert token == "secret"
+
+        def run_job(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return SimpleNamespace(id="watchdog-job")
+
+    monkeypatch.setenv("JOB_ID", "controller-job")
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+
+    assert launch_cleanup_watchdog(lock, endpoint, "secret") == "watchdog-job"
+    assert calls[0] == {
+        "image": "ghcr.io/astral-sh/uv:python3.12-bookworm",
+        "command": calls[0]["command"],
+        "secrets": {"HF_TOKEN": "secret"},
+        "flavor": "cpu-basic",
+        "timeout": 11400,
+        "labels": {"harbor-hf-watchdog": "watchdog-run"},
+        "namespace": "osolmaz",
+    }
+    command = cast(list[str], calls[0]["command"])
+    assert command[3:] == [
+        "locked-source",
+        "harbor-hf",
+        "watchdog",
+        "--controller-job-id",
+        "controller-job",
+        "--controller-namespace",
+        "osolmaz",
+        "--endpoint-name",
+        "qwen-endpoint",
+        "--endpoint-namespace",
+        "osolmaz",
+        "--token-secret-name",
+        "HF_TOKEN",
+        "--timeout-seconds",
+        "11100",
+    ]
+
+
+def test_launch_watchdog_caps_timeout_and_requires_returned_id(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    capped = remote_spec.model_copy(
+        update={
+            "remote": remote.model_copy(
+                update={"job": remote.job.model_copy(update={"timeout_seconds": 86400})}
+            )
+        }
+    )
+    lock = build_run_lock(capped)
+    endpoint = lock.deployment.endpoint
+    assert endpoint is not None
+    calls: list[dict[str, object]] = []
+
+    class FakeApi:
+        def __init__(self, *, token: str) -> None:
+            assert token == "secret"
+
+        def run_job(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return SimpleNamespace(id=None)
+
+    monkeypatch.setenv("JOB_ID", "controller-job")
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+
+    with pytest.raises(
+        WorkerError, match="^cleanup watchdog submission returned no job ID$"
+    ):
+        launch_cleanup_watchdog(lock, endpoint, "secret")
+
+    assert calls[0]["timeout"] == 86400
+    command = cast(list[str], calls[0]["command"])
+    assert command[command.index("--timeout-seconds") + 1] == "86100"
+
+
+@pytest.mark.parametrize("stage", ["COMPLETED", "ERROR", "CANCELED", "CANCELLED"])
+def test_endpoint_watchdog_pauses_after_controller_finishes(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    inspections: list[dict[str, object]] = []
+
+    class FakeApi:
+        def inspect_job(self, **kwargs: object) -> object:
+            inspections.append(kwargs)
+            return SimpleNamespace(
+                status=SimpleNamespace(stage=SimpleNamespace(value=stage))
+            )
+
+    runner = EndpointRunner([snapshot("paused", 0)])
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    result = run_endpoint_watchdog(
+        controller_job_id="controller",
+        controller_namespace="org",
+        endpoint_name="endpoint",
+        endpoint_namespace="org",
+        token_secret_name="HF_TOKEN",
+        timeout_seconds=60,
+        api=FakeApi(),
+        runner=runner,
+        monotonic=lambda: 0,
+    )
+
+    assert endpoint_state(result) == ("paused", 0, 1)
+    assert inspections == [{"job_id": "controller", "namespace": "org"}]
+    assert [command[2] for command in runner.commands] == ["pause", "describe"]
+
+
+def test_endpoint_watchdog_survives_transient_inspection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes: list[object] = [RuntimeError("transient"), "ERROR"]
+    sleeps: list[float] = []
+
+    class FakeApi:
+        def inspect_job(self, **_kwargs: object) -> object:
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return SimpleNamespace(
+                status=SimpleNamespace(stage=SimpleNamespace(value=outcome))
+            )
+
+    runner = EndpointRunner([snapshot("paused", 0)])
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    run_endpoint_watchdog(
+        controller_job_id="controller",
+        controller_namespace="org",
+        endpoint_name="endpoint",
+        endpoint_namespace="org",
+        token_secret_name="HF_TOKEN",
+        timeout_seconds=60,
+        api=FakeApi(),
+        runner=runner,
+        sleep=sleeps.append,
+        monotonic=lambda: 0,
+        poll_seconds=3,
+    )
+
+    assert sleeps == [3]
+    assert outcomes == []
+
+
+def test_endpoint_watchdog_pauses_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspections: list[str] = []
+
+    class FakeApi:
+        def inspect_job(self, **_kwargs: object) -> object:
+            inspections.append("checked")
+            return SimpleNamespace(
+                status=SimpleNamespace(stage=SimpleNamespace(value="RUNNING"))
+            )
+
+    times = iter([0.0, 0.0, 1.0, 2.0])
+    runner = EndpointRunner([snapshot("paused", 0)])
+    monkeypatch.setenv("BENCH_TOKEN", "secret")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    run_endpoint_watchdog(
+        controller_job_id="controller",
+        controller_namespace="org",
+        endpoint_name="endpoint",
+        endpoint_namespace="org",
+        token_secret_name="BENCH_TOKEN",
+        timeout_seconds=2,
+        api=FakeApi(),
+        runner=runner,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(times),
+    )
+
+    assert inspections == ["checked", "checked"]
+    assert os.environ["HF_TOKEN"] == "secret"
+
+
+def test_endpoint_watchdog_requires_configured_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MISSING_TOKEN", raising=False)
+
+    with pytest.raises(WorkerError, match="required secret MISSING_TOKEN"):
+        run_endpoint_watchdog(
+            controller_job_id="controller",
+            controller_namespace="org",
+            endpoint_name="endpoint",
+            endpoint_namespace="org",
+            token_secret_name="MISSING_TOKEN",
+            timeout_seconds=1,
+        )
+
+
+def test_job_stage_reads_hf_enum_value() -> None:
+    info = SimpleNamespace(
+        status=SimpleNamespace(stage=SimpleNamespace(value="completed"))
+    )
+
+    assert _job_stage(info) == "COMPLETED"
+
+
 def test_cleanup_timeout() -> None:
     times = iter([0.0, 2.0])
     manager = EndpointManager(
@@ -191,13 +509,17 @@ def test_harbor_command_is_pinned_and_bounded(
 ) -> None:
     lock = build_run_lock(remote_spec)
 
-    command = build_harbor_command(lock, tmp_path, "https://endpoint.example")
+    source = tmp_path / "harbor-source"
+    command = build_harbor_command(lock, tmp_path, "https://endpoint.example", source)
 
     assert command == [
-        "uvx",
-        "--from",
-        "harbor[hf-sandbox] @ https://github.com/harbor-framework/harbor/"
-        "archive/abcdef1234567890abcdef1234567890abcdef12.zip",
+        "uv",
+        "run",
+        "--project",
+        str(source),
+        "--locked",
+        "--extra",
+        "hf-sandbox",
         "harbor",
         "run",
         "--dataset",
@@ -280,7 +602,10 @@ def test_validate_harbor_result_requires_one_numeric_verifier(tmp_path: Path) ->
         )
     )
 
-    assert validate_harbor_result(tmp_path)["rewards"] == {"reward": 0.5}
+    assert validate_harbor_result(tmp_path) == {
+        "trial_count": 1,
+        "trials": [{"task_name": "task", "rewards": {"reward": 0.5}}],
+    }
     (trial / "result.json").write_text(
         json.dumps(
             {"task_name": "task", "verifier_result": {"rewards": {"reward": True}}}
@@ -294,7 +619,7 @@ def test_validate_harbor_result_rejects_missing_and_multiple_trials(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(
-        WorkerError, match="^expected exactly one Harbor trial, found 0$"
+        WorkerError, match="^expected exactly 1 Harbor trials, found 0$"
     ):
         validate_harbor_result(tmp_path)
 
@@ -311,7 +636,7 @@ def test_validate_harbor_result_rejects_missing_and_multiple_trials(
             encoding="utf-8",
         )
     with pytest.raises(
-        WorkerError, match="^expected exactly one Harbor trial, found 2$"
+        WorkerError, match="^expected exactly 1 Harbor trials, found 2$"
     ):
         validate_harbor_result(tmp_path)
 
@@ -325,7 +650,9 @@ def test_validate_harbor_result_requires_rewards(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(WorkerError, match="^Harbor trial has no verifier rewards$"):
+    with pytest.raises(
+        WorkerError, match="^Harbor trial task has no verifier rewards$"
+    ):
         validate_harbor_result(tmp_path)
 
 
@@ -343,15 +670,15 @@ def test_validate_harbor_result_rejects_trial_exception(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(WorkerError, match="^Harbor trial failed with AgentError$"):
+    with pytest.raises(WorkerError, match="^Harbor trial task failed with AgentError$"):
         validate_harbor_result(tmp_path)
 
 
 @pytest.mark.parametrize(
     ("exception_info", "message"),
     [
-        ([], "Harbor trial failed with list"),
-        ({}, "Harbor trial failed with an exception"),
+        ([], "Harbor trial task failed with list"),
+        ({}, "Harbor trial task failed with an exception"),
     ],
 )
 def test_validate_harbor_result_rejects_malformed_trial_exception(
@@ -374,6 +701,31 @@ def test_validate_harbor_result_rejects_malformed_trial_exception(
 
     with pytest.raises(WorkerError, match=f"^{message}$"):
         validate_harbor_result(tmp_path)
+
+
+def test_validate_harbor_result_accepts_every_expected_attempt(
+    tmp_path: Path,
+) -> None:
+    for ordinal in (1, 2):
+        trial = tmp_path / str(ordinal)
+        trial.mkdir()
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "task_name": "task",
+                    "verifier_result": {"rewards": {"reward": ordinal / 2}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert validate_harbor_result(tmp_path, 2) == {
+        "trial_count": 2,
+        "trials": [
+            {"task_name": "task", "rewards": {"reward": 0.5}},
+            {"task_name": "task", "rewards": {"reward": 1.0}},
+        ],
+    }
 
 
 class FakeResponse:
@@ -540,12 +892,20 @@ def test_worker_publishes_success_after_cleanup(
         tmp_path / "output",
         runner=runner,
         stream_runner=_successful_stream,
+        source_preparer=_prepare_source,
+        watchdog_launcher=_launch_watchdog,
     )
 
     assert (root / "_SUCCESS").exists()
     assert not (root / "_FAILED").exists()
-    assert json.loads((root / "verification.json").read_text())["rewards"] == {
-        "reward": 1.0
+    assert json.loads((root / "verification.json").read_text()) == {
+        "trial_count": 1,
+        "trials": [
+            {
+                "task_name": "cancel-async-tasks",
+                "rewards": {"reward": 1.0},
+            }
+        ],
     }
     assert endpoint_state(json.loads((root / "endpoint.final.json").read_text())) == (
         "paused",
@@ -588,6 +948,7 @@ def test_worker_publishes_success_after_cleanup(
         for record in event_records
     ] == [
         {"event": "worker_started", "run_id": "successful"},
+        {"event": "cleanup_watchdog_started", "job_id": "watchdog-job"},
         {"event": "endpoint_resume_requested"},
         {"event": "endpoint_ready", "state": "running"},
         {"event": "runtime_probed"},
@@ -654,6 +1015,8 @@ def test_worker_failure_still_pauses_endpoint(
             tmp_path / "output",
             runner=runner,
             stream_runner=lambda *_args, **_kwargs: 7,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
         )
 
     root = tmp_path / "output" / lock.artifact_prefix
@@ -665,6 +1028,82 @@ def test_worker_failure_still_pauses_endpoint(
         for line in (root / "events.jsonl").read_text().splitlines()
     ]
     assert events[-2:] == ["endpoint_paused", "run_failed"]
+
+
+def test_worker_marks_failed_when_success_evidence_cannot_finalize(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="finalization-failed")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime", lambda _url, _token: {"probes": {}}
+    )
+    expected_root = tmp_path / "output" / lock.artifact_prefix
+
+    def fail_finalization(root: Path, token: str) -> None:
+        assert root == expected_root
+        assert token == "test-token"
+        raise RuntimeError("archive test-token failed")
+
+    monkeypatch.setattr("harbor_hf.worker._finalize_evidence", fail_finalization)
+    runner = EndpointRunner([snapshot("running", 1), snapshot("paused", 0)])
+
+    with pytest.raises(WorkerError, match="evidence finalization failed"):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            stream_runner=_successful_stream,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
+        )
+
+    root = tmp_path / "output" / lock.artifact_prefix
+    assert json.loads((root / "_FAILED").read_text()) == {
+        "error_type": "RuntimeError",
+        "message": "archive [REDACTED] failed",
+    }
+    assert not (root / "_SUCCESS").exists()
+    events = [
+        json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-2]["event"] == "run_succeeded"
+    assert events[-1]["event"] == "evidence_finalization_failed"
+    assert events[-1]["error"] == "RuntimeError"
+
+
+def test_worker_does_not_resume_without_independent_watchdog(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="no-watchdog")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    runner = EndpointRunner([snapshot("paused", 0)])
+
+    def fail_watchdog(_lock: RunLock, _endpoint: object, _token: str) -> str:
+        raise WorkerError("watchdog unavailable")
+
+    with pytest.raises(WorkerError, match="watchdog unavailable"):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            source_preparer=_prepare_source,
+            watchdog_launcher=fail_watchdog,
+        )
+
+    assert [command[2] for command in runner.commands] == ["pause", "describe"]
 
 
 def test_cleanup_failure_prevents_success_and_redacts_failure(
@@ -689,6 +1128,8 @@ def test_cleanup_failure_prevents_success_and_redacts_failure(
             tmp_path / "output",
             runner=runner,
             stream_runner=_successful_stream,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
         )
 
     root = tmp_path / "output" / lock.artifact_prefix

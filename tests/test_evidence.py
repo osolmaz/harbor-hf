@@ -17,11 +17,18 @@ from harbor_hf.evidence import (
 
 
 def test_redact_removes_nested_sensitive_values() -> None:
-    value = {"token": "one", "nested": [{"password_value": "two", "ok": 3}]}
+    value = {
+        "token": "one",
+        "nested": [{"password_value": "two", "ok": 3}],
+        "tokenizer": "qwen",
+        "tokenizer_config": {"max_tokens": 8192},
+    }
 
     assert redact(value) == {
         "token": "[REDACTED]",
         "nested": [{"password_value": "[REDACTED]", "ok": 3}],
+        "tokenizer": "qwen",
+        "tokenizer_config": {"max_tokens": 8192},
     }
 
 

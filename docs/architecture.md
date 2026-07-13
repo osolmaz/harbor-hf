@@ -151,12 +151,13 @@ Runs progress through `planned`, `submitted`, `provisioning`, `running`,
 `verifying`, `publishing`, and a terminal state. Every transition is an
 append-only event.
 
-For endpoint-backed runs, the controller pauses an endpoint after its last
-active shard in a `finally` path. A separate scheduled watchdog finds stale
-endpoint leases and pauses them, covering controller termination before
-cleanup. Cleanup success is part of endpoint run completion, not an optional
-maintenance action. Provider-backed runs have no endpoint lease but still close
-worker resources and record final usage and request state.
+For endpoint-backed runs, the controller starts a separate companion HF Job
+watchdog before it resumes the endpoint. The watchdog observes the controller
+Job and pauses the endpoint after the controller terminates or its own deadline
+expires. The controller also pauses the endpoint after its last active shard in
+a `finally` path. Cleanup success is part of endpoint run completion, not an
+optional maintenance action. Provider-backed runs have no endpoint lease but
+still close worker resources and record final usage and request state.
 
 The worker verifies `status.state = paused` and `readyReplica = 0` before it
 writes `_SUCCESS`. The final snapshot also records `targetReplica`, which may

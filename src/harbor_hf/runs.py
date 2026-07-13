@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -15,6 +16,8 @@ from harbor_hf.models import (
     RemoteExecutionSpec,
 )
 from harbor_hf.planner import experiment_digest
+
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class Clock(Protocol):
@@ -83,6 +86,11 @@ def build_run_lock(
 
     created_at = clock().astimezone(UTC)
     digest = experiment_digest(spec)
+    if run_id is not None and _RUN_ID.fullmatch(run_id) is None:
+        raise ValueError(
+            "run ID must be one safe path component containing only letters, "
+            "digits, dots, underscores, or hyphens"
+        )
     resolved_id = run_id or _new_run_id(spec.metadata.name, digest, created_at)
     return RunLock(
         run_id=resolved_id,

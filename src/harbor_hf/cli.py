@@ -15,7 +15,7 @@ from harbor_hf.process import ProcessError, SubprocessRunner
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
-from harbor_hf.worker import WorkerError, run_worker
+from harbor_hf.worker import WorkerError, run_endpoint_watchdog, run_worker
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -114,6 +114,31 @@ def worker(
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
     typer.echo(str(destination))
+
+
+@app.command(hidden=True)
+def watchdog(
+    controller_job_id: Annotated[str, typer.Option("--controller-job-id")],
+    controller_namespace: Annotated[str, typer.Option("--controller-namespace")],
+    endpoint_name: Annotated[str, typer.Option("--endpoint-name")],
+    endpoint_namespace: Annotated[str, typer.Option("--endpoint-namespace")],
+    token_secret_name: Annotated[str, typer.Option("--token-secret-name")],
+    timeout_seconds: Annotated[int, typer.Option("--timeout-seconds", min=1)],
+) -> None:
+    """Pause an endpoint after its controller Job exits or times out."""
+    try:
+        snapshot = run_endpoint_watchdog(
+            controller_job_id=controller_job_id,
+            controller_namespace=controller_namespace,
+            endpoint_name=endpoint_name,
+            endpoint_namespace=endpoint_namespace,
+            token_secret_name=token_secret_name,
+            timeout_seconds=timeout_seconds,
+        )
+    except (OSError, ValueError, WorkerError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(snapshot, indent=2, sort_keys=True))
 
 
 def _write_lock(path: Path, lock: RunLock) -> None:

@@ -31,6 +31,17 @@ def test_run_id_override_is_preserved(remote_spec: ExperimentSpec) -> None:
     assert lock.run_id == "manual-run"
 
 
+@pytest.mark.parametrize(
+    "run_id",
+    ["../escape", "nested/path", "/absolute", ".", "x" * 129],
+)
+def test_run_id_override_must_be_a_safe_path_component(
+    remote_spec: ExperimentSpec, run_id: str
+) -> None:
+    with pytest.raises(ValueError, match="safe path component"):
+        build_run_lock(remote_spec, run_id=run_id)
+
+
 def test_submit_requires_remote_configuration(remote_spec: ExperimentSpec) -> None:
     local = remote_spec.model_copy(update={"remote": None})
 

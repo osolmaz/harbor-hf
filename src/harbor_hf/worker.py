@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Protocol, cast
 from urllib.parse import urlparse
 
 from harbor_hf.evidence import (
@@ -21,14 +22,19 @@ from harbor_hf.evidence import (
     write_json,
 )
 from harbor_hf.io import load_experiment
+from harbor_hf.models import EndpointRef, SourcePin
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.runs import RunLock
-from harbor_hf.submission import github_archive
+from harbor_hf.submission import github_repository, locked_source_command
 
 
 class WorkerError(RuntimeError):
     """Raised when a remote benchmark run cannot complete correctly."""
+
+
+class JobInspector(Protocol):
+    def inspect_job(self, *, job_id: str, namespace: str | None = None) -> object: ...
 
 
 class EndpointManager:
@@ -122,18 +128,24 @@ def endpoint_url(snapshot: Mapping[str, object]) -> str:
     return url.rstrip("/")
 
 
-def build_harbor_command(lock: RunLock, jobs_dir: Path, base_url: str) -> list[str]:
+def build_harbor_command(
+    lock: RunLock,
+    jobs_dir: Path,
+    base_url: str,
+    harbor_source: Path,
+) -> list[str]:
     harbor = lock.remote.harbor
     endpoint = lock.deployment.endpoint
     if endpoint is None:
         raise WorkerError("run lock has no endpoint binding")
     command = [
-        "uvx",
-        "--from",
-        (
-            "harbor[hf-sandbox] @ "
-            + github_archive(harbor.source.repository, harbor.source.revision)
-        ),
+        "uv",
+        "run",
+        "--project",
+        str(harbor_source),
+        "--locked",
+        "--extra",
+        "hf-sandbox",
         "harbor",
         "run",
         "--dataset",
@@ -180,6 +192,8 @@ def run_worker(
     *,
     runner: CommandRunner | None = None,
     stream_runner: Callable[..., int] = run_streaming,
+    source_preparer: Callable[[SourcePin, Path, CommandRunner], None] | None = None,
+    watchdog_launcher: Callable[[RunLock, EndpointRef, str], str] | None = None,
 ) -> Path:
     spec = load_experiment(manifest_path)
     lock = RunLock.model_validate_json(
@@ -211,7 +225,29 @@ def run_worker(
     append_event(events, "worker_started", run_id=lock.run_id)
     try:
         require_executable("git")
-        _execute_benchmark(root, events, lock, manager, token, stream_runner)
+        harbor_source = Path("/tmp/harbor-hf-sources") / (
+            f"harbor-{lock.remote.harbor.source.revision}"
+        )
+        (source_preparer or prepare_locked_source)(
+            lock.remote.harbor.source,
+            harbor_source,
+            process_runner,
+        )
+        watchdog_id = (watchdog_launcher or launch_cleanup_watchdog)(
+            lock,
+            endpoint,
+            token,
+        )
+        append_event(events, "cleanup_watchdog_started", job_id=watchdog_id)
+        _execute_benchmark(
+            root,
+            events,
+            lock,
+            manager,
+            token,
+            stream_runner,
+            harbor_source,
+        )
     except Exception as caught:
         error = caught
     finally:
@@ -232,9 +268,7 @@ def run_worker(
             append_event(events, "endpoint_cleanup_failed", error=type(caught).__name__)
 
     if error is None and cleanup_error is None:
-        append_event(events, "run_succeeded")
-        _finalize_evidence(root, token)
-        (root / "_SUCCESS").write_text("\n", encoding="utf-8")
+        _publish_success(root, events, token)
         return root
 
     failure = cleanup_error or error
@@ -260,6 +294,27 @@ def run_worker(
     raise WorkerError(failure_message) from failure
 
 
+def _publish_success(root: Path, events: Path, token: str) -> None:
+    append_event(events, "run_succeeded")
+    try:
+        _finalize_evidence(root, token)
+    except Exception as caught:
+        append_event(
+            events,
+            "evidence_finalization_failed",
+            error=type(caught).__name__,
+        )
+        write_json(
+            root / "_FAILED",
+            {
+                "error_type": type(caught).__name__,
+                "message": str(caught).replace(token, "[REDACTED]"),
+            },
+        )
+        raise WorkerError("evidence finalization failed") from caught
+    (root / "_SUCCESS").write_text("\n", encoding="utf-8")
+
+
 def _execute_benchmark(
     root: Path,
     events: Path,
@@ -267,6 +322,7 @@ def _execute_benchmark(
     manager: EndpointManager,
     token: str,
     stream_runner: Callable[..., int],
+    harbor_source: Path,
 ) -> None:
     append_event(events, "endpoint_resume_requested")
     manager.resume()
@@ -283,7 +339,12 @@ def _execute_benchmark(
     append_event(events, "runtime_probed")
 
     jobs_dir = root / "harbor-jobs"
-    harbor_command = build_harbor_command(lock, jobs_dir, base_url)
+    harbor_command = build_harbor_command(
+        lock,
+        jobs_dir,
+        base_url,
+        harbor_source,
+    )
     append_event(events, "harbor_started")
     exit_code = stream_runner(
         harbor_command,
@@ -297,9 +358,146 @@ def _execute_benchmark(
     append_event(events, "harbor_finished", exit_code=exit_code)
     if exit_code != 0:
         raise WorkerError(f"Harbor exited with status {exit_code}")
-    verifier = validate_harbor_result(jobs_dir)
+    verifier = validate_harbor_result(jobs_dir, lock.attempts)
     write_json(root / "verification.json", verifier)
     append_event(events, "verification_validated")
+
+
+def prepare_locked_source(
+    source: SourcePin,
+    destination: Path,
+    runner: CommandRunner,
+) -> None:
+    if destination.exists():
+        raise WorkerError(f"source checkout already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    runner.run_text(
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            github_repository(source.repository),
+            str(destination),
+        ]
+    )
+    runner.run_text(
+        [
+            "git",
+            "-C",
+            str(destination),
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            source.revision,
+        ]
+    )
+    runner.run_text(
+        [
+            "git",
+            "-C",
+            str(destination),
+            "checkout",
+            "--detach",
+            source.revision,
+        ]
+    )
+    if not (destination / "uv.lock").is_file():
+        raise WorkerError("pinned source checkout has no uv.lock")
+
+
+def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) -> str:
+    from huggingface_hub import HfApi
+
+    controller_job_id = os.environ.get("JOB_ID")
+    if not controller_job_id:
+        raise WorkerError("controller JOB_ID is required before endpoint resume")
+    job_timeout_seconds = min(lock.remote.job.timeout_seconds + 600, 86400)
+    watchdog_timeout_seconds = job_timeout_seconds - 300
+    command = locked_source_command(
+        lock.remote.worker,
+        "harbor-hf",
+        "watchdog",
+        "--controller-job-id",
+        controller_job_id,
+        "--controller-namespace",
+        lock.remote.job.namespace,
+        "--endpoint-name",
+        endpoint.name,
+        "--endpoint-namespace",
+        endpoint.namespace,
+        "--token-secret-name",
+        lock.remote.job.token_secret_name,
+        "--timeout-seconds",
+        str(watchdog_timeout_seconds),
+    )
+    info = HfApi(token=token).run_job(
+        image=lock.remote.job.image,
+        command=command,
+        secrets={lock.remote.job.token_secret_name: token},
+        flavor=lock.remote.job.flavor,
+        timeout=job_timeout_seconds,
+        labels={"harbor-hf-watchdog": lock.run_id},
+        namespace=lock.remote.job.namespace,
+    )
+    job_id = getattr(info, "id", None)
+    if not isinstance(job_id, str) or not job_id:
+        raise WorkerError("cleanup watchdog submission returned no job ID")
+    return job_id
+
+
+def run_endpoint_watchdog(
+    *,
+    controller_job_id: str,
+    controller_namespace: str,
+    endpoint_name: str,
+    endpoint_namespace: str,
+    token_secret_name: str,
+    timeout_seconds: int,
+    api: JobInspector | None = None,
+    runner: CommandRunner | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    poll_seconds: float = 10,
+) -> dict[str, object]:
+    token = os.environ.get(token_secret_name, "")
+    if not token:
+        raise WorkerError(f"required secret {token_secret_name} is not available")
+    os.environ.setdefault("HF_TOKEN", token)
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+    deadline = monotonic() + timeout_seconds
+    terminal = {"COMPLETED", "ERROR", "CANCELED", "CANCELLED"}
+    while monotonic() < deadline:
+        try:
+            stage = _job_stage(
+                api.inspect_job(
+                    job_id=controller_job_id,
+                    namespace=controller_namespace,
+                )
+            )
+        except Exception:
+            sleep(poll_seconds)
+            continue
+        if stage in terminal:
+            break
+        sleep(poll_seconds)
+    manager = EndpointManager(
+        endpoint_namespace,
+        endpoint_name,
+        runner or SubprocessRunner(),
+    )
+    return manager.pause_and_verify()
+
+
+def _job_stage(info: object) -> str:
+    from huggingface_hub import JobInfo
+
+    job = cast(JobInfo, info)
+    return job.status.stage.value.upper()
 
 
 def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> None:
@@ -376,35 +574,43 @@ def probe_runtime(base_url: str, token: str) -> dict[str, object]:
     return {"probes": probes}
 
 
-def validate_harbor_result(jobs_dir: Path) -> dict[str, object]:
+def validate_harbor_result(
+    jobs_dir: Path, expected_trials: int = 1
+) -> dict[str, object]:
     trials: list[dict[str, object]] = []
-    for path in jobs_dir.rglob("result.json"):
+    for path in sorted(jobs_dir.rglob("result.json")):
         value = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(value, dict) and "task_name" in value:
             trials.append(value)
-    if len(trials) != 1:
-        raise WorkerError(f"expected exactly one Harbor trial, found {len(trials)}")
-    exception = trials[0].get("exception_info")
-    if exception is not None:
-        exception_type = (
-            exception.get("exception_type")
-            if isinstance(exception, Mapping)
-            else type(exception).__name__
-        )
+    if len(trials) != expected_trials:
         raise WorkerError(
-            f"Harbor trial failed with {exception_type or 'an exception'}"
+            f"expected exactly {expected_trials} Harbor trials, found {len(trials)}"
         )
-    verifier = trials[0].get("verifier_result")
-    rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
-    if not isinstance(rewards, Mapping) or not rewards:
-        raise WorkerError("Harbor trial has no verifier rewards")
-    if not all(
-        isinstance(value, int | float) and not isinstance(value, bool)
-        for value in rewards.values()
-    ):
-        raise WorkerError("Harbor verifier rewards must be numeric")
+    verified: list[dict[str, object]] = []
+    for trial in trials:
+        task_name = str(trial["task_name"])
+        exception = trial.get("exception_info")
+        if exception is not None:
+            exception_type = (
+                exception.get("exception_type")
+                if isinstance(exception, Mapping)
+                else type(exception).__name__
+            )
+            raise WorkerError(
+                f"Harbor trial {task_name} failed with "
+                f"{exception_type or 'an exception'}"
+            )
+        verifier = trial.get("verifier_result")
+        rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
+        if not isinstance(rewards, Mapping) or not rewards:
+            raise WorkerError(f"Harbor trial {task_name} has no verifier rewards")
+        if not all(
+            isinstance(value, int | float) and not isinstance(value, bool)
+            for value in rewards.values()
+        ):
+            raise WorkerError(f"Harbor trial {task_name} rewards must be numeric")
+        verified.append({"task_name": task_name, "rewards": dict(rewards)})
     return {
-        "task_name": trials[0]["task_name"],
-        "rewards": dict(rewards),
-        "trial_count": 1,
+        "trial_count": len(verified),
+        "trials": verified,
     }

@@ -7,13 +7,27 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-_SENSITIVE_KEY_PARTS = (
-    "authorization",
-    "credential",
-    "password",
-    "secret",
-    "token",
+_SENSITIVE_KEYS = frozenset(
+    {
+        "authorization",
+        "credential",
+        "credentials",
+        "api_key",
+        "access_key",
+        "password",
+        "password_value",
+        "private_key",
+        "secret",
+        "secrets",
+        "token",
+    }
 )
+_SENSITIVE_SUFFIXES = ("_credential", "_password", "_secret", "_token")
+
+
+def _is_sensitive_key(key: object) -> bool:
+    normalized = str(key).replace("-", "_").lower()
+    return normalized in _SENSITIVE_KEYS or normalized.endswith(_SENSITIVE_SUFFIXES)
 
 
 def write_json(path: Path, value: object) -> None:
@@ -34,11 +48,7 @@ def append_event(path: Path, event: str, **fields: object) -> None:
 def redact(value: object) -> object:
     if isinstance(value, Mapping):
         return {
-            str(key): (
-                "[REDACTED]"
-                if any(part in str(key).lower() for part in _SENSITIVE_KEY_PARTS)
-                else redact(item)
-            )
+            str(key): ("[REDACTED]" if _is_sensitive_key(key) else redact(item))
             for key, item in value.items()
         }
     if isinstance(value, list):

@@ -83,3 +83,34 @@ def test_submit_reports_process_failure_without_traceback(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr == "Error: submission failed\n"
+
+
+def test_watchdog_command_reports_verified_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "harbor_hf.cli.run_endpoint_watchdog",
+        lambda **_kwargs: {"status": {"state": "paused", "readyReplica": 0}},
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "watchdog",
+            "--controller-job-id",
+            "job",
+            "--controller-namespace",
+            "org",
+            "--endpoint-name",
+            "endpoint",
+            "--endpoint-namespace",
+            "org",
+            "--token-secret-name",
+            "HF_TOKEN",
+            "--timeout-seconds",
+            "60",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"state": "paused"' in result.stdout

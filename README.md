@@ -9,7 +9,8 @@ The project is in early development. The CLI validates and expands experiment
 matrices and can submit one resolved matrix cell to an HF Job. The remote worker
 controls an existing Inference Endpoint, runs Harbor tasks in HF Sandboxes,
 archives evidence to an HF Bucket, and verifies that the endpoint is paused
-before declaring success.
+before declaring success. Before resuming an endpoint, it starts an independent
+HF Job watchdog that pauses the endpoint if the controller exits or is killed.
 
 ## Install
 
@@ -38,7 +39,8 @@ digest of the requested experiment.
 ## Submit A Remote Run
 
 Remote submission requires an endpoint binding and exact 40-character commits
-for both `harbor-hf` and Harbor. Preview the sanitized HF Job command first:
+for both `harbor-hf` and Harbor. Both checkouts execute with their committed
+`uv.lock` files in locked mode. Preview the sanitized HF Job command first:
 
 ```bash
 uv run harbor-hf submit experiment.yaml --dry-run
@@ -52,9 +54,9 @@ the model.
 
 The Job writes evidence under
 `runs/<experiment>/<run-id>/` in the configured private HF Bucket. `_SUCCESS`
-is written only after one exception-free Harbor trial has a numeric verifier
-result and the Inference Endpoint reports `paused` with zero ready replicas.
-Failures write `_FAILED` after attempting the same cleanup.
+is written only after every requested Harbor attempt is exception-free, has
+numeric verifier results, and the Inference Endpoint reports `paused` with zero
+ready replicas. Failures write `_FAILED` after attempting the same cleanup.
 
 An experiment expands into homogeneous runs. Each run contains one benchmark
 revision, model revision, deployment profile, agent profile, and execution
