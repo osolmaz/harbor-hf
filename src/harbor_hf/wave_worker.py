@@ -26,6 +26,7 @@ from harbor_hf.campaigns import (
     WaveShardLock,
     build_wave_lock,
 )
+from harbor_hf.control import RetryCategory
 from harbor_hf.evidence import (
     append_event,
     archive_directory,
@@ -48,6 +49,7 @@ from harbor_hf.providers import (
 from harbor_hf.runs import RunLock
 from harbor_hf.worker import (
     EndpointManager,
+    HarborTrialFailure,
     WorkerError,
     build_harbor_trial_command,
     controller_environment,
@@ -93,6 +95,18 @@ class WatchdogLauncher(Protocol):
 
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
+    ("authentication", ("authentication", "unauthorized", "forbidden")),
+    ("rate-limit", ("ratelimit", "rate_limit")),
+    ("quota", ("quota",)),
+    (
+        "transient",
+        ("timeout", "connection", "serviceunavailable", "internalserver", "apierror"),
+    ),
+    ("configuration", ("badrequest", "notfound", "configuration")),
+)
 
 
 class LockedSubmitWaveAction(FrozenModel):
@@ -440,6 +454,12 @@ def _prepare_provider_target(lock: WaveLock, wave_root: Path, events: Path) -> s
                 "requested_model": target.model,
                 "routed_model": routed_provider_model(target),
                 "routing": target.routing.model_dump(mode="json"),
+                "request_controls": {
+                    "max_attempts": target.limits.max_attempts,
+                    "max_concurrent_requests": target.limits.max_concurrent_requests,
+                    "parameters": target.parameters,
+                    "timeout_seconds": target.timeout_seconds,
+                },
                 "endpoint": ProviderEndpointEvidence().model_dump(mode="json"),
             },
         },
@@ -489,7 +509,7 @@ def _execute_shard(
             destination,
             trial,
             campaign_id=campaign.campaign_id,
-            wave_id=wave.wave_id,
+            wave_id=(wave.wave_id if wave.action_kind == "submit-wave" else None),
             run_id=run.configuration.run_id,
             shard_id=shard.shard_id,
         )
@@ -602,6 +622,9 @@ def _execute_trial(
     events = execution_root / "events.jsonl"
     append_event(events, "execution_started", execution_id=execution_id)
     error: Exception | None = None
+    failure_phase: Literal["configuration", "execution", "verification"] = (
+        "configuration"
+    )
     try:
         command = build_harbor_trial_command(
             run,
@@ -610,6 +633,7 @@ def _execute_trial(
             harbor_source,
             task_name=trial.task_name,
         )
+        failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
         exit_code = stream_runner(
             command,
@@ -623,7 +647,25 @@ def _execute_trial(
         )
         append_event(events, "harbor_finished", exit_code=exit_code)
         if exit_code != 0:
+            try:
+                validate_harbor_result(
+                    jobs_dir,
+                    expected_trials=1,
+                    expected_task_counts={trial.task_name: 1},
+                    expected_attempts_per_task=1,
+                    expected_task_names=[trial.task_name],
+                    expected_task_digests={trial.task_name: trial.task_digest},
+                    expected_agent_name=run.agent.name,
+                    expected_agent_version=_expected_agent_version(run),
+                    expected_model_provider="openai",
+                    expected_model_name=_wave_model_name(wave),
+                )
+            except HarborTrialFailure:
+                raise
+            except (OSError, ValueError, RuntimeError):
+                raise WorkerError(f"Harbor exited with status {exit_code}") from None
             raise WorkerError(f"Harbor exited with status {exit_code}")
+        failure_phase = "verification"
         verifier = validate_harbor_result(
             jobs_dir,
             expected_trials=1,
@@ -641,17 +683,20 @@ def _execute_trial(
     except Exception as caught:
         error = caught
         append_event(events, "execution_failed", error_type=type(caught).__name__)
+    failure_record: dict[str, object] | None = None
+    if error is not None:
+        failure_record = {
+            "category": _execution_failure_category(error, failure_phase),
+            "error_type": type(error).__name__,
+            "message": str(error).replace(token, "[REDACTED]"),
+        }
+        write_json(execution_root / "failure.json", failure_record)
     _finalize_execution(execution_root, token)
     if error is None:
         (execution_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     else:
-        write_json(
-            execution_root / "_FAILED",
-            {
-                "error_type": type(error).__name__,
-                "message": str(error).replace(token, "[REDACTED]"),
-            },
-        )
+        assert failure_record is not None
+        write_json(execution_root / "_FAILED", failure_record)
     destination = (
         output_root
         / campaign.artifact_prefix
@@ -687,6 +732,23 @@ def _execute_trial(
         / "trials"
         / trial.trial_id,
     )
+
+
+def _execution_failure_category(
+    error: Exception,
+    phase: Literal["configuration", "execution", "verification"],
+) -> RetryCategory:
+    if isinstance(error, HarborTrialFailure):
+        name = error.exception_type.lower()
+        for category, markers in _TRIAL_FAILURE_MARKERS:
+            if any(marker in name for marker in markers):
+                return category
+        return "benchmark"
+    if phase == "configuration":
+        return "configuration"
+    if phase == "execution":
+        return "transient"
+    return "benchmark"
 
 
 def _wave_model_name(wave: WaveLock) -> str:
@@ -727,7 +789,7 @@ def _valid_terminal_trial(
     expected: CampaignTrialLock,
     *,
     campaign_id: str,
-    wave_id: str,
+    wave_id: str | None,
     run_id: str,
     shard_id: str,
 ) -> bool:
@@ -758,7 +820,7 @@ def _validate_terminal_trial(
     expected: CampaignTrialLock,
     *,
     campaign_id: str,
-    wave_id: str,
+    wave_id: str | None,
     run_id: str,
     shard_id: str,
 ) -> None:
@@ -806,14 +868,13 @@ def _validate_execution_identity(
     expected: CampaignTrialLock,
     *,
     campaign_id: str,
-    wave_id: str,
+    wave_id: str | None,
     run_id: str,
     shard_id: str,
 ) -> None:
     observed = (
         execution.execution_id,
         execution.campaign_id,
-        execution.wave_id,
         execution.run_id,
         execution.shard_id,
         execution.trial_id,
@@ -824,7 +885,6 @@ def _validate_execution_identity(
     locked = (
         execution_id,
         campaign_id,
-        wave_id,
         run_id,
         shard_id,
         expected.trial_id,
@@ -832,7 +892,7 @@ def _validate_execution_identity(
         expected.task_digest,
         expected.logical_attempt,
     )
-    if observed != locked:
+    if observed != locked or (wave_id is not None and execution.wave_id != wave_id):
         raise WorkerError("terminal execution identity does not match its trial")
 
 

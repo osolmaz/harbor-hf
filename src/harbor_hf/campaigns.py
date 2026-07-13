@@ -488,7 +488,7 @@ def build_wave_lock(
 ) -> WaveLock:
     """Resolve one reserved deployment wave for an allowed endpoint identity."""
     expected_campaign = build_campaign_lock(
-        build_campaign_plan(spec),
+        build_campaign_plan(spec, recovery_policy=campaign.recovery_policy),
         campaign.campaign_id,
         clock=lambda: campaign.created_at,
     )

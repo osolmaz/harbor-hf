@@ -42,6 +42,7 @@ from harbor_hf.wave_worker import (
     _file_digest,
     _launch_wave_watchdog,
     _remaining_seconds,
+    _valid_terminal_trial,
     _wave_model_name,
     run_wave_worker,
 )
@@ -492,6 +493,12 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         "wave.lock.json",
     ]
     runtime = json.loads((destination / "runtime-environment.json").read_text())
+    assert runtime["provider"]["request_controls"] == {
+        "max_attempts": 2,
+        "max_concurrent_requests": 2,
+        "parameters": {},
+        "timeout_seconds": 60.0,
+    }
     endpoint = runtime["provider"]["endpoint"]
     assert endpoint["endpoint_name"]["status"] == "not_applicable"
     assert endpoint["endpoint_status"]["status"] == "not_applicable"
@@ -659,9 +666,16 @@ def test_wave_failure_still_pauses_and_publishes_failed_execution(
     execution = next(executions.iterdir())
     assert (execution / "_FAILED").is_file()
     assert json.loads((execution / "_FAILED").read_text()) == {
+        "category": "transient",
         "error_type": "WorkerError",
         "message": "Harbor exited with status 7",
     }
+    assert json.loads((execution / "failure.json").read_text()) == {
+        "category": "transient",
+        "error_type": "WorkerError",
+        "message": "Harbor exited with status 7",
+    }
+    assert "failure.json" in json.loads((execution / "checksums.json").read_text())
     assert _event_payloads(execution / "events.jsonl") == [
         {"event": "execution_started", "execution_id": execution.name},
         {"event": "harbor_finished", "exit_code": 7},
@@ -1055,6 +1069,58 @@ def test_wave_recovery_skips_checksum_valid_terminal_trial(
     assert len(list(first_executions.iterdir())) == 1
     events = (recovery / run.shards[0].artifact_prefix / "events.jsonl").read_text()
     assert "trial_recovered" in events
+
+
+def test_retry_wave_accepts_a_valid_success_from_an_earlier_wave(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", lambda *_args: {"probes": {}})
+    output = tmp_path / "output"
+    run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=EndpointRunner(
+            [
+                endpoint_snapshot("paused", 0),
+                endpoint_snapshot("running", 1),
+                endpoint_snapshot("paused", 0),
+            ]
+        ),
+        stream_runner=HarborStream(spec.benchmark.task_digests, expected_calls=1),
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+    run = wave.runs[0]
+    shard = run.shards[0].shard
+    trial = shard.trials[0]
+    trial_root = output / run.artifact_prefix / "trials" / trial.trial_id
+
+    assert _valid_terminal_trial(
+        trial_root,
+        trial,
+        campaign_id=campaign.campaign_id,
+        wave_id=None,
+        run_id=run.configuration.run_id,
+        shard_id=shard.shard_id,
+    )
+    with pytest.raises(WorkerError, match="execution identity does not match"):
+        _valid_terminal_trial(
+            trial_root,
+            trial,
+            campaign_id=campaign.campaign_id,
+            wave_id="wave-from-another-submit-action",
+            run_id=run.configuration.run_id,
+            shard_id=shard.shard_id,
+        )
 
 
 @pytest.mark.parametrize(

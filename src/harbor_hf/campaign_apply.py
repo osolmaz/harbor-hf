@@ -37,7 +37,9 @@ from harbor_hf.control import (
     CampaignStore,
     Clock,
     EventKind,
+    ExecutionOutcomePayload,
     IdentifierFactory,
+    LifecyclePayload,
     TerminalPayload,
     WaveLifecyclePayload,
     new_event,
@@ -491,10 +493,35 @@ class CampaignReconciler:
                 action,
                 allow_submission=allow_billable,
             )
+        return self._execute_lifecycle_action(
+            lock,
+            spec,
+            action,
+            projection=projection,
+            terminal_decision=terminal_decision,
+        )
+
+    def _execute_lifecycle_action(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        action: ReconcileAction,
+        *,
+        projection: RecoveryProjection,
+        terminal_decision: TerminalDecision | None,
+    ) -> str | None:
         if action.kind == "cancel-wave":
             return self._cancel_wave(lock, spec, action)
+        if action.kind == "cancel-execution":
+            return self._cancel_execution(lock, spec, action, projection)
+        if action.kind == "drain-wave":
+            return self._drain_wave(lock, action, projection)
         if action.kind == "cleanup-wave":
             return self._cleanup_wave(lock, spec, action, projection=projection)
+        if action.kind == "manual-intervention":
+            return self._manual_intervention(lock, action)
+        if action.kind == "publish-results":
+            return self._publish_results(lock)
         if action.kind == "publish-summary":
             return self._publish_summary(lock, spec, projection, terminal_decision)
         raise ActionExecutionError(
@@ -527,6 +554,17 @@ class CampaignReconciler:
                 f"campaign result publication failed: {error}"
             ) from error
         return decision.summary_path
+
+    def _publish_results(self, lock: CampaignLock) -> str:
+        if self.result_publisher is None:
+            raise ActionExecutionError("automatic result publication is not configured")
+        try:
+            self.result_publisher.publish(lock.campaign_id)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ActionExecutionError(
+                f"campaign result publication failed: {error}"
+            ) from error
+        return lock.campaign_id
 
     def _submit_wave(
         self,
@@ -623,6 +661,109 @@ class CampaignReconciler:
         self.jobs.cancel(job, namespace=namespace)
         return job.job_id
 
+    def _cancel_execution(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        action: ReconcileAction,
+        projection: RecoveryProjection,
+    ) -> str:
+        if len(action.target_ids) != 1:
+            raise ActionExecutionError(
+                "execution cancellation must target exactly one execution"
+            )
+        execution_id = action.target_ids[0]
+        execution = projection.executions.get(execution_id)
+        if execution is None or execution.status != "active":
+            raise ActionExecutionError(
+                f"execution cancellation target is not active: {execution_id}"
+            )
+        if execution.wave_id is None:
+            raise ActionExecutionError(
+                f"execution cancellation target has no wave: {execution_id}"
+            )
+        wave = projection.waves.get(execution.wave_id)
+        if wave is None:
+            raise ActionExecutionError(
+                f"execution cancellation wave is not observed: {execution.wave_id}"
+            )
+        cancellation = action.model_copy(
+            update={
+                "deployment_digest": wave.deployment_digest,
+                "wave_id": wave.wave_id,
+                "shard_ids": wave.shard_ids,
+            }
+        )
+        remote_id = self._cancel_wave(lock, spec, cancellation)
+        self._record_durable_event(
+            lock,
+            subject_type="execution",
+            subject_id=execution_id,
+            kind="execution.cancelled",
+            payload=ExecutionOutcomePayload(
+                trial_id=execution.trial_id,
+                physical_attempt=execution.physical_attempt,
+                message="cancelled by campaign reconciliation",
+            ),
+            identity=f"{execution_id}:cancelled:reconciler",
+        )
+        return remote_id or execution_id
+
+    def _drain_wave(
+        self,
+        lock: CampaignLock,
+        action: ReconcileAction,
+        projection: RecoveryProjection,
+    ) -> str:
+        wave_id = action.wave_id or f"wave-{action.action_key}"
+        wave = projection.waves.get(wave_id)
+        if wave is None:
+            payload = WaveLifecyclePayload(
+                deployment_digest=action.deployment_digest,
+                provider=_wave_provider(lock, action.deployment_digest),
+                shard_ids=action.shard_ids,
+            )
+        else:
+            payload = WaveLifecyclePayload(
+                deployment_digest=wave.deployment_digest,
+                provider=wave.provider,
+                shard_ids=wave.shard_ids,
+                estimated_cost_microusd=wave.estimated_cost_microusd,
+            )
+        self._record_durable_event(
+            lock,
+            subject_type="wave",
+            subject_id=wave_id,
+            kind="wave.draining",
+            payload=payload,
+            identity=f"{wave_id}:draining:reconciler",
+        )
+        if projection.campaign.status == "cancel_requested":
+            self._record_durable_event(
+                lock,
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind="campaign.draining",
+                payload=LifecyclePayload(message="campaign cancellation is draining"),
+                identity=f"{lock.campaign_id}:draining:reconciler",
+            )
+        return wave_id
+
+    def _manual_intervention(self, lock: CampaignLock, action: ReconcileAction) -> str:
+        wave_id = action.wave_id or f"wave-{action.action_key}"
+        self._record_durable_event(
+            lock,
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="campaign.manual-intervention-required",
+            payload=LifecyclePayload(
+                parent_id=wave_id,
+                message="deployment wave cleanup requires manual intervention",
+            ),
+            identity=f"{lock.campaign_id}:{wave_id}:manual-intervention",
+        )
+        return wave_id
+
     def _cleanup_wave(
         self,
         lock: CampaignLock,
@@ -691,6 +832,33 @@ class CampaignReconciler:
                     identifier=lambda identity=identity: identity,
                 ),
             )
+
+    def _record_durable_event(
+        self,
+        lock: CampaignLock,
+        *,
+        subject_type: Literal["campaign", "execution", "wave"],
+        subject_id: str,
+        kind: EventKind,
+        payload: LifecyclePayload | ExecutionOutcomePayload | WaveLifecyclePayload,
+        identity: str,
+    ) -> None:
+        observed_at = self._next_observed()
+        event_identity = hashlib.sha256(
+            f"{lock.campaign_id}:{identity}".encode()
+        ).hexdigest()[:32]
+        self.store.ensure_event(
+            lock.campaign_id,
+            new_event(
+                subject_type=subject_type,
+                subject_id=subject_id,
+                kind=kind,
+                producer="reconciler",
+                payload=payload,
+                clock=lambda: observed_at,
+                identifier=lambda: event_identity,
+            ),
+        )
 
     def _find_wave(
         self,

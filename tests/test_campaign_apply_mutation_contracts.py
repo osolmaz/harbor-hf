@@ -558,7 +558,7 @@ def test_pending_action_with_mismatched_reservation_fails_closed(
         _reconciler(store, FakeEndpoints(), FakeJobs()).apply_campaign(lock.campaign_id)
 
 
-def test_unsupported_reserved_action_kind_records_failed_outcome(
+def test_manual_intervention_action_records_the_durable_campaign_transition(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock, request, submitted = _campaign(remote_spec)
@@ -580,9 +580,12 @@ def test_unsupported_reserved_action_kind_records_failed_outcome(
     outcome = next(
         applied for applied in result.applied if applied.action_id == action.action_id
     )
-    assert outcome.status == "failed"
-    assert outcome.message == (
-        "action execution is not supported by configured adapters: manual-intervention"
+    assert outcome.status == "succeeded"
+    assert outcome.remote_id == action.wave_id
+    assert any(
+        event.kind == "campaign.manual-intervention-required"
+        and event.subject_id == lock.campaign_id
+        for event in store.events
     )
     assert action.wave_id not in {call["wave_id"] for call in jobs.find_calls}
 

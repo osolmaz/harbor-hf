@@ -238,6 +238,24 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
     )
 
 
+def test_wave_lock_reuses_the_campaign_recovery_policy(
+    remote_spec: ExperimentSpec,
+) -> None:
+    policy = CampaignRecoveryPolicy(
+        max_physical_executions_per_trial=5,
+        retry_base_seconds=7,
+    )
+    campaign = build_campaign_lock(
+        build_campaign_plan(remote_spec, recovery_policy=policy),
+        "campaign-policy-wave",
+    )
+
+    wave = build_wave_lock(campaign, remote_spec, _wave_action(campaign))
+
+    assert wave.campaign_id == campaign.campaign_id
+    assert campaign.recovery_policy == policy
+
+
 def test_campaign_recovery_policy_rejects_unbounded_base_delay() -> None:
     with pytest.raises(ValidationError, match="retry base seconds must not exceed"):
         CampaignRecoveryPolicy(retry_base_seconds=61, retry_max_seconds=60)

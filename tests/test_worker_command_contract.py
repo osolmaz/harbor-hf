@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from harbor_hf.models import DeploymentProfile, ExperimentSpec
+from harbor_hf.provider_models import (
+    ExplicitProviderRoute,
+    ProviderLimits,
+    ProviderTarget,
+)
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
     WorkerError,
@@ -206,3 +212,85 @@ def test_command_rejects_a_lock_without_an_endpoint_binding(
 
     with pytest.raises(WorkerError, match="^run lock has no endpoint binding$"):
         build_harbor_command(lock, tmp_path, "https://unused.example", tmp_path)
+
+
+def test_provider_command_applies_locked_openclaw_request_controls(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    target = ProviderTarget(
+        id="provider-contract",
+        model=remote_spec.matrix.models[0].repo,
+        routing=ExplicitProviderRoute(provider="groq"),
+        timeout_seconds=17.25,
+        limits=ProviderLimits(max_concurrent_requests=4, max_attempts=3),
+        parameters={"temperature": 0, "max_tokens": 4096},
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(update={"deployments": [target]})
+        }
+    )
+    lock = build_run_lock(spec, run_id="provider-command-contract", allow_provider=True)
+
+    command = build_harbor_trial_command(
+        lock,
+        tmp_path / "jobs",
+        "https://router.huggingface.co",
+        tmp_path / "source",
+        task_name=next(iter(lock.benchmark_task_digests)),
+    )
+
+    encoded = next(
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--agent-kwarg"
+        and command[index + 1].startswith("openclaw_config=")
+    )
+    config = json.loads(encoded.removeprefix("openclaw_config="))
+    provider = config["models"]["providers"]["openai"]
+    assert provider == {
+        "api": "openai-completions",
+        "timeoutSeconds": 18,
+        "models": [
+            {
+                "id": f"{remote_spec.matrix.models[0].repo}:groq",
+                "name": f"{remote_spec.matrix.models[0].repo}:groq",
+                "params": {
+                    "temperature": 0,
+                    "max_tokens": 4096,
+                    "maxRetries": 2,
+                    "timeoutMs": 17250,
+                },
+            }
+        ],
+    }
+
+
+def test_provider_command_rejects_an_agent_without_request_control_support(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    target = ProviderTarget(
+        id="provider-contract", model=remote_spec.matrix.models[0].repo
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(update={"deployments": [target]}),
+            "execution": remote_spec.execution.model_copy(update={"attempts": 1}),
+        }
+    )
+    lock = build_run_lock(spec, run_id="provider-command-contract", allow_provider=True)
+    lock = lock.model_copy(
+        update={"agent": lock.agent.model_copy(update={"name": "unsupported-agent"})}
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match="request controls require the OpenClaw Harbor agent",
+    ):
+        build_harbor_trial_command(
+            lock,
+            tmp_path / "jobs",
+            "https://router.huggingface.co",
+            tmp_path / "source",
+            task_name=next(iter(lock.benchmark_task_digests)),
+        )

@@ -23,7 +23,12 @@ from harbor_hf.campaigns import (
     build_campaign_plan,
     build_wave_lock,
 )
-from harbor_hf.control import CampaignProjection, CampaignSubmittedPayload, new_event
+from harbor_hf.control import (
+    CampaignProjection,
+    CampaignSubmittedPayload,
+    ExecutionOutcomePayload,
+    new_event,
+)
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.recovery import (
@@ -554,7 +559,7 @@ def _observer_files(lock: CampaignLock, wave: WaveLock) -> dict[str, bytes]:
         "2026-07-14T01:14:00+00:00",
     )
     verification = b"{}\n"
-    failed_marker = _pretty({"message": "provider exploded"})
+    failed_marker = _pretty({"category": "transient", "message": "provider exploded"})
     return {
         f"{wave_prefix}/wave.lock.json": wave_lock_bytes,
         f"{wave_prefix}/events.jsonl": wave_events,
@@ -694,6 +699,31 @@ def test_observe_projects_exact_wave_and_execution_events(
         "retry_after_seconds": None,
         "message": "provider exploded",
     }
+
+
+def test_observer_migrates_legacy_retry_wave_trial_ids_from_execution_locks(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    wave = _wave(lock, remote_spec)
+    files = _observer_files(lock, wave)
+    wave_prefix = f"waves/{wave.wave_id}"
+    raw = wave.model_dump(mode="json")
+    raw["action_kind"] = "retry-shard"
+    raw["trial_ids"] = []
+    legacy = _pretty(raw)
+    files[f"{wave_prefix}/wave.lock.json"] = legacy
+    checksums = json.loads(files[f"{wave_prefix}/checksums.json"])
+    checksums["wave.lock.json"] = _sha(legacy)
+    files[f"{wave_prefix}/checksums.json"] = _pretty(checksums)
+
+    events = BucketCampaignObserver(_Reader(files)).observe(lock, remote_spec)
+
+    observed = [event for event in events if event.kind == "execution.completed"]
+    assert len(observed) == 1
+    payload = observed[0].payload
+    assert isinstance(payload, ExecutionOutcomePayload)
+    assert payload.trial_id == lock.runs[0].shards[0].trials[0].trial_id
 
 
 def test_observe_skips_non_terminal_units_and_handles_cleanup_failures(

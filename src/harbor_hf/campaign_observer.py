@@ -25,6 +25,7 @@ from harbor_hf.results import EvidenceReader
 from harbor_hf.wave_worker import ExecutionLock
 
 _JSON_OBJECT = TypeAdapter(dict[str, object])
+_RETRY_CATEGORY = TypeAdapter(RetryCategory)
 _TERMINAL_MARKERS = frozenset({"_SUCCESS", "_FAILED", "_CANCELLED"})
 
 
@@ -55,7 +56,7 @@ class BucketCampaignObserver:
             marker = _terminal_marker(paths, wave_prefix)
             if marker is None:
                 continue
-            wave = WaveLock.model_validate_json(self._read(spec, lock, path))
+            wave = self._load_wave_lock(spec, lock, paths, path)
             if wave.campaign_id != lock.campaign_id:
                 raise CampaignObservationError(
                     "wave evidence belongs to another campaign"
@@ -73,6 +74,56 @@ class BucketCampaignObserver:
             events.extend(_wave_events(lock, wave, marker, raw_wave_events))
             events.extend(self._execution_events(spec, lock, paths, wave))
         return sorted(events, key=lambda event: (event.observed_at, event.event_id))
+
+    def _load_wave_lock(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        paths: list[str],
+        path: str,
+    ) -> WaveLock:
+        content = self._read(spec, campaign, path)
+        try:
+            return WaveLock.model_validate_json(content)
+        except ValidationError as original:
+            raw = _JSON_OBJECT.validate_json(content)
+            if raw.get("action_kind") != "retry-shard" or raw.get("trial_ids"):
+                raise CampaignObservationError(
+                    "wave lock evidence is invalid"
+                ) from original
+            wave_id = raw.get("wave_id")
+            if not isinstance(wave_id, str):
+                raise CampaignObservationError(
+                    "wave lock evidence is invalid"
+                ) from original
+            trial_ids = self._legacy_retry_trial_ids(spec, campaign, paths, wave_id)
+            if not trial_ids:
+                raise CampaignObservationError(
+                    "legacy retry wave has no matching execution evidence"
+                ) from original
+            raw["trial_ids"] = trial_ids
+            try:
+                return WaveLock.model_validate(raw)
+            except ValidationError as error:
+                raise CampaignObservationError(
+                    "wave lock evidence is invalid"
+                ) from error
+
+    def _legacy_retry_trial_ids(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        paths: list[str],
+        wave_id: str,
+    ) -> list[str]:
+        trial_ids: set[str] = set()
+        for execution_path in _execution_lock_paths(paths):
+            execution = ExecutionLock.model_validate_json(
+                self._read(spec, campaign, execution_path)
+            )
+            if execution.wave_id == wave_id:
+                trial_ids.add(execution.trial_id)
+        return sorted(trial_ids)
 
     def _execution_events(
         self,
@@ -95,9 +146,14 @@ class BucketCampaignObserver:
             critical = {"execution.lock.json", "events.jsonl"}
             if marker == "_SUCCESS":
                 critical.add("verification.json")
+            elif marker == "_FAILED" and f"{prefix}/failure.json" in paths:
+                critical.add("failure.json")
             self._verify_critical_unit(spec, campaign, paths, prefix, critical)
             raw_events = _json_lines(
                 self._read(spec, campaign, f"{prefix}/events.jsonl")
+            )
+            failure_message, failure_category = self._failure_details(
+                spec, campaign, paths, prefix, marker
             )
             events.extend(
                 _execution_control_events(
@@ -105,25 +161,41 @@ class BucketCampaignObserver:
                     execution,
                     marker,
                     raw_events,
-                    self._failure_message(spec, campaign, prefix, marker),
+                    failure_message,
+                    failure_category,
                 )
             )
         return events
 
-    def _failure_message(
+    def _failure_details(
         self,
         spec: ExperimentSpec,
         campaign: CampaignLock,
+        paths: list[str],
         prefix: str,
         marker: str,
-    ) -> str | None:
+    ) -> tuple[str | None, RetryCategory | None]:
         if marker != "_FAILED":
-            return None
-        value = _JSON_OBJECT.validate_json(
-            self._read(spec, campaign, f"{prefix}/_FAILED")
+            return None, None
+        details_path = (
+            f"{prefix}/failure.json"
+            if f"{prefix}/failure.json" in paths
+            else f"{prefix}/_FAILED"
         )
+        value = _JSON_OBJECT.validate_json(self._read(spec, campaign, details_path))
         message = value.get("message")
-        return message if isinstance(message, str) else None
+        error_type = value.get("error_type")
+        raw_category = value.get("category")
+        if raw_category is None:
+            category = _legacy_failure_category(error_type, message)
+        else:
+            try:
+                category = _RETRY_CATEGORY.validate_python(raw_category)
+            except ValidationError as error:
+                raise CampaignObservationError(
+                    "execution failure evidence has an invalid retry category"
+                ) from error
+        return message if isinstance(message, str) else None, category
 
     def _verify_critical_unit(
         self,
@@ -319,6 +391,7 @@ def _execution_control_events(
     marker: str,
     records: list[dict[str, object]],
     message: str | None,
+    failure_category: RetryCategory | None,
 ) -> list[CampaignEvent]:
     started = _event_time(records, "execution_started")
     finished = _event_time(records, "execution_succeeded", "execution_failed")
@@ -344,7 +417,11 @@ def _execution_control_events(
         category = None
     else:
         kind = "execution.failed"
-        category = "transient"
+        if failure_category is None:
+            raise CampaignObservationError(
+                "execution failure evidence has no retry category"
+            )
+        category = failure_category
     outcome = _event(
         campaign,
         subject_type="execution",
@@ -360,6 +437,21 @@ def _execution_control_events(
         identity=f"{execution.execution_id}:{kind}",
     )
     return [start, outcome]
+
+
+def _legacy_failure_category(error_type: object, message: object) -> RetryCategory:
+    value = f"{error_type or ''} {message or ''}".lower()
+    if any(item in value for item in ("authentication", "unauthorized", "forbidden")):
+        return "authentication"
+    if "ratelimit" in value or "rate_limit" in value or "status=429" in value:
+        return "rate-limit"
+    if "quota" in value:
+        return "quota"
+    if any(item in value for item in ("timeout", "connection", "status=5")):
+        return "transient"
+    if any(item in value for item in ("configuration", "badrequest", "notfound")):
+        return "configuration"
+    return "benchmark"
 
 
 def _optional_event_time(

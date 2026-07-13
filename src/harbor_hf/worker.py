@@ -12,10 +12,13 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
+
+from pydantic import JsonValue
 
 from harbor_hf.coordination import (
     ClaimConflict,
@@ -65,6 +68,14 @@ _ENDPOINT_CALL_TIMEOUT_SECONDS = 60.0
 
 class WorkerError(RuntimeError):
     """Raised when a remote benchmark run cannot complete correctly."""
+
+
+class HarborTrialFailure(WorkerError):
+    """A Harbor result reported a typed trial or step exception."""
+
+    def __init__(self, message: str, exception_type: str) -> None:
+        super().__init__(message)
+        self.exception_type = exception_type
 
 
 class JobInspector(Protocol):
@@ -358,10 +369,59 @@ def _build_harbor_command(
     if lock.agent.revision_kind == "package":
         revision = json.dumps(lock.agent.revision, separators=(",", ":"))
         command.extend(("--agent-kwarg", f"version={revision}"))
-    for key, value in sorted(lock.agent.parameters.items()):
+    for key, value in sorted(_effective_agent_parameters(lock).items()):
         rendered = json.dumps(value, separators=(",", ":"))
         command.extend(("--agent-kwarg", f"{key}={rendered}"))
     return command
+
+
+def _effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
+    parameters = deepcopy(lock.agent.parameters)
+    target = lock.deployment
+    if not isinstance(target, ProviderTarget):
+        return parameters
+    if lock.agent.name != "openclaw":
+        raise WorkerError(
+            "Inference Provider request controls require the OpenClaw Harbor agent"
+        )
+    existing = parameters.get("openclaw_config", {})
+    if not isinstance(existing, dict):
+        raise WorkerError("OpenClaw provider configuration must be a JSON object")
+    config = deepcopy(existing)
+    models = config.setdefault("models", {})
+    if not isinstance(models, dict):
+        raise WorkerError("OpenClaw models configuration must be a JSON object")
+    providers = models.setdefault("providers", {})
+    if not isinstance(providers, dict):
+        raise WorkerError("OpenClaw provider configuration must be a JSON object")
+    provider = providers.setdefault("openai", {})
+    if not isinstance(provider, dict):
+        raise WorkerError(
+            "OpenClaw OpenAI provider configuration must be a JSON object"
+        )
+    routed_model = routed_provider_model(target)
+    request_parameters = dict(target.parameters)
+    request_parameters.update(
+        {
+            "maxRetries": target.limits.max_attempts - 1,
+            "timeoutMs": int(target.timeout_seconds * 1000),
+        }
+    )
+    provider.update(
+        {
+            "api": "openai-completions",
+            "timeoutSeconds": math.ceil(target.timeout_seconds),
+            "models": [
+                {
+                    "id": routed_model,
+                    "name": routed_model,
+                    "params": request_parameters,
+                }
+            ],
+        }
+    )
+    parameters["openclaw_config"] = config
+    return parameters
 
 
 def run_worker(
@@ -1217,9 +1277,10 @@ def validate_harbor_result(
         failure = _trial_failure(trial)
         if failure is not None:
             location, exception_type = failure
-            raise WorkerError(
-                f"Harbor trial {task_name}{location} failed with "
-                f"{exception_type or 'an exception'}"
+            rendered = str(exception_type or "an exception")
+            raise HarborTrialFailure(
+                f"Harbor trial {task_name}{location} failed with {rendered}",
+                rendered,
             )
         _validate_agent_identity(
             trial,
