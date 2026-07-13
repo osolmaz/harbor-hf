@@ -18,18 +18,31 @@ class ProcessError(RuntimeError):
 
 
 class CommandRunner(Protocol):
-    def run_json(self, command: Sequence[str]) -> dict[str, object]: ...
+    def run_json(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object]: ...
 
     def run_text(self, command: Sequence[str]) -> str: ...
 
 
 class SubprocessRunner:
-    def run_text(self, command: Sequence[str]) -> str:
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-        )
+    def run_text(
+        self, command: Sequence[str], *, timeout_seconds: float | None = None
+    ) -> str:
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ProcessError(
+                f"command timed out after {timeout_seconds:g} seconds"
+            ) from error
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise ProcessError(
@@ -37,8 +50,13 @@ class SubprocessRunner:
             )
         return completed.stdout.strip()
 
-    def run_json(self, command: Sequence[str]) -> dict[str, object]:
-        output = self.run_text(command)
+    def run_json(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object]:
+        output = self.run_text(command, timeout_seconds=timeout_seconds)
         try:
             value = json.loads(output)
         except json.JSONDecodeError as error:

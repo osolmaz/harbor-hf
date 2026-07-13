@@ -197,8 +197,11 @@ verifier command because an active streaming command does not necessarily
 refresh the Sandbox idle timer.
 
 Endpoint pause requests and status reads retry transient provider failures until
-the bounded cleanup deadline. Unexpected local errors still fail immediately,
-and an exhausted retry budget is recorded as cleanup failure.
+the bounded cleanup deadline. Each endpoint CLI call is limited to 60 seconds or
+the remaining lifecycle deadline, whichever is shorter. Unexpected local errors
+still fail immediately, and an exhausted retry budget is recorded as cleanup
+failure. When execution and cleanup both fail, evidence preserves them as
+separate failures.
 
 Before benchmark execution, the worker requires `readyReplica` to reach the
 positive `targetReplica` count and probes the `healthRoute` reported in the

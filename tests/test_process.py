@@ -28,6 +28,14 @@ def test_subprocess_runner_rejects_failed_or_invalid_commands() -> None:
         runner.run_json(["python", "-c", "print('[]')"])
 
 
+def test_subprocess_runner_enforces_command_timeout() -> None:
+    with pytest.raises(ProcessError, match="timed out after 0.05 seconds"):
+        SubprocessRunner().run_text(
+            ["python", "-c", "import time; time.sleep(60)"],
+            timeout_seconds=0.05,
+        )
+
+
 def test_streaming_runner_captures_combined_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

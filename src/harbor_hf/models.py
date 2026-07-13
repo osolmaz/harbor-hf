@@ -8,6 +8,16 @@ from harbor_hf.evidence import is_sensitive_key
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
+GitHubRepository = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^(?:https://github\.com/)?"
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+            r"[A-Za-z0-9_.-]+(?:\.git)?$"
+        )
+    ),
+]
 _CONTROLLER_HEADROOM_SECONDS = 4800
 
 
@@ -161,7 +171,7 @@ class RemoteJobSpec(StrictModel):
 
 
 class SourcePin(StrictModel):
-    repository: str = Field(min_length=1)
+    repository: GitHubRepository
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 

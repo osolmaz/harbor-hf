@@ -10,6 +10,7 @@ from harbor_hf.models import (
     EngineSpec,
     ExperimentSpec,
     RemoteJobSpec,
+    SourcePin,
 )
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
@@ -79,6 +80,23 @@ def test_remote_job_timeout_reserves_controller_lifecycle_headroom(
 def test_remote_job_image_requires_immutable_digest() -> None:
     with pytest.raises(ValueError, match="String should match pattern"):
         RemoteJobSpec(namespace="org", image="registry/controller:latest")
+
+
+@pytest.mark.parametrize(
+    "repository",
+    ["org/repo", "https://github.com/org/repo", "https://github.com/org/repo.git"],
+)
+def test_source_pin_accepts_supported_github_repositories(repository: str) -> None:
+    assert SourcePin(repository=repository, revision="0" * 40).repository == repository
+
+
+@pytest.mark.parametrize(
+    "repository",
+    ["", "https://gitlab.com/org/repo", "git@github.com:org/repo.git", "org/repo/x"],
+)
+def test_source_pin_rejects_unsupported_repositories(repository: str) -> None:
+    with pytest.raises(ValueError, match="String should match pattern"):
+        SourcePin(repository=repository, revision="0" * 40)
 
 
 @pytest.mark.parametrize("task_names", [[], [""], ["same", "same"]])

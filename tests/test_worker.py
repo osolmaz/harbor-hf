@@ -65,9 +65,16 @@ class EndpointRunner:
     def __init__(self, descriptions: list[dict[str, object]]) -> None:
         self.descriptions = descriptions
         self.commands: list[list[str]] = []
+        self.timeouts: list[float | None] = []
 
-    def run_json(self, command: Sequence[str]) -> dict[str, object]:
+    def run_json(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object]:
         self.commands.append(list(command))
+        self.timeouts.append(timeout_seconds)
         operation = command[2]
         if operation == "describe":
             return self.descriptions.pop(0)
@@ -78,11 +85,17 @@ class EndpointRunner:
 
 
 class CleanupFailureRunner(EndpointRunner):
-    def run_json(self, command: Sequence[str]) -> dict[str, object]:
+    def run_json(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object]:
         if command[2] == "pause":
             self.commands.append(list(command))
+            self.timeouts.append(timeout_seconds)
             raise RuntimeError("pause failed with test-token")
-        return super().run_json(command)
+        return super().run_json(command, timeout_seconds=timeout_seconds)
 
 
 def _prepare_source(
@@ -142,6 +155,7 @@ def test_endpoint_lifecycle_and_status() -> None:
         ]
         for operation in ("resume", "describe", "pause", "describe")
     ]
+    assert all(timeout is not None and 0 < timeout <= 60 for timeout in runner.timeouts)
 
 
 def test_readiness_timeout() -> None:
@@ -160,7 +174,7 @@ def test_readiness_timeout() -> None:
 
 def test_endpoint_waits_through_transitional_states() -> None:
     sleeps: list[float] = []
-    times = iter([0.0, 1.0, 2.0, 3.0])
+    times = iter(float(value) for value in range(9))
     runner = EndpointRunner(
         [
             snapshot("initializing", 0),
@@ -274,7 +288,12 @@ def test_prepare_locked_source_checks_out_revision_and_requires_lock(
                 )
             return ""
 
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             raise AssertionError(command)
 
     runner = SourceRunner()
@@ -326,7 +345,12 @@ def test_prepare_locked_source_rejects_checkout_without_lock(
             destination.mkdir(parents=True, exist_ok=True)
             return ""
 
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             raise AssertionError(command)
 
     with pytest.raises(WorkerError, match="pinned source checkout has no uv.lock"):
@@ -351,7 +375,12 @@ def test_prepare_locked_source_requires_hf_sandbox_extra(
                 )
             return ""
 
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             raise AssertionError(command)
 
     with pytest.raises(
@@ -379,7 +408,12 @@ def test_prepare_locked_source_rejects_malformed_project_metadata(
                 )
             return ""
 
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             raise AssertionError(command)
 
     with pytest.raises(
@@ -403,7 +437,12 @@ def test_prepare_locked_source_requires_pyproject(
                 (destination / "uv.lock").write_text("", encoding="utf-8")
             return ""
 
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             raise AssertionError(command)
 
     with pytest.raises(
@@ -860,7 +899,7 @@ def test_job_stage_rejects_invalid_value() -> None:
 
 
 def test_cleanup_timeout() -> None:
-    times = iter([0.0, 2.0])
+    times = iter([0.0, 0.25, 0.5, 2.0])
     manager = EndpointManager(
         "org",
         "endpoint",
@@ -879,7 +918,12 @@ def test_cleanup_retries_transient_pause_and_describe_failures() -> None:
             self.commands: list[list[str]] = []
             self.attempts = {"pause": 0, "describe": 0}
 
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             self.commands.append(list(command))
             operation = command[2]
             self.attempts[operation] += 1
@@ -892,7 +936,7 @@ def test_cleanup_retries_transient_pause_and_describe_failures() -> None:
 
     runner = TransientRunner()
     sleeps: list[float] = []
-    times = iter([0.0, 1.0])
+    times = iter([0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
     manager = EndpointManager(
         "org",
         "endpoint",
@@ -912,7 +956,12 @@ def test_cleanup_retries_transient_pause_and_describe_failures() -> None:
 
 def test_cleanup_poll_recovers_ambiguous_pause_request() -> None:
     class AmbiguousPauseRunner:
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             if command[2] == "pause":
                 raise ProcessError("pause response was lost")
             return snapshot("pausing", 1)
@@ -934,7 +983,12 @@ def test_cleanup_poll_recovers_ambiguous_pause_request() -> None:
 
 def test_cleanup_poll_reports_transient_describe_failure() -> None:
     class DescribeFailureRunner:
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             if command[2] == "describe":
                 raise ProcessError("describe unavailable")
             return snapshot("pausing", 1)
@@ -957,13 +1011,18 @@ def test_cleanup_poll_reports_transient_describe_failure() -> None:
 
 def test_cleanup_timeout_reports_last_transient_provider_error() -> None:
     class UnavailableRunner:
-        def run_json(self, command: Sequence[str]) -> dict[str, object]:
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
             raise ProcessError(f"{command[2]} unavailable")
 
         def run_text(self, command: Sequence[str]) -> str:
             raise AssertionError(command)
 
-    times = iter([0.0, 2.0])
+    times = iter([0.0, 0.25, 0.5, 2.0])
     manager = EndpointManager(
         "org",
         "endpoint",
@@ -2221,6 +2280,59 @@ def test_cleanup_failure_prevents_success_and_redacts_failure(
         {"event": "run_failed", "error_type": "RuntimeError"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
     ]
+
+
+def test_worker_preserves_execution_and_cleanup_failures(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="execution-and-cleanup-failed")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime",
+        lambda _url, _token, _health_route: {"probes": {}},
+    )
+    runner = CleanupFailureRunner([snapshot("running", 1)])
+
+    with pytest.raises(
+        WorkerError,
+        match=(
+            r"^Harbor exited with status 7; endpoint cleanup failed: "
+            r"pause failed with \[REDACTED\]$"
+        ),
+    ):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            stream_runner=lambda *_args, **_kwargs: 7,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
+            lease_validator=_validate_lease,
+        )
+
+    root = tmp_path / "output" / lock.artifact_prefix
+    assert json.loads((root / "_FAILED").read_text()) == {
+        "error_type": "WorkerError",
+        "message": "Harbor exited with status 7",
+        "cleanup_error": {
+            "error_type": "RuntimeError",
+            "message": "pause failed with [REDACTED]",
+        },
+    }
+    events = [
+        json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()
+    ]
+    assert {key: value for key, value in events[-1].items() if key != "at"} == {
+        "event": "run_failed",
+        "error_type": "WorkerError",
+        "cleanup_error_type": "RuntimeError",
+    }
 
 
 def test_worker_rejects_mismatched_lock_before_remote_work(

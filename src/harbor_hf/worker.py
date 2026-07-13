@@ -45,6 +45,7 @@ from harbor_hf.submission import (
 
 _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
 _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
+_ENDPOINT_CALL_TIMEOUT_SECONDS = 60.0
 
 
 class WorkerError(RuntimeError):
@@ -91,21 +92,36 @@ class EndpointManager:
         self.sleep = sleep
         self.monotonic = monotonic
 
-    def describe(self) -> dict[str, object]:
-        return self.runner.run_json(self._command("describe"))
+    def describe(
+        self, timeout_seconds: float = _ENDPOINT_CALL_TIMEOUT_SECONDS
+    ) -> dict[str, object]:
+        return self.runner.run_json(
+            self._command("describe"), timeout_seconds=timeout_seconds
+        )
 
-    def resume(self) -> dict[str, object]:
-        return self.runner.run_json(self._command("resume"))
+    def resume(
+        self, timeout_seconds: float = _ENDPOINT_CALL_TIMEOUT_SECONDS
+    ) -> dict[str, object]:
+        return self.runner.run_json(
+            self._command("resume"), timeout_seconds=timeout_seconds
+        )
 
-    def pause(self) -> dict[str, object]:
-        return self.runner.run_json(self._command("pause"))
+    def pause(
+        self, timeout_seconds: float = _ENDPOINT_CALL_TIMEOUT_SECONDS
+    ) -> dict[str, object]:
+        return self.runner.run_json(
+            self._command("pause"), timeout_seconds=timeout_seconds
+        )
 
     def wait_ready(
         self, timeout_seconds: int, poll_seconds: float = 15
     ) -> dict[str, object]:
         deadline = self.monotonic() + timeout_seconds
         while True:
-            snapshot = self.describe()
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise WorkerError("endpoint readiness timed out before status check")
+            snapshot = self.describe(min(_ENDPOINT_CALL_TIMEOUT_SECONDS, remaining))
             state, ready, target = endpoint_state(snapshot)
             if state == "running" and target > 0 and ready >= target:
                 return snapshot
@@ -126,7 +142,7 @@ class EndpointManager:
         ready = -1
         while True:
             pause_accepted, snapshot, state, ready, transient_error = self._poll_pause(
-                pause_accepted
+                pause_accepted, deadline
             )
             last_transient_error = transient_error or last_transient_error
             if snapshot is not None and state == "paused" and ready == 0:
@@ -143,23 +159,29 @@ class EndpointManager:
             self.sleep(poll_seconds)
 
     def _poll_pause(
-        self, pause_accepted: bool
+        self, pause_accepted: bool, deadline: float | None = None
     ) -> tuple[bool, dict[str, object] | None, str, int, ProcessError | None]:
         transient_error: ProcessError | None = None
         if not pause_accepted:
             try:
-                self.pause()
+                self.pause(self._operation_timeout(deadline))
                 pause_accepted = True
             except ProcessError as caught:
                 transient_error = caught
         try:
-            snapshot = self.describe()
+            snapshot = self.describe(self._operation_timeout(deadline))
         except ProcessError as caught:
             return pause_accepted, None, "unknown", -1, caught
         state, ready, _ = endpoint_state(snapshot)
         if state in {"pausing", "paused"}:
             pause_accepted = True
         return pause_accepted, snapshot, state, ready, transient_error
+
+    def _operation_timeout(self, deadline: float | None) -> float:
+        if deadline is None:
+            return _ENDPOINT_CALL_TIMEOUT_SECONDS
+        remaining = deadline - self.monotonic()
+        return max(0.001, min(_ENDPOINT_CALL_TIMEOUT_SECONDS, remaining))
 
     def _command(self, operation: str) -> list[str]:
         return [
@@ -401,31 +423,46 @@ def _run_staged_worker(
         _publish_evidence(root, destination)
         return destination
 
-    failure = cleanup_error or error
-    assert failure is not None, "failed run has no recorded error"
-    failure_message = str(failure).replace(token, "[REDACTED]")
-    append_event(
-        events,
-        "run_failed",
-        error_type=type(failure).__name__,
+    failure, failure_record, failure_event, reported_message = _failure_details(
+        error, cleanup_error, token
     )
-    write_json(
-        root / "_FAILED",
-        {
-            "error_type": type(failure).__name__,
-            "message": failure_message,
-        },
-    )
+    append_event(events, "run_failed", **failure_event)
+    write_json(root / "_FAILED", failure_record)
     try:
         _finalize_evidence(root, token)
     except Exception as caught:
         finalization_message = str(caught).replace(token, "[REDACTED]")
         message = (
-            f"{failure_message}; evidence finalization failed: {finalization_message}"
+            f"{reported_message}; evidence finalization failed: {finalization_message}"
         )
         raise WorkerError(message) from caught
     _publish_evidence(root, destination)
-    raise WorkerError(failure_message) from failure
+    raise WorkerError(reported_message) from failure
+
+
+def _failure_details(
+    error: Exception | None,
+    cleanup_error: Exception | None,
+    token: str,
+) -> tuple[Exception, dict[str, object], dict[str, str], str]:
+    failure = error or cleanup_error
+    assert failure is not None, "failed run has no recorded error"
+    failure_message = str(failure).replace(token, "[REDACTED]")
+    record: dict[str, object] = {
+        "error_type": type(failure).__name__,
+        "message": failure_message,
+    }
+    event = {"error_type": type(failure).__name__}
+    reported_message = failure_message
+    if error is not None and cleanup_error is not None:
+        cleanup_message = str(cleanup_error).replace(token, "[REDACTED]")
+        record["cleanup_error"] = {
+            "error_type": type(cleanup_error).__name__,
+            "message": cleanup_message,
+        }
+        event["cleanup_error_type"] = type(cleanup_error).__name__
+        reported_message += f"; endpoint cleanup failed: {cleanup_message}"
+    return failure, record, event, reported_message
 
 
 def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:

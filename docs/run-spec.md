@@ -165,7 +165,9 @@ without putting a token value in the command. `remote.worker` pins this package
 to an exact GitHub commit. `remote.harbor.source` likewise pins Harbor to an
 exact GitHub commit and configures the HF Sandbox flavor and idle timeout.
 Source revisions must be full lowercase 40-character Git commit IDs. The
-controller checks out both revisions directly and runs them with `uv --locked`;
+current source transport accepts GitHub `owner/name` references or HTTPS GitHub
+URLs. The controller checks out both revisions directly and runs them with
+`uv --locked`;
 missing or stale lock files fail before endpoint-backed benchmark execution
 begins. The pinned Harbor revision must expose the `hf-sandbox` optional
 dependency; the worker verifies that capability before it resumes the endpoint.
