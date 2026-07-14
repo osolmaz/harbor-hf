@@ -354,6 +354,31 @@ def test_cancellation_at_every_wave_phase_is_cleanup_first(
     )
 
 
+def test_cancellation_terminalizes_drained_retry_wait_trials(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+
+    projection, plan = plan_reconciliation(
+        lock,
+        [submitted, *failed, _cancel_event(lock, sequence=4)],
+    )
+
+    assert projection.counts.retrying == 1
+    assert [action.kind for action in plan.actions] == ["publish-summary"]
+    assert plan.terminal_decision is not None
+    assert plan.terminal_decision.status == "cancelled"
+    assert plan.terminal_decision.counts.retrying == 0
+    assert plan.terminal_decision.counts.cancelled == len(projection.trials)
+
+
 def test_active_execution_is_cancelled_before_wave_cleanup(
     remote_spec: ExperimentSpec,
 ) -> None:

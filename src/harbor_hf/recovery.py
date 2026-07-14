@@ -705,7 +705,8 @@ def _terminal_decision(
     decision_counts = _terminal_counts(campaign, counts)
     cancelling = campaign.status in {"cancel_requested", "draining"}
     if not all(
-        trial.status in _TERMINAL_STATUSES or (cancelling and trial.status == "planned")
+        trial.status in _TERMINAL_STATUSES
+        or (cancelling and trial.status in {"planned", "retry_wait"})
         for trial in trials.values()
     ):
         return None
@@ -735,7 +736,11 @@ def _terminal_counts(
     if campaign.status not in {"cancel_requested", "draining"}:
         return counts
     return counts.model_copy(
-        update={"planned": 0, "cancelled": counts.cancelled + counts.planned}
+        update={
+            "planned": 0,
+            "retrying": 0,
+            "cancelled": counts.cancelled + counts.planned + counts.retrying,
+        }
     )
 
 
