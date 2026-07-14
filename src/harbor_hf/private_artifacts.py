@@ -205,7 +205,7 @@ def build_private_artifact_manifest(
         if entry.kind == "session" and entry.path.endswith(".jsonl")
     ]
     required = (
-        _openclaw_execution_started(root)
+        openclaw_execution_started(root)
         if session_required is None
         else session_required
     )
@@ -365,7 +365,7 @@ def _trim_bundle(
     return rejected
 
 
-def _openclaw_execution_started(root: Path) -> bool:
+def openclaw_execution_started(root: Path, *, fallback_attempted: bool = False) -> bool:
     readable_result_found = False
     for result_path in _trial_result_paths(root):
         try:
@@ -383,7 +383,7 @@ def _openclaw_execution_started(root: Path) -> bool:
             return True
     if readable_result_found:
         return False
-    return openclaw_execution_was_attempted(root)
+    return fallback_attempted or openclaw_execution_was_attempted(root)
 
 
 def _trial_result_paths(root: Path) -> list[Path]:

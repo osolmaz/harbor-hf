@@ -68,6 +68,7 @@ from harbor_hf.models import (
 from harbor_hf.planner import experiment_digest
 from harbor_hf.private_artifacts import (
     build_private_artifact_manifest,
+    openclaw_execution_started,
     openclaw_execution_was_attempted,
     sanitize_private_artifact_symlinks,
     sanitize_private_artifact_tree,
@@ -1168,8 +1169,8 @@ def require_executable(name: str) -> None:
 def _finalize_evidence(root: Path, token: str) -> None:
     failed = (root / "_FAILED").is_file()
     if failed:
-        _sanitize_direct_trial_artifacts(root)
         sanitize_private_artifact_symlinks(root)
+        _sanitize_direct_trial_artifacts(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
         append_event(
@@ -1212,8 +1213,8 @@ def _write_direct_private_artifact_manifests(
             strict_session=strict_session,
             execution_id=lock.run_id,
             trial_id=trial_root.name,
-            session_required=(
-                None if (trial_root / "result.json").is_file() else attempted
+            session_required=openclaw_execution_started(
+                trial_root, fallback_attempted=attempted
             ),
         )
 
@@ -1234,11 +1235,21 @@ def _sanitize_direct_trial_artifacts(root: Path) -> None:
 
 
 def _direct_trial_roots(root: Path) -> list[Path]:
-    return [
-        path
-        for path in sorted((root / "harbor-jobs").glob("*/*"))
-        if not path.is_symlink() and path.is_dir()
-    ]
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        return []
+    resolved_jobs_root = jobs_root.resolve()
+    trials: list[Path] = []
+    for job_root in sorted(jobs_root.iterdir()):
+        if job_root.is_symlink() or not job_root.is_dir():
+            continue
+        for trial_root in sorted(job_root.iterdir()):
+            if trial_root.is_symlink() or not trial_root.is_dir():
+                continue
+            if not trial_root.resolve().is_relative_to(resolved_jobs_root):
+                raise WorkerError("direct trial root escapes Harbor jobs directory")
+            trials.append(trial_root)
+    return trials
 
 
 def controller_environment(lock: RunLock) -> dict[str, object]:

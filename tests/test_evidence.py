@@ -182,12 +182,22 @@ def test_archive_is_deterministic_and_preserves_relative_tree(tmp_path: Path) ->
     second = tmp_path / "second.tar.gz"
 
     archive_directory(source, first)
+    source.chmod(0o700)
+    nested.chmod(0o700)
+    artifact.chmod(0o600)
     artifact.touch()
     archive_directory(source, second)
 
     assert first.read_bytes() == second.read_bytes()
     with tarfile.open(first, "r:gz") as archive:
         assert "harbor-jobs/job/trial/session.jsonl" in archive.getnames()
+        modes = {member.name: member.mode for member in archive.getmembers()}
+    assert modes == {
+        "harbor-jobs": 0o755,
+        "harbor-jobs/job": 0o755,
+        "harbor-jobs/job/trial": 0o755,
+        "harbor-jobs/job/trial/session.jsonl": 0o644,
+    }
 
 
 def test_secret_scrubbing_streams_across_chunk_boundaries(

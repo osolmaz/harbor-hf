@@ -2563,6 +2563,20 @@ def test_failed_direct_run_sanitizes_each_trial_independently(
     assert seen == [first, second]
 
 
+def test_failed_direct_run_does_not_follow_symlinked_job_root(tmp_path: Path) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.mkdir()
+    outside_trial = tmp_path / "outside" / "trial"
+    outside_trial.mkdir(parents=True)
+    outside_artifact = outside_trial / "large.log"
+    outside_artifact.write_bytes(b"x" * 1024)
+    (jobs / "linked-job").symlink_to(outside_trial.parent, target_is_directory=True)
+
+    _sanitize_direct_trial_artifacts(tmp_path)
+
+    assert outside_artifact.read_bytes() == b"x" * 1024
+
+
 def test_publish_evidence_requires_one_terminal_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

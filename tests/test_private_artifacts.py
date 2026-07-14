@@ -10,6 +10,7 @@ from harbor_hf.private_artifacts import (
     PrivateArtifactEntry,
     PrivateArtifactManifest,
     build_private_artifact_manifest,
+    openclaw_execution_started,
     sanitize_private_artifact_tree,
     write_private_artifact_manifest,
 )
@@ -136,6 +137,14 @@ def test_started_harbor_openclaw_request_requires_session_without_result(
 
     with pytest.raises(RuntimeError, match="no session JSONL"):
         build_private_artifact_manifest(root, strict_session=True)
+
+
+def test_malformed_result_uses_explicit_attempted_fallback(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path, started=False, with_session=False)
+    result_path = root / "harbor-jobs" / "job-one" / "trial-one" / "result.json"
+    result_path.write_text("{", encoding="utf-8")
+
+    assert openclaw_execution_started(root, fallback_attempted=True) is True
 
 
 def test_private_manifest_sorts_serialized_relative_paths(tmp_path: Path) -> None:
