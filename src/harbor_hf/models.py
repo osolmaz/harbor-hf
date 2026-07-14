@@ -101,8 +101,13 @@ class BenchmarkJudgeSpec(StrictModel):
             or value.password
             or value.query is not None
             or value.fragment is not None
+            or value.host != "router.huggingface.co"
+            or value.port != 443
         ):
-            raise ValueError("benchmark judge API URL must be credential-free HTTPS")
+            raise ValueError(
+                "benchmark judge API URL must be credential-free HTTPS on the "
+                "trusted Hugging Face router"
+            )
         return value
 
     @field_validator("model")

@@ -111,6 +111,23 @@ def test_openclaw_terminal_transport_log_makes_wrapped_exit_retryable(
     )
 
 
+def test_openclaw_structured_transport_timeout_is_retryable(tmp_path: Path) -> None:
+    log = tmp_path / "harbor-jobs" / "job" / "trial" / "agent" / "openclaw.txt"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "[provider-transport-fetch] [model-fetch] response provider=openai "
+        "status=503 elapsedMs=2363 contentType=application/json\n"
+        "FailoverError: LLM request timed out.\n",
+        encoding="utf-8",
+    )
+    error = HarborTrialFailure("agent failed", "NonZeroAgentExitCodeError")
+
+    assert (
+        _execution_failure_category(error, "execution", evidence_root=tmp_path)
+        == "transient"
+    )
+
+
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
     tmp_path: Path,
 ) -> None:

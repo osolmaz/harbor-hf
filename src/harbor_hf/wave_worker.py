@@ -1001,8 +1001,15 @@ def _openclaw_log_failure_category(log_path: Path) -> RetryCategory | None:
     try:
         with log_path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
-                if "FailoverError: HTTP " in line:
-                    return _retry_category_from_text(line.lower())
+                stripped = line.strip()
+                if stripped.startswith(
+                    "[provider-transport-fetch] [model-fetch] response "
+                ) or stripped.startswith("FailoverError: HTTP "):
+                    category = _retry_category_from_text(stripped.lower())
+                    if category is not None:
+                        return category
+                if stripped == "FailoverError: LLM request timed out.":
+                    return "transient"
     except OSError:
         return None
     return None

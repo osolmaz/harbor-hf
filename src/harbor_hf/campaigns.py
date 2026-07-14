@@ -328,6 +328,8 @@ def build_campaign_plan(
     }
     if spec.benchmark.source is not None:
         plan_payload["benchmark_source"] = spec.benchmark.source.model_dump(mode="json")
+    if spec.benchmark.judge is not None:
+        plan_payload["benchmark_judge"] = spec.benchmark.judge.model_dump(mode="json")
     return CampaignPlan(
         experiment=spec.metadata.name,
         manifest_digest=experiment_digest(spec),

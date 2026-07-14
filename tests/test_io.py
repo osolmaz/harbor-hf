@@ -204,6 +204,8 @@ def test_benchmark_judge_round_trips_without_a_credential() -> None:
         "https://credential@router.example/v1/chat/completions",
         "https://router.example/v1/chat/completions?api_key=secret",
         "https://router.example/v1/chat/completions#token=secret",
+        "https://api.example.com/v1/chat/completions",
+        "https://router.huggingface.co:8443/v1/chat/completions",
     ],
 )
 def test_benchmark_judge_requires_secure_credential_free_url(api_url: str) -> None:
