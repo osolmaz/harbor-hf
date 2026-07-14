@@ -11,7 +11,7 @@ from harbor_hf.models import (
     _validate_task_pins,
 )
 from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.runs import build_run_lock
+from harbor_hf.runs import build_run_lock, harbor_process_environment
 
 NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 
@@ -57,6 +57,32 @@ def test_build_run_lock_preserves_git_benchmark_source(
 
     assert lock.benchmark_source == source
     assert lock.benchmark_dataset_digest == spec.benchmark.dataset_digest
+
+
+def test_run_lock_preserves_and_renders_hosted_judge(
+    remote_spec: ExperimentSpec,
+) -> None:
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["judge"] = {
+        "api_url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "deepseek-ai/DeepSeek-V3.2",
+    }
+    spec = ExperimentSpec.model_validate(raw)
+
+    lock = build_run_lock(spec, run_id="judge-lock")
+    environment = harbor_process_environment(
+        lock, token="secret-token", inference_base_url="https://endpoint.example/"
+    )
+
+    assert lock.benchmark_judge == spec.benchmark.judge
+    assert environment == {
+        "AGENT_JUDGE_API_KEY": "secret-token",
+        "AGENT_JUDGE_API_URL": "https://router.huggingface.co/v1/chat/completions",
+        "AGENT_JUDGE_MODEL": "deepseek-ai/DeepSeek-V3.2",
+        "HF_TOKEN": "secret-token",
+        "OPENAI_API_KEY": "secret-token",
+        "OPENAI_BASE_URL": "https://endpoint.example/v1",
+    }
 
 
 def test_run_id_override_is_preserved(remote_spec: ExperimentSpec) -> None:
