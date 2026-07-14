@@ -268,6 +268,22 @@ def test_command_preserves_an_existing_content_addressed_dataset(
     ]
 
 
+def test_command_resolves_wildcard_task_digests(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _contract_lock(remote_spec).model_copy(update={"benchmark_tasks": ["*"]})
+
+    build_harbor_command(
+        lock,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        tmp_path / "source",
+    )
+
+    config = json.loads((tmp_path / "harbor-job.json").read_text())
+    assert config["datasets"][0]["task_names"] == ["*"]
+
+
 def test_command_rejects_an_invalid_locked_dataset_digest(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

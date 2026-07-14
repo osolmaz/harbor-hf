@@ -148,6 +148,21 @@ def test_request_digest_rejects_tampering(
         HarborExecutionRequest.model_validate(value)
 
 
+def test_adapter_models_reject_unknown_schema_versions(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    _, request = _request(remote_spec, tmp_path)
+    request_value = request.model_dump(mode="json")
+    request_value["schema_version"] = "harbor-hf/harbor-execution-request/v2"
+    bundle_value = _bundle(request).model_dump(mode="json")
+    bundle_value["schema_version"] = "harbor-hf/harbor-compatibility/v2"
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        HarborExecutionRequest.model_validate(request_value)
+    with pytest.raises(ValidationError, match="schema_version"):
+        HarborCompatibilityBundle.model_validate(bundle_value)
+
+
 def test_typed_bundle_preserves_existing_verification_result(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

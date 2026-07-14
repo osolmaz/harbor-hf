@@ -358,7 +358,9 @@ def _build_harbor_command(
         attempts=attempts,
         concurrency=concurrency,
         expected_task_digests={
-            task: lock.benchmark_task_digests[task] for task in task_names
+            task: digest
+            for task, digest in lock.benchmark_task_digests.items()
+            if any(fnmatch(task, selector) for selector in task_names)
         },
     )
     config_path = jobs_dir.parent / "harbor-job.json"

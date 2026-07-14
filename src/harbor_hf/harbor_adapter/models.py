@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
@@ -40,7 +40,9 @@ class HarborVerificationPolicy(FrozenModel):
 
 
 class HarborExecutionRequest(FrozenModel):
-    schema_version: str = "harbor-hf/harbor-execution-request/v1alpha1"
+    schema_version: Literal["harbor-hf/harbor-execution-request/v1alpha1"] = (
+        "harbor-hf/harbor-execution-request/v1alpha1"
+    )
     harbor_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     harbor_config: dict[str, JsonValue]
     harbor_config_digest: Sha256Digest
@@ -128,7 +130,9 @@ class HarborCompatibilityJob(FrozenModel):
 
 
 class HarborCompatibilityBundle(FrozenModel):
-    schema_version: str = "harbor-hf/harbor-compatibility/v1alpha1"
+    schema_version: Literal["harbor-hf/harbor-compatibility/v1alpha1"] = (
+        "harbor-hf/harbor-compatibility/v1alpha1"
+    )
     harbor_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     harbor_version: str = Field(min_length=1)
     request_digest: Sha256Digest
