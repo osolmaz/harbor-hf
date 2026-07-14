@@ -12,7 +12,8 @@ kind: Experiment
 metadata:
   name: example
 benchmark:
-  dataset: terminal-bench@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  dataset: harbor/terminal-bench@2.0
+  dataset_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
   task_names: [example-task]
   task_digests:
     example-task: sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -79,18 +80,26 @@ hyphens. `metadata.labels` is optional non-executing metadata.
 
 ### Benchmark
 
-`benchmark.dataset` is a Harbor dataset reference. Remote runs require its
-immutable `@sha256:<64 hex>` form. `task_names` defaults to `["*"]` and remains
-the selection passed to Harbor. `task_digests` enumerates the complete resolved
-selection as task name to content digest. Every selection must match at least
-one pinned task, and every pinned task must match a selection. A task content
-digest covers its instructions, environment, verifier, and other task files.
+`benchmark.dataset` is a qualified Harbor package reference in `org/name` or
+`org/name@ref` form. Remote runs require `dataset_digest`; the worker replaces a
+mutable ref with `@sha256:<64 hex>` before invoking Harbor. An already
+content-addressed reference remains valid and may omit `dataset_digest`, which
+is inferred from the reference. If both forms contain a digest, they must match.
+Legacy unqualified dataset names cannot be resolved by Harbor's package digest
+lookup and are rejected for remote runs. `task_names` defaults to `["*"]` and
+remains the selection passed to Harbor. `task_digests` enumerates the complete
+resolved selection as task name to content digest. Every selection must match
+at least one pinned task, and every pinned task must match a selection. A task
+content digest covers its instructions, environment, verifier, and other task
+files.
 
 ### Matrix
 
-The initial alpha format takes the Cartesian product of `models`, `deployments`,
-and `agents`. IDs must be unique within each dimension. A future format may add
-explicit inclusion and exclusion rules without changing the resolved run model.
+The initial candidate set is the Cartesian product of `models`, `deployments`,
+and `agents`. IDs must be unique within each dimension. Optional `include` rules
+keep cells that match at least one rule, then `exclude` rules remove matching
+cells. Omitted dimensions in a rule are wildcards. Rules use exact profile IDs,
+reject unknown IDs, and may not remove every cell.
 
 Remote model revisions must be full 40-character commit IDs, and serving images
 must use `@sha256:<64 hex>` content digests. `weights.format` describes the
@@ -124,22 +133,40 @@ such as prefix caching, speculation or MTP, CUDA graphs, attention backend, and
 MoE backend. Values observed after startup are stored separately from requested
 values so a provider default cannot silently change the run definition.
 
-The current `v1alpha1` deployment shape represents Hugging Face Inference
-Endpoints. vLLM and llama.cpp are independent engine choices within that
-endpoint type. A planned discriminated Inference Providers profile will cover
-models that are too large or expensive to host on a dedicated endpoint; it will
-not require or imply a particular serving engine. Until that profile is
-implemented, provider-routed manifests are rejected rather than silently
-treated as endpoint deployments.
+Inference Provider requests identify a model repository, but the provider API
+does not expose or accept a Hub commit for the weights it serves. The locked
+model profile still preserves the selected repository revision for source
+metadata. Published provider rows set `model_revision` to `not_observed` rather
+than claiming that revision was served. Endpoint-backed rows use the revision
+verified in the endpoint configuration. Do not treat provider runs as
+revision-equivalent when the published value is `not_observed`.
+
+Provider `limits.max_spend_usd` and `limits.estimated_wave_cost_usd` must be
+configured together. The estimate is a conservative admission reservation for
+one deployment wave, must not exceed the cap, and is preserved in the campaign
+and wave locks. It remains charged after closure when provider billing is not
+attributable, so missing observations cannot reopen spent budget. It is not
+presented as observed provider billing. Provider
+`limits.max_attempts` is a hard forwarding limit for identical requests within
+one logical trial, not only an evidence label. Independent trials have separate
+retry budgets even when their request payloads are identical.
+
+The endpoint deployment shape supports independent engines such as vLLM and
+llama.cpp. The discriminated Inference Provider profile covers models that are
+too large or expensive to host on a dedicated endpoint without requiring or
+implying a particular serving engine.
 
 ### Execution
 
 `attempts` counts independent logical attempts. Infrastructure retries do not
 consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
-provider request concurrency is part of the deployment profile. Timeout values
-are in seconds. `timeout_seconds` is a wall-clock limit for Harbor execution;
-on expiry, the controller terminates the Harbor process group and immediately
-enters verified endpoint cleanup.
+`max_trials_per_shard` deterministically bounds the number of task-attempt pairs
+in one campaign shard and defaults to 64. `max_shards_per_wave` bounds compatible
+shards assigned under one endpoint startup and defaults to 8. Provider request
+concurrency is part of the deployment profile. Timeout values are in seconds.
+`timeout_seconds` is a wall-clock limit for Harbor execution; on expiry, the
+controller terminates the Harbor process group and immediately enters verified
+endpoint cleanup.
 
 Every task selected by `benchmark.task_names` is passed to Harbor. The resolved
 `task_digests` map gives exact and glob selections a deterministic trial count.
@@ -162,7 +189,9 @@ must equal `remote.harbor.source.revision`, no package version is passed, and
 ### Publishing
 
 `publishing.dataset` identifies the versioned, benchmark-specific publication.
-`index_dataset` optionally identifies the global run catalog.
+`index_dataset` identifies the global run catalog. Single-run planning can omit
+it, but campaign submission requires it because completed campaigns publish
+their normalized result and index atomically.
 
 ### Remote Execution
 
@@ -232,8 +261,10 @@ the finalized, scrubbed tree is copied to its reserved Bucket prefix, and the
 root terminal marker is copied last. Nested task markers are preserved. If the
 controller is killed before finalization, raw sessions and logs disappear with
 the Job instead of remaining in the bucket. Submission queries both the
-configured artifact Bucket and Hugging Face's implicit `jobs-artifacts` input
-Bucket and refuses to start a Job unless both are private.
+configured artifact Bucket and the managed `jobs-artifacts` input Bucket and
+refuses to start a Job unless both are private. It uploads manifests and locks
+under a content-addressed Job input prefix and mounts that exact Bucket
+subdirectory read-only.
 
 ## Loading And Resolution
 
@@ -242,6 +273,13 @@ computes a digest from canonical JSON. Remote validation and submission reject
 mutable dataset, task, model, serving-image, source, and agent references. The
 caller resolves them before submission; the separate lock preserves the exact
 selected matrix cell without rewriting the requested document.
+
+Campaign planning additionally sorts resolved cells and tasks, creates one
+logical trial per task and requested attempt, splits those trials into bounded
+shards, and content-addresses every cell and shard. The campaign plan digest is
+derived from resolved execution semantics; the separate manifest digest still
+identifies the exact requested document. Reordering equivalent profile lists or
+task-digest mappings therefore does not change the campaign plan digest.
 
 Every submitted run writes `manifest.yaml`, `run.lock.json`,
 `endpoint.snapshot.json`, and `runtime-environment.json`. Provider-backed runs

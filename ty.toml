@@ -5,10 +5,11 @@ error-on-warning = true
 respect-type-ignore-comments = false
 
 [environment]
+extra-paths = ["space"]
 python = ".venv"
 
 [src]
-include = ["src/harbor_hf", "tests", "scripts"]
+include = ["src/harbor_hf", "space", "tests", "scripts"]
 
 [rules]
 missing-type-argument = "error"

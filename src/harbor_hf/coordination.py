@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -60,6 +61,16 @@ def run_claim_path(artifact_bucket: str, artifact_prefix: str) -> str:
     return f"run-reservations/{identity}.json"
 
 
+def action_claim_path(campaign_id: str, action_id: str) -> str:
+    identity = hashlib.sha256(f"{campaign_id}/{action_id}".encode()).hexdigest()
+    return f"action-leases/{identity}.json"
+
+
+def wave_worker_claim_path(campaign_id: str, wave_id: str) -> str:
+    identity = hashlib.sha256(f"{campaign_id}/{wave_id}".encode()).hexdigest()
+    return f"wave-worker-leases/{identity}.json"
+
+
 class HubClaimStore:
     """Serialize claims through optimistic commits to a private Hub repository."""
 
@@ -69,17 +80,21 @@ class HubClaimStore:
         token: str,
         *,
         api: CoordinationApi | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.repository = coordination_repository(namespace)
         self.token = token
         self.api = api or cast(CoordinationApi, HfApi(token=token))
+        self.clock = clock
 
     def acquire(self, path: str, owner: Mapping[str, str]) -> None:
         payload = _owner_payload(owner)
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
             head = self._head()
             if self._exists(path, head):
-                raise ClaimConflict(f"claim is already held: {path}")
+                observed = self._read_owner(path, head)
+                if not _claim_expired(observed, self.clock()):
+                    raise ClaimConflict(f"claim is already held: {path}")
             try:
                 self.api.create_commit(
                     self.repository,
@@ -163,6 +178,17 @@ class HubClaimStore:
 
 def _owner_payload(owner: Mapping[str, str]) -> bytes:
     return (json.dumps(dict(owner), sort_keys=True) + "\n").encode()
+
+
+def _claim_expired(owner: Mapping[str, object], now: datetime) -> bool:
+    value = owner.get("expires_at")
+    if not isinstance(value, str):
+        return False
+    try:
+        expires_at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return expires_at.tzinfo is not None and expires_at <= now.astimezone(UTC)
 
 
 def _is_parent_conflict(error: HfHubHTTPError) -> bool:

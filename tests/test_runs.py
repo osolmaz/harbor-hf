@@ -3,10 +3,13 @@ from datetime import UTC, datetime
 import pytest
 
 from harbor_hf.models import (
+    DeploymentProfile,
     ExperimentSpec,
+    MatrixRule,
     _validate_remote_input_pins,
     _validate_task_pins,
 )
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import build_run_lock
 
 NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
@@ -14,10 +17,13 @@ NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 
 def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
+    assert isinstance(lock.deployment, DeploymentProfile)
 
-    assert lock.run_id == "20260713T010203Z-3e46e6d60e"
+    assert lock.run_id == "20260713T010203Z-af768c3088"
+    assert lock.benchmark_dataset == "harbor/terminal-bench@2.0"
+    assert lock.benchmark_dataset_digest == "sha256:" + "1" * 64
     assert lock.spec_digest == (
-        "sha256:f216706b982f94e0f1636655c9f76b6c2a8f2ea112e946406708dcad96571ec4"
+        "sha256:928a50b654af14b1aec17be91e99911a9160ba6139ae346e2f608f66934c66ba"
     )
     assert lock.artifact_bucket == "example/benchmark-runs"
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
@@ -82,6 +88,23 @@ def test_submit_rejects_unknown_selection(remote_spec: ExperimentSpec) -> None:
         build_run_lock(remote_spec, model_id="missing")
 
 
+def test_submit_rejects_cell_excluded_by_matrix_rules(
+    remote_spec: ExperimentSpec,
+) -> None:
+    excluded = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "exclude": [MatrixRule(models=[remote_spec.matrix.models[0].id])]
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="exclude every run cell"):
+        build_run_lock(excluded)
+
+
 def test_agent_version_parameter_is_reserved(remote_spec: ExperimentSpec) -> None:
     agent = remote_spec.matrix.agents[0].model_copy(
         update={"parameters": {"version": "different"}}
@@ -116,6 +139,7 @@ def test_controller_and_endpoint_must_share_lease_namespace(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     endpoint = deployment.endpoint
     assert endpoint is not None
     mismatched = deployment.model_copy(
@@ -131,6 +155,24 @@ def test_controller_and_endpoint_must_share_lease_namespace(
 
     with pytest.raises(ValueError, match="namespace must match"):
         build_run_lock(spec)
+
+
+def test_provider_target_rejects_unsupported_agent_before_submission(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(id="provider-one", model=model.repo)
+    agent = remote_spec.matrix.agents[0].model_copy(update={"name": "terminus"})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [provider], "agents": [agent]}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="require the OpenClaw Harbor agent"):
+        build_run_lock(spec, allow_provider=True)
 
 
 def test_remote_lock_rejects_mutable_model_revision(
@@ -150,6 +192,7 @@ def test_remote_lock_rejects_mutable_model_revision(
 
 def test_remote_lock_rejects_mutable_serving_image(remote_spec: ExperimentSpec) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     engine = deployment.engine.model_copy(update={"image": "example/vllm:latest"})
     spec = remote_spec.model_copy(
         update={
@@ -182,20 +225,64 @@ def test_remote_lock_rejects_mutable_agent_revision(
 
 
 def test_remote_lock_rejects_unresolved_benchmark(remote_spec: ExperimentSpec) -> None:
-    benchmark = remote_spec.benchmark.model_copy(
-        update={"dataset": "terminal-bench@2.0"}
-    )
+    benchmark = remote_spec.benchmark.model_copy(update={"dataset_digest": None})
     spec = remote_spec.model_copy(update={"benchmark": benchmark})
     with pytest.raises(ValueError) as captured:
         _validate_remote_input_pins(spec)
     assert str(captured.value) == (
-        "remote benchmark dataset must use an immutable sha256 digest"
+        "remote benchmark dataset requires an immutable sha256 digest"
     )
 
     benchmark = remote_spec.benchmark.model_copy(update={"task_digests": {}})
     with pytest.raises(ValueError) as captured:
         _validate_task_pins(benchmark)
     assert str(captured.value) == "remote benchmarks require resolved task digests"
+
+
+def test_remote_lock_rejects_legacy_dataset_that_cannot_use_digest(
+    remote_spec: ExperimentSpec,
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"dataset": "terminal-bench@2.0"}
+    )
+    spec = remote_spec.model_copy(update={"benchmark": benchmark})
+
+    with pytest.raises(ValueError) as captured:
+        _validate_remote_input_pins(spec)
+
+    assert str(captured.value) == (
+        "remote benchmark dataset must use a Harbor package name in org/name form"
+    )
+
+
+def test_content_addressed_dataset_infers_and_preserves_digest(
+    remote_spec: ExperimentSpec,
+) -> None:
+    digest = "sha256:" + "4" * 64
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["dataset"] = f"harbor/terminal-bench@{digest}"
+    raw["benchmark"].pop("dataset_digest")
+
+    spec = ExperimentSpec.model_validate(raw)
+    lock = build_run_lock(spec)
+
+    assert spec.benchmark.dataset_digest == digest
+    assert lock.benchmark_dataset == f"harbor/terminal-bench@{digest}"
+    assert lock.benchmark_dataset_digest == digest
+
+
+def test_content_addressed_dataset_rejects_conflicting_digest(
+    remote_spec: ExperimentSpec,
+) -> None:
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["dataset"] = "harbor/terminal-bench@sha256:" + "4" * 64
+    raw["benchmark"]["dataset_digest"] = "sha256:" + "5" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="dataset digest must match its content-addressed reference",
+    ):
+        ExperimentSpec.model_validate(raw)
 
 
 @pytest.mark.parametrize(

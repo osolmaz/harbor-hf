@@ -86,7 +86,7 @@ def archive_directory(source: Path, destination: Path) -> None:
 
 
 def write_checksums(root: Path) -> dict[str, str]:
-    excluded = {"checksums.json", "_SUCCESS", "_FAILED"}
+    excluded = {"checksums.json", "_SUCCESS", "_FAILED", "_CANCELLED"}
     checksums = {
         str(path.relative_to(root)): _sha256(path)
         for path in _evidence_paths(root)
@@ -94,6 +94,38 @@ def write_checksums(root: Path) -> dict[str, str]:
     }
     write_json(root / "checksums.json", checksums)
     return checksums
+
+
+def verify_checksums(root: Path) -> dict[str, str]:
+    """Verify that a finalized evidence tree is complete and unchanged."""
+    checksum_path = root / "checksums.json"
+    try:
+        value = json.loads(checksum_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("evidence has no valid checksum manifest") from error
+    if not isinstance(value, dict) or not all(
+        isinstance(path, str)
+        and isinstance(digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        for path, digest in value.items()
+    ):
+        raise RuntimeError("evidence checksum manifest is malformed")
+    expected_paths = {
+        str(path.relative_to(root))
+        for path in _evidence_paths(root)
+        if path.is_file()
+        and str(path.relative_to(root))
+        not in {"checksums.json", "_SUCCESS", "_FAILED", "_CANCELLED"}
+    }
+    if set(value) != expected_paths:
+        raise RuntimeError("evidence checksum manifest does not cover exact contents")
+    for relative, expected in value.items():
+        candidate = root / relative
+        if not candidate.resolve().is_relative_to(root.resolve()):
+            raise RuntimeError("evidence checksum path escapes its root")
+        if _sha256(candidate) != expected:
+            raise RuntimeError(f"evidence checksum mismatch: {relative}")
+    return value
 
 
 def assert_secret_absent(root: Path, secret: str) -> None:

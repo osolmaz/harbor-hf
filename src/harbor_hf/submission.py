@@ -10,8 +10,9 @@ from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict
 
+from harbor_hf.campaigns import EndpointWaveTarget, WaveLock
 from harbor_hf.coordination import bucket_id, coordination_repository
-from harbor_hf.models import SourcePin
+from harbor_hf.models import DeploymentProfile, EndpointRef, SourcePin
 from harbor_hf.runs import RunLock
 
 _JOB_ID = re.compile(r"[a-f0-9]{24}")
@@ -33,6 +34,14 @@ class BucketApi(Protocol):
 
     def bucket_info(self, bucket_id: str) -> object: ...
 
+    def batch_bucket_files(
+        self,
+        bucket_id: str,
+        *,
+        add: list[tuple[bytes, str]],
+        **kwargs: object,
+    ) -> object: ...
+
     def create_repo(self, repo_id: str, **kwargs: object) -> object: ...
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
@@ -46,6 +55,15 @@ class Submission(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     run_id: str
+    artifact_prefix: str
+    job_id: str | None
+    command: list[str]
+
+
+class WaveSubmission(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    wave_id: str
     artifact_prefix: str
     job_id: str | None
     command: list[str]
@@ -142,6 +160,34 @@ def ensure_private_job_input_bucket(namespace: str, *, api: BucketApi) -> str:
     return bucket
 
 
+def stage_job_input(
+    input_dir: Path,
+    *,
+    bucket: str,
+    identity: str,
+    api: BucketApi,
+) -> str:
+    """Upload a content-addressed input bundle and return its HF mount URI."""
+    files = sorted(path for path in input_dir.rglob("*") if path.is_file())
+    if not files:
+        raise ValueError("Job input directory must contain at least one file")
+    digest = hashlib.sha256()
+    additions: list[tuple[bytes, str]] = []
+    staged: list[tuple[str, bytes]] = []
+    for path in files:
+        relative = path.relative_to(input_dir).as_posix()
+        content = path.read_bytes()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+        staged.append((relative, content))
+    prefix = f"job-inputs/{identity}/{digest.hexdigest()}"
+    additions.extend((content, f"{prefix}/{relative}") for relative, content in staged)
+    api.batch_bucket_files(bucket, add=additions)
+    return f"hf://buckets/{bucket}/{prefix}"
+
+
 def require_private_bucket(bucket: str, *, api: BucketApi) -> str:
     normalized = bucket_id(bucket)
     if getattr(api.bucket_info(normalized), "private", None) is not True:
@@ -150,9 +196,7 @@ def require_private_bucket(bucket: str, *, api: BucketApi) -> str:
 
 
 def endpoint_lease_label(lock: RunLock) -> str:
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise ValueError("run lock has no endpoint binding")
+    endpoint = _endpoint_binding(lock)
     return endpoint_lease_label_for(endpoint.namespace, endpoint.name)
 
 
@@ -164,7 +208,7 @@ def endpoint_lease_label_for(namespace: str, name: str) -> str:
 def build_submit_command(
     lock: RunLock,
     *,
-    input_dir: Path,
+    input_dir: Path | str,
     bucket: str,
 ) -> list[str]:
     job = lock.remote.job
@@ -203,6 +247,74 @@ def build_submit_command(
     ]
 
 
+def build_submit_wave_command(
+    lock: WaveLock,
+    *,
+    input_dir: Path | str,
+    bucket: str,
+) -> list[str]:
+    job = lock.remote.job
+    labels = ["--label", f"harbor-hf-wave={lock.wave_id}"]
+    if isinstance(lock.target, EndpointWaveTarget):
+        labels.extend(
+            (
+                "--label",
+                "harbor-hf-endpoint="
+                + endpoint_lease_label_for(
+                    lock.target.endpoint.namespace, lock.target.endpoint.name
+                ),
+            )
+        )
+    else:
+        labels.extend(
+            (
+                "--label",
+                "harbor-hf-provider="
+                + hashlib.sha256(lock.target.provider.service.encode()).hexdigest()[
+                    :32
+                ],
+            )
+        )
+    return [
+        "hf",
+        "jobs",
+        "run",
+        "--detach",
+        "--namespace",
+        job.namespace,
+        "--flavor",
+        job.flavor,
+        "--timeout",
+        f"{job.timeout_seconds}s",
+        "--secrets",
+        job.token_secret_name,
+        *labels,
+        "--volume",
+        f"{input_dir}:/input:ro",
+        "--volume",
+        f"{bucket_uri(bucket)}:/output:rw",
+        "--",
+        job.image,
+        *locked_source_command(
+            lock.remote.worker,
+            "harbor-hf",
+            "wave-worker",
+            "/input/manifest.yaml",
+            "/input/campaign.lock.json",
+            "/input/wave.lock.json",
+            "--output-root",
+            "/output",
+        ),
+    ]
+
+
+def _endpoint_binding(lock: RunLock) -> EndpointRef:
+    deployment = lock.deployment
+    if not isinstance(deployment, DeploymentProfile) or deployment.endpoint is None:
+        raise ValueError("run lock has no endpoint binding")
+    return deployment.endpoint
+
+
 def submit(
     lock: RunLock,
     *,
@@ -216,15 +328,59 @@ def submit(
 
         bucket_api = cast(BucketApi, HfApi())
     ensure_private_coordination_repository(lock.remote.job.namespace, api=bucket_api)
-    ensure_private_job_input_bucket(lock.remote.job.namespace, api=bucket_api)
+    input_bucket = ensure_private_job_input_bucket(
+        lock.remote.job.namespace, api=bucket_api
+    )
     require_private_bucket(bucket, api=bucket_api)
-    command = build_submit_command(lock, input_dir=input_dir, bucket=bucket)
+    input_source = stage_job_input(
+        input_dir,
+        bucket=input_bucket,
+        identity=lock.run_id,
+        api=bucket_api,
+    )
+    command = build_submit_command(lock, input_dir=input_source, bucket=bucket)
     output = runner.run_text(command)
     match = _JOB_ID.search(output)
     if match is None:
         raise ValueError("HF Jobs submission did not return a job ID")
     return Submission(
         run_id=lock.run_id,
+        artifact_prefix=lock.artifact_prefix,
+        job_id=match.group(),
+        command=command,
+    )
+
+
+def submit_wave(
+    lock: WaveLock,
+    *,
+    input_dir: Path,
+    bucket: str,
+    runner: TextRunner,
+    bucket_api: BucketApi | None = None,
+) -> WaveSubmission:
+    if bucket_api is None:
+        from huggingface_hub import HfApi
+
+        bucket_api = cast(BucketApi, HfApi())
+    ensure_private_coordination_repository(lock.remote.job.namespace, api=bucket_api)
+    input_bucket = ensure_private_job_input_bucket(
+        lock.remote.job.namespace, api=bucket_api
+    )
+    require_private_bucket(bucket, api=bucket_api)
+    input_source = stage_job_input(
+        input_dir,
+        bucket=input_bucket,
+        identity=lock.wave_id,
+        api=bucket_api,
+    )
+    command = build_submit_wave_command(lock, input_dir=input_source, bucket=bucket)
+    output = runner.run_text(command)
+    match = _JOB_ID.search(output)
+    if match is None:
+        raise ValueError("HF Jobs wave submission did not return a job ID")
+    return WaveSubmission(
+        wave_id=lock.wave_id,
         artifact_prefix=lock.artifact_prefix,
         job_id=match.group(),
         command=command,

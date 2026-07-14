@@ -65,6 +65,29 @@ events, and pauses the endpoint in a `finally` path. The submitting machine does
 not execute benchmark tasks. Provider-backed runs will skip endpoint
 provisioning but retain request, quota, retry, and accounting state.
 
+### Campaign Reconciler
+
+Campaigns are durable submissions of an immutable resolved plan. A campaign
+lock content-addresses its run cells, bounded shards, and logical trials. The
+same plan may be submitted more than once under distinct campaign IDs without
+overwriting or silently adopting an earlier measurement.
+
+The stateless reconciler reads campaign locks and append-only typed events from
+the private coordination Dataset, rebuilds projections, and derives
+deterministic actions. Action reservations and their events are committed
+atomically with the repository head as the expected parent. A repeated or
+concurrent pass adopts an existing reservation. Before executing a pending
+action, it acquires a parent-checked, expiring action lease; only the lease
+winner may issue the remote side effect. The lease is released after the
+durable outcome and expires after two hours if the reconciler dies. Compatible
+shards are grouped by a digest of their exact model and deployment
+configuration; agent differences do not force a second endpoint startup.
+Namespace-wide reconciliation carries active and ambiguously submitted wave
+usage forward between campaigns in the same pass. Successful actions without
+worker evidence remain admitted until their wave is observed and closed, so
+global, deployment, provider, campaign, and spend limits cannot be exceeded by
+sequential reconciliation of independently stored campaigns.
+
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
 derived from the endpoint namespace and name. They coordinate through one
 private, namespace-level `harbor-hf-coordination` Dataset repository. A
@@ -83,6 +106,36 @@ run from inheriting an endpoint whose state is unknown.
 If publishing the readiness label returns an ambiguous provider error, the
 watchdog also retains the lease, waits for the controller to exit or time out,
 verifies endpoint pause, and only then releases ownership.
+
+If a controller Job terminates after publishing successful trial evidence but
+before its wave marker, recovery closes the abandoned wave and may submit a
+replacement. The replacement accepts checksum-valid successful trial evidence
+from an earlier wave only when campaign, run, shard, trial, task, and logical
+attempt identities all match. This avoids rerunning completed work without
+allowing evidence from another campaign or task to cross the boundary.
+
+Every hosted wave Job acquires a second expiring lease keyed by campaign and
+wave before endpoint or provider work begins. This lease spans benchmark
+execution and terminal evidence publication, so an ambiguously duplicated Job
+cannot race another writer on the Bucket mount. The worker uses the mount's
+supported temporary-file rename while it holds the lease. The lease expires at
+the complete locked HF Job timeout, including source preparation and cleanup
+headroom, rather than at the shorter benchmark execution duration. It is
+released immediately after the terminal marker is published.
+
+### Endpoint Provisioner
+
+The [endpoint provisioning boundary](endpoint-provisioning.md) converts locked
+model and deployment profiles into deterministic campaign-scoped managed
+identities and exact effective Hugging Face Endpoint configuration. Its typed
+port supports create, inspect/adopt, pause, and explicit delete without
+depending on SDK response models. Adoption requires managed identity, complete
+configuration equality, and paused-zero-ready state. Ambiguous create outcomes
+are resolved by inspecting the deterministic name rather than issuing another
+create.
+
+This boundary remains independent of the wave controller. A wave acquires the
+endpoint lease and starts the watchdog before resume or shard execution.
 
 ### Harbor Adapter
 
@@ -106,7 +159,8 @@ publication. Equivalent Bucket URI spellings are normalized before deriving the
 reservation identity. Terminal markers are delayed only at the run root;
 marker-shaped files within Harbor task artifacts are preserved and included in
 the root checksum manifest. Submission verifies the
-artifact Bucket and implicit Job input Bucket are private before launch.
+artifact Bucket and managed Job input Bucket are private before launch. Job
+inputs use content-addressed Bucket prefixes mounted read-only by `hf://` URI.
 
 Raw Harbor output is staged on the controller Job's local filesystem, outside
 the bucket mount. After endpoint cleanup, the controller redacts secret values,

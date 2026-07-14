@@ -10,12 +10,13 @@ from pydantic import BaseModel, ConfigDict
 
 from harbor_hf.models import (
     AgentProfile,
-    DeploymentProfile,
+    DeploymentTarget,
     ExperimentSpec,
     ModelProfile,
     RemoteExecutionSpec,
 )
-from harbor_hf.planner import experiment_digest
+from harbor_hf.planner import experiment_digest, resolved_cells
+from harbor_hf.provider_models import ProviderTarget
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -25,7 +26,8 @@ class Clock(Protocol):
 
 
 class HasId(Protocol):
-    id: str
+    @property
+    def id(self) -> str: ...
 
 
 class RunLock(BaseModel):
@@ -37,10 +39,11 @@ class RunLock(BaseModel):
     experiment: str
     spec_digest: str
     benchmark_dataset: str
+    benchmark_dataset_digest: str
     benchmark_tasks: list[str]
     benchmark_task_digests: dict[str, str]
     model: ModelProfile
-    deployment: DeploymentProfile
+    deployment: DeploymentTarget
     agent: AgentProfile
     attempts: int
     concurrent_trials: int
@@ -73,6 +76,7 @@ def build_run_lock(
     deployment_id: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
+    allow_provider: bool = False,
     clock: Clock = lambda: datetime.now(UTC),
 ) -> RunLock:
     spec = ExperimentSpec.model_validate(spec.model_dump(mode="python"))
@@ -82,6 +86,12 @@ def build_run_lock(
     model = _select(spec.matrix.models, model_id, "model")
     deployment = _select(spec.matrix.deployments, deployment_id, "deployment")
     agent = _select(spec.matrix.agents, agent_id, "agent")
+    selected = (model.id, deployment.id, agent.id)
+    allowed = {
+        (cell.model, cell.deployment, cell.agent) for cell in resolved_cells(spec)
+    }
+    if selected not in allowed:
+        raise ValueError("selected run cell is excluded by matrix rules")
     if "version" in agent.parameters:
         raise ValueError("agent parameter 'version' is reserved by the run lock")
     if (
@@ -89,14 +99,13 @@ def build_run_lock(
         and agent.revision != spec.remote.harbor.source.revision
     ):
         raise ValueError("Harbor-source agent revision must match the Harbor source")
-    if deployment.endpoint is None:
-        raise ValueError(
-            f"deployment profile {deployment.id} requires an endpoint binding"
-        )
-    if deployment.endpoint.namespace != spec.remote.job.namespace:
-        raise ValueError(
-            "controller Job namespace must match the endpoint namespace for leasing"
-        )
+    _validate_deployment_target(
+        model,
+        deployment,
+        agent,
+        spec.remote,
+        allow_provider=allow_provider,
+    )
 
     created_at = clock().astimezone(UTC)
     digest = experiment_digest(spec)
@@ -112,6 +121,7 @@ def build_run_lock(
         experiment=spec.metadata.name,
         spec_digest=digest,
         benchmark_dataset=spec.benchmark.dataset,
+        benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
         benchmark_tasks=spec.benchmark.task_names,
         benchmark_task_digests=spec.benchmark.task_digests,
         model=model,
@@ -133,3 +143,45 @@ def _new_run_id(name: str, digest: str, created_at: datetime) -> str:
     ).encode()
     suffix = hashlib.sha256(identity).hexdigest()[:10]
     return f"{created_at:%Y%m%dT%H%M%SZ}-{suffix}"
+
+
+def _validate_deployment_target(
+    model: ModelProfile,
+    deployment: DeploymentTarget,
+    agent: AgentProfile,
+    remote: RemoteExecutionSpec,
+    *,
+    allow_provider: bool,
+) -> None:
+    if isinstance(deployment, ProviderTarget):
+        if not allow_provider:
+            raise ValueError("Inference Provider targets require campaign execution")
+        validate_provider_cell(model, deployment, agent)
+        return
+    if deployment.endpoint is None:
+        if allow_provider:
+            raise ValueError(
+                "deployment wave requires a pre-existing endpoint binding; "
+                "endpoint provisioning is outside this slice"
+            )
+        raise ValueError(
+            f"deployment profile {deployment.id} requires an endpoint binding"
+        )
+    if deployment.endpoint.namespace != remote.job.namespace:
+        raise ValueError(
+            "controller Job namespace must match the endpoint namespace for leasing"
+        )
+
+
+def validate_provider_cell(
+    model: ModelProfile,
+    deployment: ProviderTarget,
+    agent: AgentProfile,
+) -> None:
+    """Validate one resolved Inference Provider matrix cell."""
+    if deployment.model != model.repo:
+        raise ValueError(
+            "Inference Provider target model must match the selected model profile"
+        )
+    if agent.name != "openclaw":
+        raise ValueError("Inference Provider targets require the OpenClaw Harbor agent")

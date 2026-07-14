@@ -12,10 +12,13 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
+
+from pydantic import JsonValue
 
 from harbor_hf.coordination import (
     ClaimConflict,
@@ -35,7 +38,14 @@ from harbor_hf.evidence import (
     write_json,
 )
 from harbor_hf.io import load_experiment
-from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.models import (
+    DeploymentProfile,
+    EndpointRef,
+    ExperimentSpec,
+    RemoteExecutionSpec,
+    SourcePin,
+    pinned_harbor_dataset_reference,
+)
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import (
     CommandRunner,
@@ -43,9 +53,10 @@ from harbor_hf.process import (
     SubprocessRunner,
     run_streaming,
 )
+from harbor_hf.provider_models import ProviderTarget
+from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
-    endpoint_lease_label,
     endpoint_lease_label_for,
     github_repository,
     locked_source_command,
@@ -58,6 +69,14 @@ _ENDPOINT_CALL_TIMEOUT_SECONDS = 60.0
 
 class WorkerError(RuntimeError):
     """Raised when a remote benchmark run cannot complete correctly."""
+
+
+class HarborTrialFailure(WorkerError):
+    """A Harbor result reported a typed trial or step exception."""
+
+    def __init__(self, message: str, exception_type: str) -> None:
+        super().__init__(message)
+        self.exception_type = exception_type
 
 
 class JobInspector(Protocol):
@@ -244,10 +263,77 @@ def build_harbor_command(
     base_url: str,
     harbor_source: Path,
 ) -> list[str]:
-    harbor = lock.remote.harbor
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
+    return _build_harbor_command(
+        lock,
+        jobs_dir,
+        base_url,
+        harbor_source,
+        task_names=lock.benchmark_tasks,
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+    )
+
+
+def build_harbor_trial_command(
+    lock: RunLock,
+    jobs_dir: Path,
+    base_url: str,
+    harbor_source: Path,
+    *,
+    task_name: str,
+) -> list[str]:
+    if task_name not in lock.benchmark_task_digests:
+        raise WorkerError("wave trial is not in the resolved run task set")
+    return _build_harbor_command(
+        lock,
+        jobs_dir,
+        base_url,
+        harbor_source,
+        task_names=[task_name],
+        attempts=1,
+        concurrency=1,
+    )
+
+
+def _endpoint_binding(lock: RunLock) -> EndpointRef:
+    deployment = _endpoint_deployment(lock)
+    if deployment.endpoint is None:
         raise WorkerError("run lock has no endpoint binding")
+    return deployment.endpoint
+
+
+def _endpoint_deployment(lock: RunLock) -> DeploymentProfile:
+    deployment = lock.deployment
+    if not isinstance(deployment, DeploymentProfile):
+        raise WorkerError("run lock is not an Inference Endpoint target")
+    return deployment
+
+
+def _build_harbor_command(
+    lock: RunLock,
+    jobs_dir: Path,
+    base_url: str,
+    harbor_source: Path,
+    *,
+    task_names: Sequence[str],
+    attempts: int,
+    concurrency: int,
+) -> list[str]:
+    harbor = lock.remote.harbor
+    deployment = lock.deployment
+    if isinstance(deployment, ProviderTarget):
+        served_model_name = routed_provider_model(deployment)
+    else:
+        endpoint = deployment.endpoint
+        if endpoint is None:
+            raise WorkerError("run lock has no endpoint binding")
+        served_model_name = endpoint.served_model_name
+    try:
+        dataset_reference = pinned_harbor_dataset_reference(
+            lock.benchmark_dataset, lock.benchmark_dataset_digest
+        )
+    except ValueError as error:
+        raise WorkerError(str(error)) from error
     command = [
         "uv",
         "run",
@@ -260,13 +346,13 @@ def build_harbor_command(
         "harbor",
         "run",
         "--dataset",
-        lock.benchmark_dataset,
+        dataset_reference,
         "--n-attempts",
-        str(lock.attempts),
+        str(attempts),
         "--agent",
         lock.agent.name,
         "--model",
-        f"openai/{endpoint.served_model_name}",
+        f"openai/{served_model_name}",
         "--env",
         harbor.environment,
         "--environment-kwarg",
@@ -276,24 +362,73 @@ def build_harbor_command(
         "--jobs-dir",
         str(jobs_dir),
         "--n-concurrent",
-        str(lock.concurrent_trials),
+        str(concurrency),
         "--n-concurrent-agents",
-        str(lock.concurrent_trials),
+        str(concurrency),
         "--max-retries",
         "0",
         "--allow-agent-host",
         urlparse(base_url).hostname or "",
         "--yes",
     ]
-    for task_name in lock.benchmark_tasks:
+    for task_name in task_names:
         command.extend(("--include-task-name", task_name))
     if lock.agent.revision_kind == "package":
         revision = json.dumps(lock.agent.revision, separators=(",", ":"))
         command.extend(("--agent-kwarg", f"version={revision}"))
-    for key, value in sorted(lock.agent.parameters.items()):
+    for key, value in sorted(_effective_agent_parameters(lock).items()):
         rendered = json.dumps(value, separators=(",", ":"))
         command.extend(("--agent-kwarg", f"{key}={rendered}"))
     return command
+
+
+def _effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
+    parameters = deepcopy(lock.agent.parameters)
+    target = lock.deployment
+    if not isinstance(target, ProviderTarget):
+        return parameters
+    if lock.agent.name != "openclaw":
+        raise WorkerError(
+            "Inference Provider request controls require the OpenClaw Harbor agent"
+        )
+    existing = parameters.get("openclaw_config", {})
+    if not isinstance(existing, dict):
+        raise WorkerError("OpenClaw provider configuration must be a JSON object")
+    config = deepcopy(existing)
+    models = config.setdefault("models", {})
+    if not isinstance(models, dict):
+        raise WorkerError("OpenClaw models configuration must be a JSON object")
+    providers = models.setdefault("providers", {})
+    if not isinstance(providers, dict):
+        raise WorkerError("OpenClaw provider configuration must be a JSON object")
+    provider = providers.setdefault("openai", {})
+    if not isinstance(provider, dict):
+        raise WorkerError(
+            "OpenClaw OpenAI provider configuration must be a JSON object"
+        )
+    routed_model = routed_provider_model(target)
+    request_parameters = dict(target.parameters)
+    request_parameters.update(
+        {
+            "maxRetries": target.limits.max_attempts - 1,
+            "timeoutMs": int(target.timeout_seconds * 1000),
+        }
+    )
+    provider.update(
+        {
+            "api": "openai-completions",
+            "timeoutSeconds": math.ceil(target.timeout_seconds),
+            "models": [
+                {
+                    "id": routed_model,
+                    "name": routed_model,
+                    "params": request_parameters,
+                }
+            ],
+        }
+    )
+    parameters["openclaw_config"] = config
+    return parameters
 
 
 def run_worker(
@@ -371,9 +506,7 @@ def _run_staged_worker(
     write_json(root / "run.lock.json", lock.model_dump(mode="json"))
     events = root / "events.jsonl"
     process_runner = runner or SubprocessRunner()
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise WorkerError("run lock has no endpoint binding")
+    endpoint = _endpoint_binding(lock)
     manager = EndpointManager(endpoint.namespace, endpoint.name, process_runner)
     error: Exception | None = None
     cleanup_error: Exception | None = None
@@ -567,22 +700,8 @@ def _execute_benchmark(
     stream_runner: Callable[..., int],
     harbor_source: Path,
 ) -> None:
-    endpoint = lock.deployment.endpoint
-    if endpoint is None:
-        raise WorkerError("run lock has no endpoint binding")
-    append_event(events, "endpoint_resume_requested")
-    manager.resume()
-    snapshot = manager.wait_ready(3600)
-    validate_endpoint_model(lock, snapshot)
-    append_event(events, "endpoint_ready", state=endpoint_state(snapshot)[0])
-    write_json(root / "endpoint.snapshot.json", redact(snapshot))
-    base_url = endpoint_url(snapshot)
-    runtime = {
-        "controller": controller_environment(lock),
-        "endpoint": probe_runtime(base_url, token, endpoint_health_route(snapshot)),
-    }
-    write_json(root / "runtime-environment.json", redact(runtime))
-    append_event(events, "runtime_probed")
+    base_url = resume_and_probe_endpoint(root, events, lock, manager, token)
+    endpoint = _endpoint_binding(lock)
 
     jobs_dir = root / "harbor-jobs"
     harbor_command = build_harbor_command(
@@ -619,6 +738,35 @@ def _execute_benchmark(
     )
     write_json(root / "verification.json", verifier)
     append_event(events, "verification_validated")
+
+
+def resume_and_probe_endpoint(
+    root: Path,
+    events: Path,
+    lock: RunLock,
+    manager: EndpointManager,
+    token: str,
+    *,
+    readiness_timeout_seconds: int = 3600,
+    compatible_locks: Sequence[RunLock] = (),
+) -> str:
+    _endpoint_binding(lock)
+    append_event(events, "endpoint_resume_requested")
+    manager.resume()
+    snapshot = manager.wait_ready(readiness_timeout_seconds)
+    validate_endpoint_model(lock, snapshot)
+    for compatible in compatible_locks:
+        validate_endpoint_model(compatible, snapshot)
+    append_event(events, "endpoint_ready", state=endpoint_state(snapshot)[0])
+    write_json(root / "endpoint.snapshot.json", redact(snapshot))
+    base_url = endpoint_url(snapshot)
+    runtime = {
+        "controller": controller_environment(lock),
+        "endpoint": probe_runtime(base_url, token, endpoint_health_route(snapshot)),
+    }
+    write_json(root / "runtime-environment.json", redact(runtime))
+    append_event(events, "runtime_probed")
+    return base_url
 
 
 def prepare_locked_source(
@@ -678,43 +826,59 @@ def prepare_locked_source(
 
 
 def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) -> str:
+    return launch_cleanup_watchdog_for(
+        lock.remote,
+        endpoint,
+        lock.run_id,
+        token,
+    )
+
+
+def launch_cleanup_watchdog_for(
+    remote: RemoteExecutionSpec,
+    endpoint: EndpointRef,
+    owner_id: str,
+    token: str,
+) -> str:
     from huggingface_hub import HfApi
 
     controller_job_id = os.environ.get("JOB_ID")
     if not controller_job_id:
         raise WorkerError("controller JOB_ID is required before endpoint resume")
-    job_timeout_seconds = min(lock.remote.job.timeout_seconds + 600, 86400)
+    job_timeout_seconds = min(remote.job.timeout_seconds + 600, 86400)
     command = locked_source_command(
-        lock.remote.worker,
+        remote.worker,
         "harbor-hf",
         "watchdog",
         "--controller-job-id",
         controller_job_id,
         "--controller-namespace",
-        lock.remote.job.namespace,
+        remote.job.namespace,
         "--endpoint-name",
         endpoint.name,
         "--endpoint-namespace",
         endpoint.namespace,
         "--run-id",
-        lock.run_id,
+        owner_id,
         "--token-secret-name",
-        lock.remote.job.token_secret_name,
+        remote.job.token_secret_name,
         "--timeout-seconds",
-        str(lock.remote.job.timeout_seconds),
+        str(remote.job.timeout_seconds),
     )
     api = HfApi(token=token)
     info = api.run_job(
-        image=lock.remote.job.image,
+        image=remote.job.image,
         command=command,
-        secrets={lock.remote.job.token_secret_name: token},
-        flavor=lock.remote.job.flavor,
+        secrets={remote.job.token_secret_name: token},
+        flavor=remote.job.flavor,
         timeout=job_timeout_seconds,
         labels={
-            "harbor-hf-watchdog": lock.run_id,
-            "harbor-hf-endpoint": endpoint_lease_label(lock),
+            "harbor-hf-watchdog": owner_id,
+            "harbor-hf-endpoint": endpoint_lease_label_for(
+                endpoint.namespace, endpoint.name
+            ),
         },
-        namespace=lock.remote.job.namespace,
+        namespace=remote.job.namespace,
     )
     job_id = getattr(info, "id", None)
     if not isinstance(job_id, str) or not job_id:
@@ -722,7 +886,7 @@ def launch_cleanup_watchdog(lock: RunLock, endpoint: EndpointRef, token: str) ->
     wait_watchdog_ready(
         api,
         job_id,
-        lock.remote.job.namespace,
+        remote.job.namespace,
         timeout_seconds=_WATCHDOG_STARTUP_TIMEOUT_SECONDS,
     )
     return job_id
@@ -908,6 +1072,7 @@ def _job_stage(info: object) -> str:
 
 
 def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> None:
+    deployment = _endpoint_deployment(lock)
     model = snapshot.get("model")
     if not isinstance(model, Mapping):
         raise WorkerError("endpoint response has no model object")
@@ -920,33 +1085,33 @@ def validate_endpoint_model(lock: RunLock, snapshot: Mapping[str, object]) -> No
     image = model.get("image")
     custom = image.get("custom") if isinstance(image, Mapping) else None
     observed_image = custom.get("url") if isinstance(custom, Mapping) else None
-    if observed_image != lock.deployment.engine.image:
+    if observed_image != deployment.engine.image:
         raise WorkerError("endpoint image does not match the locked deployment")
     observed_command = model.get("command", [])
     if (
         not isinstance(observed_command, list)
         or not all(isinstance(argument, str) for argument in observed_command)
-        or observed_command != lock.deployment.engine.command
+        or observed_command != deployment.engine.command
     ):
         raise WorkerError("endpoint command does not match the locked deployment")
     observed_arguments = model.get("args", [])
     if (
         not isinstance(observed_arguments, list)
         or not all(isinstance(argument, str) for argument in observed_arguments)
-        or observed_arguments != lock.deployment.engine.arguments
+        or observed_arguments != deployment.engine.arguments
     ):
         raise WorkerError("endpoint arguments do not match the locked deployment")
     observed_environment = model.get("env")
     if (
         not isinstance(observed_environment, Mapping)
-        or dict(observed_environment) != lock.deployment.engine.environment
+        or dict(observed_environment) != deployment.engine.environment
     ):
         raise WorkerError("endpoint environment does not match the locked deployment")
     observed_secrets = model.get("secrets", {})
     if (
         not isinstance(observed_secrets, Mapping)
         or not all(isinstance(name, str) for name in observed_secrets)
-        or set(observed_secrets) != set(lock.deployment.engine.secret_names)
+        or set(observed_secrets) != set(deployment.engine.secret_names)
     ):
         raise WorkerError("endpoint secret names do not match the locked deployment")
     _validate_endpoint_compute(lock, snapshot)
@@ -961,6 +1126,7 @@ def require_paused_endpoint(snapshot: Mapping[str, object]) -> None:
 
 
 def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) -> None:
+    deployment = _endpoint_deployment(lock)
     provider = snapshot.get("provider")
     compute = snapshot.get("compute")
     if not isinstance(provider, Mapping) or not isinstance(compute, Mapping):
@@ -976,9 +1142,9 @@ def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) ->
     )
     instance_size = compute.get("instanceSize")
     if (
-        observed_region != lock.deployment.region
-        or normalized_hardware != lock.deployment.hardware
-        or instance_size != f"x{lock.deployment.accelerator_count}"
+        observed_region != deployment.region
+        or normalized_hardware != deployment.hardware
+        or instance_size != f"x{deployment.accelerator_count}"
     ):
         raise WorkerError("endpoint compute does not match the locked deployment")
     scaling = compute.get("scaling")
@@ -989,7 +1155,7 @@ def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) ->
         "max_replicas": "maxReplica",
     }
     for parameter, field in expected_scaling.items():
-        expected = lock.deployment.parameters.get(parameter)
+        expected = deployment.parameters.get(parameter)
         if expected is not None and scaling.get(field) != expected:
             raise WorkerError("endpoint scaling does not match the locked deployment")
 
@@ -1118,9 +1284,10 @@ def validate_harbor_result(
         failure = _trial_failure(trial)
         if failure is not None:
             location, exception_type = failure
-            raise WorkerError(
-                f"Harbor trial {task_name}{location} failed with "
-                f"{exception_type or 'an exception'}"
+            rendered = str(exception_type or "an exception")
+            raise HarborTrialFailure(
+                f"Harbor trial {task_name}{location} failed with {rendered}",
+                rendered,
             )
         _validate_agent_identity(
             trial,

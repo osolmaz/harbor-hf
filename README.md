@@ -6,15 +6,17 @@ inference and task environments, preserves complete run evidence, and publishes
 queryable results without running model inference locally.
 
 The project is in early development. The CLI validates and expands experiment
-matrices and can submit one resolved matrix cell to an HF Job. The remote worker
-controls an existing Inference Endpoint, runs Harbor tasks in HF Sandboxes,
-archives evidence to an HF Bucket, and verifies that the endpoint is paused
-before declaring success. It refuses lifecycle ownership unless the endpoint
-starts paused with zero ready replicas. It then starts an independent HF Job
-watchdog, waits for its readiness handshake, and resumes the endpoint. The
-watchdog pauses the endpoint if the controller exits or is killed. An ambiguous
-readiness-label response does not release the lease; the watchdog keeps control
-until it has verified the endpoint is paused.
+matrices, submits individual runs, and operates durable multi-shard campaigns.
+Stateless reconciler Jobs provision or adopt Inference Endpoints, submit bounded
+deployment waves, run Harbor tasks in HF Sandboxes, verify canonical evidence,
+and publish normalized result Datasets. The remote worker archives evidence to
+an HF Bucket and verifies that the endpoint is paused before declaring success.
+It refuses lifecycle ownership unless the endpoint starts paused with zero ready
+replicas. It then starts an independent HF Job watchdog, waits for its readiness
+handshake, and resumes the endpoint. The watchdog pauses the endpoint if the
+controller exits or is killed. An ambiguous readiness-label response does not
+release the lease; the watchdog keeps control until it has verified the endpoint
+is paused.
 Controllers and watchdogs targeting the same endpoint share an atomic lease in
 the namespace's private `harbor-hf-coordination` Dataset repository. The
 watchdog acquires the lease with a parent-commit compare-and-swap before it
@@ -44,6 +46,39 @@ uv run harbor-hf plan examples/shellbench.yaml
 
 `plan` performs no remote operations. It prints the resolved matrix cells and a
 digest of the requested experiment.
+
+Resolve the same manifest into deterministic campaign runs, shards, and trials:
+
+```bash
+uv run harbor-hf campaign plan experiment.yaml
+uv run harbor-hf campaign plan experiment.yaml --format json
+uv run harbor-hf campaign schema --output campaign.schema.json
+```
+
+Campaign planning also performs no remote operations. It requires the complete
+task-digest map, applies matrix inclusion and exclusion rules, and prints a
+content-addressed plan that can later be submitted more than once as distinct
+campaigns.
+
+Persist a campaign request in the private coordination Dataset, then inspect or
+dry-run its next reconciliation actions:
+
+```bash
+uv run harbor-hf campaign submit experiment.yaml --dry-run
+uv run harbor-hf campaign submit experiment.yaml
+uv run harbor-hf campaign status CAMPAIGN_ID --namespace NAMESPACE
+uv run harbor-hf campaign reconcile CAMPAIGN_ID --namespace NAMESPACE --dry-run
+uv run harbor-hf campaign reconcile CAMPAIGN_ID --namespace NAMESPACE --apply
+uv run harbor-hf campaign reconcile-all --namespace NAMESPACE --apply
+uv run harbor-hf automation install automation.yaml
+```
+
+Submission writes the immutable request, campaign lock, permanent reservation,
+and first typed event in one parent-checked commit. Reconciliation rebuilds
+state from append-only events and groups compatible shards by their exact model
+and deployment digest. An apply pass performs a bounded set of reserved actions,
+observes worker evidence, finalizes terminal summaries, and publishes verified
+results. The dry-run command does not submit Jobs or resume an endpoint.
 
 ## Submit A Remote Run
 
@@ -83,7 +118,10 @@ redacts and validates that staging tree before publishing it to the bucket, and
 copies `_SUCCESS` or `_FAILED` last.
 Submission creates or verifies the namespace-level coordination repository and
 refuses to use it if it is public. It separately verifies that the configured
-artifact Bucket and the implicit `jobs-artifacts` input Bucket are private.
+artifact Bucket and the `jobs-artifacts` input Bucket are private. Input bundles
+are uploaded to content-addressed prefixes and mounted by `hf://` URI, so a
+retry reuses the exact immutable manifest and lock files without an implicit
+local-directory synchronization step.
 Each run prefix receives a permanent compare-and-swap reservation before remote
 work, so duplicate run IDs cannot overwrite or invalidate one another.
 
@@ -93,8 +131,14 @@ policy. Harbor remains responsible for task execution and verification.
 
 The [architecture](docs/architecture.md) describes the execution and storage
 boundaries. The [run specification](docs/run-spec.md) defines the portable
-manifest, and the [implementation plan](docs/implementation-plan.md) tracks the
-path to remote execution.
+manifest. The [endpoint provisioning contract](docs/endpoint-provisioning.md)
+documents deterministic endpoint ownership, and the
+[result publication contract](docs/result-publication.md) freezes normalized
+Parquet schemas and the evidence-safety boundary. The
+[fully hosted Harbor Cookbook guide](docs/harbor-cookbook.md) covers campaign
+operation and result publication. The
+[implementation plan](docs/implementation-plan.md) tracks the complete path to
+remote execution.
 
 ## License
 

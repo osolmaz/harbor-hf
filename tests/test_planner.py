@@ -13,8 +13,8 @@ def test_builds_cartesian_plan() -> None:
     assert plan.run_count == 2
     assert plan.logical_trial_count == 2
     assert [(cell.model, cell.deployment, cell.agent) for cell in plan.cells] == [
-        ("qwen36-nvfp4", "rtx-pro-6000", "openclaw"),
         ("qwen36-nvfp4", "h200", "openclaw"),
+        ("qwen36-nvfp4", "rtx-pro-6000", "openclaw"),
     ]
 
 
@@ -23,7 +23,7 @@ def test_digest_is_stable() -> None:
 
     assert experiment_digest(spec) == experiment_digest(spec.model_copy(deep=True))
     assert experiment_digest(spec) == (
-        "sha256:654022f7cfa1e4dd3a868d13e00fbccb6b3a6129031794eb90bad10d5826e7d0"
+        "sha256:97b99fc7307035266a3f3526ce08bdab80114d885b6d1c8e5d85191a7ee89869"
     )
 
 

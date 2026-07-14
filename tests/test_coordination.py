@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,9 +14,11 @@ from harbor_hf.coordination import (
     ClaimConflict,
     CoordinationError,
     HubClaimStore,
+    action_claim_path,
     coordination_repository,
     endpoint_claim_path,
     run_claim_path,
+    wave_worker_claim_path,
 )
 
 
@@ -115,6 +119,17 @@ def test_claim_paths_are_stable_and_namespaced() -> None:
     assert path.startswith("run-reservations/")
     assert path.endswith(".json")
     assert path != run_claim_path("org/other", "runs/experiment/run-1")
+    assert action_claim_path("campaign-one", "action-one") == (
+        "action-leases/"
+        "6d9cf2ff3d30d2a0590dad7823cd55b017fa9a44418529e6efcd8617d342336d.json"
+    )
+    assert action_claim_path("campaign-two", "action-one") != action_claim_path(
+        "campaign-one", "action-one"
+    )
+    assert wave_worker_claim_path("campaign-one", "wave-one") == (
+        "wave-worker-leases/"
+        "0789175b8c48870a7c143d836393f395994d0339fd08d3bfc708cd128066ef25.json"
+    )
 
 
 def test_run_claim_path_canonicalizes_bucket_references() -> None:
@@ -161,6 +176,45 @@ def test_claim_release_retries_and_verifies_owner(tmp_path: Path) -> None:
 
     assert api.files == {}
     assert isinstance(api.commits[-1], dict)
+
+
+def test_expired_claim_is_replaced_with_a_parent_checked_commit(tmp_path: Path) -> None:
+    api = FakeCoordinationApi(tmp_path)
+    now = datetime(2026, 7, 14, tzinfo=UTC)
+    path = "coordination/publishers/results.json"
+    api.files[path] = (
+        b'{"expires_at":"2026-07-13T23:59:59+00:00","publisher_id":"dead"}\n'
+    )
+    store = HubClaimStore("org", "token", api=api, clock=lambda: now)
+    owner = {
+        "expires_at": (now + timedelta(minutes=15)).isoformat(),
+        "publisher_id": "replacement",
+    }
+
+    store.acquire(path, owner)
+
+    assert api.files[path] == (json.dumps(owner, sort_keys=True) + "\n").encode()
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    ["not-a-date", "2026-07-14T00:00:01+00:00", "2026-07-13T23:00:00"],
+)
+def test_active_or_invalid_expiring_claim_is_not_stolen(
+    tmp_path: Path, expires_at: str
+) -> None:
+    api = FakeCoordinationApi(tmp_path)
+    path = "coordination/publishers/results.json"
+    api.files[path] = json.dumps({"expires_at": expires_at}).encode()
+    store = HubClaimStore(
+        "org",
+        "token",
+        api=api,
+        clock=lambda: datetime(2026, 7, 14, tzinfo=UTC),
+    )
+
+    with pytest.raises(ClaimConflict, match="claim is already held"):
+        store.acquire(path, {"publisher_id": "replacement"})
 
 
 def test_claim_release_rejects_missing_or_changed_owner(tmp_path: Path) -> None:

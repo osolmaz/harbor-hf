@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from harbor_hf.evidence import is_sensitive_key
+from harbor_hf.provider_models import ProviderTarget
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 TaskName = Annotated[str, Field(min_length=1)]
@@ -22,6 +23,10 @@ GitHubRepository = Annotated[
     ),
 ]
 _CONTROLLER_HEADROOM_SECONDS = 4800
+_HARBOR_PACKAGE_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class StrictModel(BaseModel):
@@ -35,13 +40,26 @@ class Metadata(StrictModel):
 
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
+    dataset_digest: ContentDigest | None = None
     task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
     task_digests: dict[TaskName, ContentDigest] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def task_names_are_unique(self) -> BenchmarkSpec:
+    def benchmark_contract_is_consistent(self) -> BenchmarkSpec:
         if len(self.task_names) != len(set(self.task_names)):
             raise ValueError("benchmark task names must be unique")
+        _, reference = _split_dataset_reference(self.dataset)
+        if reference is not None and reference.startswith("sha256:"):
+            if _SHA256_DIGEST.fullmatch(reference) is None:
+                raise ValueError(
+                    "benchmark dataset content address must be a full sha256 digest"
+                )
+            if self.dataset_digest is not None and reference != self.dataset_digest:
+                raise ValueError(
+                    "benchmark dataset digest must match its "
+                    "content-addressed reference"
+                )
+            self.dataset_digest = reference
         return self
 
 
@@ -106,6 +124,9 @@ class DeploymentProfile(StrictModel):
         return self
 
 
+DeploymentTarget = DeploymentProfile | ProviderTarget
+
+
 class AgentProfile(StrictModel):
     id: ProfileId
     name: str = Field(min_length=1)
@@ -134,10 +155,31 @@ class AgentProfile(StrictModel):
         return self
 
 
+class MatrixRule(StrictModel):
+    models: list[ProfileId] = Field(default_factory=list)
+    deployments: list[ProfileId] = Field(default_factory=list)
+    agents: list[ProfileId] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def selects_at_least_one_dimension(self) -> MatrixRule:
+        if not (self.models or self.deployments or self.agents):
+            raise ValueError("matrix rules must select at least one dimension")
+        for dimension, values in (
+            ("models", self.models),
+            ("deployments", self.deployments),
+            ("agents", self.agents),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"matrix rule {dimension} must be unique")
+        return self
+
+
 class MatrixSpec(StrictModel):
     models: list[ModelProfile] = Field(min_length=1)
-    deployments: list[DeploymentProfile] = Field(min_length=1)
+    deployments: list[DeploymentTarget] = Field(min_length=1)
     agents: list[AgentProfile] = Field(min_length=1)
+    include: list[MatrixRule] = Field(default_factory=list)
+    exclude: list[MatrixRule] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def profile_ids_are_unique(self) -> MatrixSpec:
@@ -147,12 +189,27 @@ class MatrixSpec(StrictModel):
                 raise ValueError(
                     "profile IDs must be unique within each matrix dimension"
                 )
+        known = {
+            "models": {profile.id for profile in self.models},
+            "deployments": {profile.id for profile in self.deployments},
+            "agents": {profile.id for profile in self.agents},
+        }
+        for rule in [*self.include, *self.exclude]:
+            for dimension in ("models", "deployments", "agents"):
+                unknown = set(getattr(rule, dimension)) - known[dimension]
+                if unknown:
+                    raise ValueError(
+                        f"matrix rule references unknown {dimension}: "
+                        + ", ".join(sorted(unknown))
+                    )
         return self
 
 
 class ExecutionSpec(StrictModel):
     attempts: int = Field(default=1, ge=1)
     concurrent_trials: int = Field(default=1, ge=1)
+    max_trials_per_shard: int = Field(default=64, ge=1)
+    max_shards_per_wave: int = Field(default=8, ge=1)
     timeout_seconds: int = Field(default=3600, ge=1)
 
 
@@ -163,6 +220,14 @@ class ArtifactStoreSpec(StrictModel):
 class PublishingSpec(StrictModel):
     dataset: str = Field(min_length=1)
     index_dataset: str | None = None
+
+    @model_validator(mode="after")
+    def datasets_are_distinct(self) -> PublishingSpec:
+        if self.index_dataset is not None and self.index_dataset == self.dataset:
+            raise ValueError(
+                "publishing.index_dataset must differ from publishing.dataset"
+            )
+        return self
 
 
 class RemoteJobSpec(StrictModel):
@@ -226,17 +291,23 @@ class ExperimentSpec(StrictModel):
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
-    if re.fullmatch(r".+@sha256:[0-9a-f]{64}", spec.benchmark.dataset) is None:
-        raise ValueError("remote benchmark dataset must use an immutable sha256 digest")
+    pinned_harbor_dataset_reference(
+        spec.benchmark.dataset, spec.benchmark.dataset_digest
+    )
     _validate_task_pins(spec.benchmark)
     if any(
         re.fullmatch(r"[0-9a-f]{40}", model.revision) is None
         for model in spec.matrix.models
     ):
         raise ValueError("remote model revisions must be full Git commit IDs")
+    endpoint_deployments = [
+        deployment
+        for deployment in spec.matrix.deployments
+        if isinstance(deployment, DeploymentProfile)
+    ]
     if any(
         re.fullmatch(r".+@sha256:[0-9a-f]{64}", deployment.engine.image) is None
-        for deployment in spec.matrix.deployments
+        for deployment in endpoint_deployments
     ):
         raise ValueError("remote serving images must be pinned by sha256 digest")
     if any(not _is_immutable_agent_revision(agent) for agent in spec.matrix.agents):
@@ -258,6 +329,37 @@ def _validate_task_pins(benchmark: BenchmarkSpec) -> None:
     ]
     if unmatched_selections or unmatched_tasks:
         raise ValueError("remote task digests must exactly resolve the task selection")
+
+
+def pinned_harbor_dataset_reference(dataset: str, dataset_digest: str | None) -> str:
+    """Return the exact content-addressed dataset reference Harbor must execute."""
+    if dataset_digest is not None and _SHA256_DIGEST.fullmatch(dataset_digest) is None:
+        raise ValueError("benchmark dataset digest must be a full sha256 digest")
+    name, reference = _split_dataset_reference(dataset)
+    if _HARBOR_PACKAGE_NAME.fullmatch(name) is None or ".." in name:
+        raise ValueError(
+            "remote benchmark dataset must use a Harbor package name in org/name form"
+        )
+    if reference is not None and reference.startswith("sha256:"):
+        if _SHA256_DIGEST.fullmatch(reference) is None:
+            raise ValueError(
+                "benchmark dataset content address must be a full sha256 digest"
+            )
+        if dataset_digest is not None and reference != dataset_digest:
+            raise ValueError(
+                "benchmark dataset digest must match its content-addressed reference"
+            )
+        return dataset
+    if dataset_digest is None:
+        raise ValueError("remote benchmark dataset requires an immutable sha256 digest")
+    return f"{name}@{dataset_digest}"
+
+
+def _split_dataset_reference(dataset: str) -> tuple[str, str | None]:
+    name, separator, reference = dataset.rpartition("@")
+    if not separator:
+        return dataset, None
+    return name, reference
 
 
 def _is_immutable_agent_revision(agent: AgentProfile) -> bool:

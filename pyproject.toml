@@ -12,6 +12,7 @@ dependencies = [
   "pydantic>=2.11.7",
   "pyyaml>=6.0.2",
   "typer>=0.16.0",
+  "pyarrow>=18.0.0",
 ]
 
 [project.urls]
@@ -35,9 +36,14 @@ dev = [
   "slophammer-py==0.4.0",
   "ty>=0.0.59",
 ]
+presentation = [
+  "gradio>=6.20,<7",
+  "pyarrow>=18,<26",
+]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
+pythonpath = ["space"]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -61,4 +67,4 @@ skip_covered = true
 [tool.mutmut]
 source_paths = ["src/harbor_hf"]
 pytest_add_cli_args_test_selection = ["tests"]
-also_copy = ["examples"]
+also_copy = ["examples", "space"]

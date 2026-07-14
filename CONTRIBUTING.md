@@ -15,10 +15,19 @@ uv run ruff check .
 uv run ruff format --check .
 uv run ty check
 uv run pytest --cov=src/harbor_hf --cov-fail-under=85
+uv run pytest tests/test_presentation.py --cov=space --cov-fail-under=85
 uv run slophammer-py dry .
-uv run python scripts/check_mutation.py --min-kill-rate 90
 uv run pip-audit
-uv run slophammer-py check .
+uv run slophammer-py check . --baseline
+```
+
+The slower mutation suite is available as an explicit local command and a
+manually dispatched GitHub Actions workflow. It is not part of the pull-request
+critical path. The checked-in Slophammer baseline records that deliberate
+exception and still rejects every new finding:
+
+```bash
+uv run python scripts/check_mutation.py --min-kill-rate 90
 ```
 
 Tests must mock Hugging Face and Harbor network boundaries unless they are

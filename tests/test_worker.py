@@ -13,7 +13,7 @@ from typing import Any, cast
 import pytest
 
 from harbor_hf.coordination import ClaimConflict, run_claim_path
-from harbor_hf.models import ExperimentSpec, SourcePin
+from harbor_hf.models import DeploymentProfile, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
@@ -37,6 +37,7 @@ from harbor_hf.worker import (
     endpoint_state,
     endpoint_url,
     launch_cleanup_watchdog,
+    launch_cleanup_watchdog_for,
     prepare_locked_source,
     probe_runtime,
     require_executable,
@@ -393,6 +394,7 @@ def test_endpoint_arguments_require_complete_ordered_identity(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     engine = deployment.engine.model_copy(update={"arguments": ["-c", "65536"]})
     spec = remote_spec.model_copy(
         update={
@@ -417,6 +419,7 @@ def test_endpoint_omitted_arguments_match_an_empty_lock(
     remote_spec: ExperimentSpec,
 ) -> None:
     deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
     engine = deployment.engine.model_copy(update={"arguments": [], "secret_names": []})
     spec = remote_spec.model_copy(
         update={
@@ -704,6 +707,7 @@ def test_launch_watchdog_requires_controller_job_before_submission(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec)
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     monkeypatch.delenv("JOB_ID", raising=False)
@@ -718,6 +722,7 @@ def test_launch_watchdog_uses_independent_hf_job(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec, run_id="watchdog-run")
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     calls: list[dict[str, object]] = []
@@ -787,6 +792,7 @@ def test_launch_watchdog_caps_timeout_and_requires_returned_id(
         }
     )
     lock = build_run_lock(capped)
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     calls: list[dict[str, object]] = []
@@ -816,6 +822,7 @@ def test_launch_watchdog_does_not_cancel_after_failed_handshake(
     remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock = build_run_lock(remote_spec)
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     inspections: list[dict[str, object]] = []
@@ -840,6 +847,82 @@ def test_launch_watchdog_does_not_cancel_after_failed_handshake(
         launch_cleanup_watchdog(lock, endpoint, "secret")
 
     assert inspections == [{"job_id": "watchdog-job", "namespace": "osolmaz"}]
+
+
+@pytest.mark.parametrize(
+    "submission",
+    [SimpleNamespace(), SimpleNamespace(id=object())],
+)
+def test_launch_watchdog_rejects_every_missing_or_nonstr_id_before_waiting(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    submission: SimpleNamespace,
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    endpoint = deployment.endpoint
+    assert endpoint is not None
+
+    class FakeApi:
+        def __init__(self, *, token: str) -> None:
+            assert token == "secret"
+
+        def run_job(self, **_kwargs: object) -> object:
+            return submission
+
+    monkeypatch.setenv("JOB_ID", "controller-job")
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+    monkeypatch.setattr(
+        "harbor_hf.worker.wait_watchdog_ready",
+        lambda *_args, **_kwargs: pytest.fail("an invalid ID must not be awaited"),
+    )
+
+    with pytest.raises(WorkerError) as captured:
+        launch_cleanup_watchdog_for(remote, endpoint, "owner-one", "secret")
+
+    assert str(captured.value) == "cleanup watchdog submission returned no job ID"
+
+
+def test_launch_watchdog_waits_on_the_submitting_client_with_exact_identity(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote = remote_spec.remote
+    assert remote is not None
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    endpoint = deployment.endpoint
+    assert endpoint is not None
+    clients: list[object] = []
+    waits: list[tuple[object, str, str, int]] = []
+
+    class FakeApi:
+        def __init__(self, *, token: str) -> None:
+            assert token == "secret"
+            clients.append(self)
+
+        def run_job(self, **_kwargs: object) -> object:
+            return SimpleNamespace(id="watchdog-job")
+
+    def capture_wait(
+        api: object,
+        job_id: str,
+        namespace: str,
+        *,
+        timeout_seconds: int,
+    ) -> None:
+        waits.append((api, job_id, namespace, timeout_seconds))
+
+    monkeypatch.setenv("JOB_ID", "controller-job")
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+    monkeypatch.setattr("harbor_hf.worker.wait_watchdog_ready", capture_wait)
+
+    observed = launch_cleanup_watchdog_for(remote, endpoint, "owner-one", "secret")
+
+    assert observed == "watchdog-job"
+    assert waits == [(clients[0], "watchdog-job", "osolmaz", 300)]
 
 
 def test_wait_watchdog_ready_polls_until_handshake() -> None:
@@ -1460,7 +1543,7 @@ def test_harbor_command_is_pinned_and_bounded(
         "harbor",
         "run",
         "--dataset",
-        "terminal-bench@sha256:" + "1" * 64,
+        "harbor/terminal-bench@sha256:" + "1" * 64,
         "--n-attempts",
         "1",
         "--agent",
