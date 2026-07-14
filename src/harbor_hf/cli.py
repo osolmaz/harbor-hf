@@ -409,6 +409,12 @@ def automation_install(
             namespace=namespace or spec.remote.job.namespace,
             schedule=schedule,
             remote=spec.remote,
+            secret_names=(
+                [spec.benchmark.source.credentials.secret_name]
+                if spec.benchmark.source is not None
+                and spec.benchmark.source.credentials is not None
+                else []
+            ),
             suspended=suspended,
         )
         if dry_run:

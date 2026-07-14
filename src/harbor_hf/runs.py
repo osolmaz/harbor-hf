@@ -4,7 +4,11 @@ import hashlib
 import json
 import os
 import re
+import tempfile
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -25,7 +29,7 @@ _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 RUN_LOCK_V1ALPHA1 = "harbor-hf/run-lock/v1alpha1"
 RUN_LOCK_V1ALPHA2 = "harbor-hf/run-lock/v1alpha2"
 RUN_LOCK_V1ALPHA3 = "harbor-hf/run-lock/v1alpha3"
-_GIT_CREDENTIAL_ENV = "HARBOR_HF_GIT_CREDENTIAL_ENV"
+_GIT_CREDENTIAL_FILE_ENV = "HARBOR_HF_GIT_CREDENTIAL_FILE"
 _GIT_REPOSITORY_ENV = "HARBOR_HF_GIT_REPOSITORY"
 
 
@@ -182,9 +186,14 @@ def build_run_lock(
     )
 
 
+@contextmanager
 def harbor_process_environment(
-    lock: RunLock, *, token: str, inference_base_url: str
-) -> dict[str, str]:
+    lock: RunLock,
+    *,
+    token: str,
+    inference_base_url: str,
+    blocked_secret_names: Iterable[str] = (),
+) -> Iterator[dict[str, str]]:
     environment = {
         "HF_TOKEN": token,
         "OPENAI_API_KEY": token,
@@ -198,28 +207,45 @@ def harbor_process_environment(
                 "AGENT_JUDGE_MODEL": lock.benchmark_judge.model,
             }
         )
+    blocked = set(blocked_secret_names)
     source = lock.benchmark_source
-    if source is not None and source.credentials is not None:
-        secret_name = source.credentials.secret_name
-        source_token = os.environ.get(secret_name, "")
-        if not source_token:
-            raise ValueError(f"required secret {secret_name} is not available")
-        environment.update(
-            {
-                secret_name: source_token,
-                "GIT_CONFIG_COUNT": "2",
-                "GIT_CONFIG_KEY_0": "credential.useHttpPath",
-                "GIT_CONFIG_VALUE_0": "true",
-                "GIT_CONFIG_KEY_1": (
-                    f"credential.https://github.com/{source.repository}.git.helper"
-                ),
-                "GIT_CONFIG_VALUE_1": "harbor-hf",
-                "GIT_TERMINAL_PROMPT": "0",
-                _GIT_CREDENTIAL_ENV: secret_name,
-                _GIT_REPOSITORY_ENV: source.repository,
-            }
-        )
-    return environment
+    credential_path: Path | None = None
+    try:
+        if source is not None and source.credentials is not None:
+            secret_name = source.credentials.secret_name
+            source_token = os.environ.get(secret_name, "")
+            if not source_token:
+                raise ValueError(f"required secret {secret_name} is not available")
+            blocked.add(secret_name)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="harbor-hf-git-credential-",
+                delete=False,
+            ) as stream:
+                credential_path = Path(stream.name)
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(source_token)
+            environment.update(
+                {
+                    "GIT_CONFIG_COUNT": "2",
+                    "GIT_CONFIG_KEY_0": "credential.useHttpPath",
+                    "GIT_CONFIG_VALUE_0": "true",
+                    "GIT_CONFIG_KEY_1": (
+                        f"credential.https://github.com/{source.repository}.git.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_1": "harbor-hf",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    _GIT_CREDENTIAL_FILE_ENV: str(credential_path),
+                    _GIT_REPOSITORY_ENV: source.repository,
+                }
+            )
+        for secret_name in blocked:
+            environment[secret_name] = ""
+        yield environment
+    finally:
+        if credential_path is not None:
+            credential_path.unlink(missing_ok=True)
 
 
 def require_benchmark_source_secret(lock: RunLock) -> None:

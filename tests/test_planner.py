@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from harbor_hf.io import load_experiment
+from harbor_hf.models import DeploymentProfile
 from harbor_hf.planner import build_plan, experiment_digest
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
@@ -25,6 +26,19 @@ def test_digest_is_stable() -> None:
     assert experiment_digest(spec) == (
         "sha256:97b99fc7307035266a3f3526ce08bdab80114d885b6d1c8e5d85191a7ee89869"
     )
+
+
+def test_digest_preserves_legacy_empty_engine_secret_names() -> None:
+    spec = load_experiment(EXAMPLE)
+    for deployment in spec.matrix.deployments:
+        assert isinstance(deployment, DeploymentProfile)
+        deployment.engine.secret_names = []
+
+    assert experiment_digest(spec) == (
+        "sha256:07aa5ae5275c837488c17997bddf8bceeb3fd77079c730185426761848e77c96"
+    )
+    payload = spec.model_dump(mode="json", exclude_none=True)
+    assert payload["matrix"]["deployments"][0]["engine"]["secret_names"] == []
 
 
 def test_counts_explicit_tasks_and_attempts() -> None:

@@ -796,7 +796,7 @@ def _execute_shard_with_executor(
     }
     append_event(events, "shard_succeeded")
     write_json(shard_root / "shard-summary.json", summary)
-    _finalize_unit(shard_root, run_secret_values(run.configuration, token))
+    _finalize_unit(shard_root, _wave_secret_values(wave, token))
     (shard_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     _publish_unit(shard_root, output_root / locked_shard.artifact_prefix)
     return _file_digest(shard_root / "checksums.json")
@@ -873,19 +873,29 @@ def _execute_trial(
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
         append_event(events, "harbor_started")
-        outcome = adapter.execute(
-            prepared,
-            harbor_source,
-            jobs_dir,
-            execution_root / "harbor.log",
-            environment=harbor_process_environment(
-                run, token=token, inference_base_url=trial_base_url
-            ),
-            timeout_seconds=timeout,
-            stream_runner=stream_runner,
-            monotonic=monotonic,
-            deadline=deadline,
-        )
+        blocked_secret_names = {
+            candidate.configuration.benchmark_source.credentials.secret_name
+            for candidate in wave.runs
+            if candidate.configuration.benchmark_source is not None
+            and candidate.configuration.benchmark_source.credentials is not None
+        }
+        with harbor_process_environment(
+            run,
+            token=token,
+            inference_base_url=trial_base_url,
+            blocked_secret_names=blocked_secret_names,
+        ) as environment:
+            outcome = adapter.execute(
+                prepared,
+                harbor_source,
+                jobs_dir,
+                execution_root / "harbor.log",
+                environment=environment,
+                timeout_seconds=timeout,
+                stream_runner=stream_runner,
+                monotonic=monotonic,
+                deadline=deadline,
+            )
         append_event(events, "harbor_finished", exit_code=outcome.exit_code)
         if outcome.exit_code != 0:
             raise WorkerError(f"Harbor exited with status {outcome.exit_code}")
@@ -902,7 +912,7 @@ def _execute_trial(
         error = caught
         append_event(events, "execution_failed", error_type=type(caught).__name__)
     failure_record: dict[str, object] | None = None
-    secrets = run_secret_values(run, token)
+    secrets = _wave_secret_values(wave, token)
     if error is not None:
         failure_record = {
             "category": _execution_failure_category(

@@ -120,19 +120,21 @@ benchmark:
 Git sources require a GitHub repository, full commit, and safe repository-relative
 path. Public repositories omit `credentials`. Private repositories declare a
 separate HF Job secret containing a GitHub token; `HF_TOKEN` cannot be reused.
-Set `GITHUB_TOKEN` in the environment that submits a run. HF Jobs stores it as
-a remote secret, while the manifest and locks store only the secret name. For
-scheduled reconciliation, also list `GITHUB_TOKEN` in the automation manifest's
-top-level `secret_names` so the reconciler can forward it to campaign waves.
+Set `GITHUB_TOKEN` in the environment that submits a run or installs scheduled
+automation. HF Jobs stores it as a remote secret, while the manifest and locks
+store only the secret name. Automation derives the required secret names from
+the experiment manifest and forwards them to campaign waves.
 
 `dataset_digest` is derived from the canonical repository, revision, and path.
 Credential metadata does not change content identity. The worker renders the
 source as Harbor's `repo` and `path` dataset configuration, so Harbor still owns
 cloning, task resolution, and task checksum calculation. For private sources,
 the controller passes a credential-free GitHub URL and installs a Git credential
-helper scoped to that exact repository. The token stays in the process
-environment, terminal prompting is disabled, and final evidence scrubbing covers
-both the Hugging Face and GitHub token values.
+helper scoped to that exact repository. The helper reads the token from a
+mode-`0600` temporary file that is deleted after Harbor exits; source-token
+environment variables are blanked in Harbor and its task sandboxes. Terminal
+prompting is disabled, and final evidence scrubbing covers both the Hugging Face
+and GitHub token values.
 
 `benchmark.judge` optionally pins an OpenAI-compatible verifier judge on
 `router.huggingface.co`. Its API URL, model, protocol, and secret name are

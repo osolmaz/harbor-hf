@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import TextIO
 
-_CREDENTIAL_ENV = "HARBOR_HF_GIT_CREDENTIAL_ENV"
+_CREDENTIAL_FILE_ENV = "HARBOR_HF_GIT_CREDENTIAL_FILE"
 _REPOSITORY_ENV = "HARBOR_HF_GIT_REPOSITORY"
 
 
@@ -20,8 +21,10 @@ def main() -> None:
         or request.get("path", "").removeprefix("/") not in expected_paths
     ):
         return
-    secret_name = os.environ.get(_CREDENTIAL_ENV, "")
-    secret = os.environ.get(secret_name, "") if secret_name else ""
+    credential_file = os.environ.get(_CREDENTIAL_FILE_ENV, "")
+    secret = (
+        Path(credential_file).read_text(encoding="utf-8") if credential_file else ""
+    )
     if not secret:
         raise SystemExit("Git credential secret is not available")
     print("username=x-access-token")

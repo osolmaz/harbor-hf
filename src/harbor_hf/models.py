@@ -199,9 +199,7 @@ class EngineSpec(StrictModel):
     command: list[str] = Field(default_factory=list)
     arguments: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
-    secret_names: list[str] = Field(
-        default_factory=list, exclude_if=lambda value: not value
-    )
+    secret_names: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def environment_contains_no_inline_secrets(self) -> EngineSpec:

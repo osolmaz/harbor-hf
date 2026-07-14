@@ -732,17 +732,27 @@ def _execute_benchmark(
         expected_task_digests=dict(lock.benchmark_task_digests),
     )
     append_event(events, "harbor_started")
-    outcome = adapter.execute(
-        prepared,
-        harbor_source,
-        jobs_dir,
-        root / "harbor.log",
-        environment=harbor_process_environment(
-            lock, token=token, inference_base_url=base_url
-        ),
-        timeout_seconds=lock.timeout_seconds,
-        stream_runner=stream_runner,
+    source_secret_names = (
+        [lock.benchmark_source.credentials.secret_name]
+        if lock.benchmark_source is not None
+        and lock.benchmark_source.credentials is not None
+        else []
     )
+    with harbor_process_environment(
+        lock,
+        token=token,
+        inference_base_url=base_url,
+        blocked_secret_names=source_secret_names,
+    ) as environment:
+        outcome = adapter.execute(
+            prepared,
+            harbor_source,
+            jobs_dir,
+            root / "harbor.log",
+            environment=environment,
+            timeout_seconds=lock.timeout_seconds,
+            stream_runner=stream_runner,
+        )
     append_event(events, "harbor_finished", exit_code=outcome.exit_code)
     if outcome.exit_code != 0:
         raise WorkerError(f"Harbor exited with status {outcome.exit_code}")

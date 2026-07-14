@@ -1,5 +1,6 @@
 import io
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -7,7 +8,9 @@ from harbor_hf.git_credential import main
 
 
 def test_credential_helper_returns_scoped_github_token(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["git-credential-harbor-hf", "get"])
     monkeypatch.setattr(
@@ -17,9 +20,10 @@ def test_credential_helper_returns_scoped_github_token(
             "protocol=https\nhost=github.com\npath=ShellBench/public-tasks.git\n\n"
         ),
     )
-    monkeypatch.setenv("HARBOR_HF_GIT_CREDENTIAL_ENV", "GITHUB_TOKEN")
+    credential_file = tmp_path / "credential"
+    credential_file.write_text("github-secret", encoding="utf-8")
+    monkeypatch.setenv("HARBOR_HF_GIT_CREDENTIAL_FILE", str(credential_file))
     monkeypatch.setenv("HARBOR_HF_GIT_REPOSITORY", "ShellBench/public-tasks")
-    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
 
     main()
 
@@ -40,12 +44,14 @@ def test_credential_helper_refuses_other_targets(
     credential_input: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["git-credential-harbor-hf", "get"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(credential_input))
-    monkeypatch.setenv("HARBOR_HF_GIT_CREDENTIAL_ENV", "GITHUB_TOKEN")
+    credential_file = tmp_path / "credential"
+    credential_file.write_text("github-secret", encoding="utf-8")
+    monkeypatch.setenv("HARBOR_HF_GIT_CREDENTIAL_FILE", str(credential_file))
     monkeypatch.setenv("HARBOR_HF_GIT_REPOSITORY", "ShellBench/public-tasks")
-    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
 
     main()
 
