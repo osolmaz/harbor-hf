@@ -2508,14 +2508,25 @@ def test_runtime_probe_records_json_text_and_failures(
 def test_runtime_probe_requires_healthy_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    requests: list[urllib.request.Request] = []
+
+    def unhealthy(request: urllib.request.Request, **_kwargs: object) -> FakeResponse:
+        requests.append(request)
+        return FakeResponse(b"bad", 503)
+
     monkeypatch.setattr(
-        "urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse(b"bad", 503)
+        "urllib.request.urlopen",
+        unhealthy,
     )
 
     with pytest.raises(
         WorkerError, match="^endpoint health probe did not return HTTP 200$"
     ):
         probe_runtime("https://endpoint.example", "token")
+
+    assert [request.full_url for request in requests] == [
+        "https://endpoint.example/health"
+    ]
 
 
 def test_runtime_readiness_retries_gateway_race(
