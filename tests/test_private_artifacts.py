@@ -88,6 +88,26 @@ def test_successful_openclaw_execution_requires_session_jsonl(tmp_path: Path) ->
     assert retained.requirements[0].satisfied is False
 
 
+def test_trajectory_sidecar_does_not_satisfy_session_requirement(
+    tmp_path: Path,
+) -> None:
+    root = _execution_root(tmp_path, with_session=False)
+    sessions = (
+        root / "harbor-jobs" / "job-one" / "trial-one" / "agent" / "openclaw-sessions"
+    )
+    sessions.mkdir()
+    sidecar = sessions / "session-one.trajectory.jsonl"
+    sidecar.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no session JSONL"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+    retained = build_private_artifact_manifest(root, strict_session=False)
+    kinds = {entry.path: entry.kind for entry in retained.entries}
+    assert kinds[str(sidecar.relative_to(root))] == "trajectory"
+    assert retained.requirements[0].satisfied is False
+
+
 def test_session_is_not_required_before_agent_execution_starts(tmp_path: Path) -> None:
     root = _execution_root(tmp_path, started=False, with_session=False)
 

@@ -54,6 +54,8 @@ def classify_private_artifact(path: str) -> ArtifactKind:
         raise ValueError("Harbor artifact path is not safely relative")
     parts = tuple(part.lower() for part in relative.parts)
     name = parts[-1]
+    if "trajectory" in name:
+        return "trajectory"
     component_kinds: tuple[tuple[str, ArtifactKind], ...] = (
         ("openclaw-sessions", "session"),
         ("trajectories", "trajectory"),
@@ -79,8 +81,6 @@ def classify_private_artifact(path: str) -> ArtifactKind:
 
 
 def _classify_named_artifact(parts: tuple[str, ...], name: str) -> ArtifactKind:
-    if "trajectory" in name:
-        return "trajectory"
     if name.endswith(".lock.json") or name == "lock.json":
         return "lock"
     if "agent" in parts and (

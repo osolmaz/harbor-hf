@@ -205,7 +205,9 @@ def build_private_artifact_manifest(
     session_paths = [
         entry.path
         for entry in entries
-        if entry.kind == "session" and entry.path.endswith(".jsonl")
+        if entry.kind == "session"
+        and entry.path.endswith(".jsonl")
+        and not entry.path.endswith(".trajectory.jsonl")
     ]
     required = (
         openclaw_execution_started(root)
