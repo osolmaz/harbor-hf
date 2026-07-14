@@ -801,6 +801,15 @@ def test_observe_skips_non_terminal_units_and_handles_cleanup_failures(
     )
     del cancelled[f"{success}/_SUCCESS"]
     cancelled[f"{success}/_CANCELLED"] = b"\n"
+    cancelled_events = _execution_events(
+        "2026-07-14T01:03:00+00:00",
+        "execution_cancelled",
+        "2026-07-14T01:04:00+00:00",
+    )
+    cancelled[f"{success}/events.jsonl"] = cancelled_events
+    cancelled_checksums = json.loads(cancelled[f"{success}/checksums.json"])
+    cancelled_checksums["events.jsonl"] = _sha(cancelled_events)
+    cancelled[f"{success}/checksums.json"] = _pretty(cancelled_checksums)
     events = BucketCampaignObserver(_Reader(cancelled)).observe(lock, remote_spec)
     assert [event.kind for event in events if event.subject_id == "execution-one"] == [
         "execution.started",

@@ -689,7 +689,15 @@ class CampaignReconciler:
             EndpointProvisioningError,
             ValueError,
         ) as error:
-            return self._record_outcome(lock, action, "failed", str(error))
+            return self._record_outcome(
+                lock,
+                action,
+                "failed",
+                str(error),
+                remote_id=_failed_endpoint_remote_id(
+                    lock, spec, action, projection, error
+                ),
+            )
         outcome = self._record_outcome(
             lock,
             action,
@@ -1352,19 +1360,41 @@ def _terminal_wave_needs_drain(wave: object) -> bool:
     }
 
 
+def _failed_endpoint_remote_id(
+    lock: CampaignLock,
+    spec: ExperimentSpec,
+    action: ReconcileAction,
+    projection: RecoveryProjection,
+    error: Exception,
+) -> str | None:
+    if not isinstance(error, EndpointProvisioningError) or action.kind not in {
+        "submit-wave",
+        "retry-shard",
+    }:
+        return None
+    target = _deployment_target(lock, spec, action.deployment_digest)
+    if isinstance(target, ProviderTarget):
+        return None
+    desired = _desired_endpoint(lock, spec, action)
+    if not _can_recover_orphaned_endpoint(lock, action, desired, projection):
+        return None
+    return desired.identity.name
+
+
 def _can_recover_orphaned_endpoint(
     lock: CampaignLock,
     action: ReconcileAction,
     desired: DesiredEndpoint,
     projection: RecoveryProjection,
 ) -> bool:
-    current = projection.campaign.actions.get(action.action_id)
-    endpoint_ambiguity = (
-        current is not None
-        and current.status == "ambiguous"
-        and current.remote_id == desired.identity.name
-    )
-    if not endpoint_ambiguity:
+    provenance_action_ids = {
+        state.action_id
+        for state in projection.campaign.actions.values()
+        if state.status in {"ambiguous", "failed"}
+        and state.remote_id == desired.identity.name
+        and _action_targets_deployment(lock, state, action.deployment_digest)
+    }
+    if not provenance_action_ids:
         return False
     if any(
         wave.deployment_digest == action.deployment_digest and wave.status != "closed"
@@ -1373,6 +1403,7 @@ def _can_recover_orphaned_endpoint(
         return False
     return not any(
         state.action_id != action.action_id
+        and state.action_id not in provenance_action_ids
         and state.status in {"reserved", "succeeded", "ambiguous"}
         and _action_targets_deployment(lock, state, action.deployment_digest)
         and (

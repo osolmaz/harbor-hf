@@ -760,6 +760,48 @@ def test_durable_shard_retry_request_has_generation_identity_and_exact_payload(
     }
 
 
+def test_retry_request_rejects_generations_outside_its_event_time_shard_state(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2, max_trials_per_shard=1)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    first_shard, second_shard = lock.runs[0].shards
+    first_trial = first_shard.trials[0]
+    second_trial = second_shard.trials[0]
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        first_shard.shard_id,
+        "retry now",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+
+    invalid_mappings = [
+        {second_trial.trial_id: 0},
+        {"unknown-trial": 0},
+        {first_trial.trial_id: 2},
+    ]
+    for mapping in invalid_mappings:
+        invalid = request.model_copy(
+            update={
+                "payload": request.payload.model_copy(
+                    update={"trial_generations": mapping}
+                )
+            }
+        )
+        with pytest.raises(
+            ValueError,
+            match="retry request generations do not match the requested shard state",
+        ):
+            project_recovery(lock, [submitted, *failed, invalid])
+
+
 def test_durable_shard_retry_identity_includes_every_eligible_trial(
     remote_spec: ExperimentSpec,
 ) -> None:

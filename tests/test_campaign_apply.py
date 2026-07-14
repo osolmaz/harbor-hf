@@ -69,6 +69,7 @@ from harbor_hf.endpoints import (
     AmbiguousEndpointPause,
     DesiredEndpoint,
     EndpointNotPaused,
+    EndpointProviderError,
     EndpointProvisioner,
     EndpointSnapshot,
     EndpointStatus,
@@ -588,6 +589,42 @@ def test_endpoint_provenance_survives_consecutive_ambiguous_outcomes(
 
     assert recovered.applied[0].status == "succeeded"
     assert len(endpoints.pause_calls) == 1
+    assert endpoints.active is False
+    assert len(recovered_jobs.submissions) == 1
+
+
+def test_endpoint_provenance_survives_definitive_pause_failure(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    endpoints = FakeEndpoints()
+    endpoints.present = True
+    endpoints.active = True
+    endpoints.create_error = AmbiguousEndpointPause("created endpoint cleanup pending")
+
+    first = _reconciler(store, endpoints, FakeJobs()).apply_campaign(lock.campaign_id)
+    assert first.applied[0].status == "ambiguous"
+
+    endpoints.create_error = None
+    endpoints.pause_error = EndpointProviderError("pause was rejected")
+    failed = _reconciler(
+        store, endpoints, FakeJobs(), identifier_start=10
+    ).apply_campaign(lock.campaign_id)
+
+    endpoint_name = failed.applied[0].remote_id
+    assert failed.applied[0].status == "failed"
+    assert endpoint_name is not None
+
+    endpoints.pause_error = None
+    recovered_jobs = FakeJobs()
+    recovered = _reconciler(
+        store, endpoints, recovered_jobs, identifier_start=20
+    ).apply_campaign(lock.campaign_id)
+
+    assert recovered.applied[0].status == "succeeded"
+    assert recovered.applied[0].remote_id is not None
+    assert len(endpoints.pause_calls) == 2
     assert endpoints.active is False
     assert len(recovered_jobs.submissions) == 1
 

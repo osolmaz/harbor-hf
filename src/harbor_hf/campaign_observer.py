@@ -429,7 +429,12 @@ def _execution_control_events(
     failure_category: RetryCategory | None,
 ) -> list[CampaignEvent]:
     started = _event_time(records, "execution_started")
-    finished = _event_time(records, "execution_succeeded", "execution_failed")
+    finished = _event_time(
+        records,
+        "execution_succeeded",
+        "execution_failed",
+        "execution_cancelled",
+    )
     start = _event(
         campaign,
         subject_type="execution",
