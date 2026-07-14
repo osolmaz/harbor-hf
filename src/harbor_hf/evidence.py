@@ -93,6 +93,8 @@ def archive_directory(source: Path, destination: Path) -> None:
             relative = path.relative_to(source)
             arcname = Path(source.name) / relative
             info = archive.gettarinfo(str(path), arcname.as_posix())
+            if info is None:
+                raise RuntimeError("unsupported special file in run evidence")
             info.uid = 0
             info.gid = 0
             info.uname = ""
@@ -196,6 +198,8 @@ def _evidence_paths(root: Path) -> list[Path]:
     paths = sorted(root.rglob("*"))
     if any(path.is_symlink() for path in paths):
         raise RuntimeError("symbolic links are not allowed in run evidence")
+    if any(not path.is_dir() and not path.is_file() for path in paths):
+        raise RuntimeError("special files are not allowed in run evidence")
     return paths
 
 

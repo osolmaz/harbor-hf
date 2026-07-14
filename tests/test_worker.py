@@ -2617,6 +2617,29 @@ def test_direct_jobs_root_files_are_bounded(
     ]
 
 
+def test_failed_direct_run_falls_back_from_undecodable_result(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "harbor-jobs" / "job" / "trial-fallback"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_bytes(b"\xff")
+    (tmp_path / "run.lock.json").write_text(
+        build_run_lock(remote_spec, run_id="undecodable-result").model_dump_json(),
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    manifest = json.loads(
+        (trial / "private-artifacts.json").read_text(encoding="utf-8")
+    )
+    assert manifest["execution_id"] == "undecodable-result"
+    assert manifest["trial_id"] == "trial-fallback"
+
+
 def test_failed_direct_run_sanitizes_each_trial_independently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

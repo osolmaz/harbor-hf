@@ -1294,7 +1294,7 @@ def _direct_trial_id(root: Path, trial_root: Path, *, strict: bool) -> str:
 def _read_json_object(path: Path) -> dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return value if isinstance(value, dict) else {}
 

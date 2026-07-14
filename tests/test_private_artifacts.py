@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -97,6 +98,18 @@ def test_session_requirement_rejects_unusable_jsonl(
     root = _execution_root(tmp_path)
     session = next(root.rglob("session-one.jsonl"))
     session.write_text(content, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no session JSONL"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+    retained = build_private_artifact_manifest(root, strict_session=False)
+    assert retained.requirements[0].satisfied is False
+
+
+def test_session_requirement_rejects_over_nested_json(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path)
+    session = next(root.rglob("session-one.jsonl"))
+    session.write_text('{"nested":' * 20_000 + "{}" + "}" * 20_000 + "\n")
 
     with pytest.raises(RuntimeError, match="no session JSONL"):
         build_private_artifact_manifest(root, strict_session=True)
@@ -222,6 +235,22 @@ def test_private_manifest_rejects_symlinks(tmp_path: Path) -> None:
         build_private_artifact_manifest(root, strict_session=True)
 
 
+def test_private_artifact_sanitizer_rejects_special_files(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path)
+    fifo = root / "runtime.pipe"
+    os.mkfifo(fifo)
+
+    with pytest.raises(RuntimeError, match="unsupported file type: runtime.pipe"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+    rejected = sanitize_private_artifact_tree(root)
+
+    assert ("runtime.pipe", "special_file") in {
+        (item.path, item.reason) for item in rejected
+    }
+    assert not fifo.exists()
+
+
 def test_private_artifact_sanitizer_records_and_removes_rejected_files(
     tmp_path: Path,
 ) -> None:
@@ -344,6 +373,51 @@ def test_directory_sanitizer_reserves_space_for_its_rejection_record(
     assert (job / "private-artifact-rejections.json").stat().st_size <= 300
     assert all(item.path != "private-artifact-rejections.json" for item in second)
     assert second == first
+
+
+def test_private_artifact_file_count_is_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "evidence"
+    root.mkdir()
+    for name in ("one", "two", "three"):
+        (root / name).touch()
+
+    with pytest.raises(RuntimeError, match="file count limit"):
+        build_private_artifact_manifest(
+            root,
+            strict_session=False,
+            execution_id="execution-one",
+            trial_id="trial-one",
+            session_required=False,
+            max_file_count=2,
+        )
+
+    rejected = sanitize_private_artifact_tree(root, max_file_count=2)
+    manifest = write_private_artifact_manifest(
+        root,
+        strict_session=False,
+        execution_id="execution-one",
+        trial_id="trial-one",
+        session_required=False,
+        trust_rejections=True,
+        max_file_count=2,
+    )
+
+    assert len(manifest.entries) == 2
+    assert [(item.path, item.reason) for item in rejected] == [("one", "bundle_size")]
+
+
+def test_private_artifact_manifest_is_bounded(tmp_path: Path) -> None:
+    (tmp_path / "retained").touch()
+
+    with pytest.raises(RuntimeError, match="manifest exceeds file size limit"):
+        write_private_artifact_manifest(
+            tmp_path,
+            strict_session=False,
+            execution_id="execution-one",
+            trial_id="trial-one",
+            session_required=False,
+            max_file_bytes=256,
+        )
 
 
 def test_private_manifest_rejects_controller_reserved_paths(tmp_path: Path) -> None:

@@ -8,7 +8,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from harbor_hf.evidence import write_json
 from harbor_hf.harbor_adapter.exporter import (
     ArtifactKind as PrivateArtifactKind,
 )
@@ -17,6 +16,7 @@ from harbor_hf.harbor_adapter.models import Sha256Digest
 
 DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_PRIVATE_BUNDLE_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_PRIVATE_ARTIFACT_FILES = 4096
 _DERIVED_FILES = frozenset(
     {
         "_CANCELLED",
@@ -81,7 +81,13 @@ class PrivateArtifactRequirement(FrozenModel):
 
 class PrivateArtifactRejection(FrozenModel):
     path: str = Field(min_length=1)
-    reason: Literal["symlink", "file_size", "bundle_size", "reserved_path"]
+    reason: Literal[
+        "symlink",
+        "special_file",
+        "file_size",
+        "bundle_size",
+        "reserved_path",
+    ]
     size: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -171,36 +177,16 @@ def build_private_artifact_manifest(
     trust_rejections: bool = False,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+    max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
 ) -> PrivateArtifactManifest:
     identity = _artifact_identity(root, execution_id, trial_id)
-    entries: list[PrivateArtifactEntry] = []
-    total_bytes = 0
-    candidates = sorted(
-        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    entries, total_bytes = _private_artifact_entries(
+        root,
+        trust_rejections=trust_rejections,
+        max_file_bytes=max_file_bytes,
+        max_bundle_bytes=max_bundle_bytes,
+        max_file_count=max_file_count,
     )
-    for candidate in candidates:
-        if candidate.is_symlink():
-            raise RuntimeError("private artifact evidence cannot contain symlinks")
-        relative = candidate.relative_to(root).as_posix()
-        if relative in _DERIVED_FILES:
-            _validate_reserved_path(candidate, relative, trust_rejections)
-            continue
-        if not candidate.is_file():
-            continue
-        size = candidate.stat().st_size
-        if size > max_file_bytes:
-            raise RuntimeError(f"private artifact exceeds file size limit: {relative}")
-        total_bytes += size
-        if total_bytes > max_bundle_bytes:
-            raise RuntimeError("private artifact bundle exceeds size limit")
-        entries.append(
-            PrivateArtifactEntry(
-                path=relative,
-                size=size,
-                digest=_digest(candidate),
-                kind=classify_private_artifact(relative),
-            )
-        )
 
     session_paths = [
         entry.path
@@ -234,6 +220,65 @@ def build_private_artifact_manifest(
     )
 
 
+def _private_artifact_entries(
+    root: Path,
+    *,
+    trust_rejections: bool,
+    max_file_bytes: int,
+    max_bundle_bytes: int,
+    max_file_count: int,
+) -> tuple[list[PrivateArtifactEntry], int]:
+    entries: list[PrivateArtifactEntry] = []
+    total_bytes = 0
+    candidates = sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    )
+    for candidate in candidates:
+        entry = _private_artifact_entry(
+            candidate,
+            root,
+            trust_rejections=trust_rejections,
+            max_file_bytes=max_file_bytes,
+        )
+        if entry is None:
+            continue
+        total_bytes += entry.size
+        if total_bytes > max_bundle_bytes:
+            raise RuntimeError("private artifact bundle exceeds size limit")
+        entries.append(entry)
+        if len(entries) > max_file_count:
+            raise RuntimeError("private artifact bundle exceeds file count limit")
+    return entries, total_bytes
+
+
+def _private_artifact_entry(
+    candidate: Path,
+    root: Path,
+    *,
+    trust_rejections: bool,
+    max_file_bytes: int,
+) -> PrivateArtifactEntry | None:
+    if candidate.is_symlink():
+        raise RuntimeError("private artifact evidence cannot contain symlinks")
+    relative = candidate.relative_to(root).as_posix()
+    if relative in _DERIVED_FILES:
+        _validate_reserved_path(candidate, relative, trust_rejections)
+        return None
+    if candidate.is_dir():
+        return None
+    if not candidate.is_file():
+        raise RuntimeError(f"private artifact has unsupported file type: {relative}")
+    size = candidate.stat().st_size
+    if size > max_file_bytes:
+        raise RuntimeError(f"private artifact exceeds file size limit: {relative}")
+    return PrivateArtifactEntry(
+        path=relative,
+        size=size,
+        digest=_digest(candidate),
+        kind=classify_private_artifact(relative),
+    )
+
+
 def write_private_artifact_manifest(
     root: Path,
     *,
@@ -244,6 +289,7 @@ def write_private_artifact_manifest(
     trust_rejections: bool = False,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+    max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
 ) -> PrivateArtifactManifest:
     manifest = build_private_artifact_manifest(
         root,
@@ -254,8 +300,20 @@ def write_private_artifact_manifest(
         trust_rejections=trust_rejections,
         max_file_bytes=max_file_bytes,
         max_bundle_bytes=max_bundle_bytes,
+        max_file_count=max_file_count,
     )
-    write_json(root / "private-artifacts.json", manifest.model_dump(mode="json"))
+    payload = (
+        json.dumps(
+            manifest.model_dump(mode="json"),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n"
+    ).encode()
+    if len(payload) > max_file_bytes:
+        raise RuntimeError("private artifact manifest exceeds file size limit")
+    (root / "private-artifacts.json").write_bytes(payload)
     return manifest
 
 
@@ -266,10 +324,12 @@ def sanitize_private_artifact_tree(
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
     trust_existing_rejections: bool = False,
     required_directories: tuple[str, ...] = (),
+    max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
 ) -> list[PrivateArtifactRejection]:
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
     rejected = _remove_symlinks(root)
     rejected.extend(_remove_required_directory_collisions(root, required_directories))
+    rejected.extend(_remove_special_files(root))
     rejected.extend(_remove_reserved_paths(root))
     existing_rejections, omitted_count = _consume_existing_rejections(
         root, trust_existing=trust_existing_rejections
@@ -284,6 +344,7 @@ def sanitize_private_artifact_tree(
         omitted_count=omitted_count,
         max_file_bytes=max_file_bytes,
         max_bundle_bytes=max_bundle_bytes,
+        max_file_count=max_file_count,
     )
 
 
@@ -308,15 +369,22 @@ def validate_private_artifact_directory_files(
     *,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+    max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
 ) -> None:
     """Validate only files directly inside a directory, excluding child bundles."""
     total_bytes = 0
+    file_count = 0
     for candidate in sorted(root.iterdir()):
         if candidate.is_symlink():
             raise RuntimeError("private artifact evidence cannot contain symlinks")
-        if not candidate.is_file():
+        if candidate.is_dir():
             continue
+        if not candidate.is_file():
+            raise RuntimeError(
+                f"private artifact has unsupported file type: {candidate.name}"
+            )
         size = candidate.stat().st_size
+        file_count += 1
         if size > max_file_bytes:
             raise RuntimeError(
                 f"private artifact exceeds file size limit: {candidate.name}"
@@ -324,6 +392,8 @@ def validate_private_artifact_directory_files(
         total_bytes += size
         if total_bytes > max_bundle_bytes:
             raise RuntimeError("private artifact bundle exceeds size limit")
+        if file_count > max_file_count:
+            raise RuntimeError("private artifact bundle exceeds file count limit")
 
 
 def sanitize_private_artifact_directory_files(
@@ -334,6 +404,7 @@ def sanitize_private_artifact_directory_files(
     trust_existing_rejections: bool = False,
     required_directories: tuple[str, ...] = (),
     preserved_files: tuple[str, ...] = (),
+    max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
 ) -> list[PrivateArtifactRejection]:
     """Bound direct files without charging independently bounded child bundles."""
     preserved = {_direct_file_name(relative) for relative in preserved_files}
@@ -344,10 +415,19 @@ def sanitize_private_artifact_directory_files(
     rejected.extend(existing_rejections)
     files: list[tuple[Path, str, int, PrivateArtifactKind]] = []
     for candidate in sorted(root.iterdir()):
-        if candidate.is_symlink() or not candidate.is_file():
+        if candidate.is_symlink() or candidate.is_dir():
             continue
         relative = candidate.name
         if relative == _REJECTION_FILE or relative in preserved:
+            continue
+        if not candidate.is_file():
+            candidate.unlink()
+            rejected.append(
+                PrivateArtifactRejection(
+                    path=relative,
+                    reason="special_file",
+                )
+            )
             continue
         size = candidate.stat().st_size
         if size > max_file_bytes:
@@ -368,6 +448,7 @@ def sanitize_private_artifact_directory_files(
         omitted_count=omitted_count,
         max_file_bytes=max_file_bytes,
         max_bundle_bytes=max_bundle_bytes,
+        max_file_count=max_file_count,
     )
 
 
@@ -379,6 +460,7 @@ def _finalize_bounded_rejections(
     omitted_count: int,
     max_file_bytes: int,
     max_bundle_bytes: int,
+    max_file_count: int,
 ) -> list[PrivateArtifactRejection]:
     record_limit = min(max_file_bytes, max_bundle_bytes)
     while True:
@@ -393,6 +475,7 @@ def _finalize_bounded_rejections(
         bundle_rejections = _trim_bundle(
             files,
             max(0, max_bundle_bytes - record_bytes),
+            max_file_count,
         )
         if not bundle_rejections:
             return retained
@@ -494,6 +577,19 @@ def _remove_required_directory_collisions(
     return rejected
 
 
+def _remove_special_files(root: Path) -> list[PrivateArtifactRejection]:
+    rejected: list[PrivateArtifactRejection] = []
+    for candidate in sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    ):
+        if candidate.is_symlink() or candidate.is_dir() or candidate.is_file():
+            continue
+        relative = candidate.relative_to(root).as_posix()
+        candidate.unlink()
+        rejected.append(PrivateArtifactRejection(path=relative, reason="special_file"))
+    return rejected
+
+
 def _direct_child(root: Path, relative: str) -> Path:
     path = _safe_relative_path(relative)
     if len(path.parts) != 1 or relative in _DERIVED_FILES:
@@ -590,10 +686,13 @@ def _remove_oversized_files(
 
 
 def _trim_bundle(
-    files: list[tuple[Path, str, int, PrivateArtifactKind]], max_bundle_bytes: int
+    files: list[tuple[Path, str, int, PrivateArtifactKind]],
+    max_bundle_bytes: int,
+    max_file_count: int,
 ) -> list[PrivateArtifactRejection]:
     rejected: list[PrivateArtifactRejection] = []
     total = sum(item[2] for item in files)
+    retained_count = len(files)
     removal_order = sorted(
         files,
         key=lambda item: (
@@ -603,10 +702,11 @@ def _trim_bundle(
         ),
     )
     for candidate, relative, size, _kind in removal_order:
-        if total <= max_bundle_bytes:
+        if total <= max_bundle_bytes and retained_count <= max_file_count:
             break
         candidate.unlink()
         total -= size
+        retained_count -= 1
         rejected.append(
             PrivateArtifactRejection(
                 path=relative,
@@ -736,7 +836,7 @@ def _valid_jsonl_objects(path: Path) -> bool:
                 if not isinstance(json.loads(line), dict):
                     return False
                 found = True
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
         return False
     return found
 

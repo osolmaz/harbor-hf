@@ -1,4 +1,5 @@
 import json
+import socket
 import tarfile
 import tempfile
 from datetime import UTC, datetime
@@ -170,6 +171,16 @@ def test_evidence_operations_reject_symlinks(tmp_path: Path) -> None:
         archive_directory(root, tmp_path / "archive.tar.gz")
 
     assert outside.read_text(encoding="utf-8") == "secret-value"
+
+
+def test_evidence_operations_reject_special_files(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(root / "runtime.sock"))
+
+        with pytest.raises(RuntimeError, match="special files are not allowed"):
+            archive_directory(root, tmp_path / "archive.tar.gz")
 
 
 def test_archive_is_deterministic_and_preserves_relative_tree(tmp_path: Path) -> None:
