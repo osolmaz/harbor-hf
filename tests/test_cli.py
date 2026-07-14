@@ -24,6 +24,18 @@ EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
 runner = CliRunner()
 
 
+def _manifest_with_shared_publishing_dataset(
+    spec: ExperimentSpec, tmp_path: Path
+) -> Path:
+    value = spec.model_dump(mode="json", exclude_none=True)
+    publishing = value["publishing"]
+    assert isinstance(publishing, dict)
+    publishing["index_dataset"] = publishing["dataset"]
+    manifest = tmp_path / "shared-publishing-dataset.yaml"
+    manifest.write_text(yaml.safe_dump(value), encoding="utf-8")
+    return manifest
+
+
 def test_validate_command() -> None:
     result = runner.invoke(app, ["validate", str(EXAMPLE)])
 
@@ -64,6 +76,26 @@ def test_campaign_plan_reports_unresolved_tasks() -> None:
 
     assert result.exit_code == 0
     assert "Runs: 2" in result.stdout
+
+
+def test_campaign_plan_rejects_shared_publishing_dataset_before_planning(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest_with_shared_publishing_dataset(remote_spec, tmp_path)
+
+    def unexpected_planning(_spec: ExperimentSpec) -> object:
+        pytest.fail("campaign planning must not start for an invalid manifest")
+
+    monkeypatch.setattr("harbor_hf.cli.build_campaign_plan", unexpected_planning)
+
+    result = runner.invoke(app, ["campaign", "plan", str(manifest)])
+
+    assert result.exit_code == 2
+    assert (
+        "publishing.index_dataset must differ from publishing.dataset" in result.stderr
+    )
 
 
 def test_campaign_schema_command_writes_json(tmp_path: Path) -> None:
@@ -131,6 +163,30 @@ def test_campaign_submit_rejects_missing_index_before_remote_mutation(
 
     assert result.exit_code == 1
     assert "requires publishing.index_dataset" in result.stderr
+
+
+def test_campaign_submit_rejects_shared_publishing_dataset_before_remote_work(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest_with_shared_publishing_dataset(remote_spec, tmp_path)
+
+    def unexpected_remote_work(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("remote work must not start for an invalid manifest")
+
+    monkeypatch.setattr(
+        "harbor_hf.submission.ensure_private_coordination_repository",
+        unexpected_remote_work,
+    )
+    monkeypatch.setattr("harbor_hf.cli.HubCampaignStore", unexpected_remote_work)
+
+    result = runner.invoke(app, ["campaign", "submit", str(manifest)])
+
+    assert result.exit_code == 2
+    assert (
+        "publishing.index_dataset must differ from publishing.dataset" in result.stderr
+    )
 
 
 def test_campaign_status_and_dry_reconcile(

@@ -11,6 +11,7 @@ from harbor_hf.models import (
     ExperimentSpec,
     MatrixRule,
     MatrixSpec,
+    PublishingSpec,
     RemoteJobSpec,
     SourcePin,
 )
@@ -54,6 +55,14 @@ def test_reports_unreadable_path(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestError, match=f"cannot read {manifest}"):
         load_experiment(manifest)
+
+
+def test_publishing_datasets_must_be_distinct() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"publishing\.index_dataset must differ from publishing\.dataset",
+    ):
+        PublishingSpec(dataset="org/results", index_dataset="org/results")
 
 
 def test_remote_job_timeout_preserves_watchdog_cleanup_margin() -> None:

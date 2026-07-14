@@ -221,6 +221,14 @@ class PublishingSpec(StrictModel):
     dataset: str = Field(min_length=1)
     index_dataset: str | None = None
 
+    @model_validator(mode="after")
+    def datasets_are_distinct(self) -> PublishingSpec:
+        if self.index_dataset is not None and self.index_dataset == self.dataset:
+            raise ValueError(
+                "publishing.index_dataset must differ from publishing.dataset"
+            )
+        return self
+
 
 class RemoteJobSpec(StrictModel):
     namespace: str = Field(min_length=1)
