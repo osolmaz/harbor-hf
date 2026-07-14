@@ -269,14 +269,20 @@ def sanitize_private_artifact_tree(
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
     rejected = _remove_symlinks(root)
     rejected.extend(_remove_reserved_paths(root))
-    rejected.extend(
-        _consume_existing_rejections(root, trust_existing=trust_existing_rejections)
+    existing_rejections, omitted_count = _consume_existing_rejections(
+        root, trust_existing=trust_existing_rejections
     )
+    rejected.extend(existing_rejections)
     files, file_rejections = _remove_oversized_files(root, max_file_bytes)
     rejected.extend(file_rejections)
-    rejected.extend(_trim_bundle(files, max_bundle_bytes))
-    _write_rejections(root, rejected, max_record_bytes=max_file_bytes)
-    return rejected
+    return _finalize_bounded_rejections(
+        root,
+        files,
+        rejected,
+        omitted_count=omitted_count,
+        max_file_bytes=max_file_bytes,
+        max_bundle_bytes=max_bundle_bytes,
+    )
 
 
 def sanitize_private_artifact_symlinks(
@@ -284,9 +290,15 @@ def sanitize_private_artifact_symlinks(
 ) -> list[PrivateArtifactRejection]:
     """Remove symlinks without applying an aggregate size limit to child trials."""
     rejected = _remove_symlinks(root, max_depth=max_depth)
-    rejected.extend(_consume_existing_rejections(root, trust_existing=False))
-    _write_rejections(root, rejected)
-    return rejected
+    existing_rejections, omitted_count = _consume_existing_rejections(
+        root, trust_existing=False
+    )
+    rejected.extend(existing_rejections)
+    return _write_rejections(
+        root,
+        rejected,
+        base_omitted_count=omitted_count,
+    )
 
 
 def validate_private_artifact_directory_files(
@@ -320,7 +332,7 @@ def sanitize_private_artifact_directory_files(
     trust_existing_rejections: bool = False,
 ) -> list[PrivateArtifactRejection]:
     """Bound direct files without charging independently bounded child bundles."""
-    rejected = _consume_existing_rejections(
+    rejected, omitted_count = _consume_existing_rejections(
         root, trust_existing=trust_existing_rejections
     )
     files: list[tuple[Path, str, int, PrivateArtifactKind]] = []
@@ -328,6 +340,8 @@ def sanitize_private_artifact_directory_files(
         if candidate.is_symlink() or not candidate.is_file():
             continue
         relative = candidate.name
+        if relative == _REJECTION_FILE:
+            continue
         size = candidate.stat().st_size
         if size > max_file_bytes:
             candidate.unlink()
@@ -340,9 +354,43 @@ def sanitize_private_artifact_directory_files(
             )
             continue
         files.append((candidate, relative, size, classify_private_artifact(relative)))
-    rejected.extend(_trim_bundle(files, max_bundle_bytes))
-    _write_rejections(root, rejected, max_record_bytes=max_file_bytes)
-    return rejected
+    return _finalize_bounded_rejections(
+        root,
+        files,
+        rejected,
+        omitted_count=omitted_count,
+        max_file_bytes=max_file_bytes,
+        max_bundle_bytes=max_bundle_bytes,
+    )
+
+
+def _finalize_bounded_rejections(
+    root: Path,
+    files: list[tuple[Path, str, int, PrivateArtifactKind]],
+    rejected: list[PrivateArtifactRejection],
+    *,
+    omitted_count: int,
+    max_file_bytes: int,
+    max_bundle_bytes: int,
+) -> list[PrivateArtifactRejection]:
+    record_limit = min(max_file_bytes, max_bundle_bytes)
+    while True:
+        retained = _write_rejections(
+            root,
+            rejected,
+            max_record_bytes=record_limit,
+            base_omitted_count=omitted_count,
+        )
+        record = root / _REJECTION_FILE
+        record_bytes = record.stat().st_size if record.is_file() else 0
+        bundle_rejections = _trim_bundle(
+            files,
+            max(0, max_bundle_bytes - record_bytes),
+        )
+        if not bundle_rejections:
+            return retained
+        rejected.extend(bundle_rejections)
+        files = [item for item in files if item[0].is_file()]
 
 
 def _write_rejections(
@@ -350,41 +398,50 @@ def _write_rejections(
     rejected: list[PrivateArtifactRejection],
     *,
     max_record_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
-) -> None:
-    rejected[:] = sorted(
+    base_omitted_count: int = 0,
+) -> list[PrivateArtifactRejection]:
+    canonical = sorted(
         {rejection.path: rejection for rejection in rejected}.values(),
         key=lambda rejection: rejection.path,
     )
-    if not rejected:
-        return
-    all_rejections = rejected.copy()
+    path = root / _REJECTION_FILE
+    if not canonical and base_omitted_count == 0:
+        path.unlink(missing_ok=True)
+        return []
     low = 0
-    high = len(all_rejections)
+    high = len(canonical)
     selected = b""
     selected_count = 0
     while low <= high:
         count = (low + high) // 2
-        payload = _rejection_payload(all_rejections, count)
+        payload = _rejection_payload(
+            canonical,
+            count,
+            base_omitted_count=base_omitted_count,
+        )
         if len(payload) <= max_record_bytes:
             selected = payload
             selected_count = count
             low = count + 1
         else:
             high = count - 1
-    path = root / _REJECTION_FILE
     if not selected:
         path.unlink(missing_ok=True)
-        rejected.clear()
-        return
+        return []
     path.write_bytes(selected)
-    rejected[:] = all_rejections[:selected_count]
+    return canonical[:selected_count]
 
 
-def _rejection_payload(rejected: list[PrivateArtifactRejection], count: int) -> bytes:
+def _rejection_payload(
+    rejected: list[PrivateArtifactRejection],
+    count: int,
+    *,
+    base_omitted_count: int,
+) -> bytes:
     record = {
         "schema_version": "harbor-hf/private-artifact-rejections/v1",
         "rejections": [item.model_dump(mode="json") for item in rejected[:count]],
-        "omitted_count": len(rejected) - count,
+        "omitted_count": base_omitted_count + len(rejected) - count,
     }
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
@@ -409,24 +466,27 @@ def _remove_symlinks(
 
 def _consume_existing_rejections(
     root: Path, *, trust_existing: bool
-) -> list[PrivateArtifactRejection]:
+) -> tuple[list[PrivateArtifactRejection], int]:
     path = root / _REJECTION_FILE
     if not path.exists():
-        return []
+        return [], 0
     if trust_existing:
-        return _load_rejections(root)
+        return _load_rejection_record(root)
     size = path.stat().st_size
     if path.is_dir():
         shutil.rmtree(path)
     else:
         path.unlink()
-    return [
-        PrivateArtifactRejection(
-            path=_REJECTION_FILE,
-            reason="reserved_path",
-            size=size,
-        )
-    ]
+    return (
+        [
+            PrivateArtifactRejection(
+                path=_REJECTION_FILE,
+                reason="reserved_path",
+                size=size,
+            )
+        ],
+        0,
+    )
 
 
 def _validate_reserved_path(path: Path, relative: str, trust_rejections: bool) -> None:
@@ -577,15 +637,26 @@ def openclaw_execution_was_attempted(root: Path) -> bool:
 
 
 def _load_rejections(root: Path) -> list[PrivateArtifactRejection]:
+    rejections, _omitted_count = _load_rejection_record(root)
+    return rejections
+
+
+def _load_rejection_record(
+    root: Path,
+) -> tuple[list[PrivateArtifactRejection], int]:
     path = root / _REJECTION_FILE
     if not path.is_file():
-        return []
+        return [], 0
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or not isinstance(value.get("rejections"), list):
         raise ValueError("private artifact rejection record is malformed")
-    return [
-        PrivateArtifactRejection.model_validate(item) for item in value["rejections"]
-    ]
+    omitted_count = value.get("omitted_count", 0)
+    if type(omitted_count) is not int or omitted_count < 0:
+        raise ValueError("private artifact rejection record is malformed")
+    return (
+        [PrivateArtifactRejection.model_validate(item) for item in value["rejections"]],
+        omitted_count,
+    )
 
 
 def _manifest_rejections(

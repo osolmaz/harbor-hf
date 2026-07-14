@@ -264,6 +264,34 @@ def test_rejection_record_is_bounded_and_reports_omissions(tmp_path: Path) -> No
     assert [item.model_dump(mode="json") for item in rejected] == record["rejections"]
 
 
+def test_rejection_record_preserves_omissions_across_trusted_passes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "evidence"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("outside", encoding="utf-8")
+    for index in range(20):
+        (root / f"linked-{index:02d}").symlink_to(outside)
+
+    first = sanitize_private_artifact_tree(root, max_file_bytes=300)
+    first_record = json.loads(
+        (root / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    second = sanitize_private_artifact_tree(
+        root,
+        max_file_bytes=300,
+        trust_existing_rejections=True,
+    )
+    second_record_path = root / "private-artifact-rejections.json"
+    second_record = json.loads(second_record_path.read_text(encoding="utf-8"))
+
+    assert second == first
+    assert second_record == first_record
+    assert second_record["omitted_count"] > 0
+    assert second_record_path.stat().st_size <= 300
+
+
 def test_directory_file_limits_do_not_charge_child_trial_bundles(
     tmp_path: Path,
 ) -> None:
@@ -289,6 +317,33 @@ def test_directory_file_limits_do_not_charge_child_trial_bundles(
     assert [(item.path, item.reason) for item in rejected] == [("job.log", "file_size")]
     assert not (job / "job.log").exists()
     assert (trial / "session.jsonl").stat().st_size == 100
+
+
+def test_directory_sanitizer_reserves_space_for_its_rejection_record(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "job.log").write_text("x" * 180, encoding="utf-8")
+    (job / "oversized.log").write_text("x" * 400, encoding="utf-8")
+
+    first = sanitize_private_artifact_directory_files(
+        job,
+        max_file_bytes=300,
+        max_bundle_bytes=350,
+    )
+    second = sanitize_private_artifact_directory_files(
+        job,
+        max_file_bytes=300,
+        max_bundle_bytes=350,
+        trust_existing_rejections=True,
+    )
+
+    direct_files = [candidate for candidate in job.iterdir() if candidate.is_file()]
+    assert sum(candidate.stat().st_size for candidate in direct_files) <= 350
+    assert (job / "private-artifact-rejections.json").stat().st_size <= 300
+    assert all(item.path != "private-artifact-rejections.json" for item in second)
+    assert second == first
 
 
 def test_private_manifest_rejects_controller_reserved_paths(tmp_path: Path) -> None:
