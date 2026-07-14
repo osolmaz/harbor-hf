@@ -109,6 +109,14 @@ from an earlier wave only when campaign, run, shard, trial, task, and logical
 attempt identities all match. This avoids rerunning completed work without
 allowing evidence from another campaign or task to cross the boundary.
 
+Every hosted wave Job acquires a second expiring lease keyed by campaign and
+wave before endpoint or provider work begins. This lease spans benchmark
+execution and terminal evidence publication, so an ambiguously duplicated Job
+cannot race another writer on the Bucket mount. The worker uses the mount's
+supported temporary-file rename while it holds the lease. The lease expires
+one hour after the wave duration bound and is released immediately after the
+terminal marker is published.
+
 ### Endpoint Provisioner
 
 The [endpoint provisioning boundary](endpoint-provisioning.md) converts locked

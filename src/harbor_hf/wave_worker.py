@@ -8,9 +8,10 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -27,6 +28,13 @@ from harbor_hf.campaigns import (
     build_wave_lock,
 )
 from harbor_hf.control import RetryCategory
+from harbor_hf.coordination import (
+    ClaimConflict,
+    ClaimStore,
+    CoordinationError,
+    HubClaimStore,
+    wave_worker_claim_path,
+)
 from harbor_hf.evidence import (
     append_event,
     archive_directory,
@@ -242,6 +250,7 @@ def run_wave_worker(
     identifier: IdentifierFactory = lambda: uuid.uuid4().hex,
     clock: Clock = lambda: datetime.now(UTC),
     monotonic: Callable[[], float] = time.monotonic,
+    claim_store: ClaimStore | None = None,
 ) -> Path:
     spec = load_experiment(manifest_path)
     campaign = CampaignLock.model_validate_json(
@@ -256,27 +265,65 @@ def run_wave_worker(
         )
     os.environ["HF_TOKEN"] = token
 
-    process_runner = runner or SubprocessRunner()
-    destination = output_root / lock.artifact_prefix
-    _reject_terminal_wave(destination)
-    with tempfile.TemporaryDirectory(prefix="harbor-hf-wave-") as staging_name:
-        staging = Path(staging_name) / campaign.artifact_prefix
-        _stage_campaign_records(staging, campaign, lock, token, output_root)
-        return _run_staged_wave(
-            manifest_path,
-            campaign,
-            lock,
-            staging,
-            output_root,
-            token,
-            process_runner,
-            stream_runner,
-            source_preparer,
-            watchdog_launcher,
-            identifier,
-            clock,
-            monotonic,
-        )
+    with _wave_worker_lease(lock, token, claim_store, clock):
+        process_runner = runner or SubprocessRunner()
+        destination = output_root / lock.artifact_prefix
+        _reject_terminal_wave(destination)
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-wave-") as staging_name:
+            staging = Path(staging_name) / campaign.artifact_prefix
+            _stage_campaign_records(staging, campaign, lock, token, output_root)
+            return _run_staged_wave(
+                manifest_path,
+                campaign,
+                lock,
+                staging,
+                output_root,
+                token,
+                process_runner,
+                stream_runner,
+                source_preparer,
+                watchdog_launcher,
+                identifier,
+                clock,
+                monotonic,
+            )
+
+
+@contextmanager
+def _wave_worker_lease(
+    lock: WaveLock,
+    token: str,
+    claim_store: ClaimStore | None,
+    clock: Clock,
+) -> Iterator[None]:
+    job_id = os.environ.get("JOB_ID", "")
+    claims = claim_store
+    if claims is None and job_id:
+        claims = HubClaimStore(lock.remote.job.namespace, token)
+    if claims is None:
+        yield
+        return
+    if not job_id:
+        raise WorkerError("wave worker claim requires JOB_ID")
+    now = clock().astimezone(UTC)
+    owner = {
+        "campaign_id": lock.campaign_id,
+        "wave_id": lock.wave_id,
+        "job_id": job_id,
+        "expires_at": (
+            now + timedelta(seconds=lock.duration_seconds, hours=1)
+        ).isoformat(),
+    }
+    path = wave_worker_claim_path(lock.campaign_id, lock.wave_id)
+    try:
+        claims.acquire(path, owner)
+    except ClaimConflict as error:
+        raise WorkerError("wave worker is already active") from error
+    try:
+        yield
+    finally:
+        with suppress(CoordinationError):
+            claims.release(path, owner)
 
 
 def _run_staged_wave(
@@ -1027,17 +1074,7 @@ def _publish_immutable_file(source: Path, destination: Path) -> None:
     )
     try:
         shutil.copyfile(source, temporary)
-        try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            if destination.read_bytes() != source.read_bytes():
-                raise WorkerError(
-                    f"evidence path already has different contents: {destination}"
-                ) from None
-        except OSError as error:
-            raise WorkerError(
-                f"evidence path cannot be created atomically: {destination}"
-            ) from error
+        os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
 

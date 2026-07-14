@@ -105,6 +105,12 @@ reservation, but only one can submit, cancel, provision, clean up, or publish.
 Abandoned leases expire after two hours; successful passes release them after
 recording the durable outcome.
 
+The submitted wave Job independently acquires a campaign-and-wave lease before
+starting any benchmark work and holds it through terminal Bucket publication.
+This closes the gap after an ambiguous Job submission: a duplicate Job exits
+before inference or evidence writes. The lease expires after the wave timeout
+plus one hour if a Job is killed.
+
 Do not treat a timed-out create, resume, submit, cancel, or pause request as a
 confirmed failure. The next pass must inspect deterministic remote identities
 and adopt the observed resource or action before retrying.

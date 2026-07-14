@@ -18,6 +18,7 @@ from harbor_hf.coordination import (
     coordination_repository,
     endpoint_claim_path,
     run_claim_path,
+    wave_worker_claim_path,
 )
 
 
@@ -124,6 +125,10 @@ def test_claim_paths_are_stable_and_namespaced() -> None:
     )
     assert action_claim_path("campaign-two", "action-one") != action_claim_path(
         "campaign-one", "action-one"
+    )
+    assert wave_worker_claim_path("campaign-one", "wave-one") == (
+        "wave-worker-leases/"
+        "0789175b8c48870a7c143d836393f395994d0339fd08d3bfc708cd128066ef25.json"
     )
 
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -13,6 +13,7 @@ from test_wave_worker import _provider_wave_inputs
 
 import harbor_hf.wave_worker as wave_worker
 from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveLock, WaveRunLock
+from harbor_hf.coordination import ClaimConflict
 from harbor_hf.evidence import write_checksums
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.provider_models import ProviderTarget
@@ -34,6 +35,7 @@ from harbor_hf.wave_worker import (
     _trial_destination,
     _valid_terminal_trial,
     _validate_execution_identity,
+    _wave_worker_lease,
 )
 
 IDENTITY = {
@@ -42,6 +44,22 @@ IDENTITY = {
     "run_id": "run-1",
     "shard_id": "shard-1",
 }
+NOW = datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC)
+
+
+class FakeClaims:
+    def __init__(self) -> None:
+        self.acquire_calls: list[tuple[str, dict[str, str]]] = []
+        self.release_calls: list[tuple[str, dict[str, str]]] = []
+        self.conflict = False
+
+    def acquire(self, path: str, owner: Mapping[str, str]) -> None:
+        self.acquire_calls.append((path, dict(owner)))
+        if self.conflict:
+            raise ClaimConflict(f"claim is already held: {path}")
+
+    def release(self, path: str, owner: Mapping[str, str]) -> None:
+        self.release_calls.append((path, dict(owner)))
 
 
 def _expected_trial() -> CampaignTrialLock:
@@ -312,43 +330,58 @@ def test_publish_immutable_file_avoids_hf_mount_reserved_prefix(
     assert temporary_names[0].endswith("-_SUCCESS.tmp")
 
 
-def test_publish_immutable_file_compares_concurrent_create_winner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_wave_worker_lease_serializes_the_complete_remote_job(
+    remote_spec: ExperimentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = tmp_path / "source.json"
-    source.write_bytes(b"first-writer")
-    destination = tmp_path / "published" / "evidence.json"
+    _spec, _campaign, wave, *_paths = _provider_wave_inputs(
+        remote_spec,
+        tmp_path,
+        attempts=1,
+        concurrency=1,
+        provider_concurrency=1,
+    )
+    claims = FakeClaims()
+    monkeypatch.setenv("JOB_ID", "job-one")
 
-    def lose_race(_source_path: Path, destination_path: Path) -> None:
-        destination_path.write_bytes(b"concurrent-writer")
-        raise FileExistsError
+    with _wave_worker_lease(wave, "token", claims, lambda: NOW):
+        assert len(claims.acquire_calls) == 1
+        assert claims.release_calls == []
 
-    monkeypatch.setattr(wave_worker.os, "link", lose_race)
+    assert claims.release_calls == claims.acquire_calls
+    path, owner = claims.acquire_calls[0]
+    assert path.startswith("wave-worker-leases/")
+    assert owner == {
+        "campaign_id": wave.campaign_id,
+        "wave_id": wave.wave_id,
+        "job_id": "job-one",
+        "expires_at": (
+            NOW + timedelta(seconds=wave.duration_seconds, hours=1)
+        ).isoformat(),
+    }
 
-    with pytest.raises(WorkerError, match="already has different contents"):
-        _publish_immutable_file(source, destination)
 
-    assert destination.read_bytes() == b"concurrent-writer"
-    assert [path.name for path in destination.parent.iterdir()] == ["evidence.json"]
-
-
-def test_publish_immutable_file_rejects_non_atomic_filesystem(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_wave_worker_lease_rejects_duplicate_job_before_execution(
+    remote_spec: ExperimentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = tmp_path / "source.json"
-    source.write_bytes(b"payload")
-    destination = tmp_path / "published" / "evidence.json"
+    _spec, _campaign, wave, *_paths = _provider_wave_inputs(
+        remote_spec,
+        tmp_path,
+        attempts=1,
+        concurrency=1,
+        provider_concurrency=1,
+    )
+    claims = FakeClaims()
+    claims.conflict = True
+    monkeypatch.setenv("JOB_ID", "job-two")
 
-    def unsupported(_source: Path, _destination: Path) -> None:
-        raise OSError("hard links unsupported")
+    with (
+        pytest.raises(WorkerError, match="wave worker is already active"),
+        _wave_worker_lease(wave, "token", claims, lambda: NOW),
+    ):
+        raise AssertionError("duplicate worker entered the lease")
 
-    monkeypatch.setattr(wave_worker.os, "link", unsupported)
-
-    with pytest.raises(WorkerError, match="cannot be created atomically"):
-        _publish_immutable_file(source, destination)
-
-    assert not destination.exists()
-    assert list(destination.parent.iterdir()) == []
+    assert len(claims.acquire_calls) == 1
+    assert claims.release_calls == []
 
 
 def test_publish_digest_sidecar_writes_exact_digest_line(tmp_path: Path) -> None:
