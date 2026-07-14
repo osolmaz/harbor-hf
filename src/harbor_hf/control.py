@@ -526,9 +526,8 @@ class HubCampaignStore:
 
     def load_snapshot(self, campaign_id: str) -> CampaignSnapshot:
         head = self._head()
-        lock = CampaignLock.model_validate(
-            self._read_json(_campaign_lock_path(campaign_id), head)
-        )
+        lock_path = _campaign_lock_path(campaign_id)
+        lock = CampaignLock.model_validate(self._read_json(lock_path, head))
         prefix = f"campaigns/{campaign_id}/events/"
         paths = sorted(
             path
@@ -546,7 +545,7 @@ class HubCampaignStore:
             lock=lock,
             events=events,
             request=self._read_bytes(_campaign_request_path(campaign_id), head),
-            control_commit=head,
+            control_commit=self._last_commit(lock_path, head),
         )
 
     def load_request(self, campaign_id: str) -> bytes:
@@ -727,6 +726,22 @@ class HubCampaignStore:
                 revision=revision,
             )
         )
+
+    def _last_commit(self, path: str, revision: str) -> str:
+        records = self.api.get_paths_info(
+            self.repository,
+            path,
+            repo_type="dataset",
+            revision=revision,
+            expand=True,
+        )
+        if len(records) != 1:
+            raise ControlError(f"control record has no immutable commit: {path}")
+        last_commit = getattr(records[0], "last_commit", None)
+        oid = getattr(last_commit, "oid", None)
+        if not isinstance(oid, str) or not oid:
+            raise ControlError(f"control record has no immutable commit: {path}")
+        return oid
 
     def _read_json(self, path: str, revision: str) -> object:
         try:

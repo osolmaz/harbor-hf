@@ -356,6 +356,61 @@ def routed_provider_model(target: ProviderTarget) -> str:
     return _routed_model(target)
 
 
+def observe_provider_response(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    *,
+    attempt: int,
+    status_code: int,
+    headers: httpx.Headers,
+    content: bytes,
+    total_ms: float,
+    time_to_first_token_ms: float | None = None,
+) -> ProviderCallResult:
+    """Normalize evidence from a transparently forwarded provider response."""
+    response = httpx.Response(status_code, headers=headers, content=content)
+    if not response.is_success:
+        return _http_failure(target, request, attempt, response, total_ms)
+    if request.stream:
+        state = _StreamState()
+        elapsed = (
+            time_to_first_token_ms if time_to_first_token_ms is not None else total_ms
+        )
+        try:
+            for line in content.decode("utf-8").splitlines():
+                _consume_stream_line(line, state, 0.0, lambda: elapsed / 1000)
+            return _stream_result(target, request, attempt, response, state, total_ms)
+        except (UnicodeDecodeError, ValidationError, ValueError):
+            return _stream_malformed_result(target, request, attempt, state, total_ms)
+    try:
+        raw = _RawCompletion.model_validate_json(content)
+        choice = raw.choices[0]
+        message = _provider_message(choice.message)
+    except (ValidationError, ValueError):
+        return _malformed_result(
+            target, request, attempt, response, total_ms, "invalid_completion"
+        )
+    evidence = _evidence(
+        target,
+        request,
+        attempt,
+        headers,
+        total_ms,
+        unavailable("not_applicable"),
+        raw.model,
+        raw.usage,
+        "no_retry",
+    )
+    return ProviderCallResult(
+        status="succeeded",
+        remote_outcome="completed",
+        response_id=_optional_string(raw.id),
+        finish_reason=_optional_string(choice.finish_reason),
+        message=message,
+        evidence=evidence,
+    )
+
+
 def _provider_message(value: _RawMessage) -> ProviderMessage:
     return ProviderMessage(
         role="assistant",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
@@ -20,6 +21,7 @@ from harbor_hf.results import (
 )
 
 _MAX_COMMIT_ATTEMPTS = 8
+_PUBLISHER_LEASE_TTL = timedelta(minutes=15)
 
 
 class DatasetPublicationError(RuntimeError):
@@ -40,6 +42,16 @@ class PublicationResult(FrozenModel):
     result_revision: str
     index_dataset: str
     index_revision: str
+
+
+class ResultReceipt(FrozenModel):
+    schema_version: Literal["harbor-hf/result-publication/v1"] = (
+        "harbor-hf/result-publication/v1"
+    )
+    publication_id: str
+    run_id: str
+    source_checksum: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    files: dict[str, str]
 
 
 class IndexReceipt(FrozenModel):
@@ -87,12 +99,14 @@ class HubDatasetPublisher:
         publisher_id: str,
         leases: PublisherLeaseStore,
         api: DatasetApi | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if not publisher_id:
             raise ValueError("publisher ID is required")
         self.publisher_id = publisher_id
         self.leases = leases
         self.api = api or cast(DatasetApi, HfApi())
+        self.clock = clock
 
     def publish(
         self,
@@ -126,7 +140,11 @@ class HubDatasetPublisher:
 
     def _with_lease[Value](self, dataset: str, operation: Callable[[], Value]) -> Value:
         path = publisher_lease_path(dataset)
-        owner = {"publisher_id": self.publisher_id, "destination": dataset}
+        owner = {
+            "publisher_id": self.publisher_id,
+            "destination": dataset,
+            "expires_at": (self.clock() + _PUBLISHER_LEASE_TTL).isoformat(),
+        }
         self.leases.acquire(path, owner)
         try:
             return operation()
@@ -172,17 +190,27 @@ class HubDatasetPublisher:
     def _adopt_result(
         self, publication: ResultPublication, dataset: str, revision: str
     ) -> None:
-        observed = self._read(dataset, publication.receipt_path, revision)
-        if observed != publication.receipt:
+        try:
+            observed = ResultReceipt.model_validate_json(
+                self._read(dataset, publication.receipt_path, revision)
+            )
+            expected = ResultReceipt.model_validate_json(publication.receipt)
+        except Exception as error:
+            raise PublicationConflict("result publication receipt conflicts") from error
+        if (
+            observed.schema_version != expected.schema_version
+            or observed.publication_id != expected.publication_id
+            or observed.run_id != expected.run_id
+            or observed.source_checksum != expected.source_checksum
+            or set(observed.files) != {item.path for item in publication.files}
+        ):
             raise PublicationConflict("result publication receipt conflicts")
-        for item in publication.files:
-            if not self._exists(dataset, item.path, revision):
+        for path, checksum in observed.files.items():
+            if not self._exists(dataset, path, revision):
                 raise DatasetPublicationError(
                     "result publication receipt is incomplete"
                 )
-            if _sha256(self._read(dataset, item.path, revision)) != _sha256(
-                item.content
-            ):
+            if _sha256(self._read(dataset, path, revision)) != checksum:
                 raise DatasetPublicationError("published result file is corrupted")
 
     def _publish_index(

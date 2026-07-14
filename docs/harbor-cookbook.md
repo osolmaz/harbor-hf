@@ -137,6 +137,14 @@ an Inference Endpoint. Record the requested provider and model, routing data,
 request identity when exposed, retry and throttle observations, reported usage,
 latency, and quoted or observed cost.
 
+The remote wave controller starts a loopback OpenAI-compatible evidence proxy.
+OpenClaw sends its normal requests to that local address; the proxy forwards
+them to HF Inference Providers and writes `provider-requests.jsonl`. Each row
+contains typed request metadata, response routing and quota headers, retry
+attempt, usage, and latency. It never stores prompts, tool arguments, response
+text, or credentials. The proxy is part of the hosted controller Job and does
+not run inference itself.
+
 Do not infer a hidden engine, image, region, hardware, precision, cache policy,
 or token count. Endpoint-only fields must be `not_applicable` and unreported
 provider fields must be `not_reported`. Compare endpoint and provider runs only
@@ -172,6 +180,14 @@ If cancellation returns before cleanup finishes, keep reconciling and checking
 status. Do not consider cancellation finished while any owned endpoint is
 running, any cleanup reservation is unresolved, or a watchdog reports lost
 ownership.
+
+If a managed HF Job becomes terminal without terminal Bucket evidence, the
+next pass marks active executions as `lost`, drains and cleans the wave, and
+admits the bounded retry generation. If a Job becomes terminal during a
+cancellation call, the pass records an ambiguous action and stops so evidence
+is re-observed before any cancellation outcome or cleanup is synthesized.
+`reconcile-all` reports a malformed campaign as one failure record and
+continues with the remaining campaigns.
 
 ## 5. Verify canonical artifacts
 

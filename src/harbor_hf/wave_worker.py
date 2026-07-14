@@ -41,11 +41,13 @@ from harbor_hf.evidence import (
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
-from harbor_hf.provider_models import ProviderEndpointEvidence, unavailable
-from harbor_hf.providers import (
-    HF_INFERENCE_PROVIDER_BASE_URL,
-    routed_provider_model,
+from harbor_hf.provider_models import (
+    ProviderEndpointEvidence,
+    ProviderTarget,
+    unavailable,
 )
+from harbor_hf.provider_proxy import ProviderEvidenceProxy
+from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock
 from harbor_hf.worker import (
     EndpointManager,
@@ -311,6 +313,7 @@ def _run_staged_wave(
     )
     error: Exception | None = None
     cleanup_error: Exception | None = None
+    provider_proxy: ProviderEvidenceProxy | None = None
     shard_checksums: dict[str, str] = {}
     try:
         require_executable("git")
@@ -321,10 +324,14 @@ def _run_staged_wave(
         )
         source_preparer(lock.remote.harbor.source, harbor_source, runner)
         deadline = monotonic() + lock.duration_seconds
-        base_url = (
-            lifecycle.prepare(deadline, monotonic)
-            if lifecycle is not None
-            else _prepare_provider_target(lock, wave_root, events)
+        base_url, provider_proxy = _prepare_wave_transport(
+            lock,
+            wave_root,
+            events,
+            lifecycle,
+            token,
+            deadline,
+            monotonic,
         )
         shard_checksums = _execute_shards(
             manifest_path,
@@ -344,8 +351,7 @@ def _run_staged_wave(
     except Exception as caught:
         error = caught
     finally:
-        if lifecycle is not None:
-            cleanup_error = lifecycle.cleanup()
+        cleanup_error = _cleanup_wave_transport(lifecycle, provider_proxy)
 
     terminal_error = error or cleanup_error
     summary: dict[str, object] = {
@@ -384,6 +390,41 @@ def _run_staged_wave(
             token, "[REDACTED]"
         )
     raise WorkerError(failure_message) from terminal_error
+
+
+def _prepare_wave_transport(
+    lock: WaveLock,
+    wave_root: Path,
+    events: Path,
+    lifecycle: _EndpointWaveLifecycle | None,
+    token: str,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> tuple[str, ProviderEvidenceProxy | None]:
+    if lifecycle is not None:
+        return lifecycle.prepare(deadline, monotonic), None
+    target = _prepare_provider_target(lock, wave_root, events)
+    proxy = ProviderEvidenceProxy(
+        target,
+        token=token,
+        evidence_path=wave_root / "provider-requests.jsonl",
+    )
+    return proxy.start(), proxy
+
+
+def _cleanup_wave_transport(
+    lifecycle: _EndpointWaveLifecycle | None,
+    provider_proxy: ProviderEvidenceProxy | None,
+) -> Exception | None:
+    if lifecycle is not None:
+        return lifecycle.cleanup()
+    if provider_proxy is None:
+        return None
+    try:
+        provider_proxy.close()
+    except Exception as error:
+        return error
+    return None
 
 
 def _execute_shards(
@@ -440,7 +481,9 @@ def _execute_shards(
     return dict(sorted(results.items()))
 
 
-def _prepare_provider_target(lock: WaveLock, wave_root: Path, events: Path) -> str:
+def _prepare_provider_target(
+    lock: WaveLock, wave_root: Path, events: Path
+) -> ProviderTarget:
     if not isinstance(lock.target, ProviderWaveTarget):
         raise WorkerError("provider execution requires an Inference Provider target")
     target = lock.target.provider
@@ -460,6 +503,10 @@ def _prepare_provider_target(lock: WaveLock, wave_root: Path, events: Path) -> s
                     "parameters": target.parameters,
                     "timeout_seconds": target.timeout_seconds,
                 },
+                "transport": {
+                    "kind": "loopback-evidence-proxy",
+                    "evidence_path": "provider-requests.jsonl",
+                },
                 "endpoint": ProviderEndpointEvidence().model_dump(mode="json"),
             },
         },
@@ -470,7 +517,7 @@ def _prepare_provider_target(lock: WaveLock, wave_root: Path, events: Path) -> s
         service=target.service,
         target_id=target.id,
     )
-    return HF_INFERENCE_PROVIDER_BASE_URL
+    return target
 
 
 def _execute_shard(

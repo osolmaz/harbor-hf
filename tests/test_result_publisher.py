@@ -221,6 +221,37 @@ def test_duplicate_publication_is_a_no_op(
     assert len(api.commits) == 2
 
 
+def test_duplicate_publication_adopts_immutable_evidence_after_control_commit_moves(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    first = publisher.publish(
+        publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+    moved_run = publication.tables.runs[0].model_copy(
+        update={"control_commit": "7" * 40}
+    )
+    moved_publication = build_result_publication(
+        publication.tables.model_copy(update={"runs": [moved_run]})
+    )
+
+    second = publisher.publish(
+        moved_publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+
+    assert moved_publication.tables.publication_id == publication.tables.publication_id
+    assert moved_publication.receipt != publication.receipt
+    assert second == first
+    assert len(api.commits) == 2
+
+
 def test_retry_after_interruption_adopts_result_and_finishes_index(
     publication: ResultPublication, tmp_path: Path
 ) -> None:

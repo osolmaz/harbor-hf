@@ -159,7 +159,7 @@ class HarborStream:
         expected_calls: int,
         exit_code: int = 0,
         synchronize: bool = False,
-        expected_base_url: str = "https://endpoint.example/v1",
+        expected_base_url: str | None = "https://endpoint.example/v1",
         expected_model_name: str = "/repository",
     ) -> None:
         self.task_digests = task_digests
@@ -168,6 +168,7 @@ class HarborStream:
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
         self.commands: list[list[str]] = []
+        self.base_urls: list[str] = []
         self.active = 0
         self.max_active = 0
         self.lock = threading.Lock()
@@ -180,10 +181,16 @@ class HarborStream:
         environment: dict[str, str],
         timeout_seconds: int,
     ) -> int:
-        assert environment["OPENAI_BASE_URL"] == self.expected_base_url
+        base_url = environment["OPENAI_BASE_URL"]
+        if self.expected_base_url is not None:
+            assert base_url == self.expected_base_url
+        else:
+            assert base_url.startswith("http://127.0.0.1:")
+            assert base_url.endswith("/v1")
         assert timeout_seconds > 0
         with self.lock:
             self.commands.append(command)
+            self.base_urls.append(base_url)
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
@@ -453,7 +460,7 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         spec.benchmark.task_digests,
         expected_calls=2,
         synchronize=True,
-        expected_base_url="https://router.huggingface.co/v1",
+        expected_base_url=None,
         expected_model_name=routed_model,
     )
 
@@ -479,6 +486,7 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     assert wave.spend_cap_microusd == 2_500_000
     assert runner.commands == []
     assert harbor.max_active == 2
+    assert len(set(harbor.base_urls)) == 1
     assert all(
         command[command.index("--model") + 1] == f"openai/{routed_model}"
         for command in harbor.commands
@@ -487,6 +495,7 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         "_SUCCESS",
         "checksums.json",
         "events.jsonl",
+        "provider-requests.jsonl",
         "provider-target.json",
         "runtime-environment.json",
         "wave-summary.json",
@@ -499,6 +508,11 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         "parameters": {},
         "timeout_seconds": 60.0,
     }
+    assert runtime["provider"]["transport"] == {
+        "kind": "loopback-evidence-proxy",
+        "evidence_path": "provider-requests.jsonl",
+    }
+    assert (destination / "provider-requests.jsonl").read_text() == ""
     endpoint = runtime["provider"]["endpoint"]
     assert endpoint["endpoint_name"]["status"] == "not_applicable"
     assert endpoint["endpoint_status"]["status"] == "not_applicable"

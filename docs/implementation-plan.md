@@ -296,6 +296,14 @@ The reconciler never assumes that a timed-out create, resume, submit, cancel,
 or pause request failed. It inspects deterministic labels and current provider
 state before deciding whether to retry.
 
+A terminal HF Job without terminal wave evidence is recovered explicitly:
+active executions become categorized `lost` failures, the wave drains and is
+cleaned, and untouched or retryable trials enter a new action generation. A
+Job that becomes terminal during cancellation makes that pass ambiguous and
+halts later actions until the next evidence observation. One malformed
+campaign produces a per-campaign failure result and does not abort
+`reconcile-all`.
+
 ### Scheduling And Concurrency
 
 Concurrency is enforced at distinct levels:
@@ -556,6 +564,8 @@ Deliverables:
 - implement a provider target adapter separate from endpoint deployments;
 - preserve provider request, model, routing, quota, retry, usage, and latency
   evidence without inventing hidden runtime details;
+- forward OpenClaw traffic through a hosted loopback proxy that records typed,
+  content-free evidence for the actual benchmark requests;
 - apply provider-specific concurrency and spend budgets;
 - run provider-backed shards through the same Harbor and artifact contracts;
 - make endpoint and provider runs comparable only on shared observed fields.
@@ -567,6 +577,8 @@ Tests:
 - tool-use smoke tests for each supported provider path;
 - assertions that endpoint-only evidence remains `not_applicable` or
   `not_reported`, never guessed.
+- assertions that prompt text, tool arguments, response text, and credentials
+  never enter provider request evidence.
 
 Exit criteria: a provider-backed campaign shard produces a valid Harbor result,
 complete evidence, and normalized records without creating an endpoint.
@@ -577,6 +589,8 @@ Deliverables:
 
 - freeze reviewed Parquet schemas for all normalized tables;
 - implement one leased publisher per destination Dataset;
+- anchor result provenance to the immutable campaign-lock commit and expire
+  abandoned publisher claims after a bounded interval;
 - verify complete raw evidence and checksums before publishing;
 - implement idempotent row generation, partitioning, and compaction;
 - publish benchmark-specific revisions and the global index;

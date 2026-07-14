@@ -102,6 +102,7 @@ def build_run_lock(
     _validate_deployment_target(
         model,
         deployment,
+        agent,
         spec.remote,
         allow_provider=allow_provider,
     )
@@ -147,6 +148,7 @@ def _new_run_id(name: str, digest: str, created_at: datetime) -> str:
 def _validate_deployment_target(
     model: ModelProfile,
     deployment: DeploymentTarget,
+    agent: AgentProfile,
     remote: RemoteExecutionSpec,
     *,
     allow_provider: bool,
@@ -157,6 +159,10 @@ def _validate_deployment_target(
         if deployment.model != model.repo:
             raise ValueError(
                 "Inference Provider target model must match the selected model profile"
+            )
+        if agent.name != "openclaw":
+            raise ValueError(
+                "Inference Provider targets require the OpenClaw Harbor agent"
             )
         return
     if deployment.endpoint is None:

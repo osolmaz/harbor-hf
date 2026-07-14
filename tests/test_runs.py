@@ -9,6 +9,7 @@ from harbor_hf.models import (
     _validate_remote_input_pins,
     _validate_task_pins,
 )
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import build_run_lock
 
 NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
@@ -154,6 +155,24 @@ def test_controller_and_endpoint_must_share_lease_namespace(
 
     with pytest.raises(ValueError, match="namespace must match"):
         build_run_lock(spec)
+
+
+def test_provider_target_rejects_unsupported_agent_before_submission(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(id="provider-one", model=model.repo)
+    agent = remote_spec.matrix.agents[0].model_copy(update={"name": "terminus"})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [provider], "agents": [agent]}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="require the OpenClaw Harbor agent"):
+        build_run_lock(spec, allow_provider=True)
 
 
 def test_remote_lock_rejects_mutable_model_revision(

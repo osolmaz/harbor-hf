@@ -145,6 +145,12 @@ class CampaignApplyResult(FrozenModel):
     applied: list[AppliedAction]
 
 
+class CampaignApplyFailure(FrozenModel):
+    campaign_id: str
+    error_type: str
+    message: str
+
+
 class EndpointApplicationPort(Protocol):
     def inspect(self, desired: DesiredEndpoint) -> EndpointSnapshot | None: ...
 
@@ -355,6 +361,19 @@ class CampaignReconciler:
             context=context,
             now=self.clock(),
         )
+        reservations = _validated_reservations(
+            self.store.load_action_reservations(campaign_id),
+            campaign_id=campaign_id,
+        )
+        if self._recover_terminal_jobs(lock, spec, projection, reservations):
+            lock, events = self.store.load_campaign(campaign_id)
+            self._last_observed_at = max(event.observed_at for event in events)
+            projection, plan = plan_reconciliation(
+                lock,
+                events,
+                context=context,
+                now=self.clock(),
+            )
         if (
             plan.terminal_decision is not None
             and projection.campaign.status
@@ -369,10 +388,6 @@ class CampaignReconciler:
                 context=context,
                 now=self.clock(),
             )
-        reservations = _validated_reservations(
-            self.store.load_action_reservations(campaign_id),
-            campaign_id=campaign_id,
-        )
         pending = _pending_actions(projection.campaign.actions, reservations)
         selected = sorted(
             [*pending, *self._reserve_new(lock, plan.actions)],
@@ -380,8 +395,9 @@ class CampaignReconciler:
         )
         limit = (context or ReconcileContext()).limits.action_limit
         allow_billable = projection.campaign.status in {"queued", "active"}
-        applied = [
-            self._apply_action(
+        applied: list[AppliedAction] = []
+        for action in selected[:limit]:
+            outcome = self._apply_action(
                 lock,
                 spec,
                 request,
@@ -390,8 +406,9 @@ class CampaignReconciler:
                 terminal_decision=plan.terminal_decision,
                 allow_billable=allow_billable,
             )
-            for action in selected[:limit]
-        ]
+            applied.append(outcome)
+            if outcome.status == "ambiguous":
+                break
         return CampaignApplyResult(
             campaign_id=campaign_id,
             plan=plan,
@@ -402,11 +419,66 @@ class CampaignReconciler:
         self,
         *,
         context: ReconcileContext | None = None,
-    ) -> list[CampaignApplyResult]:
-        return [
-            self.apply_campaign(campaign_id, context=context)
-            for campaign_id in self.store.list_campaigns()
-        ]
+    ) -> list[CampaignApplyResult | CampaignApplyFailure]:
+        results: list[CampaignApplyResult | CampaignApplyFailure] = []
+        for campaign_id in self.store.list_campaigns():
+            try:
+                results.append(self.apply_campaign(campaign_id, context=context))
+            except Exception as error:
+                results.append(
+                    CampaignApplyFailure(
+                        campaign_id=campaign_id,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                    )
+                )
+        return results
+
+    def _recover_terminal_jobs(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        projection: RecoveryProjection,
+        reservations: Mapping[str, ReconcileAction],
+    ) -> bool:
+        changed = False
+        for action_id, action_state in sorted(projection.campaign.actions.items()):
+            if action_state.action_kind not in {"submit-wave", "retry-shard"}:
+                continue
+            action = reservations.get(action_id)
+            if action is None:
+                raise CampaignApplyError(
+                    f"action event has no reservation record: {action_id}"
+                )
+            wave_id = action.wave_id or f"wave-{action.action_key}"
+            wave = projection.waves.get(wave_id)
+            if wave is not None and wave.status == "closed":
+                continue
+            job = self._managed_wave_job(lock, spec, action)
+            if job is None or not job.terminal:
+                continue
+            for execution in projection.executions.values():
+                if execution.wave_id != wave_id or execution.status != "active":
+                    continue
+                self._record_durable_event(
+                    lock,
+                    subject_type="execution",
+                    subject_id=execution.execution_id,
+                    kind="execution.failed",
+                    payload=ExecutionOutcomePayload(
+                        trial_id=execution.trial_id,
+                        physical_attempt=execution.physical_attempt,
+                        category="lost",
+                        message=(
+                            f"HF Job {job.job_id} reached {job.stage} without "
+                            "terminal execution evidence"
+                        ),
+                    ),
+                    identity=f"{execution.execution_id}:lost:{job.job_id}",
+                )
+            self._drain_wave(lock, action, projection)
+            changed = True
+        return changed
 
     def _reserve_new(
         self,
@@ -639,22 +711,7 @@ class CampaignReconciler:
         spec: ExperimentSpec,
         action: ReconcileAction,
     ) -> str | None:
-        target = _deployment_target(lock, spec, action.deployment_digest)
-        if isinstance(target, ProviderTarget):
-            key: Literal["harbor-hf-endpoint", "harbor-hf-provider"] = (
-                "harbor-hf-provider"
-            )
-            label = hashlib.sha256(target.service.encode()).hexdigest()[:32]
-        else:
-            endpoint = managed_wave_endpoint(lock, spec, action.deployment_digest)
-            key = "harbor-hf-endpoint"
-            label = endpoint_lease_label_for(endpoint.namespace, endpoint.name)
-        job = self._find_wave(
-            spec,
-            action,
-            target_label_key=key,
-            endpoint_label=label,
-        )
+        job = self._managed_wave_job(lock, spec, action)
         if job is None:
             return None
         namespace = _remote_namespace(spec)
@@ -694,6 +751,11 @@ class CampaignReconciler:
                 "shard_ids": wave.shard_ids,
             }
         )
+        job = self._managed_wave_job(lock, spec, cancellation)
+        if job is not None and job.terminal:
+            raise AmbiguousActionOutcome(
+                f"HF Job {job.job_id} became terminal; awaiting evidence observation"
+            )
         remote_id = self._cancel_wave(lock, spec, cancellation)
         self._record_durable_event(
             lock,
@@ -708,6 +770,29 @@ class CampaignReconciler:
             identity=f"{execution_id}:cancelled:reconciler",
         )
         return remote_id or execution_id
+
+    def _managed_wave_job(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        action: ReconcileAction,
+    ) -> RemoteWaveJob | None:
+        target = _deployment_target(lock, spec, action.deployment_digest)
+        if isinstance(target, ProviderTarget):
+            key: Literal["harbor-hf-endpoint", "harbor-hf-provider"] = (
+                "harbor-hf-provider"
+            )
+            label = hashlib.sha256(target.service.encode()).hexdigest()[:32]
+        else:
+            endpoint = managed_wave_endpoint(lock, spec, action.deployment_digest)
+            key = "harbor-hf-endpoint"
+            label = endpoint_lease_label_for(endpoint.namespace, endpoint.name)
+        return self._find_wave(
+            spec,
+            action,
+            target_label_key=key,
+            endpoint_label=label,
+        )
 
     def _drain_wave(
         self,
@@ -1244,6 +1329,7 @@ __all__ = [
     "AmbiguousActionOutcome",
     "AppliedAction",
     "CampaignApplyError",
+    "CampaignApplyFailure",
     "CampaignApplyResult",
     "CampaignReconciler",
     "EndpointApplicationPort",

@@ -72,8 +72,11 @@ join or an implicit filename convention.
 
 Rows are sorted by stable IDs. Metric and artifact IDs are hashes of their
 stable owner and measurement or artifact identity. A publication ID is a hash
-of the run ID, source location, verified source checksum, run-lock checksum,
-and control commit. Parquet files use deterministic paths:
+of the run ID, source location, verified source checksum, and run-lock
+checksum. `control_commit` is the Hub commit that last modified the immutable
+campaign lock, not the moving control-repository head. Later events and leases
+therefore change neither the publication identity nor its Parquet bytes.
+Parquet files use deterministic paths:
 
 ```text
 data/<table>/schema=v1/campaign=<campaign-id>/<publication-id>.parquet
@@ -81,15 +84,20 @@ publications/<publication-id>.json
 ```
 
 The receipt path makes repeated publication a no-op. Rebuilding regenerates the
-same row models and paths from canonical evidence, and auditing compares those
-rows while checking referential and evidence-trace invariants.
+same row models and paths from canonical evidence. Adoption validates the
+receipt identity and every receipt-declared file checksum, which also permits a
+one-time adoption of pre-fix publications whose only difference was a moving
+control head. Auditing compares rows while checking referential and
+evidence-trace invariants.
 
 ## Serialized commits and interruption recovery
 
 The Hub adapter acquires a publisher lease for the benchmark Dataset, rereads
 its head, and creates one parent-checked commit containing all five Parquet
 files and the deterministic receipt. Parent conflicts are reread and retried;
-an existing matching receipt is adopted. The lease is always released.
+an existing matching receipt is adopted. Publisher claims expire after 15
+minutes so a killed process cannot block later publication forever. A live
+publisher releases its claim immediately.
 
 The global index is a second leased, parent-checked commit made only after the
 benchmark revision is known. If interruption occurs between commits, retrying

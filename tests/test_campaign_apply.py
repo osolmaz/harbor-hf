@@ -19,6 +19,8 @@ from harbor_hf.campaign_apply import (
     ActionExecutionError,
     AmbiguousActionOutcome,
     CampaignApplyError,
+    CampaignApplyFailure,
+    CampaignApplyResult,
     CampaignReconciler,
     HuggingFaceWaveJobAdapter,
     RemoteWaveJob,
@@ -195,6 +197,8 @@ class FakeEndpoints:
 class FakeJobs:
     def __init__(self) -> None:
         self.adopt_on_find = False
+        self.adopt_stage = "RUNNING"
+        self.find_stages: list[str] = []
         self.find_calls: list[dict[str, str]] = []
         self.submissions: list[tuple[WaveLock, bytes, CampaignLock]] = []
         self.cancellations: list[tuple[str, str]] = []
@@ -227,7 +231,7 @@ class FakeJobs:
             job_id="abcdef012345abcdef012345",
             wave_id=wave_id,
             endpoint_label=endpoint_label,
-            stage="RUNNING",
+            stage=self.find_stages.pop(0) if self.find_stages else self.adopt_stage,
             target_label_key=target_label_key,
         )
 
@@ -589,6 +593,119 @@ def test_apply_all_uses_campaign_listing(remote_spec: ExperimentSpec) -> None:
     results = _reconciler(store, FakeEndpoints(), FakeJobs()).apply_all()
 
     assert [result.campaign_id for result in results] == [lock.campaign_id]
+
+
+def test_apply_all_reports_one_failure_and_continues_other_campaigns(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+
+    class MultiStore(FakeStore):
+        def list_campaigns(self) -> list[str]:
+            return ["broken-campaign", self.lock.campaign_id]
+
+    class IsolatingReconciler(CampaignReconciler):
+        def apply_campaign(
+            self,
+            campaign_id: str,
+            *,
+            context: ReconcileContext | None = None,
+        ) -> CampaignApplyResult:
+            if campaign_id == "broken-campaign":
+                raise CampaignApplyError("malformed campaign")
+            return super().apply_campaign(campaign_id, context=context)
+
+    reconciler = IsolatingReconciler(
+        MultiStore(lock, request, [submitted]),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        clock=lambda: NOW,
+        identifier=lambda: "3" * 32,
+    )
+
+    results = reconciler.apply_all()
+
+    assert results[0] == CampaignApplyFailure(
+        campaign_id="broken-campaign",
+        error_type="CampaignApplyError",
+        message="malformed campaign",
+    )
+    assert results[1].campaign_id == lock.campaign_id
+
+
+def test_terminal_job_without_wave_marker_fails_active_execution_and_retries(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    endpoints = FakeEndpoints()
+    jobs = FakeJobs()
+    reconciler = _reconciler(store, endpoints, jobs)
+
+    first = reconciler.apply_campaign(lock.campaign_id)
+    submitted_action = ReconcileAction.model_validate(
+        store.reservations[first.applied[0].action_id]
+    )
+    assert submitted_action.wave_id is not None
+    shard = lock.runs[0].shards[0]
+    trial = shard.trials[0]
+    store.events.extend(
+        [
+            new_event(
+                subject_type="wave",
+                subject_id=submitted_action.wave_id,
+                kind="wave.active",
+                producer="wave-controller",
+                payload=WaveLifecyclePayload(
+                    deployment_digest=submitted_action.deployment_digest,
+                    provider="hf-inference-endpoints",
+                    shard_ids=submitted_action.shard_ids,
+                ),
+                clock=lambda: NOW + timedelta(seconds=10),
+                identifier=lambda: "a" * 32,
+            ),
+            new_event(
+                subject_type="execution",
+                subject_id="exec-lost",
+                kind="execution.started",
+                producer="wave-controller",
+                payload=ExecutionStartedPayload(
+                    trial_id=trial.trial_id,
+                    shard_id=shard.shard_id,
+                    physical_attempt=1,
+                    wave_id=submitted_action.wave_id,
+                ),
+                clock=lambda: NOW + timedelta(seconds=11),
+                identifier=lambda: "b" * 32,
+            ),
+        ]
+    )
+    jobs.adopt_on_find = True
+    jobs.adopt_stage = "ERROR"
+
+    recovered = reconciler.apply_campaign(lock.campaign_id)
+
+    assert [(item.kind, item.status) for item in recovered.applied] == [
+        ("cleanup-wave", "succeeded")
+    ]
+    projection, _plan = plan_reconciliation(lock, store.events)
+    assert projection.executions["exec-lost"].status == "failed"
+    assert projection.executions["exec-lost"].category == "lost"
+    assert projection.waves[submitted_action.wave_id].status == "closed"
+
+    jobs.adopt_on_find = False
+    retried = CampaignReconciler(
+        store,
+        endpoints=endpoints,
+        jobs=jobs,
+        clock=lambda: NOW + timedelta(hours=1),
+        identifier=lambda: "c" * 32,
+    ).apply_campaign(lock.campaign_id)
+
+    assert [(item.kind, item.status) for item in retried.applied] == [
+        ("retry-shard", "succeeded")
+    ]
+    assert jobs.submissions[-1][0].wave_id != submitted_action.wave_id
 
 
 def test_apply_observes_durable_event_reloads_and_uses_refreshed_projection(
@@ -1073,8 +1190,9 @@ def test_cancelled_unobserved_endpoint_wave_is_durably_closed(
     assert [planned.kind for planned in plan.actions] == ["publish-summary"]
 
 
+@pytest.mark.parametrize("terminal_race", [False, True])
 def test_forced_cancellation_cancels_active_execution_and_closes_wave(
-    remote_spec: ExperimentSpec,
+    remote_spec: ExperimentSpec, terminal_race: bool
 ) -> None:
     lock, request, submitted = _campaign(remote_spec)
     submit = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
@@ -1138,6 +1256,8 @@ def test_forced_cancellation_cancels_active_execution_and_closes_wave(
     store.reservations[submit.action_id] = submit.model_dump(mode="json")
     jobs = FakeJobs()
     jobs.adopt_on_find = True
+    if terminal_race:
+        jobs.find_stages = ["RUNNING", "COMPLETED"]
     identifiers = itertools.count(20)
     reconciler = CampaignReconciler(
         store,
@@ -1151,6 +1271,15 @@ def test_forced_cancellation_cancels_active_execution_and_closes_wave(
     )
 
     result = reconciler.apply_campaign(lock.campaign_id)
+
+    if terminal_race:
+        assert [(item.kind, item.status) for item in result.applied] == [
+            ("cancel-execution", "ambiguous")
+        ]
+        assert jobs.cancellations == []
+        assert not any(event.kind == "execution.cancelled" for event in store.events)
+        assert not any(event.kind == "wave.closed" for event in store.events)
+        return
 
     assert [(item.kind, item.status) for item in result.applied] == [
         ("cancel-execution", "succeeded"),

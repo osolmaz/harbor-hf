@@ -41,6 +41,7 @@ class FakeCampaignApi:
         self.root = root
         self.generation = 1
         self.files: dict[str, bytes] = {}
+        self.last_commits: dict[str, str] = {}
         self.conflicts = 0
         self.commits: list[dict[str, object]] = []
         self.info_calls: list[tuple[str, dict[str, object]]] = []
@@ -61,9 +62,13 @@ class FakeCampaignApi:
         self, repo_id: str, paths: list[str] | str, **kwargs: object
     ) -> list[object]:
         assert repo_id == "org/harbor-hf-coordination"
+        expand = kwargs.pop("expand", False)
         assert kwargs == {"repo_type": "dataset", "revision": self.head}
         path = paths if isinstance(paths, str) else paths[0]
-        return [SimpleNamespace(path=path)] if path in self.files else []
+        if path not in self.files:
+            return []
+        last_commit = SimpleNamespace(oid=self.last_commits[path]) if expand else None
+        return [SimpleNamespace(path=path, last_commit=last_commit)]
 
     def list_repo_files(self, repo_id: str, **kwargs: object) -> list[str]:
         self.list_calls.append((repo_id, kwargs))
@@ -93,6 +98,7 @@ class FakeCampaignApi:
             payload = operation.path_or_fileobj
             assert isinstance(payload, bytes)
             self.files[operation.path_in_repo] = payload
+            self.last_commits[operation.path_in_repo] = f"{self.generation + 1:040x}"
         self.commits.append(kwargs)
         self.generation += 1
         return SimpleNamespace(oid=self.head)
@@ -249,7 +255,10 @@ def test_hub_store_creates_and_loads_campaign(
     snapshot = store.load_snapshot(lock.campaign_id)
     assert snapshot.lock == lock
     assert snapshot.request == b"kind: Experiment\n"
-    assert snapshot.control_commit == api.head
+    assert (
+        snapshot.control_commit
+        == api.last_commits[f"campaigns/{lock.campaign_id}/campaign.lock.json"]
+    )
     with pytest.raises(CampaignConflict, match="campaign already exists"):
         store.create_campaign(lock, b"different", _submitted(lock))
 
@@ -279,6 +288,9 @@ def test_hub_store_snapshot_reads_every_object_from_one_exact_revision(
     api.list_calls.clear()
     api.download_calls.clear()
     expected_head = api.head
+    expected_control_commit = api.last_commits[
+        f"campaigns/{lock.campaign_id}/campaign.lock.json"
+    ]
 
     snapshot = store.load_snapshot(lock.campaign_id)
 
@@ -288,7 +300,7 @@ def test_hub_store_snapshot_reads_every_object_from_one_exact_revision(
         lock=lock,
         events=[later, _submitted(lock)],
         request=request,
-        control_commit=expected_head,
+        control_commit=expected_control_commit,
     )
     assert api.info_calls == [
         (repository, {"repo_type": "dataset", "revision": "main"})

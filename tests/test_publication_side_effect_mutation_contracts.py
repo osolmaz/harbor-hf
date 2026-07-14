@@ -171,7 +171,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     api = RecordingDatasetApi(tmp_path)
     leases = RecordingLeases()
     publisher = HubDatasetPublisher(
-        publisher_id="publisher-mutation", leases=leases, api=api
+        publisher_id="publisher-mutation", leases=leases, api=api, clock=lambda: NOW
     )
 
     first = publisher.publish(
@@ -192,7 +192,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "e01d54eae75e7e5e97fec73a956d02c64f6f84634f1431c356d5ad71aea29f27"
+        "6547849dceb0b61b639b8d766da4f4468f12620c2d523f79694c66c4b0df4e6c"
     )
 
 
@@ -214,6 +214,7 @@ def test_publisher_releases_lease_after_unrecoverable_commit_error(
         publisher_id="publisher-mutation",
         leases=leases,
         api=FailingApi(tmp_path),
+        clock=lambda: NOW,
     )
 
     with pytest.raises(HfHubHTTPError):
@@ -225,12 +226,20 @@ def test_publisher_releases_lease_after_unrecoverable_commit_error(
         (
             "acquire",
             "coordination/publishers/eb1ce4ea9e1b25394e2cff859f3d086d3afab316fc7519d7b3f901940d22e697.json",
-            {"publisher_id": "publisher-mutation", "destination": "org/results"},
+            {
+                "publisher_id": "publisher-mutation",
+                "destination": "org/results",
+                "expires_at": "2026-07-14T01:17:03+00:00",
+            },
         ),
         (
             "release",
             "coordination/publishers/eb1ce4ea9e1b25394e2cff859f3d086d3afab316fc7519d7b3f901940d22e697.json",
-            {"publisher_id": "publisher-mutation", "destination": "org/results"},
+            {
+                "publisher_id": "publisher-mutation",
+                "destination": "org/results",
+                "expires_at": "2026-07-14T01:17:03+00:00",
+            },
         ),
     ]
 
