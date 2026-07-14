@@ -435,6 +435,35 @@ def test_created_endpoint_retries_cleanup_after_definitive_pause_error(
     assert port.pause_attempts == 2
 
 
+def test_created_endpoint_revalidates_fallback_cleanup_snapshot(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    running = _snapshot(desired, state="running", ready=1)
+    mismatched = desired.configuration.model_copy(update={"access_type": "private"})
+    paused = _snapshot(desired, configuration=mismatched)
+
+    class ReplacedPort(FakePort):
+        pause_attempts = 0
+
+        def pause(self, identity: ManagedEndpointIdentity) -> EndpointSnapshot:
+            self.pause_attempts += 1
+            self.calls.append(f"pause:{identity.name}")
+            if self.pause_attempts == 1:
+                raise EndpointProviderError("rate limited")
+            return paused
+
+    port = ReplacedPort(inspections=[None, running, paused], create_result=running)
+
+    with pytest.raises(
+        AmbiguousEndpointPause,
+        match="created endpoint cleanup is not verified and must be retried",
+    ):
+        _provisioner(port).create_or_adopt(desired)
+
+    assert port.pause_attempts == 2
+
+
 def test_adopts_after_ambiguous_create_and_pauses(
     remote_spec: ExperimentSpec,
 ) -> None:

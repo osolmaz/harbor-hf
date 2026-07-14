@@ -30,8 +30,10 @@ from harbor_hf.campaign_apply import (
     _action_targets_deployment,
     _active_action_admissions,
     _build_admission_usage,
+    _can_recover_orphaned_endpoint,
     _combined_usage,
     _context_with_unobserved_actions,
+    _desired_endpoint,
     _usage_from_admissions,
 )
 from harbor_hf.campaign_finalizer import (
@@ -642,6 +644,46 @@ def test_active_endpoint_without_orphan_provenance_is_never_paused(
 
     assert result.applied[0].status == "failed"
     assert endpoints.pause_calls == []
+
+
+def test_other_ambiguous_action_blocks_orphan_endpoint_recovery(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    desired = _desired_endpoint(lock, remote_spec, action)
+    other = action.model_copy(
+        update={
+            "action_id": "act-other",
+            "action_key": "other",
+            "wave_id": "wave-other",
+        }
+    )
+
+    def ambiguous(candidate: ReconcileAction, sequence: int) -> CampaignEvent:
+        return new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="action.ambiguous",
+            producer="reconciler",
+            payload=ActionOutcomePayload(
+                action_id=candidate.action_id,
+                remote_id=desired.identity.name,
+            ),
+            clock=lambda: NOW + timedelta(seconds=sequence),
+            identifier=lambda: f"{sequence:032x}",
+        )
+
+    events = [
+        submitted,
+        _reservation(lock, action, 2),
+        ambiguous(action, 3),
+        _reservation(lock, other, 4),
+        ambiguous(other, 5),
+    ]
+    projection = project_recovery(lock, events)
+
+    assert not _can_recover_orphaned_endpoint(lock, action, desired, projection)
 
 
 @pytest.mark.parametrize("action_kind", ["submit-wave", "retry-shard"])

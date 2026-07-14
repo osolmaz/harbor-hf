@@ -471,6 +471,7 @@ class EndpointProvisioner:
                     timeout_seconds=timeout_seconds,
                     poll_seconds=poll_seconds,
                 )
+                verify_exact_endpoint(desired, paused)
             except EndpointProvisioningError as cleanup_error:
                 raise AmbiguousEndpointPause(
                     "created endpoint cleanup is not verified and must be retried"

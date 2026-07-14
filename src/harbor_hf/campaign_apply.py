@@ -1387,15 +1387,20 @@ def _can_recover_orphaned_endpoint(
     desired: DesiredEndpoint,
     projection: RecoveryProjection,
 ) -> bool:
-    provenance_action_ids = {
+    provenance_actions = {
         state.action_id
         for state in projection.campaign.actions.values()
         if state.status in {"ambiguous", "failed"}
         and state.remote_id == desired.identity.name
         and _action_targets_deployment(lock, state, action.deployment_digest)
     }
-    if not provenance_action_ids:
+    if not provenance_actions:
         return False
+    exempt_action_ids = {action.action_id} | {
+        state.action_id
+        for state in projection.campaign.actions.values()
+        if state.action_id in provenance_actions and state.status == "failed"
+    }
     if any(
         wave.deployment_digest == action.deployment_digest and wave.status != "closed"
         for wave in projection.waves.values()
@@ -1403,7 +1408,7 @@ def _can_recover_orphaned_endpoint(
         return False
     return not any(
         state.action_id != action.action_id
-        and state.action_id not in provenance_action_ids
+        and state.action_id not in exempt_action_ids
         and state.status in {"reserved", "succeeded", "ambiguous"}
         and _action_targets_deployment(lock, state, action.deployment_digest)
         and (
