@@ -1173,6 +1173,7 @@ def _finalize_evidence(root: Path, token: str) -> None:
     rejection_count = 0
     if failed:
         sanitize_private_artifact_symlinks(root, max_depth=3)
+        (root / "harbor-jobs").mkdir(exist_ok=True)
         rejection_count = _sanitize_direct_trial_artifacts(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:

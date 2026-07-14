@@ -228,9 +228,9 @@ def test_private_artifact_sanitizer_records_and_removes_rejected_files(
     root = _execution_root(tmp_path)
     (root / "linked").symlink_to(root / "events.jsonl")
     oversized = root / "harbor-jobs" / "oversized.log"
-    oversized.write_text("x" * 200, encoding="utf-8")
+    oversized.write_text("x" * 2000, encoding="utf-8")
 
-    rejected = sanitize_private_artifact_tree(root, max_file_bytes=150)
+    rejected = sanitize_private_artifact_tree(root, max_file_bytes=1024)
 
     assert [(item.path, item.reason) for item in rejected] == [
         ("harbor-jobs/oversized.log", "file_size"),
@@ -246,6 +246,24 @@ def test_private_artifact_sanitizer_records_and_removes_rejected_files(
     assert retained.rejections == rejected
 
 
+def test_rejection_record_is_bounded_and_reports_omissions(tmp_path: Path) -> None:
+    root = tmp_path / "evidence"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("outside", encoding="utf-8")
+    for index in range(20):
+        (root / f"linked-{index:02d}").symlink_to(outside)
+
+    rejected = sanitize_private_artifact_tree(root, max_file_bytes=300)
+
+    record_path = root / "private-artifact-rejections.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record_path.stat().st_size <= 300
+    assert record["omitted_count"] > 0
+    assert record["omitted_count"] + len(record["rejections"]) == 20
+    assert [item.model_dump(mode="json") for item in rejected] == record["rejections"]
+
+
 def test_directory_file_limits_do_not_charge_child_trial_bundles(
     tmp_path: Path,
 ) -> None:
@@ -259,14 +277,14 @@ def test_directory_file_limits_do_not_charge_child_trial_bundles(
         job, max_file_bytes=10, max_bundle_bytes=10
     )
 
-    (job / "job.log").write_text("x" * 20, encoding="utf-8")
+    (job / "job.log").write_text("x" * 400, encoding="utf-8")
     with pytest.raises(RuntimeError, match="file size limit: job.log"):
         validate_private_artifact_directory_files(
             job, max_file_bytes=10, max_bundle_bytes=10
         )
 
     rejected = sanitize_private_artifact_directory_files(
-        job, max_file_bytes=10, max_bundle_bytes=10
+        job, max_file_bytes=300, max_bundle_bytes=300
     )
     assert [(item.path, item.reason) for item in rejected] == [("job.log", "file_size")]
     assert not (job / "job.log").exists()

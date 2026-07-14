@@ -2546,6 +2546,27 @@ def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
     }
 
 
+def test_failed_finalize_recreates_rejected_jobs_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    jobs = tmp_path / "harbor-jobs"
+    jobs.symlink_to(outside, target_is_directory=True)
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    assert jobs.is_dir()
+    assert not jobs.is_symlink()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "harbor-jobs", "reason": "symlink", "size": None}
+    ]
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+
+
 def test_failed_direct_run_sanitizes_each_trial_independently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

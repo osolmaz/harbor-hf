@@ -275,7 +275,7 @@ def sanitize_private_artifact_tree(
     files, file_rejections = _remove_oversized_files(root, max_file_bytes)
     rejected.extend(file_rejections)
     rejected.extend(_trim_bundle(files, max_bundle_bytes))
-    _write_rejections(root, rejected)
+    _write_rejections(root, rejected, max_record_bytes=max_file_bytes)
     return rejected
 
 
@@ -341,23 +341,52 @@ def sanitize_private_artifact_directory_files(
             continue
         files.append((candidate, relative, size, classify_private_artifact(relative)))
     rejected.extend(_trim_bundle(files, max_bundle_bytes))
-    _write_rejections(root, rejected)
+    _write_rejections(root, rejected, max_record_bytes=max_file_bytes)
     return rejected
 
 
-def _write_rejections(root: Path, rejected: list[PrivateArtifactRejection]) -> None:
+def _write_rejections(
+    root: Path,
+    rejected: list[PrivateArtifactRejection],
+    *,
+    max_record_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
+) -> None:
     rejected[:] = sorted(
         {rejection.path: rejection for rejection in rejected}.values(),
         key=lambda rejection: rejection.path,
     )
-    if rejected:
-        write_json(
-            root / _REJECTION_FILE,
-            {
-                "schema_version": "harbor-hf/private-artifact-rejections/v1",
-                "rejections": [item.model_dump(mode="json") for item in rejected],
-            },
-        )
+    if not rejected:
+        return
+    all_rejections = rejected.copy()
+    low = 0
+    high = len(all_rejections)
+    selected = b""
+    selected_count = 0
+    while low <= high:
+        count = (low + high) // 2
+        payload = _rejection_payload(all_rejections, count)
+        if len(payload) <= max_record_bytes:
+            selected = payload
+            selected_count = count
+            low = count + 1
+        else:
+            high = count - 1
+    path = root / _REJECTION_FILE
+    if not selected:
+        path.unlink(missing_ok=True)
+        rejected.clear()
+        return
+    path.write_bytes(selected)
+    rejected[:] = all_rejections[:selected_count]
+
+
+def _rejection_payload(rejected: list[PrivateArtifactRejection], count: int) -> bytes:
+    record = {
+        "schema_version": "harbor-hf/private-artifact-rejections/v1",
+        "rejections": [item.model_dump(mode="json") for item in rejected[:count]],
+        "omitted_count": len(rejected) - count,
+    }
+    return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _remove_symlinks(

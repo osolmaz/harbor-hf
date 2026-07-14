@@ -1131,6 +1131,7 @@ def _finalize_execution(
     rejection_count = 0
     if not strict_compatibility:
         rejection_count = len(sanitize_private_artifact_tree(root))
+        (root / "harbor-jobs").mkdir(exist_ok=True)
     session_required = openclaw_execution_started(root, fallback_attempted=attempted)
     _redact_unit(root, token)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
