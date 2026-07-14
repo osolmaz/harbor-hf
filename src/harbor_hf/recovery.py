@@ -702,15 +702,41 @@ def _terminal_decision(
         return _decision(lock, status, counts, "recorded")
     if not _cleanup_is_complete(campaign, waves):
         return None
-    if not all(trial.status in _TERMINAL_STATUSES for trial in trials.values()):
+    decision_counts = _terminal_counts(campaign, counts)
+    cancelling = campaign.status in {"cancel_requested", "draining"}
+    if not all(
+        trial.status in _TERMINAL_STATUSES or (cancelling and trial.status == "planned")
+        for trial in trials.values()
+    ):
         return None
-    if counts.complete == len(trials):
-        return _decision(lock, "completed", counts, "all logical trials completed")
-    if counts.complete:
-        return _decision(lock, "partial", counts, "some logical trials completed")
-    if campaign.status in {"cancel_requested", "draining"} or counts.cancelled:
-        return _decision(lock, "cancelled", counts, "cancellation drained and cleaned")
-    return _decision(lock, "failed", counts, "no valid logical trial completed")
+    if decision_counts.complete == len(trials):
+        return _decision(
+            lock, "completed", decision_counts, "all logical trials completed"
+        )
+    if decision_counts.complete:
+        return _decision(
+            lock, "partial", decision_counts, "some logical trials completed"
+        )
+    if cancelling or decision_counts.cancelled:
+        return _decision(
+            lock,
+            "cancelled",
+            decision_counts,
+            "cancellation drained and cleaned",
+        )
+    return _decision(
+        lock, "failed", decision_counts, "no valid logical trial completed"
+    )
+
+
+def _terminal_counts(
+    campaign: CampaignProjection, counts: ProjectionCounts
+) -> ProjectionCounts:
+    if campaign.status not in {"cancel_requested", "draining"}:
+        return counts
+    return counts.model_copy(
+        update={"planned": 0, "cancelled": counts.cancelled + counts.planned}
+    )
 
 
 def _cleanup_is_complete(

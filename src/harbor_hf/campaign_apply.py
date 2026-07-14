@@ -969,6 +969,11 @@ class CampaignReconciler:
         *,
         projection: RecoveryProjection,
     ) -> str:
+        job = self._managed_wave_job(lock, spec, action)
+        if job is not None and not job.terminal:
+            raise AmbiguousActionOutcome(
+                f"HF Job {job.job_id} is still {job.stage}; awaiting terminal cleanup"
+            )
         target = _deployment_target(lock, spec, action.deployment_digest)
         if isinstance(target, ProviderTarget):
             remote_id = action.wave_id or f"wave-{action.action_key}"

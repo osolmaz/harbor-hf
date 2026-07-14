@@ -86,7 +86,6 @@ from harbor_hf.reconciler import (
 )
 from harbor_hf.recovery import RecoveryProjection, TerminalDecision, project_recovery
 from harbor_hf.result_publisher import HubDatasetPublisher
-from harbor_hf.submission import endpoint_lease_label_for
 
 NOW = datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC)
 
@@ -534,73 +533,52 @@ def test_losing_atomic_reservation_does_not_execute_side_effect(
     assert jobs.submissions == []
 
 
-def test_reserved_cancel_and_cleanup_use_existing_remote_adapters(
+def test_cleanup_waits_for_terminal_job_and_recovers_on_later_pass(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock, request, submitted = _campaign(remote_spec)
-    deployment = lock.runs[0].deployment_digest
-    cancel = ReconcileAction(
-        action_id="act-" + "2" * 24,
-        action_key="2" * 24,
-        kind="cancel-wave",
-        campaign_id=lock.campaign_id,
-        deployment_digest=deployment,
-        wave_id="wave-" + "1" * 24,
-        target_ids=["wave-" + "1" * 24],
+    submit = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    assert submit.wave_id is not None
+    store = FakeStore(
+        lock,
+        request,
+        [submitted, *_cancelled_submitted_wave_events(lock, submit)],
     )
-    cleanup = ReconcileAction(
-        action_id="act-" + "3" * 24,
-        action_key="3" * 24,
-        kind="cleanup-wave",
-        campaign_id=lock.campaign_id,
-        deployment_digest=deployment,
-        wave_id="wave-" + "1" * 24,
-        target_ids=["wave-" + "1" * 24],
-    )
-    events = [
-        submitted,
-        new_event(
-            subject_type="campaign",
-            subject_id=lock.campaign_id,
-            kind="campaign.cancel-requested",
-            producer="cli",
-            payload=CancellationPayload(reason="operator"),
-            clock=lambda: NOW + timedelta(seconds=1),
-            identifier=lambda: "2" * 32,
-        ),
-        _reservation(lock, cancel, 3),
-        _reservation(lock, cleanup, 4),
-    ]
-    store = FakeStore(lock, request, events)
-    store.reservations = {
-        cancel.action_id: cancel.model_dump(mode="json"),
-        cleanup.action_id: cleanup.model_dump(mode="json"),
-    }
+    store.reservations[submit.action_id] = submit.model_dump(mode="json")
     endpoints = FakeEndpoints()
     endpoints.present = True
     endpoints.active = True
     jobs = FakeJobs()
     jobs.adopt_on_find = True
+    reconciler = _reconciler(store, endpoints, jobs, identifier_start=16)
 
-    result = _reconciler(store, endpoints, jobs).apply_campaign(lock.campaign_id)
+    nonterminal = reconciler.apply_campaign(lock.campaign_id)
 
-    assert [action.status for action in result.applied] == [
-        "succeeded",
-        "succeeded",
+    assert [(action.kind, action.status) for action in nonterminal.applied] == [
+        ("cancel-wave", "succeeded"),
+        ("cleanup-wave", "ambiguous"),
     ]
+    cleanup_id = nonterminal.applied[1].action_id
     assert jobs.cancellations == [("abcdef012345abcdef012345", "osolmaz")]
-    endpoint = managed_wave_endpoint(lock, remote_spec, deployment)
-    assert jobs.find_calls == [
-        {
-            "namespace": "osolmaz",
-            "wave_id": cancel.wave_id,
-            "endpoint_label": endpoint_lease_label_for(
-                endpoint.namespace, endpoint.name
-            ),
-            "target_label_key": "harbor-hf-endpoint",
-        }
-    ]
-    assert len(endpoints.pause_calls) == 1
+    assert not any(
+        event.kind == "wave.closed" and event.subject_id == submit.wave_id
+        for event in store.events
+    )
+    assert endpoints.pause_calls == []
+    assert endpoints.active is True
+
+    jobs.adopt_stage = "CANCELED"
+    terminal = reconciler.apply_campaign(lock.campaign_id)
+
+    recovered = next(
+        action for action in terminal.applied if action.action_id == cleanup_id
+    )
+    assert (recovered.kind, recovered.status) == ("cleanup-wave", "succeeded")
+    assert any(
+        event.kind == "wave.closed" and event.subject_id == submit.wave_id
+        for event in store.events
+    )
+    assert endpoints.pause_calls
     assert endpoints.active is False
 
 
@@ -1287,6 +1265,7 @@ def test_provider_wave_cancellation_cleanup_closes_wave_without_endpoints(
     endpoints = FakeEndpoints()
     jobs = FakeJobs()
     jobs.adopt_on_find = True
+    jobs.find_stages = ["RUNNING", "RUNNING", "CANCELED"]
 
     result = _reconciler(store, endpoints, jobs, identifier_start=16).apply_campaign(
         lock.campaign_id
@@ -1335,6 +1314,7 @@ def test_cancelled_unobserved_endpoint_wave_is_durably_closed(
     endpoints.active = True
     jobs = FakeJobs()
     jobs.adopt_on_find = True
+    jobs.find_stages = ["RUNNING", "RUNNING", "CANCELED"]
 
     result = _reconciler(store, endpoints, jobs, identifier_start=16).apply_campaign(
         lock.campaign_id
@@ -1432,6 +1412,8 @@ def test_forced_cancellation_cancels_active_execution_and_closes_wave(
     jobs.adopt_on_find = True
     if terminal_race:
         jobs.find_stages = ["RUNNING", "COMPLETED"]
+    else:
+        jobs.find_stages = ["RUNNING", "RUNNING", "RUNNING", "RUNNING", "CANCELED"]
     identifiers = itertools.count(20)
     reconciler = CampaignReconciler(
         store,

@@ -804,6 +804,50 @@ def test_terminal_summary_decisions(
     assert [action.kind for action in plan.actions] == ["publish-summary"]
 
 
+def test_queued_cancellation_counts_unstarted_trials_as_cancelled(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2, max_trials_per_shard=2)
+
+    projection, plan = plan_reconciliation(lock, [submitted, _cancel_event(lock)])
+
+    assert projection.counts.planned == 2
+    assert projection.counts.cancelled == 0
+    assert projection.terminal_decision is not None
+    assert projection.terminal_decision.status == "cancelled"
+    assert projection.terminal_decision.counts.planned == 0
+    assert projection.terminal_decision.counts.cancelled == 2
+    assert [action.kind for action in plan.actions] == ["publish-summary"]
+
+
+def test_partial_cancellation_preserves_completed_trial(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2, max_trials_per_shard=2)
+    shard = lock.runs[0].shards[0]
+    completed = _event(
+        lock,
+        3,
+        "trial",
+        shard.trials[0].trial_id,
+        "trial.complete",
+        LifecyclePayload(parent_id=shard.shard_id),
+    )
+
+    projection, plan = plan_reconciliation(
+        lock, [submitted, _cancel_event(lock), completed]
+    )
+
+    assert projection.counts.complete == 1
+    assert projection.counts.planned == 1
+    assert projection.terminal_decision is not None
+    assert projection.terminal_decision.status == "partial"
+    assert projection.terminal_decision.counts.complete == 1
+    assert projection.terminal_decision.counts.cancelled == 1
+    assert projection.terminal_decision.counts.planned == 0
+    assert [action.kind for action in plan.actions] == ["publish-summary"]
+
+
 def test_randomized_duplicate_and_out_of_order_replay_converges(
     remote_spec: ExperimentSpec,
 ) -> None:
