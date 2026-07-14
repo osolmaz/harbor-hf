@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from huggingface_hub import CommitOperationAdd
 
 from harbor_hf.campaigns import build_campaign_lock, build_campaign_plan
 from harbor_hf.control import (
@@ -113,6 +114,8 @@ class MemoryRepositories:
     ) -> None:
         self.interactions = interactions
         self.private = dict(existing or {})
+        self.sha = {repository: "1" * 40 for repository in self.private}
+        self.commits: list[tuple[str, list[object], dict[str, object]]] = []
 
     def create_repo(self, repo_id: str, **kwargs: object) -> object:
         self.interactions.append(("create_repo", repo_id, kwargs))
@@ -123,7 +126,18 @@ class MemoryRepositories:
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object:
         self.interactions.append(("repo_info", repo_id, kwargs))
-        return SimpleNamespace(private=self.private[repo_id])
+        return SimpleNamespace(
+            private=self.private[repo_id],
+            sha=self.sha.get(repo_id),
+        )
+
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object:
+        self.interactions.append(("create_commit", repo_id, kwargs))
+        self.commits.append((repo_id, operations, kwargs))
+        self.sha[repo_id] = "2" * 40
+        return SimpleNamespace(oid=self.sha[repo_id])
 
 
 def _snapshot(spec: ExperimentSpec) -> CampaignSnapshot:
@@ -365,7 +379,7 @@ def test_verification_rejects_tampered_bucket_evidence(
         verify_campaign_artifacts(snapshot, namespace="osolmaz", reader=evidence)
 
 
-def test_automatic_publisher_creates_public_repositories_then_publishes(
+def test_automatic_publisher_initializes_new_empty_public_repositories(
     remote_spec: ExperimentSpec,
 ) -> None:
     interactions: list[object] = []
@@ -377,13 +391,14 @@ def test_automatic_publisher_creates_public_repositories_then_publishes(
         interactions=interactions,
     )
     publisher = FakePublisher(interactions=interactions)
+    repositories = MemoryRepositories(interactions)
 
     report = AutomaticCampaignPublisher(
         namespace="osolmaz",
         store=MemoryStore(snapshot),
         reader=reader,
         publisher=publisher,
-        repositories=MemoryRepositories(interactions),
+        repositories=repositories,
     ).publish(snapshot.lock.campaign_id)
 
     assert report.campaign_id == snapshot.lock.campaign_id
@@ -399,7 +414,12 @@ def test_automatic_publisher_creates_public_repositories_then_publishes(
         "result_revision": "a" * 40,
         "index_revision": "b" * 40,
     }
-    assert interactions[:5] == [
+    commit_kwargs = {
+        "commit_message": "chore: initialize publication Dataset",
+        "repo_type": "dataset",
+        "revision": "main",
+    }
+    assert interactions[:9] == [
         (
             "create_repo",
             "example/shellbench-results",
@@ -419,19 +439,45 @@ def test_automatic_publisher_creates_public_repositories_then_publishes(
             "repo_info",
             "example/benchmark-run-index",
             {"repo_type": "dataset"},
+        ),
+        ("create_commit", "example/shellbench-results", commit_kwargs),
+        (
+            "repo_info",
+            "example/shellbench-results",
+            {"repo_type": "dataset", "revision": "main"},
+        ),
+        ("create_commit", "example/benchmark-run-index", commit_kwargs),
+        (
+            "repo_info",
+            "example/benchmark-run-index",
+            {"repo_type": "dataset", "revision": "main"},
         ),
         "refresh",
     ]
-    assert interactions[5] == (
+    assert interactions[9] == (
         "publish",
         "example/shellbench-results",
         "example/benchmark-run-index",
         publisher.publications[0],
     )
+    assert [
+        repository for repository, _operations, _kwargs in repositories.commits
+    ] == [
+        "example/shellbench-results",
+        "example/benchmark-run-index",
+    ]
+    for _repository, operations, kwargs in repositories.commits:
+        assert kwargs == commit_kwargs
+        assert "parent_commit" not in kwargs
+        assert len(operations) == 1
+        operation = operations[0]
+        assert isinstance(operation, CommitOperationAdd)
+        assert operation.path_in_repo == ".harbor-hf-initialized"
+        assert operation.path_or_fileobj == b"harbor-hf publication Dataset\n"
     assert reader.refresh_calls == 1
 
 
-def test_automatic_publisher_adopts_existing_public_repositories(
+def test_automatic_publisher_adopts_initialized_public_repositories(
     remote_spec: ExperimentSpec,
 ) -> None:
     interactions: list[object] = []
@@ -466,6 +512,7 @@ def test_automatic_publisher_adopts_existing_public_repositories(
     }
     assert reader.refresh_calls == 1
     assert len(publisher.publications) == 1
+    assert repositories.commits == []
 
 
 @pytest.mark.parametrize(

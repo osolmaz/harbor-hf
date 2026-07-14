@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from huggingface_hub import CommitOperationAdd
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict
 
 from harbor_hf.control import CampaignEvent, CampaignSnapshot
@@ -16,6 +18,9 @@ from harbor_hf.results import (
     build_result_publication,
     build_result_tables,
 )
+
+_DATASET_INITIALIZATION_PATH = ".harbor-hf-initialized"
+_DATASET_INITIALIZATION_PAYLOAD = b"harbor-hf publication Dataset\n"
 
 
 class FrozenModel(BaseModel):
@@ -88,6 +93,10 @@ class DatasetRepositoryApi(Protocol):
 
     def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
 
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object: ...
+
 
 class AutomaticCampaignPublisher:
     """Publish every complete run after terminal evidence is finalized."""
@@ -130,6 +139,9 @@ class AutomaticCampaignPublisher:
         for repository, info in zip(repositories, repository_info, strict=True):
             if getattr(info, "private", None) is not False:
                 raise ValueError(f"Dataset repository {repository} must be public")
+        for repository, info in zip(repositories, repository_info, strict=True):
+            if _commit_identity(info) is None:
+                _initialize_public_dataset_repository(repository, self.repositories)
         self.reader.refresh()
         return publish_campaign_results(
             snapshot,
@@ -138,6 +150,38 @@ class AutomaticCampaignPublisher:
             publisher=self.publisher,
             dry_run=False,
         )
+
+
+def _initialize_public_dataset_repository(
+    repository: str, api: DatasetRepositoryApi
+) -> None:
+    initialization_error: HfHubHTTPError | None = None
+    try:
+        api.create_commit(
+            repository,
+            [
+                CommitOperationAdd(
+                    path_in_repo=_DATASET_INITIALIZATION_PATH,
+                    path_or_fileobj=_DATASET_INITIALIZATION_PAYLOAD,
+                )
+            ],
+            commit_message="chore: initialize publication Dataset",
+            repo_type="dataset",
+            revision="main",
+        )
+    except HfHubHTTPError as error:
+        initialization_error = error
+    info = api.repo_info(repository, repo_type="dataset", revision="main")
+    if _commit_identity(info) is not None:
+        return
+    if initialization_error is not None:
+        raise initialization_error
+    raise ValueError(f"Dataset repository {repository} has no commit identity")
+
+
+def _commit_identity(info: object) -> str | None:
+    revision = getattr(info, "sha", None)
+    return revision if isinstance(revision, str) and revision else None
 
 
 def cancel_campaign(
