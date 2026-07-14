@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -101,6 +102,28 @@ class FakePublisher:
             index_dataset=index_dataset,
             index_revision="b" * 40,
         )
+
+
+class MemoryRepositories:
+    def __init__(
+        self,
+        interactions: list[object],
+        *,
+        existing: dict[str, bool] | None = None,
+    ) -> None:
+        self.interactions = interactions
+        self.private = dict(existing or {})
+
+    def create_repo(self, repo_id: str, **kwargs: object) -> object:
+        self.interactions.append(("create_repo", repo_id, kwargs))
+        requested_private = kwargs.get("private")
+        assert isinstance(requested_private, bool)
+        self.private.setdefault(repo_id, requested_private)
+        return object()
+
+    def repo_info(self, repo_id: str, **kwargs: object) -> object:
+        self.interactions.append(("repo_info", repo_id, kwargs))
+        return SimpleNamespace(private=self.private[repo_id])
 
 
 def _snapshot(spec: ExperimentSpec) -> CampaignSnapshot:
@@ -342,7 +365,7 @@ def test_verification_rejects_tampered_bucket_evidence(
         verify_campaign_artifacts(snapshot, namespace="osolmaz", reader=evidence)
 
 
-def test_automatic_publisher_creates_repositories_refreshes_then_publishes(
+def test_automatic_publisher_creates_public_repositories_then_publishes(
     remote_spec: ExperimentSpec,
 ) -> None:
     interactions: list[object] = []
@@ -355,17 +378,12 @@ def test_automatic_publisher_creates_repositories_refreshes_then_publishes(
     )
     publisher = FakePublisher(interactions=interactions)
 
-    class Repositories:
-        def create_repo(self, repo_id: str, **kwargs: object) -> object:
-            interactions.append(("create_repo", repo_id, kwargs))
-            return object()
-
     report = AutomaticCampaignPublisher(
         namespace="osolmaz",
         store=MemoryStore(snapshot),
         reader=reader,
         publisher=publisher,
-        repositories=Repositories(),
+        repositories=MemoryRepositories(interactions),
     ).publish(snapshot.lock.campaign_id)
 
     assert report.campaign_id == snapshot.lock.campaign_id
@@ -381,7 +399,7 @@ def test_automatic_publisher_creates_repositories_refreshes_then_publishes(
         "result_revision": "a" * 40,
         "index_revision": "b" * 40,
     }
-    assert interactions[:3] == [
+    assert interactions[:5] == [
         (
             "create_repo",
             "example/shellbench-results",
@@ -392,15 +410,129 @@ def test_automatic_publisher_creates_repositories_refreshes_then_publishes(
             "example/benchmark-run-index",
             {"repo_type": "dataset", "private": False, "exist_ok": True},
         ),
+        (
+            "repo_info",
+            "example/shellbench-results",
+            {"repo_type": "dataset"},
+        ),
+        (
+            "repo_info",
+            "example/benchmark-run-index",
+            {"repo_type": "dataset"},
+        ),
         "refresh",
     ]
-    assert interactions[3] == (
+    assert interactions[5] == (
         "publish",
         "example/shellbench-results",
         "example/benchmark-run-index",
         publisher.publications[0],
     )
     assert reader.refresh_calls == 1
+
+
+def test_automatic_publisher_adopts_existing_public_repositories(
+    remote_spec: ExperimentSpec,
+) -> None:
+    interactions: list[object] = []
+    snapshot = _snapshot(remote_spec)
+    source = _evidence(snapshot)
+    reader = MemoryEvidence(
+        source.prefix,
+        source.files,
+        interactions=interactions,
+    )
+    publisher = FakePublisher(interactions=interactions)
+    repositories = MemoryRepositories(
+        interactions,
+        existing={
+            "example/shellbench-results": False,
+            "example/benchmark-run-index": False,
+        },
+    )
+
+    report = AutomaticCampaignPublisher(
+        namespace="osolmaz",
+        store=MemoryStore(snapshot),
+        reader=reader,
+        publisher=publisher,
+        repositories=repositories,
+    ).publish(snapshot.lock.campaign_id)
+
+    assert report.runs[0].published
+    assert repositories.private == {
+        "example/shellbench-results": False,
+        "example/benchmark-run-index": False,
+    }
+    assert reader.refresh_calls == 1
+    assert len(publisher.publications) == 1
+
+
+@pytest.mark.parametrize(
+    "private_repository",
+    ["example/shellbench-results", "example/benchmark-run-index"],
+)
+def test_automatic_publisher_rejects_existing_private_repository_before_evidence(
+    remote_spec: ExperimentSpec,
+    private_repository: str,
+) -> None:
+    interactions: list[object] = []
+    snapshot = _snapshot(remote_spec)
+    source = _evidence(snapshot)
+    reader = MemoryEvidence(
+        source.prefix,
+        source.files,
+        interactions=interactions,
+    )
+    publisher = FakePublisher(interactions=interactions)
+    repositories = MemoryRepositories(
+        interactions,
+        existing={
+            "example/shellbench-results": (
+                private_repository == "example/shellbench-results"
+            ),
+            "example/benchmark-run-index": (
+                private_repository == "example/benchmark-run-index"
+            ),
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"^Dataset repository {private_repository} must be public$",
+    ):
+        AutomaticCampaignPublisher(
+            namespace="osolmaz",
+            store=MemoryStore(snapshot),
+            reader=reader,
+            publisher=publisher,
+            repositories=repositories,
+        ).publish(snapshot.lock.campaign_id)
+
+    assert interactions == [
+        (
+            "create_repo",
+            "example/shellbench-results",
+            {"repo_type": "dataset", "private": False, "exist_ok": True},
+        ),
+        (
+            "create_repo",
+            "example/benchmark-run-index",
+            {"repo_type": "dataset", "private": False, "exist_ok": True},
+        ),
+        (
+            "repo_info",
+            "example/shellbench-results",
+            {"repo_type": "dataset"},
+        ),
+        (
+            "repo_info",
+            "example/benchmark-run-index",
+            {"repo_type": "dataset"},
+        ),
+    ]
+    assert reader.refresh_calls == 0
+    assert publisher.publications == []
 
 
 def test_automatic_publisher_rejects_missing_index_without_side_effects(
@@ -422,18 +554,13 @@ def test_automatic_publisher_rejects_missing_index_without_side_effects(
         interactions=interactions,
     )
 
-    class Repositories:
-        def create_repo(self, repo_id: str, **kwargs: object) -> object:
-            interactions.append(("create_repo", repo_id, kwargs))
-            return object()
-
     with pytest.raises(ValueError) as captured:
         AutomaticCampaignPublisher(
             namespace="osolmaz",
             store=MemoryStore(snapshot),
             reader=reader,
             publisher=FakePublisher(interactions=interactions),
-            repositories=Repositories(),
+            repositories=MemoryRepositories(interactions),
         ).publish(snapshot.lock.campaign_id)
 
     assert str(captured.value) == "campaign result publication requires index_dataset"
@@ -459,18 +586,13 @@ def test_automatic_publisher_reports_campaign_identity_for_invalid_request(
         interactions=interactions,
     )
 
-    class Repositories:
-        def create_repo(self, repo_id: str, **kwargs: object) -> object:
-            interactions.append(("create_repo", repo_id, kwargs))
-            return object()
-
     with pytest.raises(ManifestError) as captured:
         AutomaticCampaignPublisher(
             namespace="osolmaz",
             store=MemoryStore(snapshot),
             reader=reader,
             publisher=FakePublisher(interactions=interactions),
-            repositories=Repositories(),
+            repositories=MemoryRepositories(interactions),
         ).publish(snapshot.lock.campaign_id)
 
     assert str(captured.value).startswith(

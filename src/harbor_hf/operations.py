@@ -86,6 +86,8 @@ class RefreshingEvidenceReader(EvidenceReader, Protocol):
 class DatasetRepositoryApi(Protocol):
     def create_repo(self, repo_id: str, **kwargs: object) -> object: ...
 
+    def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
+
 
 class AutomaticCampaignPublisher:
     """Publish every complete run after terminal evidence is finalized."""
@@ -113,13 +115,21 @@ class AutomaticCampaignPublisher:
         )
         if spec.publishing.index_dataset is None:
             raise ValueError("campaign result publication requires index_dataset")
-        for repository in (spec.publishing.dataset, spec.publishing.index_dataset):
+        repositories = (spec.publishing.dataset, spec.publishing.index_dataset)
+        for repository in repositories:
             self.repositories.create_repo(
                 repository,
                 repo_type="dataset",
                 private=False,
                 exist_ok=True,
             )
+        repository_info = [
+            self.repositories.repo_info(repository, repo_type="dataset")
+            for repository in repositories
+        ]
+        for repository, info in zip(repositories, repository_info, strict=True):
+            if getattr(info, "private", None) is not False:
+                raise ValueError(f"Dataset repository {repository} must be public")
         self.reader.refresh()
         return publish_campaign_results(
             snapshot,
