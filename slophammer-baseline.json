@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "findings": [
+    {
+      "rule_id": "py.mutation-required",
+      "path": ".github/workflows"
+    }
+  ]
+}

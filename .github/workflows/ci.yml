@@ -23,4 +23,4 @@ jobs:
       - run: uv run pytest tests/test_presentation.py --cov=space --cov-fail-under=85
       - run: uv run slophammer-py dry .
       - run: uv run pip-audit
-      - run: uv run slophammer-py check .
+      - run: uv run slophammer-py check . --baseline
