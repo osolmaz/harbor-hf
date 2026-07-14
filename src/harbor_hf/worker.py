@@ -1168,9 +1168,10 @@ def require_executable(name: str) -> None:
 
 def _finalize_evidence(root: Path, token: str) -> None:
     failed = (root / "_FAILED").is_file()
+    rejection_count = 0
     if failed:
         sanitize_private_artifact_symlinks(root, max_depth=3)
-        _sanitize_direct_trial_artifacts(root)
+        rejection_count = _sanitize_direct_trial_artifacts(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
         append_event(
@@ -1192,7 +1193,17 @@ def _finalize_evidence(root: Path, token: str) -> None:
             error_type=refresh_error,
         )
     if failed:
-        _sanitize_direct_trial_artifacts(root, trust_existing_rejections=True)
+        final_rejection_count = _sanitize_direct_trial_artifacts(
+            root, trust_existing_rejections=True
+        )
+        if final_rejection_count > rejection_count:
+            refresh_error = refresh_retained_bundle(root, strict=False)
+            if refresh_error is not None:
+                append_event(
+                    root / "events.jsonl",
+                    "compatibility_refresh_skipped",
+                    error_type=refresh_error,
+                )
     _write_direct_private_artifact_manifests(root, strict_session=not failed)
     assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
@@ -1232,12 +1243,16 @@ def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
 
 def _sanitize_direct_trial_artifacts(
     root: Path, *, trust_existing_rejections: bool = False
-) -> None:
+) -> int:
+    rejection_count = 0
     for trial_root in _direct_trial_roots(root):
-        sanitize_private_artifact_tree(
-            trial_root,
-            trust_existing_rejections=trust_existing_rejections,
+        rejection_count += len(
+            sanitize_private_artifact_tree(
+                trial_root,
+                trust_existing_rejections=trust_existing_rejections,
+            )
         )
+    return rejection_count
 
 
 def _direct_trial_roots(root: Path) -> list[Path]:

@@ -1128,8 +1128,9 @@ def _finalize_execution(
     root: Path, token: str, *, strict_compatibility: bool = True
 ) -> None:
     attempted = openclaw_execution_was_attempted(root)
+    rejection_count = 0
     if not strict_compatibility:
-        sanitize_private_artifact_tree(root)
+        rejection_count = len(sanitize_private_artifact_tree(root))
     session_required = openclaw_execution_started(root, fallback_attempted=attempted)
     _redact_unit(root, token)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
@@ -1140,7 +1141,17 @@ def _finalize_execution(
             error_type=refresh_error,
         )
     if not strict_compatibility:
-        sanitize_private_artifact_tree(root, trust_existing_rejections=True)
+        final_rejection_count = len(
+            sanitize_private_artifact_tree(root, trust_existing_rejections=True)
+        )
+        if final_rejection_count > rejection_count:
+            refresh_error = refresh_retained_bundle(root, strict=False)
+            if refresh_error is not None:
+                append_event(
+                    root / "events.jsonl",
+                    "compatibility_refresh_skipped",
+                    error_type=refresh_error,
+                )
     write_private_artifact_manifest(
         root,
         strict_session=strict_compatibility,

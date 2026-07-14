@@ -174,6 +174,34 @@ def test_failed_execution_sanitizes_result_before_session_probe(tmp_path: Path) 
     assert outside.stat().st_size == 64 * 1024 * 1024 + 1
 
 
+def test_failed_execution_refreshes_compatibility_after_final_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.mkdir()
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    refresh_calls = 0
+
+    def refresh(root: Path, *, strict: bool) -> None:
+        nonlocal refresh_calls
+        assert strict is False
+        refresh_calls += 1
+        if refresh_calls == 1:
+            with (root / "harbor-jobs" / "late.log").open("wb") as stream:
+                stream.truncate(64 * 1024 * 1024 + 1)
+
+    monkeypatch.setattr("harbor_hf.wave_worker.refresh_retained_bundle", refresh)
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    assert refresh_calls == 2
+    assert not (jobs / "late.log").exists()
+
+
 def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:
     (tmp_path / "harbor-jobs").mkdir()
     (tmp_path / "events.jsonl").write_text("", encoding="utf-8")

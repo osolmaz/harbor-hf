@@ -2556,7 +2556,7 @@ def test_failed_direct_run_sanitizes_each_trial_independently(
     seen: list[Path] = []
     monkeypatch.setattr(
         "harbor_hf.worker.sanitize_private_artifact_tree",
-        lambda root, **_kwargs: seen.append(root),
+        lambda root, **_kwargs: (seen.append(root), [])[1],
     )
 
     _sanitize_direct_trial_artifacts(tmp_path)
@@ -2599,6 +2599,43 @@ def test_failed_direct_run_keeps_nested_symlink_rejection_with_trial(
         {"path": "linked.log", "reason": "symlink", "size": None}
     ]
     assert outside.read_text(encoding="utf-8") == "outside"
+
+
+def test_failed_direct_run_refreshes_compatibility_after_final_pruning(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "harbor-jobs" / "job" / "trial"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        '{"agent_info":{"name":"openclaw"},"agent_execution":null}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "run.lock.json").write_text(
+        build_run_lock(remote_spec, run_id="failed-refresh").model_dump_json(),
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+    refresh_calls = 0
+
+    def refresh(root: Path, *, strict: bool) -> None:
+        nonlocal refresh_calls
+        assert strict is False
+        refresh_calls += 1
+        if refresh_calls == 1:
+            with (root / "harbor-jobs" / "job" / "trial" / "late.log").open(
+                "wb"
+            ) as stream:
+                stream.truncate(64 * 1024 * 1024 + 1)
+
+    monkeypatch.setattr("harbor_hf.worker.refresh_retained_bundle", refresh)
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    assert refresh_calls == 2
+    assert not (trial / "late.log").exists()
 
 
 def test_publish_evidence_requires_one_terminal_marker(
