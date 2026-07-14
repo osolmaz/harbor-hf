@@ -125,13 +125,15 @@ class FilesystemHarborExecutionAdapter:
     ) -> HarborExecutionOutcome:
         shared_deadline = _shared_deadline(timeout_seconds, deadline, monotonic)
         self._validate_inputs(prepared)
-        exit_code = stream_runner(
-            prepared.command,
-            log_path,
-            environment=environment,
-            timeout_seconds=timeout_seconds,
-        )
-        self._validate_inputs(prepared)
+        try:
+            exit_code = stream_runner(
+                prepared.command,
+                log_path,
+                environment=environment,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            self._validate_inputs(prepared)
         has_results = any(jobs_dir.glob("*/*/result.json"))
         if exit_code != 0 and not has_results:
             return HarborExecutionOutcome(exit_code, None, None)

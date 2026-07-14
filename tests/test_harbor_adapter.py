@@ -230,6 +230,53 @@ def test_adapter_revalidates_inputs_before_failed_return(
         )
 
 
+def test_adapter_revalidates_inputs_after_runner_exception(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+
+    def fail(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("runner failed")
+
+    with pytest.raises(RuntimeError, match="runner failed"):
+        adapter.execute(
+            prepared,
+            tmp_path / "harbor",
+            tmp_path / "jobs",
+            tmp_path / "harbor.log",
+            environment={},
+            timeout_seconds=30,
+            stream_runner=fail,
+        )
+
+    def mutate_then_fail(*_args: object, **_kwargs: object) -> int:
+        prepared.request_path.write_text("{}\n", encoding="utf-8")
+        raise RuntimeError("runner failed")
+
+    with pytest.raises(WorkerError, match="request changed"):
+        adapter.execute(
+            prepared,
+            tmp_path / "harbor",
+            tmp_path / "jobs",
+            tmp_path / "harbor.log",
+            environment={},
+            timeout_seconds=30,
+            stream_runner=mutate_then_fail,
+        )
+
+
 def test_adapter_export_uses_only_remaining_shared_deadline(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
