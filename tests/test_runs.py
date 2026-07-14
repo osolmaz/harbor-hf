@@ -19,11 +19,11 @@ def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
     assert isinstance(lock.deployment, DeploymentProfile)
 
-    assert lock.run_id == "20260713T010203Z-7bef8b8f1f"
-    assert lock.benchmark_dataset == "terminal-bench@2.0"
+    assert lock.run_id == "20260713T010203Z-af768c3088"
+    assert lock.benchmark_dataset == "harbor/terminal-bench@2.0"
     assert lock.benchmark_dataset_digest == "sha256:" + "1" * 64
     assert lock.spec_digest == (
-        "sha256:bd97f81386d8cd6d1c98fc6cf86bd6164b1aeac1f20173ec37e7c9f193c2f76d"
+        "sha256:928a50b654af14b1aec17be91e99911a9160ba6139ae346e2f608f66934c66ba"
     )
     assert lock.artifact_bucket == "example/benchmark-runs"
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
@@ -237,6 +237,52 @@ def test_remote_lock_rejects_unresolved_benchmark(remote_spec: ExperimentSpec) -
     with pytest.raises(ValueError) as captured:
         _validate_task_pins(benchmark)
     assert str(captured.value) == "remote benchmarks require resolved task digests"
+
+
+def test_remote_lock_rejects_legacy_dataset_that_cannot_use_digest(
+    remote_spec: ExperimentSpec,
+) -> None:
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"dataset": "terminal-bench@2.0"}
+    )
+    spec = remote_spec.model_copy(update={"benchmark": benchmark})
+
+    with pytest.raises(ValueError) as captured:
+        _validate_remote_input_pins(spec)
+
+    assert str(captured.value) == (
+        "remote benchmark dataset must use a Harbor package name in org/name form"
+    )
+
+
+def test_content_addressed_dataset_infers_and_preserves_digest(
+    remote_spec: ExperimentSpec,
+) -> None:
+    digest = "sha256:" + "4" * 64
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["dataset"] = f"harbor/terminal-bench@{digest}"
+    raw["benchmark"].pop("dataset_digest")
+
+    spec = ExperimentSpec.model_validate(raw)
+    lock = build_run_lock(spec)
+
+    assert spec.benchmark.dataset_digest == digest
+    assert lock.benchmark_dataset == f"harbor/terminal-bench@{digest}"
+    assert lock.benchmark_dataset_digest == digest
+
+
+def test_content_addressed_dataset_rejects_conflicting_digest(
+    remote_spec: ExperimentSpec,
+) -> None:
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["dataset"] = "harbor/terminal-bench@sha256:" + "4" * 64
+    raw["benchmark"]["dataset_digest"] = "sha256:" + "5" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="dataset digest must match its content-addressed reference",
+    ):
+        ExperimentSpec.model_validate(raw)
 
 
 @pytest.mark.parametrize(

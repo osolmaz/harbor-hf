@@ -44,6 +44,7 @@ from harbor_hf.models import (
     ExperimentSpec,
     RemoteExecutionSpec,
     SourcePin,
+    pinned_harbor_dataset_reference,
 )
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import (
@@ -327,6 +328,12 @@ def _build_harbor_command(
         if endpoint is None:
             raise WorkerError("run lock has no endpoint binding")
         served_model_name = endpoint.served_model_name
+    try:
+        dataset_reference = pinned_harbor_dataset_reference(
+            lock.benchmark_dataset, lock.benchmark_dataset_digest
+        )
+    except ValueError as error:
+        raise WorkerError(str(error)) from error
     command = [
         "uv",
         "run",
@@ -339,7 +346,7 @@ def _build_harbor_command(
         "harbor",
         "run",
         "--dataset",
-        lock.benchmark_dataset,
+        dataset_reference,
         "--n-attempts",
         str(attempts),
         "--agent",

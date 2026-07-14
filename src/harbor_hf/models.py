@@ -23,6 +23,10 @@ GitHubRepository = Annotated[
     ),
 ]
 _CONTROLLER_HEADROOM_SECONDS = 4800
+_HARBOR_PACKAGE_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class StrictModel(BaseModel):
@@ -41,9 +45,21 @@ class BenchmarkSpec(StrictModel):
     task_digests: dict[TaskName, ContentDigest] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def task_names_are_unique(self) -> BenchmarkSpec:
+    def benchmark_contract_is_consistent(self) -> BenchmarkSpec:
         if len(self.task_names) != len(set(self.task_names)):
             raise ValueError("benchmark task names must be unique")
+        _, reference = _split_dataset_reference(self.dataset)
+        if reference is not None and reference.startswith("sha256:"):
+            if _SHA256_DIGEST.fullmatch(reference) is None:
+                raise ValueError(
+                    "benchmark dataset content address must be a full sha256 digest"
+                )
+            if self.dataset_digest is not None and reference != self.dataset_digest:
+                raise ValueError(
+                    "benchmark dataset digest must match its "
+                    "content-addressed reference"
+                )
+            self.dataset_digest = reference
         return self
 
 
@@ -267,8 +283,9 @@ class ExperimentSpec(StrictModel):
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
-    if spec.benchmark.dataset_digest is None:
-        raise ValueError("remote benchmark dataset requires an immutable sha256 digest")
+    pinned_harbor_dataset_reference(
+        spec.benchmark.dataset, spec.benchmark.dataset_digest
+    )
     _validate_task_pins(spec.benchmark)
     if any(
         re.fullmatch(r"[0-9a-f]{40}", model.revision) is None
@@ -304,6 +321,37 @@ def _validate_task_pins(benchmark: BenchmarkSpec) -> None:
     ]
     if unmatched_selections or unmatched_tasks:
         raise ValueError("remote task digests must exactly resolve the task selection")
+
+
+def pinned_harbor_dataset_reference(dataset: str, dataset_digest: str | None) -> str:
+    """Return the exact content-addressed dataset reference Harbor must execute."""
+    if dataset_digest is not None and _SHA256_DIGEST.fullmatch(dataset_digest) is None:
+        raise ValueError("benchmark dataset digest must be a full sha256 digest")
+    name, reference = _split_dataset_reference(dataset)
+    if _HARBOR_PACKAGE_NAME.fullmatch(name) is None or ".." in name:
+        raise ValueError(
+            "remote benchmark dataset must use a Harbor package name in org/name form"
+        )
+    if reference is not None and reference.startswith("sha256:"):
+        if _SHA256_DIGEST.fullmatch(reference) is None:
+            raise ValueError(
+                "benchmark dataset content address must be a full sha256 digest"
+            )
+        if dataset_digest is not None and reference != dataset_digest:
+            raise ValueError(
+                "benchmark dataset digest must match its content-addressed reference"
+            )
+        return dataset
+    if dataset_digest is None:
+        raise ValueError("remote benchmark dataset requires an immutable sha256 digest")
+    return f"{name}@{dataset_digest}"
+
+
+def _split_dataset_reference(dataset: str) -> tuple[str, str | None]:
+    name, separator, reference = dataset.rpartition("@")
+    if not separator:
+        return dataset, None
+    return name, reference
 
 
 def _is_immutable_agent_revision(agent: AgentProfile) -> bool:

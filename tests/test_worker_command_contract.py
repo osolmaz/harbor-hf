@@ -26,7 +26,8 @@ def _contract_lock(remote_spec: ExperimentSpec) -> RunLock:
     assert endpoint is not None
     return lock.model_copy(
         update={
-            "benchmark_dataset": "dataset-contract@9.7",
+            "benchmark_dataset": "harbor/dataset-contract@9.7",
+            "benchmark_dataset_digest": "sha256:" + "9" * 64,
             "benchmark_tasks": ["task-zeta", "task-alpha"],
             "benchmark_task_digests": {
                 "task-zeta": "sha256:" + "7" * 64,
@@ -91,7 +92,7 @@ def test_run_command_is_the_complete_ordered_process_contract(
         "harbor",
         "run",
         "--dataset",
-        "dataset-contract@9.7",
+        "harbor/dataset-contract@sha256:" + "9" * 64,
         "--n-attempts",
         "3",
         "--agent",
@@ -155,7 +156,7 @@ def test_wave_trial_command_overrides_only_attempt_and_concurrency_contract(
         "harbor",
         "run",
         "--dataset",
-        "dataset-contract@9.7",
+        "harbor/dataset-contract@sha256:" + "9" * 64,
         "--n-attempts",
         "1",
         "--agent",
@@ -211,6 +212,52 @@ def test_command_rejects_a_lock_without_an_endpoint_binding(
     )
 
     with pytest.raises(WorkerError, match="^run lock has no endpoint binding$"):
+        build_harbor_command(lock, tmp_path, "https://unused.example", tmp_path)
+
+
+def test_command_rejects_a_dataset_that_cannot_be_content_addressed(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _contract_lock(remote_spec).model_copy(
+        update={"benchmark_dataset": "legacy-dataset@9.7"}
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match="must use a Harbor package name in org/name form",
+    ):
+        build_harbor_command(lock, tmp_path, "https://unused.example", tmp_path)
+
+
+def test_command_preserves_an_existing_content_addressed_dataset(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    digest = "sha256:" + "6" * 64
+    lock = _contract_lock(remote_spec).model_copy(
+        update={
+            "benchmark_dataset": f"harbor/dataset-contract@{digest}",
+            "benchmark_dataset_digest": digest,
+        }
+    )
+
+    command = build_harbor_command(lock, tmp_path, "https://endpoint.example", tmp_path)
+
+    assert command[command.index("--dataset") + 1] == (
+        f"harbor/dataset-contract@{digest}"
+    )
+
+
+def test_command_rejects_an_invalid_locked_dataset_digest(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _contract_lock(remote_spec).model_copy(
+        update={"benchmark_dataset_digest": "sha256:short"}
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match="dataset digest must be a full sha256 digest",
+    ):
         build_harbor_command(lock, tmp_path, "https://unused.example", tmp_path)
 
 

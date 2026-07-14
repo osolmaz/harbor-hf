@@ -12,7 +12,7 @@ kind: Experiment
 metadata:
   name: example
 benchmark:
-  dataset: terminal-bench@2.0
+  dataset: harbor/terminal-bench@2.0
   dataset_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
   task_names: [example-task]
   task_digests:
@@ -80,12 +80,18 @@ hyphens. `metadata.labels` is optional non-executing metadata.
 
 ### Benchmark
 
-`benchmark.dataset` is a Harbor dataset reference. Remote runs require its
-immutable `@sha256:<64 hex>` form. `task_names` defaults to `["*"]` and remains
-the selection passed to Harbor. `task_digests` enumerates the complete resolved
-selection as task name to content digest. Every selection must match at least
-one pinned task, and every pinned task must match a selection. A task content
-digest covers its instructions, environment, verifier, and other task files.
+`benchmark.dataset` is a qualified Harbor package reference in `org/name` or
+`org/name@ref` form. Remote runs require `dataset_digest`; the worker replaces a
+mutable ref with `@sha256:<64 hex>` before invoking Harbor. An already
+content-addressed reference remains valid and may omit `dataset_digest`, which
+is inferred from the reference. If both forms contain a digest, they must match.
+Legacy unqualified dataset names cannot be resolved by Harbor's package digest
+lookup and are rejected for remote runs. `task_names` defaults to `["*"]` and
+remains the selection passed to Harbor. `task_digests` enumerates the complete
+resolved selection as task name to content digest. Every selection must match
+at least one pinned task, and every pinned task must match a selection. A task
+content digest covers its instructions, environment, verifier, and other task
+files.
 
 ### Matrix
 

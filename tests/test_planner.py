@@ -23,7 +23,7 @@ def test_digest_is_stable() -> None:
 
     assert experiment_digest(spec) == experiment_digest(spec.model_copy(deep=True))
     assert experiment_digest(spec) == (
-        "sha256:2dc605f05ec62a65a002c38b161ce094545b971367f9d6f2f8bdd016371bf98d"
+        "sha256:97b99fc7307035266a3f3526ce08bdab80114d885b6d1c8e5d85191a7ee89869"
     )
 
 

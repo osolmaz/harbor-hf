@@ -25,7 +25,7 @@ def remote_spec() -> ExperimentSpec:
         update={
             "benchmark": spec.benchmark.model_copy(
                 update={
-                    "dataset": "terminal-bench@2.0",
+                    "dataset": "harbor/terminal-bench@2.0",
                     "dataset_digest": "sha256:" + "1" * 64,
                     "task_names": ["cancel-async-tasks"],
                     "task_digests": {"cancel-async-tasks": "sha256:" + "2" * 64},
