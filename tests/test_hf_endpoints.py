@@ -441,6 +441,17 @@ def test_create_treats_malformed_success_response_as_ambiguous(
         ).create(desired)
 
 
+def test_pause_treats_malformed_success_response_as_ambiguous(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    raw = _raw(desired)
+    cast(dict[str, object], raw["status"])["readyReplica"] = "zero"
+
+    with pytest.raises(AmbiguousEndpointPause, match="invalid response"):
+        HuggingFaceEndpointAdapter(api=FakeApi(Resource(raw))).pause(desired.identity)
+
+
 def test_missing_secret_fails_before_provider_create(
     remote_spec: ExperimentSpec,
 ) -> None:

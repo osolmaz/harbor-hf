@@ -195,7 +195,7 @@ class HubDatasetPublisher:
             or observed.publication_id != expected.publication_id
             or observed.run_id != expected.run_id
             or observed.source_checksum != expected.source_checksum
-            or set(observed.files) != {item.path for item in publication.files}
+            or observed.files != expected.files
         ):
             raise PublicationConflict("result publication receipt conflicts")
         for path, checksum in observed.files.items():
@@ -226,6 +226,13 @@ class HubDatasetPublisher:
                     head,
                 )
                 row = self._read_index_row(index_dataset, receipt.index_path, head)
+                expected_row = build_global_index_row(
+                    tables,
+                    result_dataset=result_dataset,
+                    result_revision=receipt.result_revision,
+                )
+                if row != expected_row:
+                    raise PublicationConflict("global index row conflicts")
                 indexed_result_revision = receipt.result_revision
             else:
                 receipt = None

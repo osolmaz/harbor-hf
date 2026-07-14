@@ -161,7 +161,12 @@ class HuggingFaceEndpointAdapter(EndpointProvisioningPort):
             )
 
         resource = _provider_call("pause", request, ambiguous=AmbiguousEndpointPause)
-        return _validated_snapshot(resource, identity.namespace)
+        try:
+            return _validated_snapshot(resource, identity.namespace)
+        except EndpointProviderError as error:
+            raise AmbiguousEndpointPause(
+                "Hugging Face endpoint pause returned an invalid response"
+            ) from error
 
     def delete(self, identity: ManagedEndpointIdentity) -> None:
         def request() -> None:

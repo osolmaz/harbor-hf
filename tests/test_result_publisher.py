@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,8 @@ from harbor_hf.results import (
     ResultPublication,
     ResultTables,
     RunRow,
+    build_global_index_row,
+    build_index_file,
     build_result_publication,
     read_index_file,
 )
@@ -268,14 +271,14 @@ def test_adoption_repairs_missing_bounded_index_windows(
     assert len([path for path in api.files["org/index"] if "/windows/" in path]) == 12
 
 
-def test_duplicate_publication_adopts_immutable_evidence_after_control_commit_moves(
+def test_duplicate_publication_rejects_different_canonical_result_bytes(
     publication: ResultPublication, tmp_path: Path
 ) -> None:
     api = FakeDatasetApi(tmp_path)
     publisher = HubDatasetPublisher(
         publisher_id="publisher-one", leases=FakeLeases(), api=api
     )
-    first = publisher.publish(
+    publisher.publish(
         publication,
         result_dataset="org/results",
         index_dataset="org/index",
@@ -287,16 +290,51 @@ def test_duplicate_publication_adopts_immutable_evidence_after_control_commit_mo
         publication.tables.model_copy(update={"runs": [moved_run]})
     )
 
-    second = publisher.publish(
-        moved_publication,
+    assert moved_publication.tables.publication_id == publication.tables.publication_id
+    assert moved_publication.receipt != publication.receipt
+    with pytest.raises(PublicationConflict, match="result publication receipt"):
+        publisher.publish(
+            moved_publication,
+            result_dataset="org/results",
+            index_dataset="org/index",
+        )
+    assert len(api.commits) == 2
+
+
+def test_duplicate_publication_rejects_different_canonical_index_row(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    publisher.publish(
+        publication,
         result_dataset="org/results",
         index_dataset="org/index",
     )
+    receipt_path = f"publications/{publication.tables.publication_id}.json"
+    receipt = json.loads(api.files["org/index"][receipt_path])
+    index_path = receipt["index_path"]
+    stale_run = publication.tables.runs[0].model_copy(
+        update={"agent_revision": "stale"}
+    )
+    stale_row = build_global_index_row(
+        publication.tables.model_copy(update={"runs": [stale_run]}),
+        result_dataset="org/results",
+        result_revision=receipt["result_revision"],
+    )
+    stale_file = build_index_file(stale_row)
+    api.files["org/index"][index_path] = stale_file.content
+    receipt["index_sha256"] = "sha256:" + hashlib.sha256(stale_file.content).hexdigest()
+    api.files["org/index"][receipt_path] = json.dumps(receipt).encode()
 
-    assert moved_publication.tables.publication_id == publication.tables.publication_id
-    assert moved_publication.receipt != publication.receipt
-    assert second == first
-    assert len(api.commits) == 2
+    with pytest.raises(PublicationConflict, match="global index row"):
+        publisher.publish(
+            publication,
+            result_dataset="org/results",
+            index_dataset="org/index",
+        )
 
 
 def test_retry_after_interruption_adopts_result_and_finishes_index(
