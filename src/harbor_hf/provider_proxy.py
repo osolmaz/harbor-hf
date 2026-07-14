@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import re
@@ -35,6 +36,7 @@ _SCOPED_COMPLETIONS = re.compile(
 )
 _FORWARDED_RESPONSE_HEADERS = {
     "content-type",
+    "content-encoding",
     "retry-after",
     "x-request-id",
     "x-amzn-requestid",
@@ -77,7 +79,7 @@ class ProviderEvidenceProxy:
         self.target = target
         self.token = token
         self.evidence_path = evidence_path
-        self.client = client or httpx.Client()
+        self.client = client or httpx.Client(headers={"Accept-Encoding": "identity"})
         self._owns_client = client is None
         self._lock = threading.Lock()
         self._attempts: dict[tuple[str, str], int] = {}
@@ -150,8 +152,8 @@ class ProviderEvidenceProxy:
             request,
             attempt=attempt,
             status_code=observed.status_code,
-            headers=observed.headers,
-            content=observed.content,
+            headers=_evidence_headers(observed.headers),
+            content=_decode_evidence_content(observed.headers, observed.content),
             total_ms=observed.total_ms,
             time_to_first_token_ms=observed.semantic_output_ms,
         )
@@ -189,17 +191,17 @@ class ProviderEvidenceProxy:
                 status_code = response.status_code
                 response_headers = response.headers
                 response_started = True
-                captured, semantic_output_ms = _relay_response(
-                    handler, response, started
+                _captured, semantic_output_ms = _relay_response(
+                    handler, response, started, captured
                 )
         except httpx.TimeoutException:
             if not response_started:
                 self._send_json(handler, 504, {"error": "provider request timed out"})
-            status_code = 504
+                status_code = 504
         except httpx.HTTPError:
             if not response_started:
                 self._send_json(handler, 502, {"error": "provider transport failed"})
-            status_code = 502
+                status_code = 502
         total_ms = round((perf_counter() - started) * 1000, 3)
         return _ObservedResponse(
             status_code=status_code,
@@ -249,6 +251,27 @@ class ProviderEvidenceProxy:
         handler.close_connection = True
 
 
+def _decode_evidence_content(headers: httpx.Headers, content: bytes) -> bytes:
+    encoding = headers.get("content-encoding", "").lower().strip()
+    if encoding == "gzip":
+        try:
+            decoded = gzip.decompress(content)
+        except (OSError, EOFError):
+            return content
+        return decoded[:_MAX_EVIDENCE_RESPONSE_BYTES]
+    return content
+
+
+def _evidence_headers(headers: httpx.Headers) -> httpx.Headers:
+    return httpx.Headers(
+        [
+            (name, value)
+            for name, value in headers.multi_items()
+            if name.lower() != "content-encoding"
+        ]
+    )
+
+
 def _json_object(content: bytes) -> dict[str, JsonValue]:
     value = json.loads(content)
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
@@ -265,27 +288,48 @@ def _relay_response(
     handler: BaseHTTPRequestHandler,
     response: httpx.Response,
     started: float,
+    captured: bytearray | None = None,
 ) -> tuple[bytearray, float | None]:
-    handler.send_response(response.status_code)
-    for name, value in response.headers.items():
-        if name.lower() in _FORWARDED_RESPONSE_HEADERS:
-            handler.send_header(name, value)
-    handler.send_header("Connection", "close")
-    handler.end_headers()
-    captured = bytearray()
+    evidence = captured if captured is not None else bytearray()
+    downstream_connected = _start_downstream_response(handler, response)
     semantic_output_ms: float | None = None
     probe = _SseSemanticOutputProbe()
     for chunk in response.iter_raw():
         if semantic_output_ms is None and probe.feed(chunk):
             semantic_output_ms = (perf_counter() - started) * 1000
-        if len(captured) + len(chunk) <= _MAX_EVIDENCE_RESPONSE_BYTES:
-            captured.extend(chunk)
-        handler.wfile.write(chunk)
-        handler.wfile.flush()
+        remaining = _MAX_EVIDENCE_RESPONSE_BYTES - len(evidence)
+        if remaining > 0:
+            evidence.extend(chunk[:remaining])
+        if downstream_connected:
+            downstream_connected = _write_downstream_chunk(handler, chunk)
     if semantic_output_ms is None and probe.finish():
         semantic_output_ms = (perf_counter() - started) * 1000
     handler.close_connection = True
-    return captured, semantic_output_ms
+    return evidence, semantic_output_ms
+
+
+def _start_downstream_response(
+    handler: BaseHTTPRequestHandler, response: httpx.Response
+) -> bool:
+    try:
+        handler.send_response(response.status_code)
+        for name, value in response.headers.items():
+            if name.lower() in _FORWARDED_RESPONSE_HEADERS:
+                handler.send_header(name, value)
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+    except OSError:
+        return False
+    return True
+
+
+def _write_downstream_chunk(handler: BaseHTTPRequestHandler, chunk: bytes) -> bool:
+    try:
+        handler.wfile.write(chunk)
+        handler.wfile.flush()
+    except OSError:
+        return False
+    return True
 
 
 class _SseSemanticOutputProbe:

@@ -17,6 +17,7 @@ from harbor_hf.endpoints import (
     EndpointIdentityMismatch,
     EndpointNotFound,
     EndpointNotPaused,
+    EndpointProviderError,
     EndpointProvisioner,
     EndpointSnapshot,
     EndpointStatus,
@@ -374,16 +375,22 @@ def test_adopts_only_an_exact_paused_endpoint(remote_spec: ExperimentSpec) -> No
     assert not any(call.startswith(("create:", "pause:")) for call in port.calls)
 
 
-def test_rejects_active_endpoint_instead_of_pausing_competing_work(
+def test_adopts_and_pauses_active_managed_endpoint_from_failed_create(
     remote_spec: ExperimentSpec,
 ) -> None:
     desired = _desired(remote_spec)
-    port = FakePort(inspections=[_snapshot(desired, state="running", ready=1)])
+    running = _snapshot(desired, state="running", ready=1)
+    paused = _snapshot(desired)
+    port = FakePort(
+        inspections=[running, running, paused],
+        pause_result=running,
+    )
 
-    with pytest.raises(EndpointNotPaused, match="state='running'"):
-        _provisioner(port).create_or_adopt(desired)
+    result = _provisioner(port).create_or_adopt(desired)
 
-    assert not any(call.startswith("pause:") for call in port.calls)
+    assert result.action == "adopted"
+    assert result.snapshot == paused
+    assert sum(call.startswith("pause:") for call in port.calls) == 1
 
 
 def test_creates_then_pauses_and_verifies_zero_ready(
@@ -407,6 +414,31 @@ def test_creates_then_pauses_and_verifies_zero_ready(
     assert result.snapshot == paused
     assert sum(call.startswith("create:") for call in port.calls) == 1
     assert sum(call.startswith("pause:") for call in port.calls) == 1
+
+
+def test_created_endpoint_retries_cleanup_after_definitive_pause_error(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    running = _snapshot(desired, state="running", ready=1)
+    paused = _snapshot(desired)
+
+    class RecoveringPort(FakePort):
+        pause_attempts = 0
+
+        def pause(self, identity: ManagedEndpointIdentity) -> EndpointSnapshot:
+            self.pause_attempts += 1
+            self.calls.append(f"pause:{identity.name}")
+            if self.pause_attempts == 1:
+                raise EndpointProviderError("rate limited")
+            return paused
+
+    port = RecoveringPort(inspections=[None, running, paused], create_result=running)
+
+    result = _provisioner(port).create_or_adopt(desired)
+
+    assert result.snapshot == paused
+    assert port.pause_attempts == 2
 
 
 def test_adopts_after_ambiguous_create_and_pauses(

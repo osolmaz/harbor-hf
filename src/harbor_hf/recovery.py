@@ -237,7 +237,13 @@ def durable_shard_retry_event(
             subject_id=lock.campaign_id,
             kind="campaign.shard-retry-requested",
             producer="cli",
-            payload=ShardRetryPayload(shard_id=shard_id, reason=reason),
+            payload=ShardRetryPayload(
+                shard_id=shard_id,
+                reason=reason,
+                trial_generations={
+                    trial.trial_id: len(trial.executions) for trial in eligible
+                },
+            ),
             clock=clock,
             identifier=lambda: identifier,
         ),
@@ -288,18 +294,27 @@ def project_recovery(
 def _apply_retry_requests(
     events: list[CampaignEvent], trials: dict[str, TrialProjection]
 ) -> dict[str, TrialProjection]:
-    requested_at: dict[str, datetime] = {}
+    requested_at: dict[tuple[str, int], datetime] = {}
     for event in ordered_events(events):
         if event.kind != "campaign.shard-retry-requested":
             continue
         payload = cast(ShardRetryPayload, event.payload)
-        requested_at[payload.shard_id] = max(
-            requested_at.get(payload.shard_id, event.observed_at), event.observed_at
-        )
+        for trial_id, generation in payload.trial_generations.items():
+            key = (trial_id, generation)
+            requested_at[key] = max(
+                requested_at.get(key, event.observed_at), event.observed_at
+            )
     return {
         trial_id: (
-            trial.model_copy(update={"retry_not_before": requested_at[trial.shard_id]})
-            if trial.status == "retry_wait" and trial.shard_id in requested_at
+            trial.model_copy(
+                update={
+                    "retry_not_before": requested_at[
+                        (trial.trial_id, len(trial.executions))
+                    ]
+                }
+            )
+            if trial.status == "retry_wait"
+            and (trial.trial_id, len(trial.executions)) in requested_at
             else trial
         )
         for trial_id, trial in trials.items()
@@ -705,7 +720,8 @@ def _terminal_decision(
     decision_counts = _terminal_counts(campaign, counts)
     cancelling = campaign.status in {"cancel_requested", "draining"}
     if not all(
-        trial.status in _TERMINAL_STATUSES or (cancelling and trial.status == "planned")
+        trial.status in _TERMINAL_STATUSES
+        or (cancelling and trial.status in {"planned", "retry_wait"})
         for trial in trials.values()
     ):
         return None
@@ -735,7 +751,11 @@ def _terminal_counts(
     if campaign.status not in {"cancel_requested", "draining"}:
         return counts
     return counts.model_copy(
-        update={"planned": 0, "cancelled": counts.cancelled + counts.planned}
+        update={
+            "planned": 0,
+            "retrying": 0,
+            "cancelled": counts.cancelled + counts.planned + counts.retrying,
+        }
     )
 
 

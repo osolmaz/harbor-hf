@@ -50,6 +50,25 @@ def test_counts_explicit_tasks_and_attempts() -> None:
     assert plan.logical_trial_count == 12
 
 
+def test_counts_only_selected_tasks_from_a_larger_digest_map() -> None:
+    spec = load_experiment(EXAMPLE).model_copy(update={"remote": None})
+    selected = spec.model_copy(
+        update={
+            "benchmark": spec.benchmark.model_copy(
+                update={
+                    "task_names": ["selected-*"],
+                    "task_digests": {
+                        "selected-one": "sha256:" + "1" * 64,
+                        "unselected-one": "sha256:" + "2" * 64,
+                    },
+                }
+            )
+        }
+    )
+
+    assert build_plan(selected).logical_trial_count == 2
+
+
 def test_patterns_have_unresolved_trial_counts() -> None:
     spec = load_experiment(EXAMPLE).model_copy(update={"remote": None})
 

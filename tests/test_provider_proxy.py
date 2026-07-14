@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -369,3 +371,86 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
         "secret-token",
     ):
         assert private not in serialized
+
+
+def test_proxy_preserves_gzip_encoding_and_decodes_evidence(tmp_path: Path) -> None:
+    payload = (
+        b'{"id":"complete-one","model":"org/model","choices":['
+        b'{"finish_reason":"stop","message":{"role":"assistant",'
+        b'"content":"answer"}}]}'
+    )
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            stream=httpx.ByteStream(gzip.compress(payload)),
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    evidence = tmp_path / "evidence.jsonl"
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(id="provider", model="org/model"),
+        token="token",
+        evidence_path=evidence,
+        client=client,
+    )
+    base_url = proxy.start()
+    try:
+        response = httpx.post(
+            f"{proxy.scoped_base_url(base_url, 'trial')}/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "prompt"}]},
+        )
+    finally:
+        proxy.close()
+        client.close()
+
+    assert response.content == payload
+    assert response.headers["content-encoding"] == "gzip"
+    assert json.loads(evidence.read_text())["status"] == "succeeded"
+
+
+def test_mid_relay_transport_error_keeps_provider_status_and_partial_body(
+    tmp_path: Path,
+) -> None:
+    class BrokenStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            yield b"partial"
+            raise httpx.ReadError("upstream disconnected")
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BrokenStream())
+
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(id="provider", model="org/model"),
+        token="token",
+        evidence_path=tmp_path / "evidence.jsonl",
+        client=client,
+    )
+
+    class Handler:
+        responses: list[int] = []
+        response_headers: list[tuple[str, str]] = []
+        wfile = type(
+            "Output", (), {"write": lambda *_: None, "flush": lambda *_: None}
+        )()
+        close_connection = False
+
+        def send_response(self, status: int) -> None:
+            self.responses.append(status)
+
+        def send_header(self, name: str, value: str) -> None:
+            self.response_headers.append((name, value))
+
+        def end_headers(self) -> None:
+            pass
+
+    observed = proxy._forward(cast(Any, Handler()), {"messages": []})
+    client.close()
+
+    assert observed.status_code == 200
+    assert observed.content == b"partial"

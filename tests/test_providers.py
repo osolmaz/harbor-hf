@@ -14,7 +14,7 @@ from harbor_hf.provider_models import (
     ProviderTool,
     ProviderToolFunction,
 )
-from harbor_hf.providers import HfInferenceProviderAdapter
+from harbor_hf.providers import HfInferenceProviderAdapter, observe_provider_response
 
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 
@@ -327,6 +327,47 @@ def test_truncated_stream_is_ambiguous() -> None:
     assert result.remote_outcome == "ambiguous"
     assert result.error_code == "invalid_stream"
     assert result.evidence.retry.disposition == "inspect"
+
+
+def test_observed_sse_preserves_unicode_line_separator_inside_json() -> None:
+    content = (
+        'data: {"id":"one","choices":[{"delta":{"content":"left'
+        + "\u2028"
+        + 'right"}}]}\n\n'
+        + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        + "data: [DONE]\n\n"
+    ).encode()
+
+    result = observe_provider_response(
+        _target(),
+        _request(stream=True),
+        attempt=1,
+        status_code=200,
+        headers=httpx.Headers({"content-type": "text/event-stream"}),
+        content=content,
+        total_ms=10,
+    )
+
+    assert result.status == "succeeded"
+    assert result.message is not None
+    assert result.message.content == "left\u2028right"
+
+
+def test_reasoning_only_budget_exhaustion_is_a_valid_stream_completion() -> None:
+    stream = (
+        'data: {"choices":[{"delta":{"reasoning_content":"thinking"},'
+        '"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    result = _adapter(lambda request: httpx.Response(200, text=stream)).chat_completion(
+        _target(), _request(stream=True), token="mock-token"
+    )
+
+    assert result.status == "succeeded"
+    assert result.finish_reason.value == "length"
+    assert result.message is not None
+    assert result.message.content == ""
 
 
 def test_provider_evidence_never_guesses_endpoint_runtime_details() -> None:

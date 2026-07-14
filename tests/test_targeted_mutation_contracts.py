@@ -515,9 +515,28 @@ def test_provider_proxy_response_relay_caps_evidence_without_truncating_client()
 
     captured, semantic_output_ms = _relay_response(cast(Any, handler), response, 0)
 
-    assert captured == b""
+    assert captured == content[:_MAX_EVIDENCE_RESPONSE_BYTES]
     assert semantic_output_ms is None
     assert handler.wfile.getvalue() == content
+
+
+def test_provider_proxy_keeps_recording_after_client_disconnect() -> None:
+    class DisconnectingOutput:
+        def write(self, value: object) -> int:
+            del value
+            raise BrokenPipeError("client disconnected")
+
+        def flush(self) -> None:
+            pass
+
+    handler = _Handler()
+    cast(Any, handler).wfile = DisconnectingOutput()
+    content = b"complete-paid-provider-response"
+    response = httpx.Response(200, stream=httpx.ByteStream(content))
+
+    captured, _semantic_output_ms = _relay_response(cast(Any, handler), response, 0)
+
+    assert captured == content
 
 
 def test_provider_proxy_attempt_identity_budget_and_recording_are_deterministic(

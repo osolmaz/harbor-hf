@@ -309,14 +309,11 @@ def _wave_worker_lease(
     clock: Clock,
 ) -> Iterator[None]:
     job_id = os.environ.get("JOB_ID", "")
-    claims = claim_store
-    if claims is None and job_id:
-        claims = HubClaimStore(lock.remote.job.namespace, token)
-    if claims is None:
-        yield
-        return
     if not job_id:
         raise WorkerError("wave worker claim requires JOB_ID")
+    claims = claim_store
+    if claims is None:
+        claims = HubClaimStore(lock.remote.job.namespace, token)
     now = clock().astimezone(UTC)
     owner = {
         "campaign_id": lock.campaign_id,

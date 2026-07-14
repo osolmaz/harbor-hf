@@ -66,6 +66,11 @@ def action_claim_path(campaign_id: str, action_id: str) -> str:
     return f"action-leases/{identity}.json"
 
 
+def bucket_evidence_claim_path(bucket: str, path: str) -> str:
+    identity = hashlib.sha256(f"{bucket_id(bucket)}/{path}".encode()).hexdigest()
+    return f"bucket-evidence-leases/{identity}.json"
+
+
 def wave_worker_claim_path(campaign_id: str, wave_id: str) -> str:
     identity = hashlib.sha256(f"{campaign_id}/{wave_id}".encode()).hexdigest()
     return f"wave-worker-leases/{identity}.json"

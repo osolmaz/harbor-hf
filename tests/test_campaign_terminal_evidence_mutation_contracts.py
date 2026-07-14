@@ -364,6 +364,44 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     )
 
 
+def test_finalize_preserves_cancelled_execution_status_and_timestamp(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    run = lock.runs[0]
+    trial = run.shards[0].trials[0]
+    prefix = f"runs/{run.run_id}/trials/{trial.trial_id}/executions/execution-one"
+    files = _finalizer_files(remote_spec, lock)
+    del files[f"{prefix}/_FAILED"]
+    files[f"{prefix}/_CANCELLED"] = b"\n"
+    files[f"{prefix}/events.jsonl"] = _execution_events(
+        "2026-07-14T01:03:00+00:00",
+        "execution_cancelled",
+        "2026-07-14T01:04:00+00:00",
+    )
+    writer = _Writer()
+
+    BucketCampaignFinalizer(_Reader(files), writer).finalize(
+        lock,
+        remote_spec,
+        _projection(lock, "complete"),
+        _decision(lock, "completed"),
+    )
+
+    summary_path = f"{lock.artifact_prefix}/runs/{run.run_id}/run-summary.json"
+    summary_bytes = next(
+        content for _, path, content in writer.writes if path == summary_path
+    )
+    summary = json.loads(summary_bytes)
+    cancelled = next(
+        execution
+        for execution in summary["executions"]
+        if execution["execution_id"] == "execution-one"
+    )
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["completed_at"] == "2026-07-14T01:04:00Z"
+
+
 def test_finalize_skips_incomplete_runs_and_guards_completed_campaigns(
     remote_spec: ExperimentSpec,
 ) -> None:

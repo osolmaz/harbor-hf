@@ -127,6 +127,7 @@ class _StreamState:
         self.response_id: str | None = None
         self.response_model: str | None = None
         self.content: list[str] = []
+        self.saw_reasoning = False
         self.tools: dict[int, _StreamToolState] = {}
         self.finish_reason: str | None = None
         self.usage: dict[str, JsonValue] | None = None
@@ -146,6 +147,7 @@ class _StreamState:
                 self.content.append(delta.content)
                 self._record_first_token(elapsed_ms)
             if delta.reasoning_content or delta.reasoning:
+                self.saw_reasoning = True
                 self._record_first_token(elapsed_ms)
             for tool in delta.tool_calls:
                 state = self.tools.setdefault(tool.index, _StreamToolState())
@@ -158,7 +160,11 @@ class _StreamState:
             self.first_token_ms = elapsed_ms
 
     def message(self) -> ProviderMessage:
-        content = "".join(self.content) if self.content else None
+        content = (
+            "".join(self.content)
+            if self.content
+            else ("" if self.saw_reasoning else None)
+        )
         tools = [self.tools[index].build() for index in sorted(self.tools)]
         return ProviderMessage(role="assistant", content=content, tool_calls=tools)
 
@@ -379,7 +385,8 @@ def observe_provider_response(
         state = _StreamState()
         elapsed = time_to_first_token_ms or 0.0
         try:
-            for line in content.decode("utf-8").splitlines():
+            for raw_line in content.decode("utf-8").split("\n"):
+                line = raw_line.removesuffix("\r")
                 _consume_stream_line(line, state, 0.0, lambda: elapsed / 1000)
             state.first_token_ms = time_to_first_token_ms
             return _stream_result(target, request, attempt, response, state, total_ms)

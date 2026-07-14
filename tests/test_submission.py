@@ -380,6 +380,23 @@ def test_submit_rejects_missing_job_id(
         )
 
 
+@pytest.mark.parametrize("digest", ["a" * 40, "b" * 64])
+def test_submit_does_not_extract_job_id_from_longer_hex_digest(
+    remote_spec: ExperimentSpec, tmp_path: Path, digest: str
+) -> None:
+    lock = build_run_lock(remote_spec)
+    (tmp_path / "manifest.yaml").write_text("kind: Experiment\n")
+
+    with pytest.raises(ValueError, match="did not return a job ID"):
+        submit(
+            lock,
+            input_dir=tmp_path,
+            bucket="osolmaz/benchmark-runs",
+            runner=FakeRunner(f"revision {digest}"),
+            bucket_api=FakeBucketApi(),
+        )
+
+
 def test_stage_job_input_is_content_addressed_and_rejects_empty_directory(
     tmp_path: Path,
 ) -> None:

@@ -116,6 +116,7 @@ class CancellationPayload(FrozenModel):
 class ShardRetryPayload(FrozenModel):
     shard_id: str = Field(min_length=1)
     reason: str = Field(min_length=1)
+    trial_generations: dict[str, int] = Field(default_factory=dict)
 
 
 class TerminalPayload(FrozenModel):
@@ -616,7 +617,8 @@ class HubCampaignStore:
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
             head = self._head()
             if self._exists(path, head):
-                if self._read_json(path, head) != expected:
+                observed = self._read_json(path, head)
+                if not _same_event_request(observed, expected):
                     raise CampaignConflict(f"event conflicts: {event.event_id}")
                 return False
             try:
@@ -760,6 +762,17 @@ class HubCampaignStore:
             return Path(local_path).read_bytes()
         except OSError as error:
             raise ControlError(f"control record cannot be read: {path}") from error
+
+
+def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> bool:
+    """Adopt the same deterministic event even when reconcilers used new clocks."""
+    if not isinstance(observed, dict):
+        return False
+    observed_request = dict(observed)
+    expected_request = dict(expected)
+    observed_request.pop("observed_at", None)
+    expected_request.pop("observed_at", None)
+    return observed_request == expected_request
 
 
 def _campaign_request_path(campaign_id: str) -> str:

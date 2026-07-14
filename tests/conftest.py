@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,23 @@ from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, RemoteExecutionSpec
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
+
+
+class _WaveClaims:
+    def acquire(self, path: str, owner: Mapping[str, str]) -> None:
+        del path, owner
+
+    def release(self, path: str, owner: Mapping[str, str]) -> None:
+        del path, owner
+
+
+@pytest.fixture(autouse=True)
+def wave_worker_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JOB_ID", "test-wave-job")
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker.HubClaimStore",
+        lambda *_args, **_kwargs: _WaveClaims(),
+    )
 
 
 @pytest.fixture

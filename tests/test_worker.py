@@ -209,6 +209,39 @@ def test_readiness_timeout() -> None:
         manager.wait_ready(1)
 
 
+def test_readiness_retries_transient_describe_failure_within_budget() -> None:
+    class FlakyRunner(EndpointRunner):
+        attempts = 0
+
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ProcessError("temporary describe failure")
+            return super().run_json(command, timeout_seconds=timeout_seconds)
+
+    sleeps: list[float] = []
+    times = iter([0.0, 0.0, 0.0, 1.0])
+    manager = EndpointManager(
+        "org",
+        "endpoint",
+        FlakyRunner([snapshot("running", 1)]),
+        sleep=sleeps.append,
+        monotonic=lambda: next(times),
+    )
+
+    assert endpoint_state(manager.wait_ready(10, poll_seconds=2)) == (
+        "running",
+        1,
+        1,
+    )
+    assert sleeps == [2]
+
+
 def test_endpoint_waits_through_transitional_states() -> None:
     sleeps: list[float] = []
     times = iter(float(value) for value in range(9))
@@ -2544,7 +2577,7 @@ def test_publish_evidence_preserves_nested_terminal_markers(tmp_path: Path) -> N
     )
 
 
-def test_publish_evidence_removes_incomplete_destination(
+def test_publish_evidence_preserves_incomplete_destination_for_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source"
@@ -2560,9 +2593,51 @@ def test_publish_evidence_removes_incomplete_destination(
 
     _prepare_evidence_destination(destination)
     with pytest.raises(OSError, match="copy failed"):
-        _publish_evidence(source, destination)
+        _publish_evidence(source, destination, attempts=1)
 
-    assert not destination.exists()
+    assert destination.exists()
+    assert (destination / "_RESERVED").is_file()
+
+
+def test_publish_evidence_retries_transient_copy_without_losing_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "record.json").write_text("{}\n", encoding="utf-8")
+    (source / "_SUCCESS").write_text("\n", encoding="utf-8")
+    destination = tmp_path / "bucket" / "runs" / "run-1"
+    _prepare_evidence_destination(destination)
+    original = shutil.copyfile
+    calls = 0
+
+    def flaky_copy(
+        source_path: Path,
+        destination_path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary bucket write failure")
+        return str(
+            original(
+                source_path,
+                destination_path,
+                follow_symlinks=follow_symlinks,
+            )
+        )
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("harbor_hf.worker.shutil.copyfile", flaky_copy)
+
+    _publish_evidence(source, destination, sleep=sleeps.append)
+
+    assert calls == 3
+    assert sleeps == [1.0]
+    assert (destination / "_SUCCESS").is_file()
+    assert not (destination / "_RESERVED").exists()
 
 
 def _write_lock(path: Path, lock: RunLock) -> None:
@@ -2948,6 +3023,7 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
     runner = EndpointRunner(
         [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
     )
+    claims = FakeClaimStore()
 
     with pytest.raises(WorkerError, match="evidence finalization failed"):
         run_worker(
@@ -2958,10 +3034,14 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
             stream_runner=_successful_stream,
             source_preparer=_prepare_source,
             watchdog_launcher=_launch_watchdog,
+            claim_store=claims,
         )
 
     root = tmp_path / "output" / lock.artifact_prefix
-    assert not root.exists()
+    assert root.exists()
+    assert (root / "_RESERVED").is_file()
+    assert claims.claims == {}
+    assert len(claims.released) == 1
     assert len(staged_roots) == 1
     assert not staged_roots[0].exists()
 

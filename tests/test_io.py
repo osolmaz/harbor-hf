@@ -50,6 +50,15 @@ def test_rejects_unknown_fields(tmp_path: Path) -> None:
         load_experiment(manifest)
 
 
+def test_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+    manifest = tmp_path / "duplicate.yaml"
+    manifest.write_text(source + "\nexecution:\n  attempts: 2\n", encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="found duplicate key 'execution'"):
+        load_experiment(manifest)
+
+
 def test_reports_unreadable_path(tmp_path: Path) -> None:
     manifest = tmp_path / "missing.yaml"
 

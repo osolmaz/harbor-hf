@@ -172,10 +172,10 @@ def test_cancel_transport_error_is_ambiguous_before_a_response() -> None:
     "error",
     [_http_error(500), httpx.ConnectError("boom")],
 )
-def test_find_wave_inspection_failures_are_known_failures(error: Exception) -> None:
+def test_find_wave_inspection_failures_are_ambiguous(error: Exception) -> None:
     adapter = _adapter(ListErrorApi(error))
 
-    with pytest.raises(ActionExecutionError, match="^HF Jobs inspection failed$"):
+    with pytest.raises(AmbiguousActionOutcome, match="^HF Jobs inspection failed$"):
         adapter.find_wave(
             namespace="org",
             wave_id="wave-one",

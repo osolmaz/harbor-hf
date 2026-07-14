@@ -15,7 +15,7 @@ from harbor_hf.coordination import bucket_id, coordination_repository
 from harbor_hf.models import DeploymentProfile, EndpointRef, SourcePin
 from harbor_hf.runs import RunLock
 
-_JOB_ID = re.compile(r"[a-f0-9]{24}")
+_JOB_ID = re.compile(r"(?<![a-f0-9])[a-f0-9]{24}(?![a-f0-9])")
 _GITHUB_REPOSITORY = re.compile(
     r"^(?:https://github\.com/)?"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<name>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"

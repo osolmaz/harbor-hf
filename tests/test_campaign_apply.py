@@ -10,8 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
+import httpx
 import pytest
 import yaml
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import JsonValue
 
 import harbor_hf.campaign_apply as campaign_apply_module
@@ -55,6 +57,7 @@ from harbor_hf.control import (
     CancellationPayload,
     ExecutionStartedPayload,
     LifecyclePayload,
+    TerminalPayload,
     WaveLifecyclePayload,
     new_event,
     project_campaign,
@@ -817,6 +820,62 @@ def test_terminal_job_without_wave_marker_fails_active_execution_and_retries(
     assert jobs.submissions[-1][0].wave_id != submitted_action.wave_id
 
 
+def test_terminal_job_recovery_never_regresses_cleanup_failed_wave(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    jobs = FakeJobs()
+    reconciler = _reconciler(store, FakeEndpoints(), jobs)
+    first = reconciler.apply_campaign(lock.campaign_id)
+    action = ReconcileAction.model_validate(
+        store.reservations[first.applied[0].action_id]
+    )
+    assert action.wave_id is not None
+    payload = WaveLifecyclePayload(
+        deployment_digest=action.deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=action.shard_ids,
+    )
+    store.events.extend(
+        [
+            new_event(
+                subject_type="wave",
+                subject_id=action.wave_id,
+                kind="wave.active",
+                producer="wave-controller",
+                payload=payload,
+                clock=lambda: NOW + timedelta(seconds=10),
+                identifier=lambda: "a" * 32,
+            ),
+            new_event(
+                subject_type="wave",
+                subject_id=action.wave_id,
+                kind="wave.cleanup-failed",
+                producer="wave-controller",
+                payload=payload,
+                clock=lambda: NOW + timedelta(seconds=11),
+                identifier=lambda: "b" * 32,
+            ),
+        ]
+    )
+    jobs.adopt_on_find = True
+    jobs.adopt_stage = "ERROR"
+
+    result = reconciler.apply_campaign(lock.campaign_id)
+    projection = project_recovery(lock, store.events)
+
+    assert [(item.kind, item.status) for item in result.applied] == [
+        ("manual-intervention", "succeeded")
+    ]
+    assert projection.waves[action.wave_id].status == "cleanup_failed"
+    wave_kinds = [
+        event.kind for event in store.events if event.subject_id == action.wave_id
+    ]
+    tail = wave_kinds[wave_kinds.index("wave.cleanup-failed") :]
+    assert "wave.draining" not in tail
+
+
 def test_apply_observes_durable_event_reloads_and_uses_refreshed_projection(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -866,6 +925,57 @@ def test_apply_does_not_reload_when_observer_event_is_already_durable(
     ).apply_campaign(lock.campaign_id)
 
     assert store.load_campaign_calls == [lock.campaign_id]
+
+
+def test_terminal_campaign_never_observes_or_applies_late_actions(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    terminal = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.completed",
+        producer="reconciler",
+        payload=TerminalPayload(message="done"),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "d" * 32,
+    )
+    interactions: list[object] = []
+    store = FakeStore(lock, request, [submitted, terminal])
+
+    result = CampaignReconciler(
+        store,
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+        observer=RecordingObserver(
+            _terminal_event(lock, "trial.complete"), interactions
+        ),
+    ).apply_campaign(lock.campaign_id)
+
+    assert interactions == []
+    assert result.applied == []
+
+
+def test_hf_wave_adapter_treats_listing_failure_as_ambiguous() -> None:
+    request = httpx.Request("GET", "https://huggingface.co/api/jobs")
+    response = httpx.Response(429, request=request)
+
+    class FailingApi(FakeHfJobsApi):
+        def list_jobs(self, **kwargs: object) -> list[object]:
+            del kwargs
+            raise HfHubHTTPError("rate limited", response=response)
+
+    adapter = HuggingFaceWaveJobAdapter(
+        api=FailingApi([]),
+        runner=InspectingRunner(),
+        bucket_api=FakeBucketApi(),
+    )
+
+    with pytest.raises(AmbiguousActionOutcome, match="HF Jobs inspection failed"):
+        adapter.find_wave(
+            namespace="org", wave_id="wave-one", endpoint_label="endpoint-one"
+        )
 
 
 def test_apply_context_limits_pending_actions_before_side_effects(
@@ -2314,6 +2424,26 @@ def test_unobserved_billable_action_contributes_one_admission(
     assert context.usage.provider_active_waves == {action.provider: 1}
     assert context.usage.campaign_active_waves == {lock.campaign_id: 1}
     assert context.usage.campaign_spend_microusd == {}
+
+
+def test_reserved_billable_action_consumes_admission_before_execution(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    reserved = _reservation(lock, action, 1)
+
+    assert _active_action_admissions(
+        project_recovery(lock, [submitted, reserved]),
+        {action.action_id: action},
+    ) == [
+        (
+            action.wave_id,
+            action.deployment_digest,
+            action.provider,
+            action.estimated_cost_microusd or 0,
+        )
+    ]
 
 
 def test_active_action_admission_requires_its_reservation(

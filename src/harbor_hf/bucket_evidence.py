@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
+import uuid
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
 from huggingface_hub import HfApi
 
-from harbor_hf.coordination import bucket_id
+from harbor_hf.coordination import (
+    ClaimConflict,
+    ClaimStore,
+    bucket_evidence_claim_path,
+    bucket_id,
+)
 
 
 class BucketEvidenceError(RuntimeError):
@@ -80,11 +88,21 @@ class HubBucketEvidenceReader:
         destination = self.cache_root / identity
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            self.api.download_bucket_files(
-                normalized_bucket,
-                [(remote, destination)],
-                raise_on_missing_files=True,
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{identity}-", dir=destination.parent
             )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            temporary.unlink()
+            try:
+                self.api.download_bucket_files(
+                    normalized_bucket,
+                    [(remote, temporary)],
+                    raise_on_missing_files=True,
+                )
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
         try:
             return destination.read_bytes()
         except OSError as error:
@@ -95,6 +113,10 @@ class HubBucketEvidenceReader:
     def refresh(self) -> None:
         """Discard listings after another component has published new objects."""
         self._listings.clear()
+        if self.cache_root.exists():
+            for path in self.cache_root.iterdir():
+                if path.is_file():
+                    path.unlink()
 
     def _listing(self, bucket: str, prefix: str) -> dict[str, object]:
         key = (bucket, prefix)
@@ -123,11 +145,38 @@ class HubBucketEvidenceReader:
 class HubBucketEvidenceWriter:
     """Create immutable Bucket objects and adopt byte-identical retries."""
 
-    def __init__(self, *, api: BucketEvidenceWriterApi | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api: BucketEvidenceWriterApi | None = None,
+        claims: ClaimStore | None = None,
+    ) -> None:
         self.api = api or cast(BucketEvidenceWriterApi, HfApi())
+        self.claims = claims
 
     def write_immutable(self, *, bucket: str, path: str, content: bytes) -> bool:
         normalized = bucket_id(bucket)
+        if self.claims is None:
+            return self._write_locked(normalized, path, content)
+        claim_path = bucket_evidence_claim_path(normalized, path)
+        owner = {
+            "bucket": normalized,
+            "path": path,
+            "writer_id": uuid.uuid4().hex,
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+        try:
+            self.claims.acquire(claim_path, owner)
+        except ClaimConflict as error:
+            raise BucketEvidenceError(
+                f"Bucket immutable evidence is being published: {path}"
+            ) from error
+        try:
+            return self._write_locked(normalized, path, content)
+        finally:
+            self.claims.release(claim_path, owner)
+
+    def _write_locked(self, normalized: str, path: str, content: bytes) -> bool:
         observed = list(self.api.get_bucket_paths_info(normalized, [path]))
         if observed:
             if len(observed) != 1 or getattr(observed[0], "path", None) != path:

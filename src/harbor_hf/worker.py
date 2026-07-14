@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from copy import deepcopy
 from fnmatch import fnmatch
 from pathlib import Path
@@ -23,10 +24,12 @@ from pydantic import JsonValue
 from harbor_hf.coordination import (
     ClaimConflict,
     ClaimStore,
+    CoordinationError,
     HubClaimStore,
     endpoint_claim_path,
     run_claim_path,
 )
+from harbor_hf.endpoints import EndpointSettings
 from harbor_hf.evidence import (
     append_event,
     archive_directory,
@@ -138,7 +141,17 @@ class EndpointManager:
             remaining = deadline - self.monotonic()
             if remaining <= 0:
                 raise WorkerError("endpoint readiness timed out before status check")
-            snapshot = self.describe(min(_ENDPOINT_CALL_TIMEOUT_SECONDS, remaining))
+            try:
+                snapshot = self.describe(min(_ENDPOINT_CALL_TIMEOUT_SECONDS, remaining))
+            except ProcessError as error:
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    raise WorkerError(
+                        "endpoint readiness timed out after transient provider "
+                        f"errors: {error}"
+                    ) from error
+                self.sleep(min(poll_seconds, remaining))
+                continue
             state, ready, target = endpoint_state(snapshot)
             if state == "running" and target > 0 and ready >= target:
                 return snapshot
@@ -455,21 +468,22 @@ def run_worker(
     os.environ["HF_TOKEN"] = token
 
     claims = claim_store or HubClaimStore(lock.remote.job.namespace, token)
+    claim_path = run_claim_path(lock.artifact_bucket, lock.artifact_prefix)
+    claim_owner = {
+        "artifact_bucket": lock.artifact_bucket,
+        "artifact_prefix": lock.artifact_prefix,
+        "run_id": lock.run_id,
+    }
     try:
-        claims.acquire(
-            run_claim_path(lock.artifact_bucket, lock.artifact_prefix),
-            {
-                "artifact_bucket": lock.artifact_bucket,
-                "artifact_prefix": lock.artifact_prefix,
-                "run_id": lock.run_id,
-            },
-        )
+        claims.acquire(claim_path, claim_owner)
     except ClaimConflict as error:
         raise WorkerError("run ID is already reserved") from error
 
     destination = output_root / lock.artifact_prefix
-    _prepare_evidence_destination(destination)
+    entered_worker = False
     try:
+        _prepare_evidence_destination(destination, adopt_reserved=True)
+        entered_worker = True
         with tempfile.TemporaryDirectory(prefix="harbor-hf-run-") as staging:
             return _run_staged_worker(
                 manifest_path,
@@ -483,8 +497,11 @@ def run_worker(
                 watchdog_launcher=watchdog_launcher,
             )
     except Exception:
-        if (destination / "_RESERVED").is_file():
-            shutil.rmtree(destination, ignore_errors=True)
+        if not entered_worker or not any(
+            (destination / marker).is_file() for marker in ("_SUCCESS", "_FAILED")
+        ):
+            with suppress(CoordinationError):
+                claims.release(claim_path, claim_owner)
         raise
 
 
@@ -656,34 +673,62 @@ def _publish_success(root: Path, events: Path, token: str) -> None:
     (root / "_SUCCESS").write_text("\n", encoding="utf-8")
 
 
-def _publish_evidence(source: Path, destination: Path) -> None:
+def _publish_evidence(
+    source: Path,
+    destination: Path,
+    *,
+    attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
     markers = [name for name in ("_FAILED", "_SUCCESS") if (source / name).is_file()]
     if len(markers) != 1:
         raise WorkerError("finalized evidence must have exactly one terminal marker")
     if not (destination / "_RESERVED").is_file():
         raise WorkerError("run evidence destination is not reserved")
-    try:
-        source_root = source.resolve()
-        shutil.copytree(
-            source,
-            destination,
-            dirs_exist_ok=True,
-            ignore=lambda directory, names: (
-                [name for name in names if name in {"_FAILED", "_SUCCESS"}]
-                if Path(directory).resolve() == source_root
-                else []
-            ),
-        )
-        (destination / "_RESERVED").unlink()
-        shutil.copyfile(source / markers[0], destination / markers[0])
-    except Exception:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise
+    if attempts < 1:
+        raise ValueError("publication attempts must be positive")
+    source_root = source.resolve()
+    terminal = markers[0]
+    temporary_marker = destination / "harbor-hf-terminal.tmp"
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.copytree(
+                source,
+                destination,
+                dirs_exist_ok=True,
+                ignore=lambda directory, names: (
+                    [name for name in names if name in {"_FAILED", "_SUCCESS"}]
+                    if Path(directory).resolve() == source_root
+                    else []
+                ),
+            )
+            shutil.copyfile(source / terminal, temporary_marker)
+            (destination / "_RESERVED").unlink()
+            temporary_marker.replace(destination / terminal)
+            return
+        except Exception:
+            if not (destination / terminal).is_file():
+                (destination / "_RESERVED").touch(exist_ok=True)
+            if attempt == attempts:
+                raise
+            sleep(float(attempt))
 
 
-def _prepare_evidence_destination(destination: Path) -> None:
+def _prepare_evidence_destination(
+    destination: Path, *, adopt_reserved: bool = False
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.mkdir(exist_ok=False)
+    if destination.exists():
+        if (
+            adopt_reserved
+            and (destination / "_RESERVED").is_file()
+            and not any(
+                (destination / marker).exists() for marker in ("_FAILED", "_SUCCESS")
+            )
+        ):
+            return
+        raise FileExistsError(destination)
+    destination.mkdir()
     try:
         (destination / "_RESERVED").write_text("\n", encoding="utf-8")
     except Exception:
@@ -1150,13 +1195,13 @@ def _validate_endpoint_compute(lock: RunLock, snapshot: Mapping[str, object]) ->
     scaling = compute.get("scaling")
     if not isinstance(scaling, Mapping):
         raise WorkerError("endpoint response has no scaling configuration")
+    settings = EndpointSettings.model_validate(deployment.parameters)
     expected_scaling = {
-        "min_replicas": "minReplica",
-        "max_replicas": "maxReplica",
+        "minReplica": settings.min_replicas,
+        "maxReplica": settings.max_replicas,
     }
-    for parameter, field in expected_scaling.items():
-        expected = deployment.parameters.get(parameter)
-        if expected is not None and scaling.get(field) != expected:
+    for field, expected in expected_scaling.items():
+        if scaling.get(field) != expected:
             raise WorkerError("endpoint scaling does not match the locked deployment")
 
 

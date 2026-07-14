@@ -439,6 +439,29 @@ def test_hub_store_ensures_identical_event_once(
         store.ensure_event(lock.campaign_id, conflicting)
 
 
+def test_hub_store_adopts_deterministic_event_with_a_new_observation_time(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    store = HubCampaignStore("org", api=FakeCampaignApi(tmp_path))
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.draining",
+        producer="reconciler",
+        payload=LifecyclePayload(message="draining"),
+        clock=lambda: NOW,
+        identifier=lambda: "7" * 32,
+    )
+
+    assert store.ensure_event(lock.campaign_id, event)
+    assert not store.ensure_event(
+        lock.campaign_id,
+        event.model_copy(update={"observed_at": NOW + timedelta(minutes=5)}),
+    )
+
+
 def test_hub_store_reports_malformed_records(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

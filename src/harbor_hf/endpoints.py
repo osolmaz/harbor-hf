@@ -425,8 +425,12 @@ class EndpointProvisioner:
     ) -> ProvisioningResult:
         existing = self.inspect(desired)
         if existing is not None:
-            require_paused_zero_ready(existing)
-            return ProvisioningResult(action="adopted", snapshot=existing)
+            paused = self.pause_and_verify(
+                desired,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
+            return ProvisioningResult(action="adopted", snapshot=paused)
         action: Literal["created", "adopted"] = "created"
         try:
             snapshot = self.port.create(desired)
@@ -446,11 +450,23 @@ class EndpointProvisioner:
                 poll_seconds=poll_seconds,
             )
             raise
-        paused = self.pause_and_verify(
-            desired,
-            timeout_seconds=timeout_seconds,
-            poll_seconds=poll_seconds,
-        )
+        try:
+            paused = self.pause_and_verify(
+                desired,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
+        except EndpointProvisioningError:
+            try:
+                paused = self._pause_created_identity(
+                    desired.identity,
+                    timeout_seconds=timeout_seconds,
+                    poll_seconds=poll_seconds,
+                )
+            except EndpointProvisioningError as cleanup_error:
+                raise AmbiguousEndpointPause(
+                    "created endpoint cleanup is not verified and must be retried"
+                ) from cleanup_error
         return ProvisioningResult(action=action, snapshot=paused)
 
     def pause_and_verify(
@@ -542,7 +558,7 @@ class EndpointProvisioner:
         *,
         timeout_seconds: float,
         poll_seconds: float,
-    ) -> None:
+    ) -> EndpointSnapshot:
         with suppress(AmbiguousEndpointPause):
             self.port.pause(identity)
         deadline = _validated_deadline(self.monotonic, timeout_seconds, poll_seconds)
@@ -551,7 +567,7 @@ class EndpointProvisioner:
             if snapshot is None:
                 raise EndpointNotFound("created endpoint disappeared during cleanup")
             if _is_paused_zero_ready(snapshot):
-                return
+                return snapshot
             if not _sleep_before_deadline(
                 self.sleep, self.monotonic, deadline, poll_seconds
             ):
