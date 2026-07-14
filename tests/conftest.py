@@ -35,6 +35,7 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
                 "exception_type": step["exception_info"].get(
                     "exception_type", "malformed result"
                 ),
+                "exception_message": step["exception_info"].get("exception_message"),
             }
             for index, step in enumerate(result.get("step_results") or [], start=1)
             if isinstance(step, dict) and isinstance(step.get("exception_info"), dict)
@@ -70,6 +71,11 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
                 "model_name": model.get("name"),
                 "exception_type": (
                     exception.get("exception_type")
+                    if isinstance(exception, dict)
+                    else None
+                ),
+                "exception_message": (
+                    exception.get("exception_message")
                     if isinstance(exception, dict)
                     else None
                 ),

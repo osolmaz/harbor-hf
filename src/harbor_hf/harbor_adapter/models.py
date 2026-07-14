@@ -111,6 +111,7 @@ class HarborUsageSummary(FrozenModel):
 class HarborStepException(FrozenModel):
     step_name: str
     exception_type: str
+    exception_message: str | None = None
 
 
 class HarborCompatibilityTrial(FrozenModel):
@@ -126,6 +127,7 @@ class HarborCompatibilityTrial(FrozenModel):
     model_provider: str | None = None
     model_name: str | None = None
     exception_type: str | None = None
+    exception_message: str | None = None
     step_exceptions: list[HarborStepException] = Field(default_factory=list)
     rewards: dict[str, int | float] | None = None
     timing: HarborTrialTiming
