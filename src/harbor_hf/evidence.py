@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -80,9 +81,31 @@ def redact(value: object) -> object:
 
 
 def archive_directory(source: Path, destination: Path) -> None:
-    _evidence_paths(source)
-    with tarfile.open(destination, "w:gz") as archive:
-        archive.add(source, arcname=source.name)
+    paths = [source, *_evidence_paths(source)]
+    with (
+        destination.open("wb") as raw,
+        gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed,
+        tarfile.open(
+            fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
+        ) as archive,
+    ):
+        for path in paths:
+            relative = path.relative_to(source)
+            arcname = Path(source.name) / relative
+            info = archive.gettarinfo(str(path), arcname.as_posix())
+            if info is None:
+                raise RuntimeError("unsupported special file in run evidence")
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mtime = 0
+            info.mode = 0o755 if path.is_dir() else 0o644
+            if path.is_file():
+                with path.open("rb") as stream:
+                    archive.addfile(info, stream)
+            else:
+                archive.addfile(info)
 
 
 def write_checksums(root: Path) -> dict[str, str]:
@@ -175,6 +198,8 @@ def _evidence_paths(root: Path) -> list[Path]:
     paths = sorted(root.rglob("*"))
     if any(path.is_symlink() for path in paths):
         raise RuntimeError("symbolic links are not allowed in run evidence")
+    if any(not path.is_dir() and not path.is_file() for path in paths):
+        raise RuntimeError("special files are not allowed in run evidence")
     return paths
 
 

@@ -63,6 +63,10 @@ def test_failed_execution_retains_malformed_compatibility_evidence(
 ) -> None:
     (tmp_path / "harbor-jobs").mkdir()
     (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
     (tmp_path / "harbor-compatibility.json").write_text("{", encoding="utf-8")
 
     _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
@@ -75,6 +79,172 @@ def test_failed_execution_retains_malformed_compatibility_evidence(
             "error_type": "JSONDecodeError",
         }
     ]
+
+
+def test_failed_execution_recreates_rejected_jobs_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    jobs = tmp_path / "harbor-jobs"
+    jobs.symlink_to(outside, target_is_directory=True)
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    assert jobs.is_dir()
+    assert not jobs.is_symlink()
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "harbor-jobs", "reason": "symlink", "size": None}
+    ]
+
+
+def test_failed_execution_recreates_rejected_jobs_file(tmp_path: Path) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.write_text("collision", encoding="utf-8")
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    assert jobs.is_dir()
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "harbor-jobs", "reason": "reserved_path", "size": 9}
+    ]
+
+
+def test_failed_execution_prunes_unsafe_evidence_and_still_finalizes(
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (jobs / "linked").symlink_to(tmp_path / "execution.lock.json")
+    oversized = jobs / "oversized.log"
+    with oversized.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    verify_checksums(tmp_path)
+    manifest = json.loads((tmp_path / "private-artifacts.json").read_text())
+    assert [(item["path"], item["reason"]) for item in manifest["rejections"]] == [
+        ("harbor-jobs/linked", "symlink"),
+        ("harbor-jobs/oversized.log", "file_size"),
+    ]
+    assert not (jobs / "linked").exists()
+    assert not oversized.exists()
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+
+
+def test_failed_execution_preserves_attempt_state_before_sanitizing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "harbor-request.json").write_text(
+        '{"verification":{"expected_agent_name":"openclaw"}}\n',
+        encoding="utf-8",
+    )
+    events = tmp_path / "events.jsonl"
+    events.write_text('{"event":"harbor_started"}\n', encoding="utf-8")
+
+    def trim_attempt_event(root: Path, **_kwargs: object) -> list[object]:
+        (root / "events.jsonl").unlink(missing_ok=True)
+        return []
+
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker.sanitize_private_artifact_tree", trim_attempt_event
+    )
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    manifest = json.loads((tmp_path / "private-artifacts.json").read_text())
+    assert manifest["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": True,
+            "satisfied": False,
+        }
+    ]
+
+
+def test_failed_execution_sanitizes_result_before_session_probe(tmp_path: Path) -> None:
+    trial = tmp_path / "harbor-jobs" / "job" / "trial"
+    trial.mkdir(parents=True)
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "harbor-request.json").write_text(
+        '{"verification":{"expected_agent_name":"openclaw"}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text(
+        '{"event":"harbor_started"}\n', encoding="utf-8"
+    )
+    outside = tmp_path.parent / "oversized-result.json"
+    with outside.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+    (trial / "result.json").symlink_to(outside)
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    manifest = json.loads((tmp_path / "private-artifacts.json").read_text())
+    assert manifest["requirements"][0]["required"] is True
+    assert ("harbor-jobs/job/trial/result.json", "symlink") in {
+        (item["path"], item["reason"]) for item in manifest["rejections"]
+    }
+    assert outside.stat().st_size == 64 * 1024 * 1024 + 1
+
+
+def test_failed_execution_refreshes_compatibility_after_final_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.mkdir()
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    refresh_calls = 0
+
+    def refresh(root: Path, *, strict: bool) -> None:
+        nonlocal refresh_calls
+        assert strict is False
+        refresh_calls += 1
+        if refresh_calls == 1:
+            with (root / "harbor-jobs" / "late.log").open("wb") as stream:
+                stream.truncate(64 * 1024 * 1024 + 1)
+
+    monkeypatch.setattr("harbor_hf.wave_worker.refresh_retained_bundle", refresh)
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    assert refresh_calls == 2
+    assert not (jobs / "late.log").exists()
 
 
 def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:
@@ -199,12 +369,14 @@ class HarborStream:
         synchronize: bool = False,
         expected_base_url: str | None = "https://endpoint.example/v1",
         expected_model_name: str = "/repository",
+        agent_started: bool = False,
     ) -> None:
         self.task_digests = task_digests
         self.barrier = threading.Barrier(expected_calls) if synchronize else None
         self.exit_code = exit_code
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
+        self.agent_started = agent_started
         self.commands: list[list[str]] = []
         self.configs: list[dict[str, Any]] = []
         self.base_urls: list[str] = []
@@ -260,6 +432,11 @@ class HarborStream:
                                 "name": self.expected_model_name,
                             },
                         },
+                        "agent_execution": (
+                            {"started_at": "2026-07-14T00:00:00Z"}
+                            if self.agent_started
+                            else None
+                        ),
                         "verifier_result": {"rewards": {"reward": 1.0}},
                     }
                 ),
@@ -412,6 +589,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "harbor-request.json",
             "harbor.log",
             "manifest.yaml",
+            "private-artifacts.json",
             "verification.json",
         ]
         execution = json.loads(
@@ -434,6 +612,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
         }
         assert _event_payloads(execution_root / "events.jsonl") == [
             {"event": "execution_started", "execution_id": execution_root.name},
+            {"event": "harbor_started"},
             {"event": "harbor_finished", "exit_code": 0},
             {"event": "execution_succeeded"},
             {"event": "secrets_redacted", "files": ["harbor.log"]},
@@ -741,10 +920,70 @@ def test_wave_failure_still_pauses_and_publishes_failed_execution(
     assert "failure.json" in json.loads((execution / "checksums.json").read_text())
     assert _event_payloads(execution / "events.jsonl") == [
         {"event": "execution_started", "execution_id": execution.name},
+        {"event": "harbor_started"},
         {"event": "harbor_finished", "exit_code": 7},
         {"event": "execution_failed", "error_type": "WorkerError"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
     ]
+
+
+def test_missing_required_session_publishes_terminal_failed_evidence(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", lambda *_args: {"probes": {}})
+    output = tmp_path / "output"
+
+    with pytest.raises(WorkerError, match="no session JSONL"):
+        run_wave_worker(
+            manifest,
+            campaign_path,
+            wave_path,
+            output,
+            runner=EndpointRunner(
+                [
+                    endpoint_snapshot("paused", 0),
+                    endpoint_snapshot("running", 1),
+                    endpoint_snapshot("paused", 0),
+                ]
+            ),
+            stream_runner=HarborStream(
+                spec.benchmark.task_digests,
+                expected_calls=1,
+                agent_started=True,
+            ),
+            source_preparer=prepare_source,
+            watchdog_launcher=launch_watchdog,
+            identifier=IdentifierSequence(),
+        )
+
+    run = wave.runs[0]
+    trial_id = run.shards[0].shard.trials[0].trial_id
+    executions = output / run.artifact_prefix / "trials" / trial_id / "executions"
+    execution = next(executions.iterdir())
+    failure = json.loads((execution / "_FAILED").read_text(encoding="utf-8"))
+    private = json.loads(
+        (execution / "private-artifacts.json").read_text(encoding="utf-8")
+    )
+    assert failure == {
+        "category": "configuration",
+        "error_type": "PrivateArtifactRequirementError",
+        "message": "successful OpenClaw execution has no session JSONL",
+    }
+    assert private["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": True,
+            "satisfied": False,
+        }
+    ]
+    verify_checksums(execution)
     assert not (execution.parent.parent / "_SUCCESS").exists()
 
 

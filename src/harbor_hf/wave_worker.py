@@ -53,6 +53,14 @@ from harbor_hf.harbor_adapter import (
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.private_artifacts import (
+    PrivateArtifactRequirementError,
+    build_private_artifact_manifest,
+    openclaw_execution_started,
+    openclaw_execution_was_attempted,
+    sanitize_private_artifact_tree,
+    write_private_artifact_manifest,
+)
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.provider_models import (
     ProviderEndpointEvidence,
@@ -817,6 +825,7 @@ def _execute_trial(
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
+        append_event(events, "harbor_started")
         outcome = adapter.execute(
             prepared,
             harbor_source,
@@ -842,6 +851,7 @@ def _execute_trial(
             execution_root / "verification.json",
             outcome.verification.model_dump(mode="json"),
         )
+        build_private_artifact_manifest(execution_root, strict_session=True)
         append_event(events, "execution_succeeded")
     except Exception as caught:
         error = caught
@@ -901,6 +911,8 @@ def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
 ) -> RetryCategory:
+    if isinstance(error, PrivateArtifactRequirementError):
+        return "configuration"
     if isinstance(error, HarborVerificationFailure):
         return "benchmark"
     if isinstance(error, HarborTrialFailure):
@@ -1115,6 +1127,17 @@ def _trial_destination(
 def _finalize_execution(
     root: Path, token: str, *, strict_compatibility: bool = True
 ) -> None:
+    attempted = openclaw_execution_was_attempted(root)
+    rejection_count = 0
+    if not strict_compatibility:
+        rejection_count = len(
+            sanitize_private_artifact_tree(
+                root,
+                required_directories=("harbor-jobs",),
+            )
+        )
+        (root / "harbor-jobs").mkdir(exist_ok=True)
+    session_required = openclaw_execution_started(root, fallback_attempted=attempted)
     _redact_unit(root, token)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
     if refresh_error is not None:
@@ -1123,6 +1146,29 @@ def _finalize_execution(
             "compatibility_refresh_skipped",
             error_type=refresh_error,
         )
+    if not strict_compatibility:
+        final_rejection_count = len(
+            sanitize_private_artifact_tree(
+                root,
+                trust_existing_rejections=True,
+                required_directories=("harbor-jobs",),
+            )
+        )
+        (root / "harbor-jobs").mkdir(exist_ok=True)
+        if final_rejection_count > rejection_count:
+            refresh_error = refresh_retained_bundle(root, strict=False)
+            if refresh_error is not None:
+                append_event(
+                    root / "events.jsonl",
+                    "compatibility_refresh_skipped",
+                    error_type=refresh_error,
+                )
+    write_private_artifact_manifest(
+        root,
+        strict_session=strict_compatibility,
+        session_required=session_required,
+        trust_rejections=not strict_compatibility,
+    )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
     write_checksums(root)

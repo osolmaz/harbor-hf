@@ -50,7 +50,7 @@ After Harbor exits, the adapter runs `harbor_adapter/exporter.py` with the same
 pinned Harbor project environment. The exporter imports and validates Harbor's
 own `JobLock`, `JobResult`, `TrialLock`, and `TrialResult` models. It emits
 `harbor-compatibility.json` with schema
-`harbor-hf/harbor-compatibility/v1alpha1`.
+`harbor-hf/harbor-compatibility/v1alpha2`.
 
 The bundle contains:
 
@@ -58,13 +58,21 @@ The bundle contains:
 - the immutable request digest;
 - checksums and progress counts for each Harbor job lock and result;
 - checksums, task and agent identity, model identity, exceptions, verifier
-  rewards, timing, usage, and artifact inventory for each trial;
+  rewards, timing, usage, and a typed private artifact inventory for each trial;
 - no exception tracebacks, environment variables, agent config, task content,
   or secret values.
 
 The exporter log is retained as `harbor-export.log`. The normal evidence
 redaction, secret scan, checksums, and terminal-marker rules apply to the input,
 bundle, log, and raw Harbor artifacts together.
+
+The controller writes `private-artifacts.json` for every direct Harbor trial and
+for each complete campaign physical execution. Entries are sorted,
+private-only, size-bounded, and checksummed. A successful OpenClaw trial whose
+agent execution started must include a session JSONL. Failed and timed-out
+trials retain the same requirement record without turning incomplete evidence
+into a score. Raw files and this private manifest cannot cross the normalized
+result publication boundary.
 
 ## Additional Policy
 

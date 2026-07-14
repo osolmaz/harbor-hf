@@ -79,6 +79,8 @@ def _bundle(
                 "path": "result.json",
                 "size": 10,
                 "digest": "sha256:" + "5" * 64,
+                "kind": "result",
+                "classification": "private",
             }
         ],
     }

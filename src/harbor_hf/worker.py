@@ -66,6 +66,16 @@ from harbor_hf.models import (
     SourcePin,
 )
 from harbor_hf.planner import experiment_digest
+from harbor_hf.private_artifacts import (
+    build_private_artifact_manifest,
+    openclaw_execution_started,
+    openclaw_execution_was_attempted,
+    sanitize_private_artifact_directory_files,
+    sanitize_private_artifact_symlinks,
+    sanitize_private_artifact_tree,
+    validate_private_artifact_directory_files,
+    write_private_artifact_manifest,
+)
 from harbor_hf.process import (
     CommandRunner,
     ProcessError,
@@ -729,6 +739,7 @@ def _execute_benchmark(
     if outcome.verification is None:
         raise WorkerError("Harbor produced no validated compatibility bundle")
     write_json(root / "verification.json", outcome.verification.model_dump(mode="json"))
+    _validate_direct_private_artifacts(root, lock)
     append_event(events, "verification_validated")
 
 
@@ -1158,6 +1169,22 @@ def require_executable(name: str) -> None:
 
 
 def _finalize_evidence(root: Path, token: str) -> None:
+    failed = (root / "_FAILED").is_file()
+    fallback_attempted = openclaw_execution_was_attempted(root)
+    rejection_count = 0
+    if failed:
+        sanitize_private_artifact_symlinks(root, max_depth=3)
+        rejection_count = len(
+            sanitize_private_artifact_directory_files(
+                root,
+                trust_existing_rejections=True,
+                required_directories=("harbor-jobs",),
+                preserved_files=("_FAILED",),
+                allowed_directories=("harbor-jobs",),
+            )
+        )
+        (root / "harbor-jobs").mkdir(exist_ok=True)
+        rejection_count += _sanitize_direct_trial_artifacts(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
         append_event(
@@ -1178,9 +1205,186 @@ def _finalize_evidence(root: Path, token: str) -> None:
             "compatibility_refresh_skipped",
             error_type=refresh_error,
         )
+    if failed:
+        final_rejection_count = len(
+            sanitize_private_artifact_directory_files(
+                root,
+                trust_existing_rejections=True,
+                required_directories=("harbor-jobs",),
+                preserved_files=("_FAILED",),
+                allowed_directories=("harbor-jobs",),
+            )
+        )
+        (root / "harbor-jobs").mkdir(exist_ok=True)
+        final_rejection_count += _sanitize_direct_trial_artifacts(
+            root, trust_existing_rejections=True
+        )
+        if final_rejection_count > rejection_count:
+            refresh_error = refresh_retained_bundle(root, strict=False)
+            if refresh_error is not None:
+                append_event(
+                    root / "events.jsonl",
+                    "compatibility_refresh_skipped",
+                    error_type=refresh_error,
+                )
+    _validate_retained_direct_artifacts(root, failed=failed)
+    _write_direct_private_artifact_manifests(
+        root,
+        strict_session=not failed,
+        fallback_attempted=fallback_attempted,
+    )
     assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     write_checksums(root)
+
+
+def _validate_retained_direct_artifacts(root: Path, *, failed: bool) -> None:
+    if not failed:
+        _validate_direct_artifact_directories(root)
+
+
+def _write_direct_private_artifact_manifests(
+    root: Path,
+    *,
+    strict_session: bool,
+    fallback_attempted: bool | None = None,
+) -> None:
+    lock_path = root / "run.lock.json"
+    if not lock_path.is_file():
+        return
+    lock = RunLock.model_validate_json(lock_path.read_text(encoding="utf-8"))
+    attempted = (
+        openclaw_execution_was_attempted(root)
+        if fallback_attempted is None
+        else fallback_attempted
+    )
+    for trial_root in _direct_trial_roots(root):
+        trial_id = _direct_trial_id(root, trial_root, strict=strict_session)
+        write_private_artifact_manifest(
+            trial_root,
+            strict_session=strict_session,
+            execution_id=lock.run_id,
+            trial_id=trial_id,
+            session_required=openclaw_execution_started(
+                trial_root, fallback_attempted=attempted
+            ),
+            trust_rejections=not strict_session,
+        )
+
+
+def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
+    _validate_direct_artifact_directories(root)
+    for trial_root in _direct_trial_roots(root):
+        build_private_artifact_manifest(
+            trial_root,
+            strict_session=True,
+            execution_id=lock.run_id,
+            trial_id=_direct_trial_id(root, trial_root, strict=True),
+        )
+
+
+def _validate_direct_artifact_directories(root: Path) -> None:
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        raise RuntimeError("private artifact Harbor jobs root is not a directory")
+    validate_private_artifact_directory_files(
+        root, allowed_directories=("harbor-jobs",)
+    )
+    validate_private_artifact_directory_files(jobs_root)
+    for job_root in _direct_job_roots(root):
+        validate_private_artifact_directory_files(job_root)
+
+
+def _direct_trial_id(root: Path, trial_root: Path, *, strict: bool) -> str:
+    result = _read_json_object(trial_root / "result.json")
+    trial_id = _nonempty_string(result.get("id"))
+    if trial_id is not None:
+        return trial_id
+
+    compatibility = _read_json_object(root / "harbor-compatibility.json")
+    trials = compatibility.get("trials")
+    if isinstance(trials, list):
+        path = trial_root.relative_to(root / "harbor-jobs").as_posix()
+        for trial in trials:
+            if not isinstance(trial, dict) or trial.get("path") != path:
+                continue
+            trial_id = _nonempty_string(trial.get("trial_id"))
+            if trial_id is not None:
+                return trial_id
+
+    if strict:
+        raise WorkerError("Harbor trial has no canonical trial ID")
+    return trial_root.name
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _nonempty_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _sanitize_direct_trial_artifacts(
+    root: Path, *, trust_existing_rejections: bool = False
+) -> int:
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        return 0
+    rejection_count = len(
+        sanitize_private_artifact_directory_files(
+            jobs_root,
+            trust_existing_rejections=trust_existing_rejections,
+        )
+    )
+    for job_root in _direct_job_roots(root):
+        rejection_count += len(
+            sanitize_private_artifact_directory_files(
+                job_root,
+                trust_existing_rejections=trust_existing_rejections,
+            )
+        )
+    for trial_root in _direct_trial_roots(root):
+        rejection_count += len(
+            sanitize_private_artifact_tree(
+                trial_root,
+                trust_existing_rejections=trust_existing_rejections,
+            )
+        )
+    return rejection_count
+
+
+def _direct_job_roots(root: Path) -> list[Path]:
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        return []
+    resolved_jobs_root = jobs_root.resolve()
+    jobs: list[Path] = []
+    for job_root in sorted(jobs_root.iterdir()):
+        if job_root.is_symlink() or not job_root.is_dir():
+            continue
+        if not job_root.resolve().is_relative_to(resolved_jobs_root):
+            raise WorkerError("direct job root escapes Harbor jobs directory")
+        jobs.append(job_root)
+    return jobs
+
+
+def _direct_trial_roots(root: Path) -> list[Path]:
+    jobs_root = root / "harbor-jobs"
+    resolved_jobs_root = jobs_root.resolve()
+    trials: list[Path] = []
+    for job_root in _direct_job_roots(root):
+        for trial_root in sorted(job_root.iterdir()):
+            if trial_root.is_symlink() or not trial_root.is_dir():
+                continue
+            if not trial_root.resolve().is_relative_to(resolved_jobs_root):
+                raise WorkerError("direct trial root escapes Harbor jobs directory")
+            trials.append(trial_root)
+    return trials
 
 
 def controller_environment(lock: RunLock) -> dict[str, object]:

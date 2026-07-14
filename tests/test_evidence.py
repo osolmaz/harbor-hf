@@ -1,4 +1,5 @@
 import json
+import socket
 import tarfile
 import tempfile
 from datetime import UTC, datetime
@@ -170,6 +171,44 @@ def test_evidence_operations_reject_symlinks(tmp_path: Path) -> None:
         archive_directory(root, tmp_path / "archive.tar.gz")
 
     assert outside.read_text(encoding="utf-8") == "secret-value"
+
+
+def test_evidence_operations_reject_special_files(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(root / "runtime.sock"))
+
+        with pytest.raises(RuntimeError, match="special files are not allowed"):
+            archive_directory(root, tmp_path / "archive.tar.gz")
+
+
+def test_archive_is_deterministic_and_preserves_relative_tree(tmp_path: Path) -> None:
+    source = tmp_path / "harbor-jobs"
+    nested = source / "job" / "trial"
+    nested.mkdir(parents=True)
+    artifact = nested / "session.jsonl"
+    artifact.write_text("{}\n", encoding="utf-8")
+    first = tmp_path / "first.tar.gz"
+    second = tmp_path / "second.tar.gz"
+
+    archive_directory(source, first)
+    source.chmod(0o700)
+    nested.chmod(0o700)
+    artifact.chmod(0o600)
+    artifact.touch()
+    archive_directory(source, second)
+
+    assert first.read_bytes() == second.read_bytes()
+    with tarfile.open(first, "r:gz") as archive:
+        assert "harbor-jobs/job/trial/session.jsonl" in archive.getnames()
+        modes = {member.name: member.mode for member in archive.getmembers()}
+    assert modes == {
+        "harbor-jobs": 0o755,
+        "harbor-jobs/job": 0o755,
+        "harbor-jobs/job/trial": 0o755,
+        "harbor-jobs/job/trial/session.jsonl": 0o644,
+    }
 
 
 def test_secret_scrubbing_streams_across_chunk_boundaries(

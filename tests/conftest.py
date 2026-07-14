@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from harbor_hf.harbor_adapter.exporter import classify_private_artifact
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, RemoteExecutionSpec
 
@@ -44,6 +45,10 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
                 "path": path.relative_to(trial_dir).as_posix(),
                 "size": path.stat().st_size,
                 "digest": digest(path),
+                "kind": classify_private_artifact(
+                    path.relative_to(trial_dir).as_posix()
+                ),
+                "classification": "private",
             }
             for path in sorted(trial_dir.rglob("*"))
             if path.is_file()
@@ -88,7 +93,7 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
             }
         )
     bundle = {
-        "schema_version": "harbor-hf/harbor-compatibility/v1alpha1",
+        "schema_version": "harbor-hf/harbor-compatibility/v1alpha2",
         "harbor_revision": command[command.index("--harbor-revision") + 1],
         "harbor_version": "test",
         "request_digest": command[command.index("--request-digest") + 1],
