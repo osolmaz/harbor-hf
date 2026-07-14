@@ -11,6 +11,7 @@ from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
 from harbor_hf.harbor_adapter.models import (
     HarborCompatibilityBundle,
     HarborExecutionRequest,
+    HarborStepException,
     canonical_json_bytes,
     sha256_digest,
 )
@@ -122,13 +123,13 @@ def _validate_task_counts(
 
 
 def _trial_failure(
-    exception_type: str | None, step_exceptions: list[object]
+    exception_type: str | None, step_exceptions: list[HarborStepException]
 ) -> tuple[str, str] | None:
     if exception_type is not None:
         return "", exception_type
     if step_exceptions:
         step = step_exceptions[0]
-        name = str(step.step_name)
-        kind = str(step.exception_type)
+        name = step.step_name
+        kind = step.exception_type
         return f" step {name}", kind
     return None

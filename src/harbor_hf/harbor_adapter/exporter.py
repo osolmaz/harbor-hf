@@ -58,9 +58,14 @@ def export_bundle(
     harbor_revision: str,
     request_digest: str,
 ) -> None:
-    from harbor.models.job.lock import JobLock, TrialLock
-    from harbor.models.job.result import JobResult
-    from harbor.models.trial.result import TrialResult
+    from harbor.models.job.lock import (  # ty: ignore[unresolved-import]
+        JobLock,
+        TrialLock,
+    )
+    from harbor.models.job.result import JobResult  # ty: ignore[unresolved-import]
+    from harbor.models.trial.result import (  # ty: ignore[unresolved-import]
+        TrialResult,
+    )
 
     jobs: list[dict[str, Any]] = []
     trials: list[dict[str, Any]] = []

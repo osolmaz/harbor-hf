@@ -4,6 +4,7 @@ import math
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
@@ -181,8 +182,10 @@ def build_execution_request(
 ) -> HarborExecutionRequest:
     if attempts < 1 or concurrency < 1:
         raise WorkerError("Harbor attempts and concurrency must be positive")
-    missing = set(task_names).difference(expected_task_digests)
-    if missing:
+    if any(
+        not any(fnmatch(task, selector) for task in expected_task_digests)
+        for selector in task_names
+    ):
         raise WorkerError("Harbor request contains a task outside the resolved run set")
     served_model_name = _served_model_name(lock)
     try:
@@ -225,10 +228,10 @@ def build_execution_request(
             }
         ],
     }
-    expected_trials = len(task_names) * attempts
+    expected_trials = len(expected_task_digests) * attempts
     policy = HarborVerificationPolicy(
         expected_trials=expected_trials,
-        expected_task_counts={task: attempts for task in task_names},
+        expected_task_counts={task: attempts for task in expected_task_digests},
         expected_attempts_per_task=attempts,
         expected_task_names=task_names,
         expected_task_digests=expected_task_digests,

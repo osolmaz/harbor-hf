@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -169,7 +169,7 @@ class HarborStream:
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
         self.commands: list[list[str]] = []
-        self.configs: list[dict[str, object]] = []
+        self.configs: list[dict[str, Any]] = []
         self.base_urls: list[str] = []
         self.active = 0
         self.max_active = 0
