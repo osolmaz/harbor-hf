@@ -168,6 +168,7 @@ class HarborStream:
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
         self.commands: list[list[str]] = []
+        self.configs: list[dict[str, object]] = []
         self.base_urls: list[str] = []
         self.active = 0
         self.max_active = 0
@@ -188,8 +189,11 @@ class HarborStream:
             assert base_url.startswith("http://127.0.0.1:")
             assert base_url.endswith("/v1")
         assert timeout_seconds > 0
+        config_path = Path(command[command.index("--config") + 1])
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         with self.lock:
             self.commands.append(command)
+            self.configs.append(config)
             self.base_urls.append(base_url)
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -199,8 +203,8 @@ class HarborStream:
             log_path.write_text("completed test-token\n", encoding="utf-8")
             if self.exit_code != 0:
                 return self.exit_code
-            task_name = command[command.index("--include-task-name") + 1]
-            jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+            task_name = config["datasets"][0]["task_names"][0]
+            jobs_dir = Path(config["jobs_dir"])
             trial = jobs_dir / "job" / "trial"
             trial.mkdir(parents=True)
             (trial / "result.json").write_text(
@@ -284,9 +288,8 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     assert harbor.max_active == 2
     assert len(harbor.commands) == 2
     assert all(
-        command[command.index("--n-attempts") + 1] == "1"
-        and command[command.index("--n-concurrent") + 1] == "1"
-        for command in harbor.commands
+        config["n_attempts"] == 1 and config["n_concurrent_trials"] == 1
+        for config in harbor.configs
     )
     assert [command[2] for command in endpoint.commands] == [
         "describe",
@@ -361,7 +364,9 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "checksums.json",
             "events.jsonl",
             "execution.lock.json",
+            "harbor-job.json",
             "harbor-jobs",
+            "harbor-request.json",
             "harbor.log",
             "manifest.yaml",
             "verification.json",
@@ -489,8 +494,8 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     assert len(set(harbor.base_urls)) == 2
     assert all("/scopes/trial-" in base_url for base_url in harbor.base_urls)
     assert all(
-        command[command.index("--model") + 1] == f"openai/{routed_model}"
-        for command in harbor.commands
+        config["agents"][0]["model_name"] == f"openai/{routed_model}"
+        for config in harbor.configs
     )
     assert sorted(path.name for path in destination.iterdir()) == [
         "_SUCCESS",

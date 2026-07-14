@@ -40,6 +40,16 @@ from harbor_hf.evidence import (
     write_checksums,
     write_json,
 )
+from harbor_hf.harbor_adapter import (
+    FilesystemHarborExecutionAdapter,
+    HarborTrialFailure,
+    WorkerError,
+    build_execution_request,
+)
+from harbor_hf.harbor_adapter.adapter import (
+    effective_agent_parameters,
+    render_harbor_command,
+)
 from harbor_hf.io import load_experiment
 from harbor_hf.models import (
     DeploymentProfile,
@@ -47,7 +57,6 @@ from harbor_hf.models import (
     ExperimentSpec,
     RemoteExecutionSpec,
     SourcePin,
-    pinned_harbor_dataset_reference,
 )
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import (
@@ -56,8 +65,6 @@ from harbor_hf.process import (
     SubprocessRunner,
     run_streaming,
 )
-from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
     endpoint_lease_label_for,
@@ -69,18 +76,6 @@ _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
 _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
 _ENDPOINT_CALL_TIMEOUT_SECONDS = 60.0
 _MAX_CONSECUTIVE_READINESS_ERRORS = 3
-
-
-class WorkerError(RuntimeError):
-    """Raised when a remote benchmark run cannot complete correctly."""
-
-
-class HarborTrialFailure(WorkerError):
-    """A Harbor result reported a typed trial or step exception."""
-
-    def __init__(self, message: str, exception_type: str) -> None:
-        super().__init__(message)
-        self.exception_type = exception_type
 
 
 class JobInspector(Protocol):
@@ -341,116 +336,23 @@ def _build_harbor_command(
     attempts: int,
     concurrency: int,
 ) -> list[str]:
-    harbor = lock.remote.harbor
-    deployment = lock.deployment
-    if isinstance(deployment, ProviderTarget):
-        served_model_name = routed_provider_model(deployment)
-    else:
-        endpoint = deployment.endpoint
-        if endpoint is None:
-            raise WorkerError("run lock has no endpoint binding")
-        served_model_name = endpoint.served_model_name
-    try:
-        dataset_reference = pinned_harbor_dataset_reference(
-            lock.benchmark_dataset, lock.benchmark_dataset_digest
-        )
-    except ValueError as error:
-        raise WorkerError(str(error)) from error
-    command = [
-        "uv",
-        "run",
-        "--project",
-        str(harbor_source),
-        "--locked",
-        "--no-dev",
-        "--extra",
-        "hf-sandbox",
-        "harbor",
-        "run",
-        "--dataset",
-        dataset_reference,
-        "--n-attempts",
-        str(attempts),
-        "--agent",
-        lock.agent.name,
-        "--model",
-        f"openai/{served_model_name}",
-        "--env",
-        harbor.environment,
-        "--environment-kwarg",
-        f"flavor={harbor.sandbox_flavor}",
-        "--environment-kwarg",
-        f"job_timeout={harbor.sandbox_idle_timeout_seconds}",
-        "--jobs-dir",
-        str(jobs_dir),
-        "--n-concurrent",
-        str(concurrency),
-        "--n-concurrent-agents",
-        str(concurrency),
-        "--max-retries",
-        "0",
-        "--allow-agent-host",
-        urlparse(base_url).hostname or "",
-        "--yes",
-    ]
-    for task_name in task_names:
-        command.extend(("--include-task-name", task_name))
-    if lock.agent.revision_kind == "package":
-        revision = json.dumps(lock.agent.revision, separators=(",", ":"))
-        command.extend(("--agent-kwarg", f"version={revision}"))
-    for key, value in sorted(_effective_agent_parameters(lock).items()):
-        rendered = json.dumps(value, separators=(",", ":"))
-        command.extend(("--agent-kwarg", f"{key}={rendered}"))
-    return command
+    request = build_execution_request(
+        lock,
+        jobs_dir,
+        base_url,
+        task_names=list(task_names),
+        attempts=attempts,
+        concurrency=concurrency,
+        expected_task_digests={
+            task: lock.benchmark_task_digests[task] for task in task_names
+        },
+    )
+    del request
+    return render_harbor_command(harbor_source, jobs_dir.parent / "harbor-job.json")
 
 
 def _effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
-    parameters = deepcopy(lock.agent.parameters)
-    target = lock.deployment
-    if not isinstance(target, ProviderTarget):
-        return parameters
-    if lock.agent.name != "openclaw":
-        raise WorkerError(
-            "Inference Provider request controls require the OpenClaw Harbor agent"
-        )
-    existing = parameters.get("openclaw_config", {})
-    if not isinstance(existing, dict):
-        raise WorkerError("OpenClaw provider configuration must be a JSON object")
-    config = deepcopy(existing)
-    models = config.setdefault("models", {})
-    if not isinstance(models, dict):
-        raise WorkerError("OpenClaw models configuration must be a JSON object")
-    providers = models.setdefault("providers", {})
-    if not isinstance(providers, dict):
-        raise WorkerError("OpenClaw provider configuration must be a JSON object")
-    provider = providers.setdefault("openai", {})
-    if not isinstance(provider, dict):
-        raise WorkerError(
-            "OpenClaw OpenAI provider configuration must be a JSON object"
-        )
-    routed_model = routed_provider_model(target)
-    request_parameters = dict(target.parameters)
-    request_parameters.update(
-        {
-            "maxRetries": target.limits.max_attempts - 1,
-            "timeoutMs": int(target.timeout_seconds * 1000),
-        }
-    )
-    provider.update(
-        {
-            "api": "openai-completions",
-            "timeoutSeconds": math.ceil(target.timeout_seconds),
-            "models": [
-                {
-                    "id": routed_model,
-                    "name": routed_model,
-                    "params": request_parameters,
-                }
-            ],
-        }
-    )
-    parameters["openclaw_config"] = config
-    return parameters
+    return effective_agent_parameters(lock)
 
 
 def run_worker(
@@ -768,15 +670,20 @@ def _execute_benchmark(
     endpoint = _endpoint_binding(lock)
 
     jobs_dir = root / "harbor-jobs"
-    harbor_command = build_harbor_command(
+    prepared = FilesystemHarborExecutionAdapter().prepare(
         lock,
+        root,
         jobs_dir,
         base_url,
         harbor_source,
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
     )
     append_event(events, "harbor_started")
     exit_code = stream_runner(
-        harbor_command,
+        prepared.command,
         root / "harbor.log",
         environment={
             "HF_TOKEN": token,

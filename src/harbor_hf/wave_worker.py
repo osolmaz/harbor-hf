@@ -46,6 +46,7 @@ from harbor_hf.evidence import (
     write_checksums,
     write_json,
 )
+from harbor_hf.harbor_adapter import FilesystemHarborExecutionAdapter
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
@@ -61,7 +62,6 @@ from harbor_hf.worker import (
     EndpointManager,
     HarborTrialFailure,
     WorkerError,
-    build_harbor_trial_command,
     controller_environment,
     endpoint_state,
     launch_cleanup_watchdog_for,
@@ -800,17 +800,21 @@ def _execute_trial(
             if isinstance(wave.target, ProviderWaveTarget)
             else base_url
         )
-        command = build_harbor_trial_command(
+        prepared = FilesystemHarborExecutionAdapter().prepare(
             run,
+            execution_root,
             jobs_dir,
             trial_base_url,
             harbor_source,
-            task_name=trial.task_name,
+            task_names=[trial.task_name],
+            attempts=1,
+            concurrency=1,
+            expected_task_digests={trial.task_name: trial.task_digest},
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
         exit_code = stream_runner(
-            command,
+            prepared.command,
             execution_root / "harbor.log",
             environment={
                 "HF_TOKEN": token,
