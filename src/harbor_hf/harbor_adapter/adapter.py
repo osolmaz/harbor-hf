@@ -143,25 +143,20 @@ class FilesystemHarborExecutionAdapter:
         request_digest = sha256_digest(
             canonical_json_bytes(prepared.request.model_dump(mode="json"))
         )
-        exporter_exit = stream_runner(
-            render_export_command(
-                harbor_source,
-                jobs_dir,
-                compatibility_path,
-                prepared.request.harbor_revision,
-                request_digest,
-            ),
+        exported = self._export_compatibility(
+            prepared,
+            harbor_source,
+            jobs_dir,
+            compatibility_path,
             export_log,
-            environment=environment,
-            timeout_seconds=export_timeout,
+            request_digest,
+            environment,
+            export_timeout,
+            exit_code,
+            stream_runner,
         )
-        self._validate_inputs(prepared)
-        if exporter_exit != 0:
-            if exit_code != 0:
-                return HarborExecutionOutcome(exit_code, None, None)
-            raise WorkerError(
-                f"Harbor compatibility exporter exited with status {exporter_exit}"
-            )
+        if not exported:
+            return HarborExecutionOutcome(exit_code, None, None)
         try:
             bundle = load_compatibility_bundle(compatibility_path, prepared.request)
             verification = validate_compatibility_bundle(bundle, prepared.request)
@@ -172,6 +167,46 @@ class FilesystemHarborExecutionAdapter:
                 return HarborExecutionOutcome(exit_code, None, None)
             raise
         return HarborExecutionOutcome(exit_code, verification, compatibility_path)
+
+    def _export_compatibility(
+        self,
+        prepared: PreparedHarborExecution,
+        harbor_source: Path,
+        jobs_dir: Path,
+        compatibility_path: Path,
+        export_log: Path,
+        request_digest: str,
+        environment: dict[str, str],
+        export_timeout: int,
+        harbor_exit: int,
+        stream_runner: Callable[..., int],
+    ) -> bool:
+        try:
+            exporter_exit = stream_runner(
+                render_export_command(
+                    harbor_source,
+                    jobs_dir,
+                    compatibility_path,
+                    prepared.request.harbor_revision,
+                    request_digest,
+                ),
+                export_log,
+                environment=environment,
+                timeout_seconds=export_timeout,
+            )
+        except (OSError, RuntimeError):
+            self._validate_inputs(prepared)
+            if harbor_exit != 0:
+                return False
+            raise
+        self._validate_inputs(prepared)
+        if exporter_exit != 0:
+            if harbor_exit != 0:
+                return False
+            raise WorkerError(
+                f"Harbor compatibility exporter exited with status {exporter_exit}"
+            )
+        return True
 
     @staticmethod
     def _validate_inputs(prepared: PreparedHarborExecution) -> None:

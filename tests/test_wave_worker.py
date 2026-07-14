@@ -43,6 +43,7 @@ from harbor_hf.wave_worker import (
     _execution_failure_category,
     _execution_id,
     _file_digest,
+    _finalize_execution,
     _launch_wave_watchdog,
     _remaining_seconds,
     _valid_terminal_trial,
@@ -55,6 +56,34 @@ def test_verification_failure_is_terminal_benchmark_evidence() -> None:
     error = HarborVerificationFailure("task digest does not match")
 
     assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_failed_execution_retains_malformed_compatibility_evidence(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "harbor-compatibility.json").write_text("{", encoding="utf-8")
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    verify_checksums(tmp_path)
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+    assert _event_payloads(tmp_path / "events.jsonl") == [
+        {
+            "event": "compatibility_refresh_skipped",
+            "error_type": "JSONDecodeError",
+        }
+    ]
+
+
+def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "harbor-compatibility.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        _finalize_execution(tmp_path, "test-token")
 
 
 def endpoint_snapshot(state: str, ready: int) -> dict[str, object]:

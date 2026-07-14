@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,10 @@ def test_run_command_is_the_complete_ordered_process_contract(
         str(jobs.parent / "harbor-job.json"),
         "--yes",
     ]
+    assert (
+        json.loads((tmp_path / "harbor-job.json").read_text())["n_concurrent_trials"]
+        == 4
+    )
     request = build_execution_request(
         lock,
         jobs,
@@ -167,6 +172,9 @@ def test_wave_trial_command_overrides_only_attempt_and_concurrency_contract(
         str(jobs.parent / "harbor-job.json"),
         "--yes",
     ]
+    assert json.loads((tmp_path / "harbor-job.json").read_text())["datasets"][0][
+        "task_names"
+    ] == ["task-alpha"]
     request = build_execution_request(
         lock,
         jobs,

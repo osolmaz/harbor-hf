@@ -60,11 +60,21 @@ def _bundle_directory(jobs_dir: Path, relative: object) -> Path:
 def refresh_bundle_artifacts(jobs_dir: Path, output: Path) -> None:
     """Refresh retained-file metadata after evidence redaction."""
     bundle = json.loads(output.read_text(encoding="utf-8"))
-    for job in bundle.get("jobs", []):
+    if not isinstance(bundle, dict):
+        raise ValueError("Harbor compatibility bundle is not an object")
+    jobs = bundle.get("jobs")
+    trials = bundle.get("trials")
+    if not isinstance(jobs, list) or not isinstance(trials, list):
+        raise ValueError("Harbor compatibility bundle has no artifact inventories")
+    for job in jobs:
+        if not isinstance(job, dict):
+            raise ValueError("Harbor compatibility job is malformed")
         job_dir = _bundle_directory(jobs_dir, job.get("path"))
         job["lock_digest"] = _digest(job_dir / "lock.json")
         job["result_digest"] = _digest(job_dir / "result.json")
-    for trial in bundle.get("trials", []):
+    for trial in trials:
+        if not isinstance(trial, dict):
+            raise ValueError("Harbor compatibility trial is malformed")
         trial_dir = _bundle_directory(jobs_dir, trial.get("path"))
         trial["lock_digest"] = _digest(trial_dir / "lock.json")
         trial["result_digest"] = _digest(trial_dir / "result.json")
@@ -73,6 +83,20 @@ def refresh_bundle_artifacts(jobs_dir: Path, output: Path) -> None:
         json.dumps(bundle, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+
+
+def refresh_retained_bundle(root: Path, *, strict: bool) -> str | None:
+    """Refresh published metadata, or report why failed-run metadata was retained."""
+    compatibility = root / "harbor-compatibility.json"
+    if not compatibility.is_file():
+        return None
+    try:
+        refresh_bundle_artifacts(root / "harbor-jobs", compatibility)
+    except (OSError, ValueError) as error:
+        if strict:
+            raise
+        return type(error).__name__
+    return None
 
 
 def _timing(value: TimingValue) -> dict[str, str | None]:

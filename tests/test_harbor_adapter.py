@@ -306,6 +306,51 @@ def test_adapter_revalidates_inputs_after_failed_export(
     assert calls == 2
 
 
+def test_adapter_preserves_harbor_failure_when_export_raises(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(*_args: object, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 7
+        raise RuntimeError("export timed out")
+
+    outcome = adapter.execute(
+        prepared,
+        tmp_path / "harbor",
+        jobs_dir,
+        tmp_path / "harbor.log",
+        environment={},
+        timeout_seconds=30,
+        stream_runner=run,
+    )
+
+    assert calls == 2
+    assert outcome.exit_code == 7
+    assert outcome.verification is None
+    assert outcome.compatibility_path is None
+
+
 def test_adapter_does_not_start_export_after_shared_deadline(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

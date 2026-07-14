@@ -50,7 +50,7 @@ from harbor_hf.harbor_adapter import (
     FilesystemHarborExecutionAdapter,
     HarborVerificationFailure,
 )
-from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
+from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
@@ -854,7 +854,7 @@ def _execute_trial(
             "message": str(error).replace(token, "[REDACTED]"),
         }
         write_json(execution_root / "failure.json", failure_record)
-    _finalize_execution(execution_root, token)
+    _finalize_execution(execution_root, token, strict_compatibility=error is None)
     if error is None:
         (execution_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     else:
@@ -1112,11 +1112,17 @@ def _trial_destination(
     )
 
 
-def _finalize_execution(root: Path, token: str) -> None:
+def _finalize_execution(
+    root: Path, token: str, *, strict_compatibility: bool = True
+) -> None:
     _redact_unit(root, token)
-    compatibility = root / "harbor-compatibility.json"
-    if compatibility.is_file():
-        refresh_bundle_artifacts(root / "harbor-jobs", compatibility)
+    refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
+    if refresh_error is not None:
+        append_event(
+            root / "events.jsonl",
+            "compatibility_refresh_skipped",
+            error_type=refresh_error,
+        )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
     write_checksums(root)
