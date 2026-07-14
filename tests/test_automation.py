@@ -354,8 +354,9 @@ def test_every_managed_webhook_field_participates_in_drift_detection(
     api = FakeApi()
     request = _request(remote_spec)
     install_automation(request, token="test-only", api=api)
-    api.webhooks[0].job = deepcopy(api.webhooks[0].job)
-    mutate(api.webhooks[0])
+    webhook = cast(SimpleNamespace, api.webhooks[0])
+    webhook.job = deepcopy(webhook.job)
+    mutate(webhook)
 
     with pytest.raises(AutomationError) as captured:
         install_automation(request, token="test-only", api=api)
