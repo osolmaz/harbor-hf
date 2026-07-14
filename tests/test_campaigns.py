@@ -14,6 +14,7 @@ from harbor_hf.campaigns import (
     build_campaign_plan,
     build_wave_lock,
     campaign_json_schemas,
+    new_campaign_id,
 )
 from harbor_hf.endpoints import deployment_digest
 from harbor_hf.models import DeploymentProfile, ExperimentSpec, MatrixRule
@@ -409,6 +410,21 @@ def test_retry_wave_locks_only_trials_admitted_by_its_action(
             remote_spec,
             action.model_copy(update={"trial_ids": [trial_id]}),
         )
+
+
+def test_new_campaign_id_uses_utc_plan_identity_and_bounded_nonce(
+    remote_spec: ExperimentSpec,
+) -> None:
+    plan = build_campaign_plan(remote_spec)
+    campaign_id = new_campaign_id(
+        plan,
+        clock=lambda: datetime(2026, 7, 14, 9, 8, 7, tzinfo=UTC),
+        identifier=lambda: "0123456789abcdef",
+    )
+
+    assert campaign_id == (
+        f"20260714T090807Z-{plan.plan_digest.removeprefix('sha256:')[:10]}-0123456789"
+    )
 
 
 def _wave_action(lock: CampaignLock) -> ReconcileAction:

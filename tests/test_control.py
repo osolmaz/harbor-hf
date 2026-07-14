@@ -690,3 +690,196 @@ def test_action_reservation_validates_kind_and_campaign_separately(
         assert str(captured.value) == (
             "action reservation requires its reservation event"
         )
+
+
+def test_hub_store_ensure_event_retries_parent_conflicts_with_exact_commit(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    api.conflicts = 2
+    store = HubCampaignStore("org", api=api)
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW,
+        identifier=lambda: "7" * 32,
+    )
+
+    assert store.ensure_event(lock.campaign_id, event) is True
+    assert len(api.info_calls) == 3
+    assert api.commits == [
+        {
+            "commit_message": "chore: record campaign.cancel-requested",
+            "repo_type": "dataset",
+            "revision": "main",
+            "parent_commit": f"{3:040x}",
+        }
+    ]
+    event_path = f"campaigns/{lock.campaign_id}/events/{event.event_id}.json"
+    assert json.loads(api.files[event_path]) == event.model_dump(mode="json")
+
+
+def test_hub_store_ensure_event_has_bounded_parent_conflict_retries(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    api.conflicts = 20
+    store = HubCampaignStore("org", api=api)
+
+    with pytest.raises(ControlError) as captured:
+        store.ensure_event(lock.campaign_id, _submitted(lock))
+
+    assert str(captured.value) == "control repository remained contended"
+    assert len(api.info_calls) == 8
+    assert api.commits == []
+
+
+def test_hub_store_reservation_commit_contains_action_and_event_atomically(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="act-atomic",
+            action_key="atomic-key",
+            action_kind="retry-shard",
+            target_ids=["trial-one"],
+        ),
+        clock=lambda: NOW,
+        identifier=lambda: "8" * 32,
+    )
+    action: dict[str, JsonValue] = {
+        "action_id": "act-atomic",
+        "kind": "retry-shard",
+        "trial_ids": ["trial-one"],
+    }
+
+    assert store.reserve_action(lock.campaign_id, action, event) is True
+
+    reservation_path = f"campaigns/{lock.campaign_id}/reservations/act-atomic.json"
+    event_path = f"campaigns/{lock.campaign_id}/events/{event.event_id}.json"
+    assert set(api.files) == {reservation_path, event_path}
+    assert json.loads(api.files[reservation_path]) == action
+    assert json.loads(api.files[event_path]) == event.model_dump(mode="json")
+    assert api.commits == [
+        {
+            "commit_message": "chore: reserve act-atomic",
+            "repo_type": "dataset",
+            "revision": "main",
+            "parent_commit": f"{1:040x}",
+        }
+    ]
+    conflicting = {**action, "kind": "submit-wave"}
+    with pytest.raises(CampaignConflict) as captured:
+        store.reserve_action(lock.campaign_id, conflicting, event)
+    assert str(captured.value) == "action reservation content conflicts"
+
+
+def test_hub_store_reservation_retries_only_parent_conflicts(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="act-retry",
+            action_key="retry-key",
+            action_kind="submit-wave",
+            target_ids=[],
+        ),
+        clock=lambda: NOW,
+        identifier=lambda: "9" * 32,
+    )
+    contended = FakeCampaignApi(tmp_path)
+    contended.conflicts = 20
+
+    with pytest.raises(ControlError) as captured:
+        HubCampaignStore("org", api=contended).reserve_action(
+            lock.campaign_id, {"action_id": "act-retry"}, event
+        )
+
+    assert str(captured.value) == "control repository remained contended"
+    assert len(contended.info_calls) == 8
+
+    class FailingApi(FakeCampaignApi):
+        def create_commit(
+            self, repo_id: str, operations: list[object], **kwargs: object
+        ) -> object:
+            raise _http_error(500)
+
+    with pytest.raises(HfHubHTTPError):
+        HubCampaignStore("org", api=FailingApi(tmp_path)).reserve_action(
+            lock.campaign_id, {"action_id": "act-retry"}, event
+        )
+
+
+def test_hub_store_rejects_non_object_action_reservation(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    path = f"campaigns/{lock.campaign_id}/reservations/act-invalid.json"
+    api.files[path] = b"[]"
+    store = HubCampaignStore("org", api=api)
+
+    with pytest.raises(ControlError) as captured:
+        store.load_action_reservations(lock.campaign_id)
+
+    assert str(captured.value) == f"action reservation must be an object: {path}"
+
+
+def test_hub_store_snapshot_requires_lock_commit_identity(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    lock_path = f"campaigns/{lock.campaign_id}/campaign.lock.json"
+    api.last_commits[lock_path] = ""
+
+    with pytest.raises(ControlError) as captured:
+        store.load_snapshot(lock.campaign_id)
+
+    assert str(captured.value) == (
+        f"control record has no immutable commit: {lock_path}"
+    )
+
+
+def test_hub_store_snapshot_requires_one_lock_commit_record(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    class MissingCommitApi(FakeCampaignApi):
+        def get_paths_info(
+            self, repo_id: str, paths: list[str] | str, **kwargs: object
+        ) -> list[object]:
+            if kwargs.get("expand") is True:
+                return []
+            return super().get_paths_info(repo_id, paths, **kwargs)
+
+    lock = _lock(remote_spec)
+    api = MissingCommitApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    lock_path = f"campaigns/{lock.campaign_id}/campaign.lock.json"
+
+    with pytest.raises(ControlError) as captured:
+        store.load_snapshot(lock.campaign_id)
+
+    assert str(captured.value) == (
+        f"control record has no immutable commit: {lock_path}"
+    )

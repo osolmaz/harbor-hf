@@ -27,6 +27,7 @@ from harbor_hf.control import (
     LifecyclePayload,
     RetryCategory,
     SubjectType,
+    TerminalPayload,
     WaveLifecyclePayload,
     new_event,
 )
@@ -442,6 +443,30 @@ def test_durable_cancellation_request_is_idempotent(
     assert repeated == first
 
 
+def test_durable_cancellation_request_has_stable_identity_and_requested_time(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    observed_at = NOW + timedelta(seconds=19)
+
+    event, created = durable_cancellation_event(
+        lock,
+        [submitted],
+        "operator stop",
+        clock=lambda: observed_at,
+    )
+
+    identity = hashlib.sha256(f"{lock.campaign_id}:cancel".encode()).hexdigest()[:32]
+    assert created is True
+    assert event.event_id == f"evt-{identity}"
+    assert event.subject_type == "campaign"
+    assert event.subject_id == lock.campaign_id
+    assert event.kind == "campaign.cancel-requested"
+    assert event.producer == "cli"
+    assert event.observed_at == observed_at
+    assert event.payload == CancellationPayload(reason="operator stop")
+
+
 def test_durable_shard_retry_request_skips_current_backoff(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -477,6 +502,175 @@ def test_durable_shard_retry_request_skips_current_backoff(
     assert repeated == request
     assert projection.counts.retrying == 1
     assert [action.kind for action in plan.actions] == ["retry-shard"]
+
+
+def test_durable_shard_retry_request_has_generation_identity_and_exact_payload(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard = lock.runs[0].shards[0]
+    trial = shard.trials[0]
+    observed_at = NOW + timedelta(seconds=11)
+
+    event, created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard.shard_id,
+        "retry now",
+        clock=lambda: observed_at,
+    )
+
+    generation = f"{trial.trial_id}:1"
+    identity = hashlib.sha256(
+        f"{lock.campaign_id}:{shard.shard_id}:{generation}".encode()
+    ).hexdigest()[:32]
+    assert created is True
+    assert event.event_id == f"evt-{identity}"
+    assert event.kind == "campaign.shard-retry-requested"
+    assert event.subject_id == lock.campaign_id
+    assert event.observed_at == observed_at
+    assert event.payload.model_dump(mode="json") == {
+        "shard_id": shard.shard_id,
+        "reason": "retry now",
+    }
+
+
+def test_durable_shard_retry_identity_includes_every_eligible_trial(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2, max_trials_per_shard=2)
+    shard = lock.runs[0].shards[0]
+    failures: list[CampaignEvent] = []
+    for index, trial in enumerate(shard.trials, 1):
+        execution_id = f"execution-{trial.trial_id}"
+        failures.extend(
+            [
+                _event(
+                    lock,
+                    index * 3,
+                    "execution",
+                    execution_id,
+                    "execution.started",
+                    ExecutionStartedPayload(
+                        trial_id=trial.trial_id,
+                        shard_id=shard.shard_id,
+                        physical_attempt=1,
+                        wave_id="wave-one",
+                    ),
+                ),
+                _event(
+                    lock,
+                    index * 3 + 1,
+                    "execution",
+                    execution_id,
+                    "execution.failed",
+                    ExecutionOutcomePayload(
+                        trial_id=trial.trial_id,
+                        physical_attempt=1,
+                        category="transient",
+                    ),
+                ),
+            ]
+        )
+
+    event, created = durable_shard_retry_event(
+        lock, [submitted, *failures], shard.shard_id, "retry both"
+    )
+
+    generation = ",".join(f"{trial.trial_id}:1" for trial in shard.trials)
+    identity = hashlib.sha256(
+        f"{lock.campaign_id}:{shard.shard_id}:{generation}".encode()
+    ).hexdigest()[:32]
+    assert created is True
+    assert event.event_id == f"evt-{identity}"
+
+
+def test_durable_shard_retry_rejects_conflicting_event_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard = lock.runs[0].shards[0]
+    retry, _created = durable_shard_retry_event(
+        lock, [submitted, *failed], shard.shard_id, "retry"
+    )
+    conflict = _event(
+        lock,
+        5,
+        "run",
+        lock.runs[0].run_id,
+        "run.queued",
+        LifecyclePayload(parent_id=lock.campaign_id),
+    ).model_copy(update={"event_id": retry.event_id})
+
+    with pytest.raises(ValueError) as captured:
+        durable_shard_retry_event(
+            lock, [submitted, *failed, conflict], shard.shard_id, "retry"
+        )
+
+    assert str(captured.value) == "retry event identity conflicts"
+
+
+@pytest.mark.parametrize(
+    ("transition", "message"),
+    [
+        ("terminal", "a terminal campaign cannot be retried"),
+        ("cancel_requested", "a cancelling campaign cannot be retried"),
+        ("draining", "a cancelling campaign cannot be retried"),
+        ("unknown", "unknown campaign shard: shard-unknown"),
+        ("planned", "shard has no retryable logical trials"),
+    ],
+)
+def test_durable_shard_retry_rejects_ineligible_recovery_transitions(
+    remote_spec: ExperimentSpec, transition: str, message: str
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    events = [submitted]
+    shard_id = lock.runs[0].shards[0].shard_id
+    if transition == "terminal":
+        events.append(
+            _event(
+                lock,
+                2,
+                "campaign",
+                lock.campaign_id,
+                "campaign.failed",
+                TerminalPayload(message="failed"),
+            )
+        )
+    elif transition == "cancel_requested":
+        events.append(_cancel_event(lock))
+    elif transition == "draining":
+        events.append(
+            _event(
+                lock,
+                2,
+                "campaign",
+                lock.campaign_id,
+                "campaign.draining",
+                LifecyclePayload(parent_id=lock.campaign_id),
+            )
+        )
+    elif transition == "unknown":
+        shard_id = "shard-unknown"
+
+    with pytest.raises(ValueError) as captured:
+        durable_shard_retry_event(lock, events, shard_id, "retry")
+
+    assert str(captured.value) == message
 
 
 @pytest.mark.parametrize(

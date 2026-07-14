@@ -25,6 +25,11 @@ from harbor_hf.campaign_apply import (
     CampaignReconciler,
     HuggingFaceWaveJobAdapter,
     RemoteWaveJob,
+    _active_action_admissions,
+    _build_admission_usage,
+    _combined_usage,
+    _context_with_unobserved_actions,
+    _usage_from_admissions,
 )
 from harbor_hf.campaign_finalizer import (
     BucketCampaignFinalizer,
@@ -75,9 +80,11 @@ from harbor_hf.reconciler import (
     AdmissionUsage,
     ReconcileAction,
     ReconcileContext,
+    _Candidate,
+    _MutableUsage,
     plan_reconciliation,
 )
-from harbor_hf.recovery import RecoveryProjection, TerminalDecision
+from harbor_hf.recovery import RecoveryProjection, TerminalDecision, project_recovery
 from harbor_hf.result_publisher import HubDatasetPublisher
 from harbor_hf.submission import endpoint_lease_label_for
 
@@ -2115,6 +2122,430 @@ def test_hf_wave_adapter_rejects_unresolved_duplicate_identity(
             wave_id="wave-one",
             endpoint_label="endpoint-one",
         )
+
+
+def test_usage_from_admissions_deduplicates_waves_and_accounts_every_scope() -> None:
+    usage = _usage_from_admissions(
+        "campaign-one",
+        70,
+        [
+            ("wave-one", "deployment-old", "provider-old", 5),
+            ("wave-two", "deployment-two", "provider-two", 20),
+            ("wave-one", "deployment-one", "provider-one", 10),
+            ("wave-three", "deployment-one", "provider-two", 30),
+        ],
+    )
+
+    assert usage.model_dump(mode="json") == {
+        "global_active_waves": 3,
+        "deployment_active_waves": {"deployment-two": 1, "deployment-one": 2},
+        "provider_active_waves": {"provider-two": 2, "provider-one": 1},
+        "campaign_active_waves": {"campaign-one": 3},
+        "campaign_spend_microusd": {"campaign-one": 130},
+    }
+    assert _usage_from_admissions("campaign-one", 0, []).model_dump(mode="json") == {
+        "global_active_waves": 0,
+        "deployment_active_waves": {},
+        "provider_active_waves": {},
+        "campaign_active_waves": {},
+        "campaign_spend_microusd": {},
+    }
+    assert _usage_from_admissions("campaign-one", 7, []).campaign_spend_microusd == {
+        "campaign-one": 7
+    }
+
+
+def test_combined_admission_usage_adds_overlapping_and_distinct_scopes() -> None:
+    combined = _combined_usage(
+        AdmissionUsage(
+            global_active_waves=1,
+            deployment_active_waves={"deployment-one": 1},
+            provider_active_waves={"provider-one": 2},
+            campaign_active_waves={"campaign-one": 1},
+            campaign_spend_microusd={"campaign-one": 10},
+        ),
+        [
+            AdmissionUsage(
+                global_active_waves=2,
+                deployment_active_waves={"deployment-one": 3},
+                provider_active_waves={"provider-two": 4},
+                campaign_active_waves={"campaign-one": 2},
+                campaign_spend_microusd={"campaign-one": 20},
+            ),
+            AdmissionUsage(
+                global_active_waves=5,
+                deployment_active_waves={"deployment-two": 6},
+                provider_active_waves={"provider-one": 7},
+                campaign_active_waves={"campaign-two": 8},
+                campaign_spend_microusd={"campaign-two": 30},
+            ),
+        ],
+    )
+
+    assert combined.model_dump(mode="json") == {
+        "global_active_waves": 8,
+        "deployment_active_waves": {
+            "deployment-one": 4,
+            "deployment-two": 6,
+        },
+        "provider_active_waves": {"provider-one": 9, "provider-two": 4},
+        "campaign_active_waves": {"campaign-one": 3, "campaign-two": 8},
+        "campaign_spend_microusd": {"campaign-one": 30, "campaign-two": 30},
+    }
+
+
+def test_wave_projection_usage_accounts_open_and_closed_estimates(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    run = lock.runs[0]
+    shard_id = run.shards[0].shard_id
+
+    def wave(sequence: int, wave_id: str, kind: str, estimate: int) -> CampaignEvent:
+        return new_event(
+            subject_type="wave",
+            subject_id=wave_id,
+            kind=cast(Literal["wave.active", "wave.closed"], kind),
+            producer="wave-controller",
+            payload=WaveLifecyclePayload(
+                deployment_digest=run.deployment_digest,
+                provider="provider-one",
+                shard_ids=[shard_id],
+                estimated_cost_microusd=estimate,
+            ),
+            clock=lambda: NOW + timedelta(seconds=sequence),
+            identifier=lambda: f"{sequence:032x}",
+        )
+
+    projection = project_recovery(
+        lock,
+        [
+            submitted,
+            wave(1, "wave-closed", "wave.closed", 20),
+            wave(2, "wave-open", "wave.active", 30),
+        ],
+    ).model_copy(update={"spend_microusd": 7})
+
+    assert _build_admission_usage(lock.campaign_id, projection, {}).model_dump(
+        mode="json"
+    ) == {
+        "global_active_waves": 1,
+        "deployment_active_waves": {run.deployment_digest: 1},
+        "provider_active_waves": {"provider-one": 1},
+        "campaign_active_waves": {lock.campaign_id: 1},
+        "campaign_spend_microusd": {lock.campaign_id: 57},
+    }
+
+    mutable = _MutableUsage(
+        ReconcileContext(
+            usage=AdmissionUsage(
+                global_active_waves=2,
+                deployment_active_waves={run.deployment_digest: 3},
+                provider_active_waves={"provider-one": 4},
+                campaign_active_waves={lock.campaign_id: 5},
+                campaign_spend_microusd={lock.campaign_id: 11},
+            )
+        ),
+        projection,
+    )
+    assert mutable.global_waves == 3
+    assert mutable.deployments == {run.deployment_digest: 4}
+    assert mutable.providers == {"provider-one": 5}
+    assert mutable.campaigns == {lock.campaign_id: 6}
+    assert mutable.spend == {lock.campaign_id: 68}
+
+    defaulted = _MutableUsage(ReconcileContext(), projection)
+    assert defaulted.campaigns == {lock.campaign_id: 1}
+    assert defaulted.spend == {lock.campaign_id: 57}
+
+    mutable.admit(
+        _Candidate(
+            kind="retry-shard",
+            deployment_digest=run.deployment_digest,
+            provider="provider-one",
+            estimated_cost_microusd=13,
+        ),
+        lock.campaign_id,
+    )
+    assert (
+        mutable.global_waves,
+        mutable.deployments,
+        mutable.providers,
+        mutable.campaigns,
+        mutable.spend,
+    ) == (
+        4,
+        {run.deployment_digest: 5},
+        {"provider-one": 6},
+        {lock.campaign_id: 7},
+        {lock.campaign_id: 81},
+    )
+
+    mutable.admit(
+        _Candidate(
+            kind="submit-wave",
+            deployment_digest="deployment-two",
+            provider="provider-two",
+        ),
+        "campaign-two",
+    )
+    assert mutable.campaigns["campaign-two"] == 1
+    assert mutable.spend["campaign-two"] == 0
+
+
+@pytest.mark.parametrize("outcome", ["action.succeeded", "action.ambiguous"])
+def test_unobserved_billable_action_contributes_one_admission(
+    remote_spec: ExperimentSpec, outcome: str
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    reserved = _reservation(lock, action, 1)
+    finished = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind=cast(Literal["action.succeeded", "action.ambiguous"], outcome),
+        producer="reconciler",
+        payload=ActionOutcomePayload(action_id=action.action_id),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "2" * 32,
+    )
+    projection = project_recovery(lock, [submitted, reserved, finished])
+    reservations = {action.action_id: action}
+    expected = [
+        (
+            action.wave_id,
+            action.deployment_digest,
+            action.provider,
+            action.estimated_cost_microusd or 0,
+        )
+    ]
+
+    assert _active_action_admissions(projection, reservations) == expected
+    context = _context_with_unobserved_actions(
+        lock,
+        [submitted, reserved, finished],
+        reservations,
+        ReconcileContext(usage=AdmissionUsage(global_active_waves=2)),
+    )
+    assert context.usage.global_active_waves == 3
+    assert context.usage.deployment_active_waves == {action.deployment_digest: 1}
+    assert context.usage.provider_active_waves == {action.provider: 1}
+    assert context.usage.campaign_active_waves == {lock.campaign_id: 1}
+    assert context.usage.campaign_spend_microusd == {}
+
+
+def test_active_action_admission_requires_its_reservation(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    projection = project_recovery(
+        lock,
+        [
+            submitted,
+            _reservation(lock, action, 1),
+            new_event(
+                subject_type="campaign",
+                subject_id=lock.campaign_id,
+                kind="action.succeeded",
+                producer="reconciler",
+                payload=ActionOutcomePayload(action_id=action.action_id),
+                clock=lambda: NOW + timedelta(seconds=2),
+                identifier=lambda: "2" * 32,
+            ),
+        ],
+    )
+
+    with pytest.raises(
+        CampaignApplyError,
+        match=f"^action event has no reservation record: {action.action_id}$",
+    ):
+        _active_action_admissions(projection, {})
+
+
+def test_closed_action_wave_releases_reservation_admission(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    assert action.wave_id is not None
+    run = lock.runs[0]
+    projection_events = [
+        submitted,
+        _reservation(lock, action, 1),
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="action.succeeded",
+            producer="reconciler",
+            payload=ActionOutcomePayload(action_id=action.action_id),
+            clock=lambda: NOW + timedelta(seconds=2),
+            identifier=lambda: "2" * 32,
+        ),
+        new_event(
+            subject_type="wave",
+            subject_id=action.wave_id,
+            kind="wave.closed",
+            producer="wave-controller",
+            payload=WaveLifecyclePayload(
+                deployment_digest=action.deployment_digest,
+                provider=action.provider,
+                shard_ids=action.shard_ids,
+                estimated_cost_microusd=action.estimated_cost_microusd or 0,
+            ),
+            clock=lambda: NOW + timedelta(seconds=3),
+            identifier=lambda: "3" * 32,
+        ),
+    ]
+    projection = project_recovery(lock, projection_events)
+    reservations = {action.action_id: action}
+    baseline = ReconcileContext(
+        usage=AdmissionUsage(
+            global_active_waves=2,
+            deployment_active_waves={run.deployment_digest: 2},
+        )
+    )
+
+    assert _active_action_admissions(projection, reservations) == []
+    assert (
+        _context_with_unobserved_actions(
+            lock, projection_events, reservations, baseline
+        )
+        == baseline
+    )
+
+
+def test_nonbillable_and_unfinished_actions_do_not_consume_admission(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    billable = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    ignored = billable.model_copy(
+        update={
+            "action_id": "act-ignored",
+            "action_key": "ignored",
+            "kind": "publish-results",
+            "wave_id": None,
+        }
+    )
+    events = [
+        submitted,
+        _reservation(lock, ignored, 1),
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="action.succeeded",
+            producer="reconciler",
+            payload=ActionOutcomePayload(action_id=ignored.action_id),
+            clock=lambda: NOW + timedelta(seconds=2),
+            identifier=lambda: "2" * 32,
+        ),
+        _reservation(lock, billable, 3),
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="action.succeeded",
+            producer="reconciler",
+            payload=ActionOutcomePayload(action_id=billable.action_id),
+            clock=lambda: NOW + timedelta(seconds=4),
+            identifier=lambda: "4" * 32,
+        ),
+    ]
+
+    assert _active_action_admissions(
+        project_recovery(lock, events),
+        {ignored.action_id: ignored, billable.action_id: billable},
+    ) == [
+        (
+            billable.wave_id,
+            billable.deployment_digest,
+            billable.provider,
+            billable.estimated_cost_microusd or 0,
+        )
+    ]
+
+
+def test_observed_open_action_wave_is_not_double_counted(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    assert action.wave_id is not None
+    events = [
+        submitted,
+        _reservation(lock, action, 1),
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="action.succeeded",
+            producer="reconciler",
+            payload=ActionOutcomePayload(action_id=action.action_id),
+            clock=lambda: NOW + timedelta(seconds=2),
+            identifier=lambda: "2" * 32,
+        ),
+        new_event(
+            subject_type="wave",
+            subject_id=action.wave_id,
+            kind="wave.active",
+            producer="wave-controller",
+            payload=WaveLifecyclePayload(
+                deployment_digest=action.deployment_digest,
+                provider=action.provider,
+                shard_ids=action.shard_ids,
+                estimated_cost_microusd=action.estimated_cost_microusd or 0,
+            ),
+            clock=lambda: NOW + timedelta(seconds=3),
+            identifier=lambda: "3" * 32,
+        ),
+    ]
+    baseline = ReconcileContext(usage=AdmissionUsage(global_active_waves=4))
+
+    assert (
+        _context_with_unobserved_actions(
+            lock, events, {action.action_id: action}, baseline
+        )
+        == baseline
+    )
+
+
+def test_retry_action_uses_its_explicit_wave_admission_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, _request, submitted = _campaign(remote_spec)
+    submit = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    retry = submit.model_copy(
+        update={
+            "action_id": "act-retry-explicit",
+            "action_key": "retry-explicit",
+            "kind": "retry-shard",
+            "wave_id": "wave-explicit",
+            "trial_ids": [lock.runs[0].shards[0].trials[0].trial_id],
+        }
+    )
+    events = [
+        submitted,
+        _reservation(lock, retry, 1),
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="action.ambiguous",
+            producer="reconciler",
+            payload=ActionOutcomePayload(action_id=retry.action_id),
+            clock=lambda: NOW + timedelta(seconds=2),
+            identifier=lambda: "2" * 32,
+        ),
+    ]
+
+    assert _active_action_admissions(
+        project_recovery(lock, events), {retry.action_id: retry}
+    ) == [
+        (
+            "wave-explicit",
+            retry.deployment_digest,
+            retry.provider,
+            retry.estimated_cost_microusd or 0,
+        )
+    ]
 
 
 def _reservation(
