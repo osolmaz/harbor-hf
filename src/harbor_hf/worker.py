@@ -1434,9 +1434,10 @@ def probe_runtime(
                 "status": "unknown",
                 "error_type": type(caught).__name__,
             }
-    health = probes["health"]
-    if not isinstance(health, Mapping) or health.get("http_status") != 200:
-        raise WorkerError("endpoint health probe did not return HTTP 200")
+        if name == "health":
+            health = probes["health"]
+            if not isinstance(health, Mapping) or health.get("http_status") != 200:
+                raise WorkerError("endpoint health probe did not return HTTP 200")
     return {"probes": probes}
 
 
