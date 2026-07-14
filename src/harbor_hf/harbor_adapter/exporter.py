@@ -63,22 +63,22 @@ def export_bundle(
     harbor_revision: str,
     request_digest: str,
 ) -> None:
-    from harbor.models.job.lock import (  # ty: ignore[unresolved-import]
-        JobLock,
-        TrialLock,
-    )
-    from harbor.models.job.result import JobResult  # ty: ignore[unresolved-import]
-    from harbor.models.trial.result import (  # ty: ignore[unresolved-import]
-        TrialResult,
-    )
+    # These modules exist only in the separately pinned Harbor environment.
+    job_lock_module = importlib.import_module("harbor.models.job.lock")
+    job_result_module = importlib.import_module("harbor.models.job.result")
+    trial_result_module = importlib.import_module("harbor.models.trial.result")
+    job_lock_type = job_lock_module.JobLock
+    trial_lock_type = job_lock_module.TrialLock
+    job_result_type = job_result_module.JobResult
+    trial_result_type = trial_result_module.TrialResult
 
     jobs: list[dict[str, Any]] = []
     trials: list[dict[str, Any]] = []
     for job_result_path in sorted(jobs_dir.glob("*/result.json")):
         job_dir = job_result_path.parent
         job_lock_path = job_dir / "lock.json"
-        job_result = JobResult.model_validate_json(job_result_path.read_text())
-        JobLock.model_validate_json(job_lock_path.read_text())
+        job_result = job_result_type.model_validate_json(job_result_path.read_text())
+        job_lock_type.model_validate_json(job_lock_path.read_text())
         jobs.append(
             {
                 "path": _relative(job_dir, jobs_dir),
@@ -92,8 +92,8 @@ def export_bundle(
     for result_path in sorted(jobs_dir.glob("*/*/result.json")):
         trial_dir = result_path.parent
         lock_path = trial_dir / "lock.json"
-        result = TrialResult.model_validate_json(result_path.read_text())
-        lock = TrialLock.model_validate_json(lock_path.read_text())
+        result = trial_result_type.model_validate_json(result_path.read_text())
+        lock = trial_lock_type.model_validate_json(lock_path.read_text())
         model = result.agent_info.model_info
         usage = result.compute_token_cost_totals()
         step_exceptions = [
