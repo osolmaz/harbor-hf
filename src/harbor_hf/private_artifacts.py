@@ -263,7 +263,25 @@ def sanitize_private_artifact_tree(
     files, file_rejections = _remove_oversized_files(root, max_file_bytes)
     rejected.extend(file_rejections)
     rejected.extend(_trim_bundle(files, max_bundle_bytes))
-    rejected.sort(key=lambda rejection: rejection.path)
+    _write_rejections(root, rejected)
+    return rejected
+
+
+def sanitize_private_artifact_symlinks(
+    root: Path,
+) -> list[PrivateArtifactRejection]:
+    """Remove symlinks without applying an aggregate size limit to child trials."""
+    rejected = _load_rejections(root)
+    rejected.extend(_remove_symlinks(root))
+    _write_rejections(root, rejected)
+    return rejected
+
+
+def _write_rejections(root: Path, rejected: list[PrivateArtifactRejection]) -> None:
+    rejected[:] = sorted(
+        {rejection.path: rejection for rejection in rejected}.values(),
+        key=lambda rejection: rejection.path,
+    )
     if rejected:
         write_json(
             root / _REJECTION_FILE,
@@ -272,7 +290,6 @@ def sanitize_private_artifact_tree(
                 "rejections": [item.model_dump(mode="json") for item in rejected],
             },
         )
-    return rejected
 
 
 def _remove_symlinks(root: Path) -> list[PrivateArtifactRejection]:

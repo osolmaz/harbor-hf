@@ -29,6 +29,7 @@ from harbor_hf.worker import (
     _mark_watchdog_ready,
     _prepare_evidence_destination,
     _publish_evidence,
+    _sanitize_direct_trial_artifacts,
     _validate_endpoint_compute,
     _validate_task_counts,
     _validate_trial_count,
@@ -2542,6 +2543,24 @@ def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
         "events.jsonl",
         "harbor-jobs/[REDACTED].log",
     }
+
+
+def test_failed_direct_run_sanitizes_each_trial_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "harbor-jobs" / "job" / "trial-one"
+    second = tmp_path / "harbor-jobs" / "job" / "trial-two"
+    first.mkdir(parents=True)
+    second.mkdir()
+    seen: list[Path] = []
+    monkeypatch.setattr(
+        "harbor_hf.worker.sanitize_private_artifact_tree",
+        lambda root: seen.append(root),
+    )
+
+    _sanitize_direct_trial_artifacts(tmp_path)
+
+    assert seen == [first, second]
 
 
 def test_publish_evidence_requires_one_terminal_marker(

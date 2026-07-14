@@ -69,6 +69,7 @@ from harbor_hf.planner import experiment_digest
 from harbor_hf.private_artifacts import (
     build_private_artifact_manifest,
     openclaw_execution_was_attempted,
+    sanitize_private_artifact_symlinks,
     sanitize_private_artifact_tree,
     write_private_artifact_manifest,
 )
@@ -1167,7 +1168,8 @@ def require_executable(name: str) -> None:
 def _finalize_evidence(root: Path, token: str) -> None:
     failed = (root / "_FAILED").is_file()
     if failed:
-        sanitize_private_artifact_tree(root)
+        _sanitize_direct_trial_artifacts(root)
+        sanitize_private_artifact_symlinks(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
         append_event(
@@ -1189,7 +1191,7 @@ def _finalize_evidence(root: Path, token: str) -> None:
             error_type=refresh_error,
         )
     if failed:
-        sanitize_private_artifact_tree(root)
+        _sanitize_direct_trial_artifacts(root)
     _write_direct_private_artifact_manifests(root, strict_session=not failed)
     assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
@@ -1224,6 +1226,11 @@ def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
             execution_id=lock.run_id,
             trial_id=trial_root.name,
         )
+
+
+def _sanitize_direct_trial_artifacts(root: Path) -> None:
+    for trial_root in _direct_trial_roots(root):
+        sanitize_private_artifact_tree(trial_root)
 
 
 def _direct_trial_roots(root: Path) -> list[Path]:
