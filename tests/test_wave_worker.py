@@ -76,6 +76,14 @@ def test_plain_nonzero_agent_exit_remains_benchmark_failure() -> None:
     assert _execution_failure_category(error, "execution") == "benchmark"
 
 
+def test_benchmark_exception_message_does_not_trigger_transport_retry() -> None:
+    error = HarborTrialFailure(
+        "verifier failed", "AssertionError", "expected timeout handling"
+    )
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
 def test_openclaw_terminal_transport_log_makes_wrapped_exit_retryable(
     tmp_path: Path,
 ) -> None:

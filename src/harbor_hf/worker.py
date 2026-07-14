@@ -763,7 +763,12 @@ def resume_and_probe_endpoint(
     base_url = endpoint_url(snapshot)
     runtime = {
         "controller": controller_environment(lock),
-        "endpoint": probe_runtime(base_url, token, endpoint_health_route(snapshot)),
+        "endpoint": wait_for_runtime(
+            base_url,
+            token,
+            endpoint_health_route(snapshot),
+            timeout_seconds=min(300, readiness_timeout_seconds),
+        ),
     }
     write_json(root / "runtime-environment.json", redact(runtime))
     append_event(events, "runtime_probed")
@@ -1433,6 +1438,29 @@ def probe_runtime(
     if not isinstance(health, Mapping) or health.get("http_status") != 200:
         raise WorkerError("endpoint health probe did not return HTTP 200")
     return {"probes": probes}
+
+
+def wait_for_runtime(
+    base_url: str,
+    token: str,
+    health_route: str,
+    *,
+    timeout_seconds: int,
+    poll_seconds: float = 15,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        try:
+            return probe_runtime(base_url, token, health_route)
+        except WorkerError as error:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise WorkerError(
+                    "endpoint runtime did not become healthy before timeout"
+                ) from error
+            sleep(min(poll_seconds, remaining))
 
 
 def _expected_trial_count(lock: RunLock) -> int:

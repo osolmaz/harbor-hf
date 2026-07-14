@@ -56,6 +56,7 @@ from harbor_hf.worker import (
     validate_endpoint_model,
     validate_harbor_result,
     validate_run_lock,
+    wait_for_runtime,
     wait_watchdog_ready,
 )
 
@@ -2520,6 +2521,56 @@ def test_runtime_probe_requires_healthy_endpoint(
         WorkerError, match="^endpoint health probe did not return HTTP 200$"
     ):
         probe_runtime("https://endpoint.example", "token")
+
+
+def test_runtime_readiness_retries_gateway_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def flaky_probe(*_args: object) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise WorkerError("endpoint health probe did not return HTTP 200")
+        return {"probes": {"health": {"http_status": 200}}}
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", flaky_probe)
+
+    result = wait_for_runtime(
+        "https://endpoint.example",
+        "token",
+        "/health",
+        timeout_seconds=60,
+        poll_seconds=5,
+        sleep=sleeps.append,
+    )
+
+    assert result == {"probes": {"health": {"http_status": 200}}}
+    assert attempts == 3
+    assert sleeps == [5, 5]
+
+
+def test_runtime_readiness_timeout_preserves_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unhealthy(*_args: object) -> dict[str, object]:
+        raise WorkerError("endpoint health probe did not return HTTP 200")
+
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", unhealthy)
+
+    with pytest.raises(
+        WorkerError, match="^endpoint runtime did not become healthy before timeout$"
+    ) as caught:
+        wait_for_runtime(
+            "https://endpoint.example",
+            "token",
+            "/health",
+            timeout_seconds=0,
+        )
+
+    assert isinstance(caught.value.__cause__, WorkerError)
 
 
 def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
