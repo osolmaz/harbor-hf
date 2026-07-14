@@ -181,10 +181,11 @@ def build_private_artifact_manifest(
     for candidate in candidates:
         if candidate.is_symlink():
             raise RuntimeError("private artifact evidence cannot contain symlinks")
-        if not candidate.is_file():
-            continue
         relative = candidate.relative_to(root).as_posix()
         if relative in _DERIVED_FILES:
+            _validate_reserved_path(candidate, relative, trust_rejections)
+            continue
+        if not candidate.is_file():
             continue
         size = candidate.stat().st_size
         if size > max_file_bytes:
@@ -264,6 +265,7 @@ def sanitize_private_artifact_tree(
 ) -> list[PrivateArtifactRejection]:
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
     rejected = _remove_symlinks(root)
+    rejected.extend(_remove_reserved_paths(root))
     rejected.extend(
         _consume_existing_rejections(root, trust_existing=trust_existing_rejections)
     )
@@ -337,6 +339,31 @@ def _consume_existing_rejections(
             size=size,
         )
     ]
+
+
+def _validate_reserved_path(path: Path, relative: str, trust_rejections: bool) -> None:
+    if relative == _REJECTION_FILE and trust_rejections and path.is_file():
+        return
+    raise RuntimeError(
+        f"private artifact contains controller-reserved path: {relative}"
+    )
+
+
+def _remove_reserved_paths(root: Path) -> list[PrivateArtifactRejection]:
+    rejected: list[PrivateArtifactRejection] = []
+    for name in sorted(_DERIVED_FILES - {_REJECTION_FILE}):
+        path = root / name
+        if not path.exists():
+            continue
+        size = path.stat().st_size if path.is_file() else None
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        rejected.append(
+            PrivateArtifactRejection(path=name, reason="reserved_path", size=size)
+        )
+    return rejected
 
 
 def _remove_oversized_files(

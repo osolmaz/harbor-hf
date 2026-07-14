@@ -209,6 +209,47 @@ def test_private_artifact_sanitizer_records_and_removes_rejected_files(
     assert retained.rejections == rejected
 
 
+def test_private_manifest_rejects_controller_reserved_paths(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path)
+    (root / "private-artifacts.json").write_text("x" * 200, encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="controller-reserved path: private-artifacts.json",
+    ):
+        build_private_artifact_manifest(
+            root,
+            strict_session=True,
+            max_file_bytes=100,
+        )
+
+
+def test_private_artifact_sanitizer_removes_reserved_path_collisions(
+    tmp_path: Path,
+) -> None:
+    root = _execution_root(tmp_path)
+    forged_manifest = root / "private-artifacts.json"
+    forged_manifest.write_text("forged", encoding="utf-8")
+    forged_checksums = root / "checksums.json"
+    forged_checksums.mkdir()
+    (forged_checksums / "payload").write_text("hidden", encoding="utf-8")
+
+    rejected = sanitize_private_artifact_tree(root)
+
+    assert [(item.path, item.reason, item.size) for item in rejected] == [
+        ("checksums.json", "reserved_path", None),
+        ("private-artifacts.json", "reserved_path", 6),
+    ]
+    assert not forged_manifest.exists()
+    assert not forged_checksums.exists()
+    retained = build_private_artifact_manifest(
+        root,
+        strict_session=True,
+        trust_rejections=True,
+    )
+    assert retained.rejections == rejected
+
+
 def test_private_artifact_sanitizer_removes_forged_rejection_symlink_first(
     tmp_path: Path,
 ) -> None:
