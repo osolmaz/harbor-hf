@@ -44,6 +44,8 @@ def _bundle(
     task_name = next(iter(policy.expected_task_digests or {}))
     trial: dict[str, object] = {
         "path": "job/trial",
+        "trial_id": "00000000-0000-0000-0000-000000000001",
+        "trial_name": "trial-contract",
         "lock_digest": "sha256:" + "3" * 64,
         "result_digest": "sha256:" + "4" * 64,
         "task_name": task_name,
@@ -55,7 +57,14 @@ def _bundle(
         "exception_type": None,
         "step_exceptions": [],
         "rewards": {"reward": 1.0},
-        "timing": {"started_at": None, "finished_at": None},
+        "timing": {
+            "trial": {"started_at": None, "finished_at": None},
+            "environment_setup": None,
+            "agent_setup": None,
+            "agent_execution": None,
+            "verifier": None,
+            "steps": [],
+        },
         "usage": {
             "input_tokens": 12,
             "cache_tokens": 4,

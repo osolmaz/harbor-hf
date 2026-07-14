@@ -51,6 +51,10 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
         trials.append(
             {
                 "path": trial_dir.relative_to(jobs_dir).as_posix(),
+                "trial_id": str(
+                    result.get("id", "00000000-0000-0000-0000-000000000001")
+                ),
+                "trial_name": str(result.get("trial_name", trial_dir.name)),
                 "lock_digest": digest(lock_path),
                 "result_digest": digest(result_path),
                 "task_name": result["task_name"],
@@ -66,7 +70,14 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
                 ),
                 "step_exceptions": step_exceptions,
                 "rewards": verifier.get("rewards"),
-                "timing": {"started_at": None, "finished_at": None},
+                "timing": {
+                    "trial": {"started_at": None, "finished_at": None},
+                    "environment_setup": None,
+                    "agent_setup": None,
+                    "agent_execution": None,
+                    "verifier": None,
+                    "steps": [],
+                },
                 "usage": {
                     "input_tokens": None,
                     "cache_tokens": None,

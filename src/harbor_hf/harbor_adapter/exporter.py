@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -50,6 +51,10 @@ def _timing(value: TimingValue) -> dict[str, str | None]:
         "started_at": value.started_at.isoformat() if value.started_at else None,
         "finished_at": value.finished_at.isoformat() if value.finished_at else None,
     }
+
+
+def _optional_timing(value: TimingValue | None) -> dict[str, str | None] | None:
+    return _timing(value) if value is not None else None
 
 
 def export_bundle(
@@ -108,6 +113,8 @@ def export_bundle(
         trials.append(
             {
                 "path": _relative(trial_dir, jobs_dir),
+                "trial_id": str(result.id),
+                "trial_name": result.trial_name,
                 "lock_digest": _digest(lock_path),
                 "result_digest": _digest(result_path),
                 "task_name": result.task_name,
@@ -123,7 +130,21 @@ def export_bundle(
                 ),
                 "step_exceptions": step_exceptions,
                 "rewards": rewards,
-                "timing": _timing(result),
+                "timing": {
+                    "trial": _timing(result),
+                    "environment_setup": _optional_timing(result.environment_setup),
+                    "agent_setup": _optional_timing(result.agent_setup),
+                    "agent_execution": _optional_timing(result.agent_execution),
+                    "verifier": _optional_timing(result.verifier),
+                    "steps": [
+                        {
+                            "step_name": step.step_name,
+                            "agent_execution": _optional_timing(step.agent_execution),
+                            "verifier": _optional_timing(step.verifier),
+                        }
+                        for step in (result.step_results or [])
+                    ],
+                },
                 "usage": {
                     "input_tokens": usage[0],
                     "cache_tokens": usage[1],
@@ -154,12 +175,19 @@ def main() -> None:
     parser.add_argument("--harbor-revision", required=True)
     parser.add_argument("--request-digest", required=True)
     args = parser.parse_args()
-    export_bundle(
-        args.jobs_dir,
-        args.output,
-        args.harbor_revision,
-        args.request_digest,
-    )
+    try:
+        export_bundle(
+            args.jobs_dir,
+            args.output,
+            args.harbor_revision,
+            args.request_digest,
+        )
+    except Exception as error:
+        print(
+            f"Harbor compatibility export failed: {type(error).__name__}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

@@ -71,6 +71,21 @@ class HarborTimingSummary(FrozenModel):
     finished_at: str | None = None
 
 
+class HarborStepTiming(FrozenModel):
+    step_name: str
+    agent_execution: HarborTimingSummary | None = None
+    verifier: HarborTimingSummary | None = None
+
+
+class HarborTrialTiming(FrozenModel):
+    trial: HarborTimingSummary
+    environment_setup: HarborTimingSummary | None = None
+    agent_setup: HarborTimingSummary | None = None
+    agent_execution: HarborTimingSummary | None = None
+    verifier: HarborTimingSummary | None = None
+    steps: list[HarborStepTiming] = Field(default_factory=list)
+
+
 class HarborUsageSummary(FrozenModel):
     input_tokens: int | None = Field(default=None, ge=0)
     cache_tokens: int | None = Field(default=None, ge=0)
@@ -85,6 +100,8 @@ class HarborStepException(FrozenModel):
 
 class HarborCompatibilityTrial(FrozenModel):
     path: str = Field(min_length=1)
+    trial_id: str = Field(min_length=1)
+    trial_name: str = Field(min_length=1)
     lock_digest: Sha256Digest
     result_digest: Sha256Digest
     task_name: str = Field(min_length=1)
@@ -96,7 +113,7 @@ class HarborCompatibilityTrial(FrozenModel):
     exception_type: str | None = None
     step_exceptions: list[HarborStepException] = Field(default_factory=list)
     rewards: dict[str, int | float] | None = None
-    timing: HarborTimingSummary
+    timing: HarborTrialTiming
     usage: HarborUsageSummary
     artifacts: list[HarborArtifactEntry]
 
