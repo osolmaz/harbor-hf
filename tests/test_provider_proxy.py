@@ -427,11 +427,11 @@ def test_proxy_preserves_encoding_and_decodes_evidence(
 
 
 @pytest.mark.parametrize(
-    ("encoding", "delimiter"),
-    [("gzip", b"\n"), (None, b"\r")],
+    ("encoding", "delimiter", "compression"),
+    [("gzip", b"\n", "gzip"), ("deflate", b"\n", "raw"), (None, b"\r", None)],
 )
 def test_ttft_probe_decodes_compression_and_accepts_bare_cr(
-    encoding: str | None, delimiter: bytes
+    encoding: str | None, delimiter: bytes, compression: str | None
 ) -> None:
     stream = delimiter.join(
         [
@@ -441,7 +441,13 @@ def test_ttft_probe_decodes_compression_and_accepts_bare_cr(
             b"",
         ]
     )
-    content = gzip.compress(stream) if encoding == "gzip" else stream
+    if compression == "gzip":
+        content = gzip.compress(stream)
+    elif compression == "raw":
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        content = compressor.compress(stream) + compressor.flush()
+    else:
+        content = stream
     headers = {"content-encoding": encoding} if encoding is not None else {}
 
     class FragmentedStream(httpx.SyncByteStream):

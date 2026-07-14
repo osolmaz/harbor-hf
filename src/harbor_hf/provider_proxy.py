@@ -317,10 +317,17 @@ class _ZlibDecoder(_Decoder):
     def __init__(self, *, gzip: bool = False, deflate: bool = False) -> None:
         self._deflate = deflate
         self._first_attempt = True
+        self._initial_prefix = bytearray()
         window = zlib.MAX_WBITS | 16 if gzip else zlib.MAX_WBITS
         self._decompressor = zlib.decompressobj(window)
 
     def decode(self, content: bytes, max_output: int) -> bytes:
+        if self._deflate and self._first_attempt:
+            self._initial_prefix.extend(content)
+            if len(self._initial_prefix) < 2:
+                return b""
+            content = bytes(self._initial_prefix)
+            self._initial_prefix.clear()
         first_attempt = self._first_attempt
         self._first_attempt = False
         try:

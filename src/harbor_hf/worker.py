@@ -14,6 +14,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol, cast
@@ -24,7 +25,6 @@ from pydantic import JsonValue
 from harbor_hf.coordination import (
     ClaimConflict,
     ClaimStore,
-    CoordinationError,
     HubClaimStore,
     endpoint_claim_path,
     run_claim_path,
@@ -482,6 +482,9 @@ def run_worker(
         "artifact_bucket": lock.artifact_bucket,
         "artifact_prefix": lock.artifact_prefix,
         "run_id": lock.run_id,
+        "expires_at": (
+            datetime.now(UTC) + timedelta(seconds=lock.remote.job.timeout_seconds + 600)
+        ).isoformat(),
     }
     try:
         claims.acquire(claim_path, claim_owner)
@@ -509,7 +512,7 @@ def run_worker(
         if not entered_worker or not any(
             (destination / marker).is_file() for marker in ("_SUCCESS", "_FAILED")
         ):
-            with suppress(CoordinationError):
+            with suppress(Exception):
                 claims.release(claim_path, claim_owner)
         raise
 

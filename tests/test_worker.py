@@ -2923,6 +2923,38 @@ def test_worker_refuses_existing_run_prefix_before_remote_work(
     assert runner.commands == []
 
 
+def test_failed_run_claim_release_cannot_mask_failure_and_claim_expires(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingReleaseClaims(FakeClaimStore):
+        def release(self, path: str, owner: Mapping[str, str]) -> None:
+            del path, owner
+            raise RuntimeError("release transport failed")
+
+    lock = build_run_lock(remote_spec, run_id="release-failed")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    destination = tmp_path / "output" / lock.artifact_prefix
+    destination.mkdir(parents=True)
+    claims = FailingReleaseClaims()
+
+    with pytest.raises(FileExistsError):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=EndpointRunner([]),
+            claim_store=claims,
+        )
+
+    assert len(claims.acquired) == 1
+    assert "expires_at" in claims.acquired[0][1]
+
+
 def test_worker_rejects_incomplete_explicit_task_set(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
