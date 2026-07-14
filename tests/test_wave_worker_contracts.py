@@ -14,7 +14,7 @@ from test_wave_worker import _provider_wave_inputs
 import harbor_hf.wave_worker as wave_worker
 from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveLock, WaveRunLock
 from harbor_hf.coordination import ClaimConflict
-from harbor_hf.evidence import write_checksums
+from harbor_hf.evidence import verify_checksums, write_checksums
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import RunLock
@@ -129,6 +129,18 @@ def _rewrite_summary(trial: Path, **updates: object) -> None:
 def test_valid_terminal_trial_accepts_exact_success_evidence(tmp_path: Path) -> None:
     trial, expected, _execution = _terminal_trial(tmp_path)
     assert _valid_terminal_trial(trial, expected, **IDENTITY) is True
+
+
+def test_valid_terminal_trial_finishes_interrupted_marker_publication(
+    tmp_path: Path,
+) -> None:
+    trial, expected, _execution = _terminal_trial(tmp_path)
+    (trial / "_SUCCESS").unlink()
+
+    assert _valid_terminal_trial(trial, expected, **IDENTITY) is True
+
+    assert (trial / "_SUCCESS").read_text(encoding="utf-8") == "\n"
+    verify_checksums(trial)
 
 
 def test_valid_terminal_trial_returns_false_without_evidence(tmp_path: Path) -> None:
@@ -432,6 +444,137 @@ def test_publish_unit_publishes_all_files_and_marker(tmp_path: Path) -> None:
     assert (destination / "nested" / "inner.log").read_text(encoding="utf-8") == "log\n"
 
 
+def test_publish_unit_recovers_interrupted_destination_with_new_contents(
+    tmp_path: Path,
+) -> None:
+    source = _finalized_unit(tmp_path / "retry", "_FAILED")
+    (source / "top.json").write_text('{"attempt": 2}\n', encoding="utf-8")
+    write_checksums(source)
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / "top.json").write_text('{"attempt": 1}\n', encoding="utf-8")
+    (destination / "abandoned.tmp").write_text("partial\n", encoding="utf-8")
+
+    _publish_unit(source, destination)
+
+    assert (destination / "top.json").read_text(encoding="utf-8") == (
+        '{"attempt": 2}\n'
+    )
+    assert not (destination / "abandoned.tmp").exists()
+    assert verify_checksums(destination) == verify_checksums(source)
+    assert (destination / "_FAILED").is_file()
+
+
+@pytest.mark.parametrize("marker", ["_SUCCESS", "_FAILED", "_CANCELLED"])
+def test_publish_unit_rejects_complete_terminal_destination(
+    tmp_path: Path, marker: str
+) -> None:
+    source = _finalized_unit(tmp_path / "source", "_SUCCESS")
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / marker).write_text("terminal\n", encoding="utf-8")
+
+    with pytest.raises(WorkerError, match="cannot be overwritten"):
+        _publish_unit(source, destination)
+
+    assert (destination / marker).read_text(encoding="utf-8") == "terminal\n"
+
+
+def test_publish_unit_verifies_destination_before_terminal_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _finalized_unit(tmp_path / "source", "_SUCCESS")
+    destination = tmp_path / "published"
+    original_replace = wave_worker.os.replace
+
+    def corrupt_after_replace(temporary: Path, published: Path) -> None:
+        original_replace(temporary, published)
+        if published == destination / "top.json":
+            published.write_text("corrupted\n", encoding="utf-8")
+
+    monkeypatch.setattr(wave_worker.os, "replace", corrupt_after_replace)
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        _publish_unit(source, destination)
+
+    assert not (destination / "_SUCCESS").exists()
+
+
+def _finalized_execution(root: Path, execution_id: str, marker: str) -> Path:
+    execution = root / "executions" / execution_id
+    execution.mkdir(parents=True)
+    (execution / "events.jsonl").write_text(
+        f'{{"execution_id": "{execution_id}"}}\n', encoding="utf-8"
+    )
+    write_checksums(execution)
+    (execution / marker).write_text("\n", encoding="utf-8")
+    return execution
+
+
+def test_publish_unit_recovers_trial_around_immutable_terminal_executions(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-trial"
+    prior_source = _finalized_execution(source, "exec-prior", "_FAILED")
+    _finalized_execution(source, "exec-new", "_SUCCESS")
+    (source / "trial-summary.json").write_text(
+        '{"execution_id": "exec-new"}\n', encoding="utf-8"
+    )
+    write_checksums(source)
+    (source / "_SUCCESS").write_text("\n", encoding="utf-8")
+
+    destination = tmp_path / "published-trial"
+    prior_destination = _finalized_execution(destination, "exec-prior", "_FAILED")
+    abandoned = destination / "executions" / "exec-abandoned"
+    abandoned.mkdir()
+    (abandoned / "events.jsonl").write_text("partial\n", encoding="utf-8")
+    (destination / "trial-summary.json").write_text(
+        '{"execution_id": "exec-old"}\n', encoding="utf-8"
+    )
+    prior_checksum = _file_digest(prior_destination / "events.jsonl")
+
+    _publish_unit(source, destination)
+
+    assert not abandoned.exists()
+    assert _file_digest(prior_destination / "events.jsonl") == prior_checksum
+    assert _trees_equal(prior_source, prior_destination)
+    assert (destination / "executions" / "exec-new" / "_SUCCESS").is_file()
+    assert (destination / "_SUCCESS").is_file()
+    verify_checksums(destination)
+
+
+def test_publish_unit_rejects_changed_terminal_nested_execution(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-trial"
+    source_execution = _finalized_execution(source, "exec-prior", "_FAILED")
+    (source_execution / "events.jsonl").write_text("new\n", encoding="utf-8")
+    write_checksums(source_execution)
+    write_checksums(source)
+    (source / "_SUCCESS").write_text("\n", encoding="utf-8")
+    destination = tmp_path / "published-trial"
+    _finalized_execution(destination, "exec-prior", "_FAILED")
+
+    with pytest.raises(WorkerError, match="cannot be overwritten"):
+        _publish_unit(source, destination)
+
+    assert not (destination / "_SUCCESS").exists()
+
+
+def _trees_equal(first: Path, second: Path) -> bool:
+    first_files = {
+        path.relative_to(first): path.read_bytes()
+        for path in first.rglob("*")
+        if path.is_file()
+    }
+    second_files = {
+        path.relative_to(second): path.read_bytes()
+        for path in second.rglob("*")
+        if path.is_file()
+    }
+    return first_files == second_files
+
+
 def test_publish_unit_requires_exactly_one_marker(tmp_path: Path) -> None:
     unmarked = tmp_path / "unmarked"
     unmarked.mkdir()
@@ -495,11 +638,15 @@ def test_prepare_trial_recovery_refuses_terminal_destination(
     assert not (tmp_path / "trial").exists()
 
 
-def test_prepare_trial_recovery_copies_prior_executions(tmp_path: Path) -> None:
+def test_prepare_trial_recovery_copies_terminal_prior_executions(
+    tmp_path: Path,
+) -> None:
     destination = tmp_path / "destination"
     executions = destination / "executions" / "exec-prior"
     executions.mkdir(parents=True)
     (executions / "harbor.log").write_text("prior\n", encoding="utf-8")
+    write_checksums(executions)
+    (executions / "_FAILED").write_text("{}\n", encoding="utf-8")
     trial_root = tmp_path / "trial"
 
     _prepare_trial_recovery(destination, trial_root)
@@ -507,6 +654,32 @@ def test_prepare_trial_recovery_copies_prior_executions(tmp_path: Path) -> None:
     assert (trial_root / "executions" / "exec-prior" / "harbor.log").read_text(
         encoding="utf-8"
     ) == "prior\n"
+
+
+def test_prepare_trial_recovery_removes_interrupted_execution(tmp_path: Path) -> None:
+    execution = tmp_path / "destination" / "executions" / "exec-abandoned"
+    execution.mkdir(parents=True)
+    (execution / "events.jsonl").write_text("partial\n", encoding="utf-8")
+    trial_root = tmp_path / "trial"
+
+    _prepare_trial_recovery(tmp_path / "destination", trial_root)
+
+    assert not execution.exists()
+    assert list((trial_root / "executions").iterdir()) == []
+
+
+def test_prepare_trial_recovery_rejects_corrupt_terminal_execution(
+    tmp_path: Path,
+) -> None:
+    execution = tmp_path / "destination" / "executions" / "exec-corrupt"
+    execution.mkdir(parents=True)
+    (execution / "events.jsonl").write_text("original\n", encoding="utf-8")
+    write_checksums(execution)
+    (execution / "_SUCCESS").write_text("\n", encoding="utf-8")
+    (execution / "events.jsonl").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(WorkerError, match="failed checksum validation"):
+        _prepare_trial_recovery(tmp_path / "destination", tmp_path / "trial")
 
 
 def test_prepare_trial_recovery_creates_empty_trial_root(tmp_path: Path) -> None:

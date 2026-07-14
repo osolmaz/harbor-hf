@@ -118,6 +118,8 @@ _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
     ("configuration", ("badrequest", "notfound", "configuration")),
 )
 
+_TERMINAL_MARKERS = ("_SUCCESS", "_FAILED", "_CANCELLED")
+
 
 class LockedSubmitWaveAction(FrozenModel):
     action_id: str
@@ -899,13 +901,31 @@ def _valid_terminal_trial(
 ) -> bool:
     if not path.exists():
         return False
-    markers = [
-        name
-        for name in ("_SUCCESS", "_FAILED", "_CANCELLED")
-        if (path / name).is_file()
-    ]
+    markers = _terminal_markers(path)
     if not markers:
-        return False
+        required = (
+            "checksums.json",
+            "trial.lock.json",
+            "trial-summary.json",
+        )
+        if not all((path / name).is_file() for name in required):
+            return False
+        _validate_terminal_trial(
+            path,
+            expected,
+            campaign_id=campaign_id,
+            wave_id=wave_id,
+            run_id=run_id,
+            shard_id=shard_id,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="harbor-hf-trial-marker-"
+        ) as marker_directory:
+            marker = Path(marker_directory) / "_SUCCESS"
+            marker.write_text("\n", encoding="utf-8")
+            _publish_immutable_file(marker, path / marker.name)
+        verify_checksums(path)
+        return True
     if markers != ["_SUCCESS"]:
         raise WorkerError("terminal trial evidence is not a valid success")
     _validate_terminal_trial(
@@ -1001,15 +1021,20 @@ def _validate_execution_identity(
 
 
 def _prepare_trial_recovery(destination: Path, trial_root: Path) -> None:
-    if any(
-        (destination / marker).is_file()
-        for marker in ("_SUCCESS", "_FAILED", "_CANCELLED")
-    ):
+    if _terminal_markers(destination):
         raise WorkerError("terminal trial evidence cannot be overwritten")
     trial_root.mkdir(parents=True, exist_ok=True)
     existing = destination / "executions"
-    if existing.is_dir():
-        shutil.copytree(existing, trial_root / "executions")
+    if not existing.exists():
+        return
+    terminal = _terminal_execution_directories(destination)
+    recovered = trial_root / "executions"
+    recovered.mkdir()
+    for execution in sorted(existing.iterdir()):
+        if execution.name in terminal:
+            shutil.copytree(execution, recovered / execution.name)
+        else:
+            _remove_path(execution)
 
 
 def _trial_destination(
@@ -1053,22 +1078,129 @@ def _redact_unit(root: Path, token: str) -> None:
 
 
 def _publish_unit(source: Path, destination: Path) -> None:
-    markers = [
-        name
-        for name in ("_SUCCESS", "_FAILED", "_CANCELLED")
-        if (source / name).is_file()
-    ]
+    markers = _terminal_markers(source)
     if len(markers) != 1:
         raise WorkerError("finalized wave evidence must have one terminal marker")
     verify_checksums(source)
+    if _terminal_markers(destination):
+        raise WorkerError("terminal evidence destination cannot be overwritten")
     destination.mkdir(parents=True, exist_ok=True)
-    marker_paths = {source / marker for marker in markers}
-    for path in sorted(source.rglob("*")):
-        if path.is_dir() or path in marker_paths:
-            continue
+    protected_executions = _recover_partial_publication(source, destination)
+    marker_path = source / markers[0]
+    files = [path for path in source.rglob("*") if path.is_file()]
+    nested_markers = {
+        path for path in files if path != marker_path and path.name in _TERMINAL_MARKERS
+    }
+    ordered = sorted(
+        path for path in files if path != marker_path and path not in nested_markers
+    )
+    ordered.extend(
+        sorted(nested_markers, key=lambda path: (-len(path.parts), str(path)))
+    )
+    for path in ordered:
         relative = path.relative_to(source)
+        if any(
+            relative.is_relative_to(protected) for protected in protected_executions
+        ):
+            continue
         _publish_immutable_file(path, destination / relative)
-    _publish_immutable_file(source / markers[0], destination / markers[0])
+    verify_checksums(destination)
+    _publish_immutable_file(marker_path, destination / marker_path.name)
+    verify_checksums(destination)
+
+
+def _recover_partial_publication(source: Path, destination: Path) -> set[Path]:
+    """Remove interrupted content while preserving immutable child executions."""
+    terminal = _terminal_execution_directories(destination)
+    protected: set[Path] = set()
+    for name, (execution, marker) in terminal.items():
+        _require_matching_execution(source, name, execution, marker)
+        protected.add(Path("executions") / name)
+    _remove_unprotected_destination(destination, protected)
+    return protected
+
+
+def _terminal_execution_directories(
+    root: Path,
+) -> dict[str, tuple[Path, str]]:
+    executions = root / "executions"
+    if not executions.exists():
+        return {}
+    if executions.is_symlink() or not executions.is_dir():
+        raise WorkerError("partial execution publication is invalid")
+    terminal: dict[str, tuple[Path, str]] = {}
+    for execution in sorted(executions.iterdir()):
+        if execution.is_symlink() or not execution.is_dir():
+            continue
+        markers = _terminal_markers(execution)
+        if markers:
+            _verify_terminal_execution(execution, markers)
+            terminal[execution.name] = (execution, markers[0])
+    return terminal
+
+
+def _verify_terminal_execution(execution: Path, markers: list[str]) -> None:
+    if len(markers) != 1:
+        raise WorkerError("terminal execution evidence has conflicting markers")
+    try:
+        verify_checksums(execution)
+    except RuntimeError as error:
+        raise WorkerError(
+            "terminal execution evidence failed checksum validation"
+        ) from error
+
+
+def _require_matching_execution(
+    source: Path,
+    name: str,
+    observed: Path,
+    marker: str,
+) -> None:
+    expected = source / "executions" / name
+    if not expected.is_dir():
+        raise WorkerError("terminal execution evidence cannot be overwritten")
+    expected_markers = _terminal_markers(expected)
+    _verify_terminal_execution(expected, expected_markers)
+    if expected_markers != [marker] or not _trees_match(observed, expected):
+        raise WorkerError("terminal execution evidence cannot be overwritten")
+
+
+def _remove_unprotected_destination(destination: Path, protected: set[Path]) -> None:
+    for path in sorted(destination.iterdir()):
+        if path.name != "executions":
+            _remove_path(path)
+            continue
+        for execution in sorted(path.iterdir()):
+            relative = Path("executions") / execution.name
+            if relative not in protected:
+                _remove_path(execution)
+        if not any(path.iterdir()):
+            path.rmdir()
+
+
+def _trees_match(first: Path, second: Path) -> bool:
+    first_files = {
+        path.relative_to(first): _file_digest(path)
+        for path in first.rglob("*")
+        if path.is_file()
+    }
+    second_files = {
+        path.relative_to(second): _file_digest(path)
+        for path in second.rglob("*")
+        if path.is_file()
+    }
+    return first_files == second_files
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _terminal_markers(root: Path) -> list[str]:
+    return [name for name in _TERMINAL_MARKERS if (root / name).is_file()]
 
 
 def _publish_immutable_file(source: Path, destination: Path) -> None:
@@ -1096,10 +1228,7 @@ def _publish_digest_sidecar(source: Path, destination: Path) -> None:
 
 
 def _reject_terminal_wave(destination: Path) -> None:
-    if any(
-        (destination / marker).is_file()
-        for marker in ("_SUCCESS", "_FAILED", "_CANCELLED")
-    ):
+    if _terminal_markers(destination):
         raise WorkerError("deployment wave already has terminal evidence")
 
 
