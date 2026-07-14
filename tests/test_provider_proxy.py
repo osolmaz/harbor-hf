@@ -70,9 +70,10 @@ def test_proxy_forwards_stream_and_records_content_free_provider_evidence(
         client=upstream_client,
     )
     base_url = proxy.start()
+    scoped_url = proxy.scoped_base_url(base_url, "trial-one")
     try:
         response = httpx.post(
-            f"{base_url}/v1/chat/completions",
+            f"{scoped_url}/v1/chat/completions",
             json={
                 "model": "ignored/model",
                 "messages": [{"role": "user", "content": "private benchmark prompt"}],
@@ -298,28 +299,31 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
         client=upstream_client,
     )
     base_url = proxy.start()
+    throttled_url = proxy.scoped_base_url(base_url, "trial-throttled")
+    complete_url = proxy.scoped_base_url(base_url, "trial-complete")
+    timeout_url = proxy.scoped_base_url(base_url, "trial-timeout")
     with pytest.raises(ProviderProxyError, match="already running"):
         proxy.start()
     try:
         invalid_route = httpx.post(f"{base_url}/unsupported", json={}, timeout=5)
         invalid_message = httpx.post(
-            f"{base_url}/v1/chat/completions", json={"messages": {}}, timeout=5
+            f"{complete_url}/v1/chat/completions", json={"messages": {}}, timeout=5
         )
         responses = [
             httpx.post(
-                f"{base_url}/v1/chat/completions",
+                f"{url}/v1/chat/completions",
                 json={
                     "model": "ignored",
                     "messages": [{"role": "user", "content": content}],
                 },
                 timeout=5,
             )
-            for content in (
-                "PRIVATE_THROTTLE",
-                "PRIVATE_THROTTLE",
-                "PRIVATE_THROTTLE",
-                "PRIVATE_COMPLETE",
-                "PRIVATE_TIMEOUT",
+            for url, content in (
+                (throttled_url, "PRIVATE_THROTTLE"),
+                (throttled_url, "PRIVATE_THROTTLE"),
+                (throttled_url, "PRIVATE_THROTTLE"),
+                (complete_url, "PRIVATE_COMPLETE"),
+                (timeout_url, "PRIVATE_TIMEOUT"),
             )
         ]
     finally:

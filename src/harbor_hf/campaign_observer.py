@@ -376,10 +376,11 @@ def _wave_events(
             identity=f"{wave.wave_id}:active",
         )
     ]
-    cleanup_failed = any(
-        record.get("event") == "endpoint_cleanup_failed" for record in records
+    cleanup_incomplete = any(
+        record.get("event") in {"endpoint_cleanup_failed", "endpoint_cleanup_skipped"}
+        for record in records
     )
-    if cleanup_failed:
+    if cleanup_incomplete:
         events.append(
             _event(
                 campaign,

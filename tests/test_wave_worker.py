@@ -486,7 +486,8 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     assert wave.spend_cap_microusd == 2_500_000
     assert runner.commands == []
     assert harbor.max_active == 2
-    assert len(set(harbor.base_urls)) == 1
+    assert len(set(harbor.base_urls)) == 2
+    assert all("/scopes/trial-" in base_url for base_url in harbor.base_urls)
     assert all(
         command[command.index("--model") + 1] == f"openai/{routed_model}"
         for command in harbor.commands

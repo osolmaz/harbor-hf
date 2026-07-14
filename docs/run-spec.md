@@ -147,8 +147,9 @@ one deployment wave, must not exceed the cap, and is preserved in the campaign
 and wave locks. It remains charged after closure when provider billing is not
 attributable, so missing observations cannot reopen spent budget. It is not
 presented as observed provider billing. Provider
-`limits.max_attempts` is a hard forwarding limit for identical requests, not
-only an evidence label.
+`limits.max_attempts` is a hard forwarding limit for identical requests within
+one logical trial, not only an evidence label. Independent trials have separate
+retry budgets even when their request payloads are identical.
 
 The endpoint deployment shape supports independent engines such as vLLM and
 llama.cpp. The discriminated Inference Provider profile covers models that are

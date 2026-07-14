@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -28,6 +29,10 @@ from harbor_hf.providers import (
 
 _MAX_REQUEST_BYTES = 32 * 1024 * 1024
 _MAX_EVIDENCE_RESPONSE_BYTES = 32 * 1024 * 1024
+_REQUEST_SCOPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SCOPED_COMPLETIONS = re.compile(
+    r"^/scopes/(?P<scope>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/v1/chat/completions/?$"
+)
 _FORWARDED_RESPONSE_HEADERS = {
     "content-type",
     "retry-after",
@@ -75,7 +80,7 @@ class ProviderEvidenceProxy:
         self.client = client or httpx.Client()
         self._owns_client = client is None
         self._lock = threading.Lock()
-        self._attempts: dict[str, int] = {}
+        self._attempts: dict[tuple[str, str], int] = {}
         self._request_counter = 0
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -121,13 +126,20 @@ class ProviderEvidenceProxy:
         if self._owns_client:
             self.client.close()
 
+    @staticmethod
+    def scoped_base_url(base_url: str, scope: str) -> str:
+        if not _REQUEST_SCOPE.fullmatch(scope):
+            raise ValueError("provider request scope is invalid")
+        return f"{base_url.rstrip('/')}/scopes/{scope}"
+
     def _handle(self, handler: BaseHTTPRequestHandler) -> None:
-        if handler.path.rstrip("/") != "/v1/chat/completions":
+        scope = _request_scope(handler.path)
+        if scope is None:
             self._send_json(handler, 404, {"error": "unsupported provider route"})
             return
         try:
             payload = self._read_request(handler)
-            request, attempt = self._request(payload)
+            request, attempt = self._request(payload, scope=scope)
             forwarded = _forwarded_payload(self.target, payload)
         except (ProviderProxyError, ValidationError, ValueError) as error:
             self._send_json(handler, 400, {"error": str(error)})
@@ -198,7 +210,7 @@ class ProviderEvidenceProxy:
         )
 
     def _request(
-        self, payload: dict[str, JsonValue]
+        self, payload: dict[str, JsonValue], *, scope: str
     ) -> tuple[ProviderChatRequest, int]:
         request_digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -206,11 +218,12 @@ class ProviderEvidenceProxy:
         with self._lock:
             self._request_counter += 1
             request = _provider_request(payload, f"provider-{self._request_counter}")
-            previous_attempts = self._attempts.get(request_digest, 0)
+            attempt_key = (scope, request_digest)
+            previous_attempts = self._attempts.get(attempt_key, 0)
             if previous_attempts >= self.target.limits.max_attempts:
                 raise ProviderProxyError("provider request attempt budget is exhausted")
             attempt = previous_attempts + 1
-            self._attempts[request_digest] = attempt
+            self._attempts[attempt_key] = attempt
         return request, attempt
 
     def _record(self, value: dict[str, object]) -> None:
@@ -241,6 +254,11 @@ def _json_object(content: bytes) -> dict[str, JsonValue]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ProviderProxyError("provider request must be a JSON object")
     return cast(dict[str, JsonValue], value)
+
+
+def _request_scope(path: str) -> str | None:
+    matched = _SCOPED_COMPLETIONS.fullmatch(path)
+    return matched.group("scope") if matched is not None else None
 
 
 def _relay_response(

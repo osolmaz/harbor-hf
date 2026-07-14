@@ -795,6 +795,25 @@ def test_observe_skips_non_terminal_units_and_handles_cleanup_failures(
     )
     assert cleanup_event.observed_at == datetime(2026, 7, 14, 1, 19, tzinfo=UTC)
 
+    skipped = dict(files)
+    skipped[f"{wave_prefix}/events.jsonl"] = _wave_events_lines(
+        {"event": "wave_started", "at": "2026-07-14T01:10:00+00:00"},
+        {"event": "endpoint_cleanup_skipped", "at": "2026-07-14T01:18:00+00:00"},
+        {"event": "wave_failed", "at": "2026-07-14T01:19:00+00:00"},
+    )
+    skipped[f"{wave_prefix}/checksums.json"] = _pretty(
+        {
+            "wave.lock.json": _sha(files[f"{wave_prefix}/wave.lock.json"]),
+            "events.jsonl": _sha(skipped[f"{wave_prefix}/events.jsonl"]),
+            "wave-summary.json": _sha(b"{}\n"),
+        }
+    )
+    events = BucketCampaignObserver(_Reader(skipped)).observe(lock, remote_spec)
+    assert [event.kind for event in events if event.subject_type == "wave"] == [
+        "wave.active",
+        "wave.cleanup-failed",
+    ]
+
     no_pause = dict(files)
     no_pause[f"{wave_prefix}/events.jsonl"] = _wave_events_lines(
         {"event": "wave_started", "at": "2026-07-14T01:10:00+00:00"},

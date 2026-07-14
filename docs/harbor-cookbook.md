@@ -168,9 +168,10 @@ is active and conservatively retains it after the wave closes. Observed spend
 is additive until the provider reports enough attribution to replace a wave's
 reservation safely. This fails closed instead of letting missing billing data
 reset the campaign budget.
-`max_attempts` is also enforced at the proxy boundary: an identical request
-beyond the configured attempt count is rejected locally and is never forwarded
-or billed.
+`max_attempts` is also enforced at the proxy boundary per logical trial: an
+identical request beyond that trial's configured attempt count is rejected
+locally and is never forwarded or billed. Identical requests from independent
+trials do not share a retry budget.
 
 Do not infer a hidden engine, image, region, hardware, precision, cache policy,
 or token count. Endpoint-only fields must be `not_applicable` and unreported

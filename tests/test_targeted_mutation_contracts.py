@@ -531,19 +531,22 @@ def test_provider_proxy_attempt_identity_budget_and_recording_are_deterministic(
     )
     payload: dict[str, JsonValue] = {"messages": [{"role": "user", "content": "same"}]}
 
-    first, first_attempt = proxy._request(payload)
-    second, second_attempt = proxy._request(payload)
+    first, first_attempt = proxy._request(payload, scope="trial-one")
+    second, second_attempt = proxy._request(payload, scope="trial-one")
     different, different_attempt = proxy._request(
-        {"messages": [{"role": "user", "content": "different"}]}
+        {"messages": [{"role": "user", "content": "different"}]},
+        scope="trial-one",
     )
+    independent, independent_attempt = proxy._request(payload, scope="trial-two")
 
     assert (first.request_id, first_attempt) == ("provider-1", 1)
     assert (second.request_id, second_attempt) == ("provider-2", 2)
     assert (different.request_id, different_attempt) == ("provider-3", 1)
+    assert (independent.request_id, independent_attempt) == ("provider-4", 1)
     with pytest.raises(ProviderProxyError, match="attempt budget is exhausted"):
-        proxy._request(payload)
-    assert proxy._request_counter == 4
-    assert sorted(proxy._attempts.values()) == [1, 2]
+        proxy._request(payload, scope="trial-one")
+    assert proxy._request_counter == 5
+    assert sorted(proxy._attempts.values()) == [1, 1, 2]
 
     evidence_path.parent.mkdir(parents=True)
     proxy._record({"z": "é", "a": 1})

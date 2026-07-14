@@ -798,10 +798,15 @@ def _execute_trial(
         "configuration"
     )
     try:
+        trial_base_url = (
+            ProviderEvidenceProxy.scoped_base_url(base_url, trial.trial_id)
+            if isinstance(wave.target, ProviderWaveTarget)
+            else base_url
+        )
         command = build_harbor_trial_command(
             run,
             jobs_dir,
-            base_url,
+            trial_base_url,
             harbor_source,
             task_name=trial.task_name,
         )
@@ -813,7 +818,7 @@ def _execute_trial(
             environment={
                 "HF_TOKEN": token,
                 "OPENAI_API_KEY": token,
-                "OPENAI_BASE_URL": f"{base_url}/v1",
+                "OPENAI_BASE_URL": f"{trial_base_url}/v1",
             },
             timeout_seconds=timeout,
         )
