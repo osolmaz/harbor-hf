@@ -7,7 +7,20 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+ArtifactKind = Literal[
+    "agent_log",
+    "configuration",
+    "execution_log",
+    "lock",
+    "other",
+    "result",
+    "runtime",
+    "session",
+    "trajectory",
+    "verifier",
+]
 
 
 class TimingValue(Protocol):
@@ -30,6 +43,59 @@ def _relative(path: Path, root: Path) -> str:
     return value
 
 
+def classify_private_artifact(path: str) -> ArtifactKind:
+    relative = Path(path)
+    if (
+        not relative.parts
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != path
+    ):
+        raise ValueError("Harbor artifact path is not safely relative")
+    parts = tuple(part.lower() for part in relative.parts)
+    name = parts[-1]
+    component_kinds: tuple[tuple[str, ArtifactKind], ...] = (
+        ("openclaw-sessions", "session"),
+        ("trajectories", "trajectory"),
+        ("verifier", "verifier"),
+    )
+    for component, kind in component_kinds:
+        if component in parts:
+            return kind
+    exact_kinds: dict[str, ArtifactKind] = {
+        "openclaw.session.jsonl": "session",
+        "reward.txt": "verifier",
+        "ctrf.json": "verifier",
+        "result.json": "result",
+        "verification.json": "result",
+        "failure.json": "result",
+        "manifest.yaml": "configuration",
+        "harbor-job.json": "configuration",
+        "harbor-request.json": "configuration",
+    }
+    if name in exact_kinds:
+        return exact_kinds[name]
+    return _classify_named_artifact(parts, name)
+
+
+def _classify_named_artifact(parts: tuple[str, ...], name: str) -> ArtifactKind:
+    if "trajectory" in name:
+        return "trajectory"
+    if name.endswith(".lock.json") or name == "lock.json":
+        return "lock"
+    if "agent" in parts and (
+        name.endswith(".log") or name.endswith(".txt") or name == "exception.txt"
+    ):
+        return "agent_log"
+    if name.endswith(".log") or name in {"job.log", "trial.log"}:
+        return "execution_log"
+    if name.endswith(".json") and ("config" in name or "openclaw.upload" in name):
+        return "configuration"
+    if "runtime" in name or "endpoint" in name:
+        return "runtime"
+    return "other"
+
+
 def _artifacts(trial_dir: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for path in sorted(trial_dir.rglob("*")):
@@ -41,6 +107,8 @@ def _artifacts(trial_dir: Path) -> list[dict[str, Any]]:
                     "path": _relative(path, trial_dir),
                     "size": path.stat().st_size,
                     "digest": _digest(path),
+                    "kind": classify_private_artifact(_relative(path, trial_dir)),
+                    "classification": "private",
                 }
             )
     return entries
@@ -208,7 +276,7 @@ def export_bundle(
             }
         )
     bundle = {
-        "schema_version": "harbor-hf/harbor-compatibility/v1alpha1",
+        "schema_version": "harbor-hf/harbor-compatibility/v1alpha2",
         "harbor_revision": harbor_revision,
         "harbor_version": importlib.metadata.version("harbor"),
         "request_digest": request_digest,

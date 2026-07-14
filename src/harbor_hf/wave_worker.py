@@ -53,6 +53,7 @@ from harbor_hf.harbor_adapter import (
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.private_artifacts import write_private_artifact_manifest
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.provider_models import (
     ProviderEndpointEvidence,
@@ -1123,6 +1124,7 @@ def _finalize_execution(
             "compatibility_refresh_skipped",
             error_type=refresh_error,
         )
+    write_private_artifact_manifest(root, strict_session=strict_compatibility)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
     write_checksums(root)

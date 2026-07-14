@@ -266,6 +266,7 @@ campaigns/<campaign-id>/
         events.jsonl
         harbor.log
         harbor-jobs/
+        private-artifacts.json
         artifacts.tar.gz
         checksums.json
         _SUCCESS or _FAILED or _CANCELLED
@@ -280,6 +281,15 @@ campaigns/<campaign-id>/
 Every summary references child checksums. A parent terminal marker is written
 only after all required child markers and cleanup evidence are present. Existing
 single-run artifact prefixes remain readable and are never rewritten.
+
+`private-artifacts.json` is the terminal private inventory for one physical
+execution. It records sorted relative paths, logical kinds, byte sizes, SHA-256
+digests, and private publication classification. Files are limited to 64 MiB
+each and 512 MiB per execution. Symbolic links and unsafe paths are rejected.
+Successful OpenClaw executions require at least one session JSONL; handled
+failures still publish the requirement and its satisfaction state for diagnosis.
+The compressed Harbor archive is deterministic and the execution checksum
+manifest covers both the inventory and archive.
 
 ## Reconciliation Algorithm
 

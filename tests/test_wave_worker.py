@@ -63,6 +63,10 @@ def test_failed_execution_retains_malformed_compatibility_evidence(
 ) -> None:
     (tmp_path / "harbor-jobs").mkdir()
     (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
     (tmp_path / "harbor-compatibility.json").write_text("{", encoding="utf-8")
 
     _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
@@ -412,6 +416,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "harbor-request.json",
             "harbor.log",
             "manifest.yaml",
+            "private-artifacts.json",
             "verification.json",
         ]
         execution = json.loads(

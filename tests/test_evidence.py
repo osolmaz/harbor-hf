@@ -172,6 +172,24 @@ def test_evidence_operations_reject_symlinks(tmp_path: Path) -> None:
     assert outside.read_text(encoding="utf-8") == "secret-value"
 
 
+def test_archive_is_deterministic_and_preserves_relative_tree(tmp_path: Path) -> None:
+    source = tmp_path / "harbor-jobs"
+    nested = source / "job" / "trial"
+    nested.mkdir(parents=True)
+    artifact = nested / "session.jsonl"
+    artifact.write_text("{}\n", encoding="utf-8")
+    first = tmp_path / "first.tar.gz"
+    second = tmp_path / "second.tar.gz"
+
+    archive_directory(source, first)
+    artifact.touch()
+    archive_directory(source, second)
+
+    assert first.read_bytes() == second.read_bytes()
+    with tarfile.open(first, "r:gz") as archive:
+        assert "harbor-jobs/job/trial/session.jsonl" in archive.getnames()
+
+
 def test_secret_scrubbing_streams_across_chunk_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

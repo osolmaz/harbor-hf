@@ -312,6 +312,8 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/manifest.yaml",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/private-artifacts.json",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/verification.json",
         f"waves/{wave.wave_id}/_SUCCESS",
         f"waves/{wave.wave_id}/checksums.json",
@@ -348,6 +350,23 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         {"event": "execution_succeeded"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
     ]
+    private_artifacts = json.loads(
+        (execution_root / "private-artifacts.json").read_text(encoding="utf-8")
+    )
+    assert private_artifacts["schema_version"] == "harbor-hf/private-artifacts/v1"
+    assert private_artifacts["execution_id"] == execution_id
+    assert private_artifacts["trial_id"] == trial.trial_id
+    assert private_artifacts["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": False,
+            "satisfied": False,
+        }
+    ]
+    assert all(
+        entry["classification"] == "private" for entry in private_artifacts["entries"]
+    )
     assert _events(trial_root / "events.jsonl") == [{"event": "trial_succeeded"}]
     assert _events(shard_root / "events.jsonl") == [
         {"event": "shard_started", "shard_id": shard.shard_id},

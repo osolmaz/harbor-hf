@@ -66,6 +66,19 @@ class HarborArtifactEntry(FrozenModel):
     path: str = Field(min_length=1)
     size: int = Field(ge=0)
     digest: Sha256Digest
+    kind: Literal[
+        "agent_log",
+        "configuration",
+        "execution_log",
+        "lock",
+        "other",
+        "result",
+        "runtime",
+        "session",
+        "trajectory",
+        "verifier",
+    ]
+    classification: Literal["private"] = "private"
 
 
 class HarborTimingSummary(FrozenModel):
@@ -130,8 +143,8 @@ class HarborCompatibilityJob(FrozenModel):
 
 
 class HarborCompatibilityBundle(FrozenModel):
-    schema_version: Literal["harbor-hf/harbor-compatibility/v1alpha1"] = (
-        "harbor-hf/harbor-compatibility/v1alpha1"
+    schema_version: Literal["harbor-hf/harbor-compatibility/v1alpha2"] = (
+        "harbor-hf/harbor-compatibility/v1alpha2"
     )
     harbor_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     harbor_version: str = Field(min_length=1)
