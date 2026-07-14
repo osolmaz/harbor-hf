@@ -370,14 +370,21 @@ def validate_private_artifact_directory_files(
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
     max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
+    allowed_directories: tuple[str, ...] | None = None,
 ) -> None:
     """Validate only files directly inside a directory, excluding child bundles."""
+    allowed = (
+        None
+        if allowed_directories is None
+        else {_direct_directory_name(name) for name in allowed_directories}
+    )
     total_bytes = 0
     file_count = 0
     for candidate in sorted(root.iterdir()):
         if candidate.is_symlink():
             raise RuntimeError("private artifact evidence cannot contain symlinks")
         if candidate.is_dir():
+            _validate_direct_directory(candidate, allowed)
             continue
         if not candidate.is_file():
             raise RuntimeError(
@@ -396,6 +403,13 @@ def validate_private_artifact_directory_files(
             raise RuntimeError("private artifact bundle exceeds file count limit")
 
 
+def _validate_direct_directory(candidate: Path, allowed: set[str] | None) -> None:
+    if allowed is not None and candidate.name not in allowed:
+        raise RuntimeError(
+            f"private artifact has unexpected directory: {candidate.name}"
+        )
+
+
 def sanitize_private_artifact_directory_files(
     root: Path,
     *,
@@ -405,10 +419,13 @@ def sanitize_private_artifact_directory_files(
     required_directories: tuple[str, ...] = (),
     preserved_files: tuple[str, ...] = (),
     max_file_count: int = DEFAULT_MAX_PRIVATE_ARTIFACT_FILES,
+    allowed_directories: tuple[str, ...] | None = None,
 ) -> list[PrivateArtifactRejection]:
     """Bound direct files without charging independently bounded child bundles."""
     preserved = {_direct_file_name(relative) for relative in preserved_files}
     rejected = _remove_required_directory_collisions(root, required_directories)
+    rejected.extend(_remove_reserved_paths(root, preserved=preserved))
+    rejected.extend(_remove_unexpected_directories(root, allowed_directories))
     existing_rejections, omitted_count = _consume_existing_rejections(
         root, trust_existing=trust_existing_rejections
     )
@@ -604,6 +621,13 @@ def _direct_file_name(relative: str) -> str:
     return relative
 
 
+def _direct_directory_name(relative: str) -> str:
+    path = _safe_relative_path(relative)
+    if len(path.parts) != 1 or relative in _DERIVED_FILES:
+        raise ValueError("allowed artifact directory must be a direct child")
+    return relative
+
+
 def _consume_existing_rejections(
     root: Path, *, trust_existing: bool
 ) -> tuple[list[PrivateArtifactRejection], int]:
@@ -637,19 +661,50 @@ def _validate_reserved_path(path: Path, relative: str, trust_rejections: bool) -
     )
 
 
-def _remove_reserved_paths(root: Path) -> list[PrivateArtifactRejection]:
+def _remove_reserved_paths(
+    root: Path, *, preserved: set[str] | frozenset[str] = frozenset()
+) -> list[PrivateArtifactRejection]:
     rejected: list[PrivateArtifactRejection] = []
-    for name in sorted(_DERIVED_FILES - {_REJECTION_FILE}):
+    for name in sorted(_DERIVED_FILES - {_REJECTION_FILE} - preserved):
         path = root / name
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             continue
-        size = path.stat().st_size if path.is_file() else None
-        if path.is_dir():
+        is_symlink = path.is_symlink()
+        size = path.stat().st_size if path.is_file() and not is_symlink else None
+        if path.is_dir() and not is_symlink:
             shutil.rmtree(path)
         else:
             path.unlink()
         rejected.append(
-            PrivateArtifactRejection(path=name, reason="reserved_path", size=size)
+            PrivateArtifactRejection(
+                path=name,
+                reason="symlink" if is_symlink else "reserved_path",
+                size=size,
+            )
+        )
+    return rejected
+
+
+def _remove_unexpected_directories(
+    root: Path, allowed_directories: tuple[str, ...] | None
+) -> list[PrivateArtifactRejection]:
+    if allowed_directories is None:
+        return []
+    allowed = {_direct_directory_name(name) for name in allowed_directories}
+    rejected: list[PrivateArtifactRejection] = []
+    for candidate in sorted(root.iterdir()):
+        if (
+            candidate.is_symlink()
+            or not candidate.is_dir()
+            or candidate.name in allowed
+        ):
+            continue
+        shutil.rmtree(candidate)
+        rejected.append(
+            PrivateArtifactRejection(
+                path=candidate.name,
+                reason="reserved_path",
+            )
         )
     return rejected
 

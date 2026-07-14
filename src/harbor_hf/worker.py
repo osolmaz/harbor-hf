@@ -1170,6 +1170,7 @@ def require_executable(name: str) -> None:
 
 def _finalize_evidence(root: Path, token: str) -> None:
     failed = (root / "_FAILED").is_file()
+    fallback_attempted = openclaw_execution_was_attempted(root)
     rejection_count = 0
     if failed:
         sanitize_private_artifact_symlinks(root, max_depth=3)
@@ -1179,6 +1180,7 @@ def _finalize_evidence(root: Path, token: str) -> None:
                 trust_existing_rejections=True,
                 required_directories=("harbor-jobs",),
                 preserved_files=("_FAILED",),
+                allowed_directories=("harbor-jobs",),
             )
         )
         (root / "harbor-jobs").mkdir(exist_ok=True)
@@ -1210,6 +1212,7 @@ def _finalize_evidence(root: Path, token: str) -> None:
                 trust_existing_rejections=True,
                 required_directories=("harbor-jobs",),
                 preserved_files=("_FAILED",),
+                allowed_directories=("harbor-jobs",),
             )
         )
         (root / "harbor-jobs").mkdir(exist_ok=True)
@@ -1224,20 +1227,37 @@ def _finalize_evidence(root: Path, token: str) -> None:
                     "compatibility_refresh_skipped",
                     error_type=refresh_error,
                 )
-    _write_direct_private_artifact_manifests(root, strict_session=not failed)
+    _validate_retained_direct_artifacts(root, failed=failed)
+    _write_direct_private_artifact_manifests(
+        root,
+        strict_session=not failed,
+        fallback_attempted=fallback_attempted,
+    )
     assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     write_checksums(root)
 
 
+def _validate_retained_direct_artifacts(root: Path, *, failed: bool) -> None:
+    if not failed:
+        _validate_direct_artifact_directories(root)
+
+
 def _write_direct_private_artifact_manifests(
-    root: Path, *, strict_session: bool
+    root: Path,
+    *,
+    strict_session: bool,
+    fallback_attempted: bool | None = None,
 ) -> None:
     lock_path = root / "run.lock.json"
     if not lock_path.is_file():
         return
     lock = RunLock.model_validate_json(lock_path.read_text(encoding="utf-8"))
-    attempted = openclaw_execution_was_attempted(root)
+    attempted = (
+        openclaw_execution_was_attempted(root)
+        if fallback_attempted is None
+        else fallback_attempted
+    )
     for trial_root in _direct_trial_roots(root):
         trial_id = _direct_trial_id(root, trial_root, strict=strict_session)
         write_private_artifact_manifest(
@@ -1253,13 +1273,7 @@ def _write_direct_private_artifact_manifests(
 
 
 def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
-    jobs_root = root / "harbor-jobs"
-    if jobs_root.is_symlink() or not jobs_root.is_dir():
-        raise RuntimeError("private artifact Harbor jobs root is not a directory")
-    validate_private_artifact_directory_files(root)
-    validate_private_artifact_directory_files(jobs_root)
-    for job_root in _direct_job_roots(root):
-        validate_private_artifact_directory_files(job_root)
+    _validate_direct_artifact_directories(root)
     for trial_root in _direct_trial_roots(root):
         build_private_artifact_manifest(
             trial_root,
@@ -1267,6 +1281,18 @@ def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
             execution_id=lock.run_id,
             trial_id=_direct_trial_id(root, trial_root, strict=True),
         )
+
+
+def _validate_direct_artifact_directories(root: Path) -> None:
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        raise RuntimeError("private artifact Harbor jobs root is not a directory")
+    validate_private_artifact_directory_files(
+        root, allowed_directories=("harbor-jobs",)
+    )
+    validate_private_artifact_directory_files(jobs_root)
+    for job_root in _direct_job_roots(root):
+        validate_private_artifact_directory_files(job_root)
 
 
 def _direct_trial_id(root: Path, trial_root: Path, *, strict: bool) -> str:

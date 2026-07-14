@@ -16,7 +16,11 @@ from conftest import write_fake_compatibility_bundle
 from harbor_hf.coordination import ClaimConflict, run_claim_path
 from harbor_hf.harbor_adapter import build_execution_request
 from harbor_hf.models import DeploymentProfile, ExperimentSpec, SourcePin
-from harbor_hf.private_artifacts import sanitize_private_artifact_symlinks
+from harbor_hf.private_artifacts import (
+    PrivateArtifactRejection,
+    sanitize_private_artifact_directory_files,
+    sanitize_private_artifact_symlinks,
+)
 from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
@@ -2548,7 +2552,7 @@ def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
 
 
 def test_failed_finalize_recreates_rejected_jobs_symlink(tmp_path: Path) -> None:
-    outside = tmp_path / "outside"
+    outside = tmp_path.with_name(f"{tmp_path.name}-outside")
     outside.mkdir()
     jobs = tmp_path / "harbor-jobs"
     jobs.symlink_to(outside, target_is_directory=True)
@@ -2584,6 +2588,70 @@ def test_failed_finalize_recreates_rejected_jobs_file(tmp_path: Path) -> None:
         {"path": "harbor-jobs", "reason": "reserved_path", "size": 9}
     ]
     assert (tmp_path / "artifacts.tar.gz").is_file()
+
+
+def test_failed_finalize_removes_forged_success_marker(tmp_path: Path) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+    (tmp_path / "_SUCCESS").write_text("forged", encoding="utf-8")
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    assert not (tmp_path / "_SUCCESS").exists()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert {item["path"] for item in rejection["rejections"]} == {"_SUCCESS"}
+
+
+def test_direct_run_rejects_unexpected_root_directory(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    (extra / "unbounded.log").write_text("evidence", encoding="utf-8")
+    lock = build_run_lock(remote_spec, run_id="unexpected-root-directory")
+
+    with pytest.raises(RuntimeError, match="unexpected directory: extra"):
+        _validate_direct_private_artifacts(tmp_path, lock)
+
+
+def test_failed_finalize_removes_unexpected_root_directory(tmp_path: Path) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    (extra / "unbounded.log").write_text("evidence", encoding="utf-8")
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    assert not extra.exists()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert {item["path"] for item in rejection["rejections"]} == {"extra"}
+
+
+def test_success_finalize_revalidates_late_root_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+
+    def refresh(root: Path, *, strict: bool) -> None:
+        assert strict is True
+        with (root / "late.log").open("wb") as stream:
+            stream.truncate(64 * 1024 * 1024 + 1)
+
+    monkeypatch.setattr("harbor_hf.worker.refresh_retained_bundle", refresh)
+
+    with pytest.raises(RuntimeError, match="file size limit: late.log"):
+        _finalize_evidence(tmp_path, "test-token")
 
 
 def test_direct_jobs_root_files_are_bounded(
@@ -2638,6 +2706,72 @@ def test_failed_direct_run_falls_back_from_undecodable_result(
     )
     assert manifest["execution_id"] == "undecodable-result"
     assert manifest["trial_id"] == "trial-fallback"
+
+
+def test_failed_direct_run_preserves_attempt_state_before_pruning(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trial = tmp_path / "harbor-jobs" / "job" / "trial-fallback"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text("{", encoding="utf-8")
+    (tmp_path / "run.lock.json").write_text(
+        build_run_lock(remote_spec, run_id="pruned-attempt").model_dump_json(),
+        encoding="utf-8",
+    )
+    (tmp_path / "harbor-request.json").write_text(
+        json.dumps({"verification": {"expected_agent_name": "openclaw"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps({"event": "harbor_started"}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+    pruned = False
+
+    def sanitize(
+        root: Path,
+        *,
+        trust_existing_rejections: bool = False,
+        required_directories: tuple[str, ...] = (),
+        preserved_files: tuple[str, ...] = (),
+        allowed_directories: tuple[str, ...] | None = None,
+    ) -> list[PrivateArtifactRejection]:
+        nonlocal pruned
+        if root == tmp_path and not pruned:
+            pruned = True
+            (root / "harbor-request.json").unlink()
+            (root / "events.jsonl").unlink()
+        return sanitize_private_artifact_directory_files(
+            root,
+            trust_existing_rejections=trust_existing_rejections,
+            required_directories=required_directories,
+            preserved_files=preserved_files,
+            allowed_directories=allowed_directories,
+        )
+
+    monkeypatch.setattr(
+        "harbor_hf.worker.sanitize_private_artifact_directory_files", sanitize
+    )
+    monkeypatch.setattr(
+        "harbor_hf.worker.refresh_retained_bundle", lambda _root, *, strict: None
+    )
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    manifest = json.loads(
+        (trial / "private-artifacts.json").read_text(encoding="utf-8")
+    )
+    assert manifest["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": True,
+            "satisfied": False,
+        }
+    ]
 
 
 def test_failed_direct_run_sanitizes_each_trial_independently(
