@@ -278,7 +278,7 @@ def _decode_evidence_response(
         decoded = _decode_bounded_content(decoder, content)
     except httpx.DecodingError:
         return headers, content, True
-    if not decoder.truncated and not decoder.complete:
+    if decoder.truncated or not decoder.complete:
         return headers, content, True
     decoded_headers = httpx.Headers(
         [
@@ -339,7 +339,7 @@ class _ZlibDecoder(_Decoder):
 
     @property
     def complete(self) -> bool:
-        return self._decompressor.eof
+        return self._decompressor.eof and not self._decompressor.unused_data
 
 
 class _BoundedContentDecoder:

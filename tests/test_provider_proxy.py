@@ -482,13 +482,12 @@ def test_evidence_decoder_bounds_high_ratio_compressed_content(
     monkeypatch.setattr(provider_proxy, "_MAX_EVIDENCE_RESPONSE_BYTES", 64)
     headers = httpx.Headers({"content-encoding": "gzip"})
 
-    decoded_headers, decoded, invalid = _decode_evidence_response(
-        headers, gzip.compress(b"x" * 4096)
-    )
+    content = gzip.compress(b"x" * 4096)
+    decoded_headers, decoded, invalid = _decode_evidence_response(headers, content)
 
-    assert "content-encoding" not in decoded_headers
-    assert decoded == b"x" * 64
-    assert invalid is False
+    assert decoded_headers == headers
+    assert decoded == content
+    assert invalid is True
 
 
 def test_evidence_decoder_preserves_unknown_or_malformed_encoding() -> None:
@@ -527,6 +526,19 @@ def test_evidence_decoder_rejects_compressed_body_without_eof(
 ) -> None:
     headers = httpx.Headers({"content-encoding": encoding})
     content = encoded(b'{"choices":[]}')[:-1]
+
+    observed_headers, observed_content, invalid = _decode_evidence_response(
+        headers, content
+    )
+
+    assert observed_headers == headers
+    assert observed_content == content
+    assert invalid is True
+
+
+def test_evidence_decoder_rejects_trailing_gzip_member() -> None:
+    headers = httpx.Headers({"content-encoding": "gzip"})
+    content = gzip.compress(b'{"first":true}') + gzip.compress(b'{"second":true}')
 
     observed_headers, observed_content, invalid = _decode_evidence_response(
         headers, content
