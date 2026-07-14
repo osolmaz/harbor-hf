@@ -61,13 +61,16 @@ def validate_compatibility_bundle(
             raise HarborVerificationFailure(
                 f"Harbor trial {trial.task_name} task digest does not match the lock"
             )
-        failure = _trial_failure(trial.exception_type, trial.step_exceptions)
+        failure = _trial_failure(
+            trial.exception_type, trial.exception_message, trial.step_exceptions
+        )
         if failure is not None:
-            location, exception_type = failure
+            location, exception_type, exception_message = failure
             raise HarborTrialFailure(
                 f"Harbor trial {trial.task_name}{location} failed with "
                 f"{exception_type}",
                 exception_type,
+                exception_message,
             )
         if (
             trial.agent_name != policy.expected_agent_name
@@ -134,13 +137,15 @@ def _validate_task_counts(
 
 
 def _trial_failure(
-    exception_type: str | None, step_exceptions: list[HarborStepException]
-) -> tuple[str, str] | None:
+    exception_type: str | None,
+    exception_message: str | None,
+    step_exceptions: list[HarborStepException],
+) -> tuple[str, str, str | None] | None:
     if exception_type is not None:
-        return "", exception_type
+        return "", exception_type, exception_message
     if step_exceptions:
         step = step_exceptions[0]
         name = step.step_name
         kind = step.exception_type
-        return f" step {name}", kind
+        return f" step {name}", kind, step.exception_message
     return None

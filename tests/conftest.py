@@ -35,6 +35,7 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
                 "exception_type": step["exception_info"].get(
                     "exception_type", "malformed result"
                 ),
+                "exception_message": step["exception_info"].get("exception_message"),
             }
             for index, step in enumerate(result.get("step_results") or [], start=1)
             if isinstance(step, dict) and isinstance(step.get("exception_info"), dict)
@@ -73,6 +74,11 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
                     if isinstance(exception, dict)
                     else None
                 ),
+                "exception_message": (
+                    exception.get("exception_message")
+                    if isinstance(exception, dict)
+                    else None
+                ),
                 "step_exceptions": step_exceptions,
                 "rewards": verifier.get("rewards"),
                 "timing": {
@@ -93,7 +99,7 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
             }
         )
     bundle = {
-        "schema_version": "harbor-hf/harbor-compatibility/v1alpha2",
+        "schema_version": "harbor-hf/harbor-compatibility/v1alpha3",
         "harbor_revision": command[command.index("--harbor-revision") + 1],
         "harbor_version": "test",
         "request_digest": command[command.index("--request-digest") + 1],

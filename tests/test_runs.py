@@ -5,12 +5,13 @@ import pytest
 from harbor_hf.models import (
     DeploymentProfile,
     ExperimentSpec,
+    GitBenchmarkSource,
     MatrixRule,
     _validate_remote_input_pins,
     _validate_task_pins,
 )
 from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.runs import build_run_lock
+from harbor_hf.runs import RunLock, build_run_lock, harbor_process_environment
 
 NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 
@@ -35,6 +36,80 @@ def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     assert lock.attempts == 1
     assert lock.concurrent_trials == 1
     assert lock.timeout_seconds == 60
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha1"
+
+
+def test_build_run_lock_preserves_git_benchmark_source(
+    remote_spec: ExperimentSpec,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"dataset": "shellbench/public-115", "source": source}
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"] = benchmark.model_dump(mode="python", exclude={"dataset_digest"})
+    spec = ExperimentSpec.model_validate(raw)
+
+    lock = build_run_lock(spec)
+
+    assert lock.benchmark_source == source
+    assert lock.benchmark_dataset_digest == spec.benchmark.dataset_digest
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
+
+
+def test_run_lock_preserves_and_renders_hosted_judge(
+    remote_spec: ExperimentSpec,
+) -> None:
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["judge"] = {
+        "api_url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "deepseek-ai/DeepSeek-V3.2",
+    }
+    spec = ExperimentSpec.model_validate(raw)
+
+    lock = build_run_lock(spec, run_id="judge-lock")
+    environment = harbor_process_environment(
+        lock, token="secret-token", inference_base_url="https://endpoint.example/"
+    )
+
+    assert lock.benchmark_judge == spec.benchmark.judge
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
+    assert environment == {
+        "AGENT_JUDGE_API_KEY": "secret-token",
+        "AGENT_JUDGE_API_URL": "https://router.huggingface.co/v1/chat/completions",
+        "AGENT_JUDGE_MODEL": "deepseek-ai/DeepSeek-V3.2",
+        "HF_TOKEN": "secret-token",
+        "OPENAI_API_KEY": "secret-token",
+        "OPENAI_BASE_URL": "https://endpoint.example/v1",
+    }
+
+
+def test_run_lock_reader_accepts_legacy_v1alpha1(remote_spec: ExperimentSpec) -> None:
+    payload = build_run_lock(remote_spec, run_id="legacy-lock").model_dump(mode="json")
+    payload.pop("benchmark_source", None)
+    payload.pop("benchmark_judge", None)
+
+    lock = RunLock.model_validate(payload)
+
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha1"
+    assert lock.benchmark_source is None
+    assert lock.benchmark_judge is None
+
+
+def test_run_lock_v1alpha1_rejects_new_fields(remote_spec: ExperimentSpec) -> None:
+    payload = build_run_lock(remote_spec, run_id="legacy-lock").model_dump(mode="json")
+    payload["benchmark_source"] = {
+        "repository": "ShellBench/public-tasks",
+        "revision": "8" * 40,
+        "path": "tasks/115-tasks",
+    }
+
+    with pytest.raises(ValueError, match="v1alpha1 cannot contain"):
+        RunLock.model_validate(payload)
 
 
 def test_run_id_override_is_preserved(remote_spec: ExperimentSpec) -> None:

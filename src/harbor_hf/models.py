@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from fnmatch import fnmatch
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 from harbor_hf.evidence import is_sensitive_key
 from harbor_hf.provider_models import ProviderTarget
@@ -38,9 +49,84 @@ class Metadata(StrictModel):
     labels: dict[str, str] = Field(default_factory=dict)
 
 
+class GitBenchmarkSource(StrictModel):
+    type: Literal["git"] = "git"
+    repository: GitHubRepository
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    path: str = Field(min_length=1)
+
+    @field_validator("repository", mode="before")
+    @classmethod
+    def canonicalize_repository(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        repository = value.removeprefix("https://github.com/")
+        return repository.removesuffix(".git")
+
+    @field_validator("path")
+    @classmethod
+    def path_is_safely_relative(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or path.as_posix() != value
+            or value in {"", "."}
+        ):
+            raise ValueError("Git benchmark path must be safely relative")
+        return value
+
+
+def git_benchmark_source_digest(source: GitBenchmarkSource) -> str:
+    payload = json.dumps(
+        source.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+class BenchmarkJudgeSpec(StrictModel):
+    protocol: Literal["openai-compatible"] = "openai-compatible"
+    api_url: AnyHttpUrl
+    model: str = Field(min_length=1)
+    api_key_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
+
+    @field_validator("api_url")
+    @classmethod
+    def api_url_is_secure(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        if (
+            value.scheme != "https"
+            or value.username is not None
+            or value.password
+            or value.query is not None
+            or value.fragment is not None
+            or value.host != "router.huggingface.co"
+            or value.port != 443
+        ):
+            raise ValueError(
+                "benchmark judge API URL must be credential-free HTTPS on the "
+                "trusted Hugging Face router"
+            )
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def model_is_canonical(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("benchmark judge model cannot have surrounding whitespace")
+        return value
+
+
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
     dataset_digest: ContentDigest | None = None
+    source: GitBenchmarkSource | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    judge: BenchmarkJudgeSpec | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
     task_digests: dict[TaskName, ContentDigest] = Field(default_factory=dict)
 
@@ -48,6 +134,18 @@ class BenchmarkSpec(StrictModel):
     def benchmark_contract_is_consistent(self) -> BenchmarkSpec:
         if len(self.task_names) != len(set(self.task_names)):
             raise ValueError("benchmark task names must be unique")
+        if self.source is not None:
+            if "@" in self.dataset:
+                raise ValueError(
+                    "Git-backed benchmark dataset names cannot contain a reference"
+                )
+            source_digest = git_benchmark_source_digest(self.source)
+            if self.dataset_digest is not None and self.dataset_digest != source_digest:
+                raise ValueError(
+                    "benchmark dataset digest must match its immutable Git source"
+                )
+            self.dataset_digest = source_digest
+            return self
         _, reference = _split_dataset_reference(self.dataset)
         if reference is not None and reference.startswith("sha256:"):
             if _SHA256_DIGEST.fullmatch(reference) is None:
@@ -291,9 +389,10 @@ class ExperimentSpec(StrictModel):
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
-    pinned_harbor_dataset_reference(
-        spec.benchmark.dataset, spec.benchmark.dataset_digest
-    )
+    if spec.benchmark.source is None:
+        pinned_harbor_dataset_reference(
+            spec.benchmark.dataset, spec.benchmark.dataset_digest
+        )
     _validate_task_pins(spec.benchmark)
     if any(
         re.fullmatch(r"[0-9a-f]{40}", model.revision) is None

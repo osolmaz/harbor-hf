@@ -26,7 +26,7 @@ from harbor_hf.campaigns import (
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import verify_checksums, write_checksums
-from harbor_hf.harbor_adapter import HarborVerificationFailure
+from harbor_hf.harbor_adapter import HarborTrialFailure, HarborVerificationFailure
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner
 from harbor_hf.provider_models import ProviderLimits, ProviderTarget
@@ -56,6 +56,90 @@ def test_verification_failure_is_terminal_benchmark_evidence() -> None:
     error = HarborVerificationFailure("task digest does not match")
 
     assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_wrapped_endpoint_server_error_without_log_remains_benchmark_failure() -> None:
+    error = HarborTrialFailure(
+        "agent failed",
+        "NonZeroAgentExitCodeError",
+        'provider response status=500: "500 Internal Server Error"',
+    )
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_plain_nonzero_agent_exit_remains_benchmark_failure() -> None:
+    error = HarborTrialFailure(
+        "agent failed", "NonZeroAgentExitCodeError", "command exited with status 1"
+    )
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_benchmark_exception_message_does_not_trigger_transport_retry() -> None:
+    error = HarborTrialFailure(
+        "verifier failed", "AssertionError", "expected timeout handling"
+    )
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_agent_output_keywords_do_not_trigger_transport_retry() -> None:
+    error = HarborTrialFailure(
+        "agent failed",
+        "NonZeroAgentExitCodeError",
+        "command asked to diagnose a timeout and quota issue; exit status 1",
+    )
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_openclaw_terminal_transport_log_makes_wrapped_exit_retryable(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "harbor-jobs" / "job" / "trial" / "agent" / "openclaw.txt"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        'model request failed\nFailoverError: HTTP 500: "500 Internal Server Error"\n',
+        encoding="utf-8",
+    )
+    error = HarborTrialFailure("agent failed", "NonZeroAgentExitCodeError")
+
+    assert (
+        _execution_failure_category(error, "execution", evidence_root=tmp_path)
+        == "transient"
+    )
+
+
+def test_openclaw_structured_transport_timeout_is_retryable(tmp_path: Path) -> None:
+    log = tmp_path / "harbor-jobs" / "job" / "trial" / "agent" / "openclaw.txt"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "[provider-transport-fetch] [model-fetch] response provider=openai "
+        "status=503 elapsedMs=2363 contentType=application/json\n"
+        "FailoverError: LLM request timed out.\n",
+        encoding="utf-8",
+    )
+    error = HarborTrialFailure("agent failed", "NonZeroAgentExitCodeError")
+
+    assert (
+        _execution_failure_category(error, "execution", evidence_root=tmp_path)
+        == "transient"
+    )
+
+
+def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "harbor-jobs" / "job" / "trial" / "agent" / "openclaw.txt"
+    log.parent.mkdir(parents=True)
+    log.write_text("provider response status=500\n", encoding="utf-8")
+    error = HarborTrialFailure("agent failed", "NonZeroAgentExitCodeError")
+
+    assert (
+        _execution_failure_category(error, "execution", evidence_root=tmp_path)
+        == "benchmark"
+    )
 
 
 def test_failed_execution_retains_malformed_compatibility_evidence(
@@ -474,7 +558,9 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _route: {"probes": {"health": {"http_status": 200}}},
+        lambda _url, _token, _route, *_deadline: {
+            "probes": {"health": {"http_status": 200}}
+        },
     )
     endpoint = EndpointRunner(
         [
@@ -777,7 +863,9 @@ def test_terminal_wave_evidence_closes_and_normalizes_campaign(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _route: {"probes": {"health": {"http_status": 200}}},
+        lambda _url, _token, _route, *_deadline: {
+            "probes": {"health": {"http_status": 200}}
+        },
     )
     output = tmp_path / "output"
     run_wave_worker(

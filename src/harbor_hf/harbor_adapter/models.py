@@ -8,6 +8,8 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 Sha256Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+HARBOR_COMPATIBILITY_V1ALPHA2 = "harbor-hf/harbor-compatibility/v1alpha2"
+HARBOR_COMPATIBILITY_V1ALPHA3 = "harbor-hf/harbor-compatibility/v1alpha3"
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -111,6 +113,9 @@ class HarborUsageSummary(FrozenModel):
 class HarborStepException(FrozenModel):
     step_name: str
     exception_type: str
+    exception_message: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class HarborCompatibilityTrial(FrozenModel):
@@ -126,6 +131,9 @@ class HarborCompatibilityTrial(FrozenModel):
     model_provider: str | None = None
     model_name: str | None = None
     exception_type: str | None = None
+    exception_message: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     step_exceptions: list[HarborStepException] = Field(default_factory=list)
     rewards: dict[str, int | float] | None = None
     timing: HarborTrialTiming
@@ -143,14 +151,33 @@ class HarborCompatibilityJob(FrozenModel):
 
 
 class HarborCompatibilityBundle(FrozenModel):
-    schema_version: Literal["harbor-hf/harbor-compatibility/v1alpha2"] = (
-        "harbor-hf/harbor-compatibility/v1alpha2"
-    )
+    schema_version: Literal[
+        "harbor-hf/harbor-compatibility/v1alpha2",
+        "harbor-hf/harbor-compatibility/v1alpha3",
+    ] = HARBOR_COMPATIBILITY_V1ALPHA3
     harbor_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     harbor_version: str = Field(min_length=1)
     request_digest: Sha256Digest
     jobs: list[HarborCompatibilityJob]
     trials: list[HarborCompatibilityTrial]
+
+    @model_validator(mode="after")
+    def version_matches_trial_fields(self) -> HarborCompatibilityBundle:
+        if self.schema_version != HARBOR_COMPATIBILITY_V1ALPHA2:
+            return self
+        has_exception_messages = any(
+            "exception_message" in trial.model_fields_set
+            or any(
+                "exception_message" in step.model_fields_set
+                for step in trial.step_exceptions
+            )
+            for trial in self.trials
+        )
+        if has_exception_messages:
+            raise ValueError(
+                "harbor-compatibility/v1alpha2 cannot contain exception messages"
+            )
+        return self
 
 
 class HarborVerifiedTrial(FrozenModel):

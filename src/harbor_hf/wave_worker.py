@@ -69,7 +69,7 @@ from harbor_hf.provider_models import (
 )
 from harbor_hf.provider_proxy import ProviderEvidenceProxy
 from harbor_hf.providers import routed_provider_model
-from harbor_hf.runs import RunLock
+from harbor_hf.runs import RunLock, harbor_process_environment
 from harbor_hf.worker import (
     EndpointManager,
     HarborTrialFailure,
@@ -119,14 +119,43 @@ class FrozenModel(BaseModel):
 
 
 _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
-    ("authentication", ("authentication", "unauthorized", "forbidden")),
-    ("rate-limit", ("ratelimit", "rate_limit")),
+    (
+        "authentication",
+        (
+            "authentication",
+            "unauthorized",
+            "forbidden",
+            "status=401",
+            "status=403",
+            "http 401",
+            "http 403",
+        ),
+    ),
+    ("rate-limit", ("ratelimit", "rate_limit", "status=429", "http 429")),
     ("quota", ("quota",)),
     (
         "transient",
-        ("timeout", "connection", "serviceunavailable", "internalserver", "apierror"),
+        (
+            "timeout",
+            "connection",
+            "serviceunavailable",
+            "internalserver",
+            "internal server error",
+            "apierror",
+            "status=500",
+            "status=502",
+            "status=503",
+            "status=504",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+        ),
     ),
-    ("configuration", ("badrequest", "notfound", "configuration")),
+    (
+        "configuration",
+        ("badrequest", "notfound", "configuration", "status=400", "status=404"),
+    ),
 )
 
 _TERMINAL_MARKERS = ("_SUCCESS", "_FAILED", "_CANCELLED")
@@ -831,11 +860,9 @@ def _execute_trial(
             harbor_source,
             jobs_dir,
             execution_root / "harbor.log",
-            environment={
-                "HF_TOKEN": token,
-                "OPENAI_API_KEY": token,
-                "OPENAI_BASE_URL": f"{trial_base_url}/v1",
-            },
+            environment=harbor_process_environment(
+                run, token=token, inference_base_url=trial_base_url
+            ),
             timeout_seconds=timeout,
             stream_runner=stream_runner,
             monotonic=monotonic,
@@ -859,7 +886,9 @@ def _execute_trial(
     failure_record: dict[str, object] | None = None
     if error is not None:
         failure_record = {
-            "category": _execution_failure_category(error, failure_phase),
+            "category": _execution_failure_category(
+                error, failure_phase, evidence_root=execution_root
+            ),
             "error_type": type(error).__name__,
             "message": str(error).replace(token, "[REDACTED]"),
         }
@@ -910,22 +939,80 @@ def _execute_trial(
 def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
+    *,
+    evidence_root: Path | None = None,
 ) -> RetryCategory:
     if isinstance(error, PrivateArtifactRequirementError):
         return "configuration"
     if isinstance(error, HarborVerificationFailure):
         return "benchmark"
     if isinstance(error, HarborTrialFailure):
-        name = error.exception_type.lower()
-        for category, markers in _TRIAL_FAILURE_MARKERS:
-            if any(marker in name for marker in markers):
-                return category
-        return "benchmark"
+        return _harbor_trial_failure_category(error, evidence_root)
     if phase == "configuration":
         return "configuration"
     if phase == "execution":
         return "transient"
     return "benchmark"
+
+
+def _harbor_trial_failure_category(
+    error: HarborTrialFailure, evidence_root: Path | None
+) -> RetryCategory:
+    exception_type = error.exception_type.lower()
+    category = _retry_category_from_text(exception_type)
+    if category is not None:
+        return category
+    if exception_type == "nonzeroagentexitcodeerror":
+        return _openclaw_transport_failure_category(evidence_root) or "benchmark"
+    return "benchmark"
+
+
+def _retry_category_from_text(value: str) -> RetryCategory | None:
+    for category, markers in _TRIAL_FAILURE_MARKERS:
+        if any(marker in value for marker in markers):
+            return category
+    return None
+
+
+def _openclaw_transport_failure_category(
+    evidence_root: Path | None,
+) -> RetryCategory | None:
+    if evidence_root is None:
+        return None
+    resolved_root = evidence_root.resolve()
+    for log_path in sorted(evidence_root.glob("harbor-jobs/*/*/agent/openclaw.txt")):
+        if not _safe_evidence_file(log_path, resolved_root):
+            continue
+        category = _openclaw_log_failure_category(log_path)
+        if category is not None:
+            return category
+    return None
+
+
+def _safe_evidence_file(path: Path, resolved_root: Path) -> bool:
+    return (
+        not path.is_symlink()
+        and path.is_file()
+        and path.resolve().is_relative_to(resolved_root)
+    )
+
+
+def _openclaw_log_failure_category(log_path: Path) -> RetryCategory | None:
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                stripped = line.strip()
+                if stripped.startswith(
+                    "[provider-transport-fetch] [model-fetch] response "
+                ) or stripped.startswith("FailoverError: HTTP "):
+                    category = _retry_category_from_text(stripped.lower())
+                    if category is not None:
+                        return category
+                if stripped == "FailoverError: LLM request timed out.":
+                    return "transient"
+    except OSError:
+        return None
+    return None
 
 
 def _wave_model_name(wave: WaveLock) -> str:

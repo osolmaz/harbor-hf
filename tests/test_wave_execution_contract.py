@@ -233,7 +233,7 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
     monkeypatch.setenv("HF_TOKEN", "contract-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda url, token, route: {
+        lambda url, token, route, *_deadline: {
             "contract_url": url,
             "contract_token": token,
             "contract_route": route,

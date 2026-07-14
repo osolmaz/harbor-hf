@@ -9,11 +9,13 @@ from harbor_hf.models import (
     DeploymentProfile,
     EngineSpec,
     ExperimentSpec,
+    GitBenchmarkSource,
     MatrixRule,
     MatrixSpec,
     PublishingSpec,
     RemoteJobSpec,
     SourcePin,
+    git_benchmark_source_digest,
 )
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
@@ -159,6 +161,86 @@ def test_benchmark_requires_distinct_nonempty_task_names(
 ) -> None:
     with pytest.raises(ValueError):
         BenchmarkSpec(dataset="dataset", task_names=task_names)
+
+
+def test_git_benchmark_source_is_canonical_and_content_addressed() -> None:
+    source = GitBenchmarkSource(
+        repository="https://github.com/ShellBench/public-tasks.git",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    benchmark = BenchmarkSpec(dataset="shellbench/public-115", source=source)
+
+    assert source.repository == "ShellBench/public-tasks"
+    assert benchmark.dataset_digest == git_benchmark_source_digest(source)
+
+
+def test_benchmark_judge_round_trips_without_a_credential() -> None:
+    benchmark = BenchmarkSpec.model_validate(
+        {
+            "dataset": "harbor/terminal-bench@2.0",
+            "dataset_digest": "sha256:" + "1" * 64,
+            "judge": {
+                "api_url": "https://router.huggingface.co/v1/chat/completions",
+                "model": "deepseek-ai/DeepSeek-V3.2",
+            },
+        }
+    )
+
+    payload = benchmark.model_dump(mode="json", exclude_none=True)
+
+    assert payload["judge"] == {
+        "api_key_secret_name": "HF_TOKEN",
+        "api_url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "deepseek-ai/DeepSeek-V3.2",
+        "protocol": "openai-compatible",
+    }
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://router.example/v1/chat/completions",
+        "https://credential@router.example/v1/chat/completions",
+        "https://router.example/v1/chat/completions?api_key=secret",
+        "https://router.example/v1/chat/completions#token=secret",
+        "https://api.example.com/v1/chat/completions",
+        "https://router.huggingface.co:8443/v1/chat/completions",
+    ],
+)
+def test_benchmark_judge_requires_secure_credential_free_url(api_url: str) -> None:
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        BenchmarkSpec.model_validate(
+            {
+                "dataset": "harbor/terminal-bench@2.0",
+                "dataset_digest": "sha256:" + "1" * 64,
+                "judge": {"api_url": api_url, "model": "judge/model"},
+            }
+        )
+
+
+@pytest.mark.parametrize("path", ["../tasks", "/tasks", "tasks/../other", "."])
+def test_git_benchmark_source_rejects_unsafe_paths(path: str) -> None:
+    with pytest.raises(ValueError, match="safely relative"):
+        GitBenchmarkSource(
+            repository="ShellBench/public-tasks",
+            revision="8" * 40,
+            path=path,
+        )
+
+
+def test_git_benchmark_source_rejects_conflicting_identity_digest() -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    with pytest.raises(ValueError, match="match its immutable Git source"):
+        BenchmarkSpec(
+            dataset="shellbench/public-115",
+            dataset_digest="sha256:" + "1" * 64,
+            source=source,
+        )
 
 
 def test_matrix_rule_requires_a_dimension() -> None:

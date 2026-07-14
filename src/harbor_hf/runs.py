@@ -4,14 +4,16 @@ import hashlib
 import json
 import re
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harbor_hf.models import (
     AgentProfile,
+    BenchmarkJudgeSpec,
     DeploymentTarget,
     ExperimentSpec,
+    GitBenchmarkSource,
     ModelProfile,
     RemoteExecutionSpec,
 )
@@ -19,6 +21,8 @@ from harbor_hf.planner import experiment_digest, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+RUN_LOCK_V1ALPHA1 = "harbor-hf/run-lock/v1alpha1"
+RUN_LOCK_V1ALPHA2 = "harbor-hf/run-lock/v1alpha2"
 
 
 class Clock(Protocol):
@@ -33,13 +37,21 @@ class HasId(Protocol):
 class RunLock(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: str = "harbor-hf/run-lock/v1alpha1"
+    schema_version: Literal[
+        "harbor-hf/run-lock/v1alpha1", "harbor-hf/run-lock/v1alpha2"
+    ] = RUN_LOCK_V1ALPHA1
     run_id: str
     created_at: datetime
     experiment: str
     spec_digest: str
     benchmark_dataset: str
     benchmark_dataset_digest: str
+    benchmark_source: GitBenchmarkSource | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    benchmark_judge: BenchmarkJudgeSpec | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     benchmark_tasks: list[str]
     benchmark_task_digests: dict[str, str]
     model: ModelProfile
@@ -51,6 +63,14 @@ class RunLock(BaseModel):
     artifact_bucket: str
     artifact_prefix: str
     remote: RemoteExecutionSpec
+
+    @model_validator(mode="after")
+    def version_matches_fields(self) -> RunLock:
+        if self.schema_version == RUN_LOCK_V1ALPHA1 and (
+            self.benchmark_source is not None or self.benchmark_judge is not None
+        ):
+            raise ValueError("run-lock/v1alpha1 cannot contain source or judge fields")
+        return self
 
 
 def _select[Profile: HasId](
@@ -116,12 +136,19 @@ def build_run_lock(
         )
     resolved_id = run_id or _new_run_id(spec.metadata.name, digest, created_at)
     return RunLock(
+        schema_version=(
+            RUN_LOCK_V1ALPHA2
+            if spec.benchmark.source is not None or spec.benchmark.judge is not None
+            else RUN_LOCK_V1ALPHA1
+        ),
         run_id=resolved_id,
         created_at=created_at,
         experiment=spec.metadata.name,
         spec_digest=digest,
         benchmark_dataset=spec.benchmark.dataset,
         benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
+        benchmark_source=spec.benchmark.source,
+        benchmark_judge=spec.benchmark.judge,
         benchmark_tasks=spec.benchmark.task_names,
         benchmark_task_digests=spec.benchmark.task_digests,
         model=model,
@@ -134,6 +161,25 @@ def build_run_lock(
         artifact_prefix=f"runs/{spec.metadata.name}/{resolved_id}",
         remote=spec.remote,
     )
+
+
+def harbor_process_environment(
+    lock: RunLock, *, token: str, inference_base_url: str
+) -> dict[str, str]:
+    environment = {
+        "HF_TOKEN": token,
+        "OPENAI_API_KEY": token,
+        "OPENAI_BASE_URL": f"{inference_base_url.rstrip('/')}/v1",
+    }
+    if lock.benchmark_judge is not None:
+        environment.update(
+            {
+                "AGENT_JUDGE_API_KEY": token,
+                "AGENT_JUDGE_API_URL": str(lock.benchmark_judge.api_url),
+                "AGENT_JUDGE_MODEL": lock.benchmark_judge.model,
+            }
+        )
+    return environment
 
 
 def _new_run_id(name: str, digest: str, created_at: datetime) -> str:

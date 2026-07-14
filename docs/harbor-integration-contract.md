@@ -50,7 +50,8 @@ After Harbor exits, the adapter runs `harbor_adapter/exporter.py` with the same
 pinned Harbor project environment. The exporter imports and validates Harbor's
 own `JobLock`, `JobResult`, `TrialLock`, and `TrialResult` models. It emits
 `harbor-compatibility.json` with schema
-`harbor-hf/harbor-compatibility/v1alpha2`.
+`harbor-hf/harbor-compatibility/v1alpha3`. Readers remain compatible with
+`v1alpha2` bundles, which did not include exception messages.
 
 The bundle contains:
 

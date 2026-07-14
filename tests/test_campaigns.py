@@ -102,6 +102,22 @@ def test_plan_digest_ignores_semantically_irrelevant_input_order(
     assert first_plan.manifest_digest != second_plan.manifest_digest
 
 
+def test_plan_digest_includes_hosted_judge(remote_spec: ExperimentSpec) -> None:
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["judge"] = {
+        "api_url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "judge/model-one",
+    }
+    first = ExperimentSpec.model_validate(raw)
+    raw["benchmark"]["judge"]["model"] = "judge/model-two"
+    second = ExperimentSpec.model_validate(raw)
+
+    assert (
+        build_campaign_plan(first).plan_digest
+        != build_campaign_plan(second).plan_digest
+    )
+
+
 def test_matrix_rules_filter_campaign_cells(remote_spec: ExperimentSpec) -> None:
     second_model = remote_spec.matrix.models[0].model_copy(update={"id": "other-model"})
     spec = remote_spec.model_copy(
