@@ -23,7 +23,7 @@ from harbor_hf.models import (
 )
 from harbor_hf.planner import RunCell, experiment_digest, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.runs import RunLock, build_run_lock
+from harbor_hf.runs import RunLock, build_run_lock, validate_provider_cell
 
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -309,7 +309,9 @@ def build_campaign_plan(
         {profile.id: profile for profile in spec.matrix.deployments},
         {profile.id: profile for profile in spec.matrix.agents},
     )
-    runs = [_plan_run(spec, cell, trials, profiles) for cell in resolved_cells(spec)]
+    cells = resolved_cells(spec)
+    _validate_campaign_cells(cells, profiles)
+    runs = [_plan_run(spec, cell, trials, profiles) for cell in cells]
     plan_payload = {
         "schema_version": "harbor-hf/campaign-plan/v1alpha1",
         "experiment": spec.metadata.model_dump(mode="json"),
@@ -352,6 +354,31 @@ def _resolved_tasks(spec: ExperimentSpec) -> list[tuple[str, str]]:
     ):
         raise ValueError("campaign task digests must exactly resolve task selections")
     return sorted(digests.items())
+
+
+def _validate_campaign_cells(
+    cells: list[RunCell],
+    profiles: tuple[
+        dict[str, ModelProfile],
+        dict[str, DeploymentTarget],
+        dict[str, AgentProfile],
+    ],
+) -> None:
+    models, deployments, agents = profiles
+    profile_pairs_by_digest: dict[str, tuple[str, str]] = {}
+    for cell in cells:
+        model = models[cell.model]
+        deployment = deployments[cell.deployment]
+        if isinstance(deployment, ProviderTarget):
+            validate_provider_cell(model, deployment, agents[cell.agent])
+        digest = deployment_digest(model, deployment)
+        pair = (cell.model, cell.deployment)
+        previous = profile_pairs_by_digest.setdefault(digest, pair)
+        if previous != pair:
+            raise ValueError(
+                "campaign deployment digest must resolve to one model and "
+                "deployment profile pair"
+            )
 
 
 def _plan_run(

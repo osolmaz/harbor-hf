@@ -17,7 +17,8 @@ from harbor_hf.campaigns import (
     new_campaign_id,
 )
 from harbor_hf.endpoints import deployment_digest
-from harbor_hf.models import DeploymentProfile, ExperimentSpec, MatrixRule
+from harbor_hf.models import DeploymentProfile, EndpointRef, ExperimentSpec, MatrixRule
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.reconciler import ReconcileAction, plan_reconciliation
 
 
@@ -68,7 +69,9 @@ def test_shards_ordered_task_attempts_deterministically(
 def test_plan_digest_ignores_semantically_irrelevant_input_order(
     remote_spec: ExperimentSpec,
 ) -> None:
-    second_model = remote_spec.matrix.models[0].model_copy(update={"id": "z-model"})
+    second_model = remote_spec.matrix.models[0].model_copy(
+        update={"id": "z-model", "repo": "example/z-model"}
+    )
     first = remote_spec.model_copy(
         update={
             "matrix": remote_spec.matrix.model_copy(
@@ -116,6 +119,129 @@ def test_matrix_rules_filter_campaign_cells(remote_spec: ExperimentSpec) -> None
     plan = build_campaign_plan(spec)
 
     assert [run.model for run in plan.runs] == ["other-model"]
+
+
+@pytest.mark.parametrize(
+    ("invalid_dimension", "error"),
+    [
+        (
+            "model",
+            "Inference Provider target model must match the selected model profile",
+        ),
+        ("agent", "Inference Provider targets require the OpenClaw Harbor agent"),
+    ],
+)
+def test_campaign_plan_validates_every_resolved_provider_matrix_cell(
+    remote_spec: ExperimentSpec,
+    invalid_dimension: str,
+    error: str,
+) -> None:
+    first_model = remote_spec.matrix.models[0]
+    second_model = first_model.model_copy(
+        update={"id": "second-model", "repo": "example/second-model"}
+    )
+    first_provider = ProviderTarget(id="first-provider", model=first_model.repo)
+    second_provider = ProviderTarget(
+        id="second-provider",
+        model=(first_model.repo if invalid_dimension == "model" else second_model.repo),
+    )
+    first_agent = remote_spec.matrix.agents[0]
+    second_agent = first_agent.model_copy(
+        update={
+            "id": "second-agent",
+            "name": "terminus" if invalid_dimension == "agent" else "openclaw",
+        }
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "models": [first_model, second_model],
+                    "deployments": [first_provider, second_provider],
+                    "agents": [first_agent, second_agent],
+                    "include": [
+                        MatrixRule(
+                            models=[first_model.id],
+                            deployments=[first_provider.id],
+                            agents=[first_agent.id],
+                        ),
+                        MatrixRule(
+                            models=[second_model.id],
+                            deployments=[second_provider.id],
+                            agents=[second_agent.id],
+                        ),
+                    ],
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match=error):
+        build_campaign_plan(spec)
+
+
+def test_campaign_plan_allows_agent_aliases_for_one_effective_deployment(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(id="provider-one", model=model.repo)
+    second_agent = remote_spec.matrix.agents[0].model_copy(update={"id": "agent-two"})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "deployments": [provider],
+                    "agents": [remote_spec.matrix.agents[0], second_agent],
+                }
+            )
+        }
+    )
+
+    plan = build_campaign_plan(spec)
+    campaign = build_campaign_lock(plan, "campaign-agent-aliases")
+    action = _wave_action(campaign)
+    wave = build_wave_lock(campaign, spec, action)
+
+    assert plan.run_count == 2
+    assert len({run.deployment_digest for run in plan.runs}) == 1
+    assert len(action.shard_ids) == 2
+    assert len(wave.runs) == 2
+    assert wave.provider_target == provider
+
+
+def test_campaign_plan_rejects_duplicate_effective_deployment_aliases(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    endpoint = deployment.endpoint
+    assert endpoint is not None
+    alias = deployment.model_copy(
+        update={
+            "id": "deployment-alias",
+            "endpoint": EndpointRef(
+                namespace=endpoint.namespace,
+                name="alternate-endpoint",
+                served_model_name=endpoint.served_model_name,
+            ),
+        }
+    )
+    assert deployment_digest(remote_spec.matrix.models[0], alias) == deployment_digest(
+        remote_spec.matrix.models[0], deployment
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [deployment, alias]}
+            )
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="deployment digest must resolve to one model and deployment profile pair",
+    ):
+        build_campaign_plan(spec)
 
 
 def test_campaign_lock_has_stable_scoped_ids(remote_spec: ExperimentSpec) -> None:
@@ -199,7 +325,9 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
     remote_spec: ExperimentSpec,
 ) -> None:
     tasks = {f"task-{index}": f"sha256:{index:064x}" for index in range(1, 6)}
-    second_model = remote_spec.matrix.models[0].model_copy(update={"id": "model-two"})
+    second_model = remote_spec.matrix.models[0].model_copy(
+        update={"id": "model-two", "repo": "example/model-two"}
+    )
     spec = remote_spec.model_copy(
         update={
             "benchmark": remote_spec.benchmark.model_copy(
@@ -235,7 +363,7 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
         separators=(",", ":"),
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "42c80657f057001b86a31248875e8f13190993d0c469a6ad55149b84ce297ae5"
+        "21aa1f0fdd91ffe2cefa12182f05cd062a43ed1e18a5e27583e65f5b729b9857"
     )
 
 

@@ -156,14 +156,7 @@ def _validate_deployment_target(
     if isinstance(deployment, ProviderTarget):
         if not allow_provider:
             raise ValueError("Inference Provider targets require campaign execution")
-        if deployment.model != model.repo:
-            raise ValueError(
-                "Inference Provider target model must match the selected model profile"
-            )
-        if agent.name != "openclaw":
-            raise ValueError(
-                "Inference Provider targets require the OpenClaw Harbor agent"
-            )
+        validate_provider_cell(model, deployment, agent)
         return
     if deployment.endpoint is None:
         if allow_provider:
@@ -178,3 +171,17 @@ def _validate_deployment_target(
         raise ValueError(
             "controller Job namespace must match the endpoint namespace for leasing"
         )
+
+
+def validate_provider_cell(
+    model: ModelProfile,
+    deployment: ProviderTarget,
+    agent: AgentProfile,
+) -> None:
+    """Validate one resolved Inference Provider matrix cell."""
+    if deployment.model != model.repo:
+        raise ValueError(
+            "Inference Provider target model must match the selected model profile"
+        )
+    if agent.name != "openclaw":
+        raise ValueError("Inference Provider targets require the OpenClaw Harbor agent")
