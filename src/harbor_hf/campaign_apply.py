@@ -1390,14 +1390,14 @@ def _action_targets_deployment(
     for run in lock.runs:
         if run.deployment_digest != deployment_digest:
             continue
-        if action.action_kind == "submit-wave":
-            return any(shard.shard_id in targets for shard in run.shards)
-        if action.action_kind == "retry-shard":
-            return any(
-                trial.trial_id in targets
-                for shard in run.shards
-                for trial in shard.trials
-            )
+        if action.action_kind == "submit-wave" and any(
+            shard.shard_id in targets for shard in run.shards
+        ):
+            return True
+        if action.action_kind == "retry-shard" and any(
+            trial.trial_id in targets for shard in run.shards for trial in shard.trials
+        ):
+            return True
     return False
 
 

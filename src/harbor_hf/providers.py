@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from time import perf_counter
 from typing import Literal
@@ -218,7 +219,14 @@ class HfInferenceProviderAdapter:
             return self._timeout_result(target, request, attempt, started)
         total_ms = _elapsed_ms(started, self._clock())
         if not response.is_success:
-            return _http_failure(target, request, attempt, response, total_ms)
+            return _http_failure(
+                target,
+                request,
+                attempt,
+                response.status_code,
+                response.headers,
+                total_ms,
+            )
         try:
             raw = _RawCompletion.model_validate_json(response.content)
             choice = raw.choices[0]
@@ -267,7 +275,14 @@ class HfInferenceProviderAdapter:
             ) as response:
                 if not response.is_success:
                     total_ms = _elapsed_ms(started, self._clock())
-                    return _http_failure(target, request, attempt, response, total_ms)
+                    return _http_failure(
+                        target,
+                        request,
+                        attempt,
+                        response.status_code,
+                        response.headers,
+                        total_ms,
+                    )
                 for line in response.iter_lines():
                     _consume_stream_line(line, state, started, self._clock)
                 total_ms = _elapsed_ms(started, self._clock())
@@ -379,6 +394,8 @@ def observe_provider_response(
     transport_interrupted: bool = False,
 ) -> ProviderCallResult:
     """Normalize evidence from a transparently forwarded provider response."""
+    if not 200 <= status_code < 300:
+        return _http_failure(target, request, attempt, status_code, headers, total_ms)
     if transport_interrupted:
         return _transport_interrupted_result(
             target,
@@ -392,14 +409,11 @@ def observe_provider_response(
         response = httpx.Response(status_code, headers=headers, content=content)
     except httpx.DecodingError:
         return _malformed_encoding_result(target, request, attempt, headers, total_ms)
-    if not response.is_success:
-        return _http_failure(target, request, attempt, response, total_ms)
     if request.stream:
         state = _StreamState()
         elapsed = time_to_first_token_ms or 0.0
         try:
-            for raw_line in content.decode("utf-8").split("\n"):
-                line = raw_line.removesuffix("\r")
+            for line in re.split(r"\r\n?|\n", content.decode("utf-8")):
                 _consume_stream_line(line, state, 0.0, lambda: elapsed / 1000)
             state.first_token_ms = time_to_first_token_ms
             return _stream_result(target, request, attempt, response, state, total_ms)
@@ -635,10 +649,11 @@ def _http_failure(
     target: ProviderTarget,
     request: ProviderChatRequest,
     attempt: int,
-    response: httpx.Response,
+    status_code: int,
+    headers: httpx.Headers,
     total_ms: float,
 ) -> ProviderCallResult:
-    status, outcome, code = _classify_status(response.status_code)
+    status, outcome, code = _classify_status(status_code)
     can_retry = attempt < target.limits.max_attempts
     disposition: Literal["no_retry", "retry", "inspect"]
     disposition = "retry" if can_retry and status == "throttled" else "no_retry"
@@ -648,7 +663,7 @@ def _http_failure(
         target,
         request,
         attempt,
-        response.headers,
+        headers,
         total_ms,
         (
             unavailable("not_observed")

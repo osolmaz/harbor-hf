@@ -295,6 +295,51 @@ def test_interrupted_response_body_is_ambiguous_even_after_success_headers() -> 
 
 
 @pytest.mark.parametrize(
+    (
+        "status_code",
+        "headers",
+        "transport_interrupted",
+        "status",
+        "outcome",
+        "error_code",
+    ),
+    [
+        (429, {}, True, "throttled", "not_completed", "rate_limited"),
+        (
+            400,
+            {"content-encoding": "gzip"},
+            False,
+            "rejected",
+            "not_completed",
+            "http_400",
+        ),
+    ],
+)
+def test_non_success_status_precedes_body_transport_and_encoding_failures(
+    status_code: int,
+    headers: dict[str, str],
+    transport_interrupted: bool,
+    status: str,
+    outcome: str,
+    error_code: str,
+) -> None:
+    result = observe_provider_response(
+        _target(),
+        _request(),
+        attempt=1,
+        status_code=status_code,
+        headers=httpx.Headers(headers),
+        content=b"incomplete-or-malformed",
+        total_ms=12.5,
+        transport_interrupted=transport_interrupted,
+    )
+
+    assert result.status == status
+    assert result.remote_outcome == outcome
+    assert result.error_code == error_code
+
+
+@pytest.mark.parametrize(
     ("stream", "ttft", "digest"),
     [
         (
@@ -449,6 +494,28 @@ def test_observed_sse_preserves_unicode_line_separator_inside_json() -> None:
     assert result.status == "succeeded"
     assert result.message is not None
     assert result.message.content == "left\u2028right"
+
+
+def test_observed_sse_accepts_bare_carriage_return_line_endings() -> None:
+    content = (
+        b'data: {"id":"one","choices":[{"delta":{"content":"answer"}}]}\r\r'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\r\r'
+        b"data: [DONE]\r\r"
+    )
+
+    result = observe_provider_response(
+        _target(),
+        _request(stream=True),
+        attempt=1,
+        status_code=200,
+        headers=httpx.Headers({"content-type": "text/event-stream"}),
+        content=content,
+        total_ms=10,
+    )
+
+    assert result.status == "succeeded"
+    assert result.message is not None
+    assert result.message.content == "answer"
 
 
 def test_reasoning_only_budget_exhaustion_is_a_valid_stream_completion() -> None:

@@ -27,6 +27,7 @@ from harbor_hf.campaign_apply import (
     CampaignReconciler,
     HuggingFaceWaveJobAdapter,
     RemoteWaveJob,
+    _action_targets_deployment,
     _active_action_admissions,
     _build_admission_usage,
     _combined_usage,
@@ -50,6 +51,7 @@ from harbor_hf.campaigns import (
 )
 from harbor_hf.control import (
     ActionOutcomePayload,
+    ActionProjection,
     ActionReservedPayload,
     CampaignEvent,
     CampaignSnapshot,
@@ -562,6 +564,48 @@ def test_active_endpoint_without_orphan_provenance_is_never_paused(
 
     assert result.applied[0].status == "failed"
     assert endpoints.pause_calls == []
+
+
+@pytest.mark.parametrize("action_kind", ["submit-wave", "retry-shard"])
+def test_action_target_scan_covers_every_run_sharing_a_deployment(
+    remote_spec: ExperimentSpec, action_kind: Literal["submit-wave", "retry-shard"]
+) -> None:
+    first_agent = remote_spec.matrix.agents[0]
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={
+                    "agents": [
+                        first_agent,
+                        first_agent.model_copy(
+                            update={"id": "second-agent", "name": "Second Agent"}
+                        ),
+                    ]
+                }
+            )
+        }
+    )
+    lock, _request, _submitted = _campaign(spec)
+    first_run, second_run = lock.runs
+    target = (
+        second_run.shards[0].shard_id
+        if action_kind == "submit-wave"
+        else second_run.shards[0].trials[0].trial_id
+    )
+    assert target not in {
+        value
+        for shard in first_run.shards
+        for value in [shard.shard_id, *(trial.trial_id for trial in shard.trials)]
+    }
+    action = ActionProjection(
+        action_id="action-two",
+        action_key="key-two",
+        action_kind=action_kind,
+        target_ids=[target],
+        status="reserved",
+    )
+
+    assert _action_targets_deployment(lock, action, second_run.deployment_digest)
 
 
 def test_adopted_durable_event_advances_clock_before_following_transition(
