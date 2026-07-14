@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 
 from harbor_hf.bucket_evidence import (
@@ -10,7 +11,6 @@ from harbor_hf.bucket_evidence import (
     HubBucketEvidenceReader,
     HubBucketEvidenceWriter,
 )
-from harbor_hf.coordination import CoordinationError
 
 
 class FakeBucketApi:
@@ -249,7 +249,7 @@ def test_writer_does_not_fail_completed_write_when_claim_release_fails() -> None
     class FailingReleaseClaims(FakeClaims):
         def release(self, path: str, owner: Mapping[str, str]) -> None:
             super().release(path, owner)
-            raise CoordinationError("claim release timed out")
+            raise httpx.ConnectError("claim release timed out")
 
     api = FakeBucketWriterApi()
     claims = FailingReleaseClaims()

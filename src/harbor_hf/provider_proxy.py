@@ -12,7 +12,6 @@ from pathlib import Path
 from time import perf_counter
 from typing import cast
 
-import brotli
 import httpx
 from pydantic import JsonValue, ValidationError
 
@@ -149,8 +148,8 @@ class ProviderEvidenceProxy:
             self._send_json(handler, 400, {"error": str(error)})
             return
         observed = self._forward(handler, forwarded)
-        evidence_headers, evidence_content = _decode_evidence_response(
-            observed.headers, observed.content
+        evidence_headers, evidence_content, invalid_content_encoding = (
+            _decode_evidence_response(observed.headers, observed.content)
         )
         result = observe_provider_response(
             self.target,
@@ -162,6 +161,7 @@ class ProviderEvidenceProxy:
             total_ms=observed.total_ms,
             time_to_first_token_ms=observed.semantic_output_ms,
             transport_interrupted=observed.transport_interrupted,
+            invalid_content_encoding=invalid_content_encoding,
         )
         self._record(result.model_dump(mode="json", exclude={"message"}))
 
@@ -265,20 +265,21 @@ class ProviderEvidenceProxy:
 
 def _decode_evidence_response(
     headers: httpx.Headers, content: bytes
-) -> tuple[httpx.Headers, bytes]:
+) -> tuple[httpx.Headers, bytes, bool]:
+    encodings = _content_encodings(headers)
+    if not encodings:
+        return headers, content, False
+    if any(value not in {"gzip", "deflate"} for value in encodings):
+        return headers, content, True
     decoder = _bounded_content_decoder(headers)
-    if decoder is None:
-        return headers, content
+    if decoder is None:  # pragma: no cover - guarded by encodings above
+        return headers, content, True
     try:
-        decoded = bytearray()
-        for offset in range(0, len(content), 16 * 1024):
-            decoded.extend(decoder.decode(content[offset : offset + 16 * 1024]))
-            if decoder.truncated:
-                break
-        if not decoder.truncated:
-            decoded.extend(decoder.flush())
+        decoded = _decode_bounded_content(decoder, content)
     except httpx.DecodingError:
-        return headers, content
+        return headers, content, True
+    if not decoder.truncated and not decoder.complete:
+        return headers, content, True
     decoded_headers = httpx.Headers(
         [
             (name, value)
@@ -286,7 +287,18 @@ def _decode_evidence_response(
             if name.lower() != "content-encoding"
         ]
     )
-    return decoded_headers, bytes(decoded)
+    return decoded_headers, bytes(decoded), False
+
+
+def _decode_bounded_content(decoder: _BoundedContentDecoder, content: bytes) -> bytes:
+    decoded = bytearray()
+    for offset in range(0, len(content), 16 * 1024):
+        decoded.extend(decoder.decode(content[offset : offset + 16 * 1024]))
+        if decoder.truncated:
+            break
+    if not decoder.truncated:
+        decoded.extend(decoder.flush())
+    return bytes(decoded)
 
 
 class _Decoder:
@@ -294,6 +306,10 @@ class _Decoder:
         raise NotImplementedError
 
     def flush(self, max_output: int) -> bytes:
+        raise NotImplementedError
+
+    @property
+    def complete(self) -> bool:
         raise NotImplementedError
 
 
@@ -321,26 +337,9 @@ class _ZlibDecoder(_Decoder):
         except zlib.error as error:
             raise httpx.DecodingError(str(error)) from error
 
-
-class _BrotliDecoder(_Decoder):
-    def __init__(self) -> None:
-        self._decompressor = brotli.Decompressor()
-
-    def decode(self, content: bytes, max_output: int) -> bytes:
-        decoded = bytearray()
-        try:
-            for offset in range(0, len(content), 1024):
-                chunk = self._decompressor.process(content[offset : offset + 1024])
-                remaining = max_output - len(decoded)
-                decoded.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    break
-        except brotli.error as error:
-            raise httpx.DecodingError(str(error)) from error
-        return bytes(decoded)
-
-    def flush(self, max_output: int) -> bytes:
-        return self.decode(b"", max_output)
+    @property
+    def complete(self) -> bool:
+        return self._decompressor.eof
 
 
 class _BoundedContentDecoder:
@@ -348,6 +347,10 @@ class _BoundedContentDecoder:
         self._decoders = list(reversed(decoders))
         self._remaining = _MAX_EVIDENCE_RESPONSE_BYTES
         self.truncated = False
+
+    @property
+    def complete(self) -> bool:
+        return all(decoder.complete for decoder in self._decoders)
 
     def decode(self, content: bytes) -> bytes:
         return self._bounded(self._decode(content))
@@ -374,21 +377,21 @@ class _BoundedContentDecoder:
 
 
 def _bounded_content_decoder(headers: httpx.Headers) -> _BoundedContentDecoder | None:
-    encoding = headers.get("content-encoding", "").lower().strip()
-    encodings = [value.strip() for value in encoding.split(",") if value.strip()]
-    if not encodings or any(
-        value not in {"gzip", "deflate", "br"} for value in encodings
-    ):
+    encodings = _content_encodings(headers)
+    if not encodings or any(value not in {"gzip", "deflate"} for value in encodings):
         return None
     decoders: list[_Decoder] = []
     for value in encodings:
         if value == "gzip":
             decoders.append(_ZlibDecoder(gzip=True))
-        elif value == "deflate":
-            decoders.append(_ZlibDecoder(deflate=True))
         else:
-            decoders.append(_BrotliDecoder())
+            decoders.append(_ZlibDecoder(deflate=True))
     return _BoundedContentDecoder(decoders)
+
+
+def _content_encodings(headers: httpx.Headers) -> list[str]:
+    encoding = headers.get("content-encoding", "").lower().strip()
+    return [value.strip() for value in encoding.split(",") if value.strip()]
 
 
 def _json_object(content: bytes) -> dict[str, JsonValue]:

@@ -15,7 +15,6 @@ from huggingface_hub import HfApi
 from harbor_hf.coordination import (
     ClaimConflict,
     ClaimStore,
-    CoordinationError,
     bucket_evidence_claim_path,
     bucket_id,
 )
@@ -176,7 +175,7 @@ class HubBucketEvidenceWriter:
         try:
             return self._write_locked(normalized, path, content)
         finally:
-            with suppress(CoordinationError):
+            with suppress(Exception):
                 self.claims.release(claim_path, owner)
 
     def _write_locked(self, normalized: str, path: str, content: bytes) -> bool:

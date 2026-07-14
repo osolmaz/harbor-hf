@@ -7,7 +7,6 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
-import brotli
 import httpx
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -383,7 +382,6 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
     [
         ("gzip", gzip.compress),
         ("deflate", zlib.compress),
-        ("br", brotli.compress),
     ],
 )
 def test_proxy_preserves_encoding_and_decodes_evidence(
@@ -484,21 +482,59 @@ def test_evidence_decoder_bounds_high_ratio_compressed_content(
     monkeypatch.setattr(provider_proxy, "_MAX_EVIDENCE_RESPONSE_BYTES", 64)
     headers = httpx.Headers({"content-encoding": "gzip"})
 
-    decoded_headers, decoded = _decode_evidence_response(
+    decoded_headers, decoded, invalid = _decode_evidence_response(
         headers, gzip.compress(b"x" * 4096)
     )
 
     assert "content-encoding" not in decoded_headers
     assert decoded == b"x" * 64
+    assert invalid is False
 
 
 def test_evidence_decoder_preserves_unknown_or_malformed_encoding() -> None:
     for encoding, content in (("custom", b"encoded"), ("gzip", b"truncated")):
         headers = httpx.Headers({"content-encoding": encoding})
-        observed_headers, observed_content = _decode_evidence_response(headers, content)
+        observed_headers, observed_content, invalid = _decode_evidence_response(
+            headers, content
+        )
 
         assert observed_headers["content-encoding"] == encoding
         assert observed_content == content
+        assert invalid is True
+
+
+@pytest.mark.parametrize("encoding", ["br", "zstd"])
+def test_evidence_decoder_rejects_encodings_without_bounded_decoders(
+    encoding: str,
+) -> None:
+    headers = httpx.Headers({"content-encoding": encoding})
+
+    observed_headers, observed_content, invalid = _decode_evidence_response(
+        headers, b"provider-controlled encoded bytes"
+    )
+
+    assert observed_headers == headers
+    assert observed_content == b"provider-controlled encoded bytes"
+    assert invalid is True
+
+
+@pytest.mark.parametrize(
+    ("encoding", "encoded"),
+    [("gzip", gzip.compress), ("deflate", zlib.compress)],
+)
+def test_evidence_decoder_rejects_compressed_body_without_eof(
+    encoding: str, encoded: Callable[[bytes], bytes]
+) -> None:
+    headers = httpx.Headers({"content-encoding": encoding})
+    content = encoded(b'{"choices":[]}')[:-1]
+
+    observed_headers, observed_content, invalid = _decode_evidence_response(
+        headers, content
+    )
+
+    assert observed_headers == headers
+    assert observed_content == content
+    assert invalid is True
 
 
 def test_mid_relay_transport_error_keeps_provider_status_and_partial_body(

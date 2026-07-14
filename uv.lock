@@ -462,7 +462,6 @@ name = "harbor-hf"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "brotli" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "pyarrow" },
@@ -488,7 +487,6 @@ presentation = [
 
 [package.metadata]
 requires-dist = [
-    { name = "brotli", specifier = ">=1.1.0" },
     { name = "httpx", specifier = ">=0.23.0" },
     { name = "huggingface-hub", specifier = ">=1.22.0" },
     { name = "pyarrow", specifier = ">=18.0.0" },

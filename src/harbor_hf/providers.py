@@ -392,19 +392,22 @@ def observe_provider_response(
     total_ms: float,
     time_to_first_token_ms: float | None = None,
     transport_interrupted: bool = False,
+    invalid_content_encoding: bool = False,
 ) -> ProviderCallResult:
     """Normalize evidence from a transparently forwarded provider response."""
-    if not 200 <= status_code < 300:
-        return _http_failure(target, request, attempt, status_code, headers, total_ms)
-    if transport_interrupted:
-        return _transport_interrupted_result(
-            target,
-            request,
-            attempt,
-            headers,
-            total_ms,
-            time_to_first_token_ms,
-        )
+    early = _early_provider_response(
+        target,
+        request,
+        attempt,
+        status_code,
+        headers,
+        total_ms,
+        time_to_first_token_ms,
+        transport_interrupted,
+        invalid_content_encoding,
+    )
+    if early is not None:
+        return early
     try:
         response = httpx.Response(status_code, headers=headers, content=content)
     except httpx.DecodingError:
@@ -446,6 +449,33 @@ def observe_provider_response(
         message=message,
         evidence=evidence,
     )
+
+
+def _early_provider_response(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    attempt: int,
+    status_code: int,
+    headers: httpx.Headers,
+    total_ms: float,
+    time_to_first_token_ms: float | None,
+    transport_interrupted: bool,
+    invalid_content_encoding: bool,
+) -> ProviderCallResult | None:
+    if not 200 <= status_code < 300:
+        return _http_failure(target, request, attempt, status_code, headers, total_ms)
+    if transport_interrupted:
+        return _transport_interrupted_result(
+            target,
+            request,
+            attempt,
+            headers,
+            total_ms,
+            time_to_first_token_ms,
+        )
+    if invalid_content_encoding:
+        return _malformed_encoding_result(target, request, attempt, headers, total_ms)
+    return None
 
 
 def _transport_interrupted_result(

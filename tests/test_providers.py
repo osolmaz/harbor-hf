@@ -285,6 +285,7 @@ def test_interrupted_response_body_is_ambiguous_even_after_success_headers() -> 
         content=b'{"id":"partial"',
         total_ms=12.5,
         transport_interrupted=True,
+        invalid_content_encoding=True,
     )
 
     assert result.status == "provider_error"
@@ -407,6 +408,23 @@ def test_malformed_content_encoding_is_ambiguous_and_stable(
     assert result.remote_outcome == "ambiguous"
     assert result.error_code == "invalid_content_encoding"
     assert _result_digest(result) == digest
+
+
+def test_explicitly_rejected_content_encoding_is_ambiguous() -> None:
+    result = observe_provider_response(
+        _target(),
+        _request(stream=True),
+        attempt=1,
+        status_code=200,
+        headers=httpx.Headers({"content-encoding": "br"}),
+        content=b"provider-controlled encoded bytes",
+        total_ms=12.5,
+        invalid_content_encoding=True,
+    )
+
+    assert result.status == "malformed_response"
+    assert result.remote_outcome == "ambiguous"
+    assert result.error_code == "invalid_content_encoding"
 
 
 @pytest.mark.parametrize(
