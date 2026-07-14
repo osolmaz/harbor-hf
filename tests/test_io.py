@@ -10,6 +10,7 @@ from harbor_hf.models import (
     EngineSpec,
     ExperimentSpec,
     GitBenchmarkSource,
+    GitHubTokenCredentials,
     MatrixRule,
     MatrixSpec,
     PublishingSpec,
@@ -173,6 +174,27 @@ def test_git_benchmark_source_is_canonical_and_content_addressed() -> None:
 
     assert source.repository == "ShellBench/public-tasks"
     assert benchmark.dataset_digest == git_benchmark_source_digest(source)
+
+
+def test_git_credentials_do_not_change_source_content_digest() -> None:
+    public = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    private = public.model_copy(
+        update={"credentials": GitHubTokenCredentials(secret_name="GITHUB_TOKEN")}
+    )
+
+    assert git_benchmark_source_digest(private) == git_benchmark_source_digest(public)
+
+
+@pytest.mark.parametrize("secret_name", ["HF_TOKEN", "lowercase", "9TOKEN"])
+def test_git_credentials_require_a_separate_environment_secret(
+    secret_name: str,
+) -> None:
+    with pytest.raises(ValueError):
+        GitHubTokenCredentials(secret_name=secret_name)
 
 
 def test_benchmark_judge_round_trips_without_a_credential() -> None:

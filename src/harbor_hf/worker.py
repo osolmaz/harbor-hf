@@ -28,6 +28,7 @@ from harbor_hf.coordination import (
 )
 from harbor_hf.endpoints import EndpointSettings
 from harbor_hf.evidence import (
+    SecretValues,
     append_event,
     archive_directory,
     assert_secret_absent,
@@ -82,7 +83,13 @@ from harbor_hf.process import (
     SubprocessRunner,
     run_streaming,
 )
-from harbor_hf.runs import RunLock, build_run_lock, harbor_process_environment
+from harbor_hf.runs import (
+    RunLock,
+    build_run_lock,
+    harbor_process_environment,
+    require_benchmark_source_secret,
+    run_secret_values,
+)
 from harbor_hf.submission import (
     endpoint_lease_label_for,
     github_repository,
@@ -414,6 +421,10 @@ def run_worker(
     token = os.environ.get(token_name, "")
     if not token:
         raise WorkerError(f"required secret {token_name} is not available")
+    try:
+        require_benchmark_source_secret(lock)
+    except ValueError as error:
+        raise WorkerError(str(error)) from error
     os.environ["HF_TOKEN"] = token
 
     claims = claim_store or HubClaimStore(lock.remote.job.namespace, token)
@@ -480,6 +491,7 @@ def _run_staged_worker(
     error: Exception | None = None
     cleanup_error: Exception | None = None
     watchdog_started = False
+    secrets = run_secret_values(lock, token)
 
     append_event(events, "worker_started", run_id=lock.run_id)
     try:
@@ -538,19 +550,19 @@ def _run_staged_worker(
             append_event(events, "endpoint_cleanup_skipped", reason="lease_not_owned")
 
     if error is None and cleanup_error is None:
-        _publish_success(root, events, token)
+        _publish_success(root, events, secrets)
         _publish_evidence(root, destination)
         return destination
 
     failure, failure_record, failure_event, reported_message = _failure_details(
-        error, cleanup_error, token
+        error, cleanup_error, secrets
     )
     append_event(events, "run_failed", **failure_event)
     write_json(root / "_FAILED", failure_record)
     try:
-        _finalize_evidence(root, token)
+        _finalize_evidence(root, secrets)
     except Exception as caught:
-        finalization_message = str(caught).replace(token, "[REDACTED]")
+        finalization_message = _redact_secret_values(str(caught), secrets)
         message = (
             f"{reported_message}; evidence finalization failed: {finalization_message}"
         )
@@ -562,11 +574,11 @@ def _run_staged_worker(
 def _failure_details(
     error: Exception | None,
     cleanup_error: Exception | None,
-    token: str,
+    secrets: SecretValues,
 ) -> tuple[Exception, dict[str, object], dict[str, str], str]:
     failure = error or cleanup_error
     assert failure is not None, "failed run has no recorded error"
-    failure_message = str(failure).replace(token, "[REDACTED]")
+    failure_message = _redact_secret_values(str(failure), secrets)
     record: dict[str, object] = {
         "error_type": type(failure).__name__,
         "message": failure_message,
@@ -574,7 +586,7 @@ def _failure_details(
     event = {"error_type": type(failure).__name__}
     reported_message = failure_message
     if error is not None and cleanup_error is not None:
-        cleanup_message = str(cleanup_error).replace(token, "[REDACTED]")
+        cleanup_message = _redact_secret_values(str(cleanup_error), secrets)
         record["cleanup_error"] = {
             "error_type": type(cleanup_error).__name__,
             "message": cleanup_message,
@@ -604,10 +616,10 @@ def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
         raise WorkerError("run lock fields do not match the resolved manifest cell")
 
 
-def _publish_success(root: Path, events: Path, token: str) -> None:
+def _publish_success(root: Path, events: Path, secrets: SecretValues) -> None:
     append_event(events, "run_succeeded")
     try:
-        _finalize_evidence(root, token)
+        _finalize_evidence(root, secrets)
     except Exception as caught:
         append_event(
             events,
@@ -618,7 +630,7 @@ def _publish_success(root: Path, events: Path, token: str) -> None:
             root / "_FAILED",
             {
                 "error_type": type(caught).__name__,
-                "message": str(caught).replace(token, "[REDACTED]"),
+                "message": _redact_secret_values(str(caught), secrets),
             },
         )
         raise WorkerError("evidence finalization failed") from caught
@@ -1176,7 +1188,7 @@ def require_executable(name: str) -> None:
         raise WorkerError(f"required controller executable is missing: {name}")
 
 
-def _finalize_evidence(root: Path, token: str) -> None:
+def _finalize_evidence(root: Path, secrets: SecretValues) -> None:
     failed = (root / "_FAILED").is_file()
     fallback_attempted = openclaw_execution_was_attempted(root)
     rejection_count = 0
@@ -1193,17 +1205,17 @@ def _finalize_evidence(root: Path, token: str) -> None:
         )
         (root / "harbor-jobs").mkdir(exist_ok=True)
         rejection_count += _sanitize_direct_trial_artifacts(root)
-    redacted_paths = scrub_secret_paths(root, token)
+    redacted_paths = scrub_secret_paths(root, secrets)
     if redacted_paths:
         append_event(
             root / "events.jsonl",
             "secret_paths_redacted",
             count=redacted_paths,
         )
-    scrubbed = scrub_secret(root, token)
+    scrubbed = scrub_secret(root, secrets)
     if scrubbed:
         append_event(root / "events.jsonl", "secrets_redacted", files=scrubbed)
-    assert_secret_absent(root, token)
+    assert_secret_absent(root, secrets)
     refresh_error = refresh_retained_bundle(
         root, strict=not (root / "_FAILED").is_file()
     )
@@ -1241,9 +1253,17 @@ def _finalize_evidence(root: Path, token: str) -> None:
         strict_session=not failed,
         fallback_attempted=fallback_attempted,
     )
-    assert_secret_absent(root, token)
+    assert_secret_absent(root, secrets)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     write_checksums(root)
+
+
+def _redact_secret_values(value: str, secrets: SecretValues) -> str:
+    values = (secrets,) if isinstance(secrets, str) else tuple(secrets)
+    for secret in values:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    return value
 
 
 def _validate_retained_direct_artifacts(root: Path, *, failed: bool) -> None:

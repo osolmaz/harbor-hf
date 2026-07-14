@@ -27,7 +27,13 @@ from harbor_hf.campaigns import (
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import verify_checksums, write_checksums
 from harbor_hf.harbor_adapter import HarborTrialFailure, HarborVerificationFailure
-from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.models import (
+    EndpointRef,
+    ExperimentSpec,
+    GitBenchmarkSource,
+    GitHubTokenCredentials,
+    SourcePin,
+)
 from harbor_hf.process import CommandRunner
 from harbor_hf.provider_models import ProviderLimits, ProviderTarget
 from harbor_hf.reconciler import (
@@ -1319,6 +1325,45 @@ def test_wave_validates_lock_and_secret_before_remote_work(
             tmp_path / "tampered",
             runner=endpoint,
         )
+    assert endpoint.commands == []
+
+
+def test_wave_requires_git_source_secret_before_remote_work(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    private_spec = ExperimentSpec.model_validate(raw)
+    _spec, _campaign, _wave, manifest, campaign_path, wave_path = _wave_inputs(
+        private_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    endpoint = EndpointRunner([])
+
+    with pytest.raises(WorkerError, match="required secret GITHUB_TOKEN"):
+        run_wave_worker(
+            manifest,
+            campaign_path,
+            wave_path,
+            tmp_path / "missing-git-token",
+            runner=endpoint,
+        )
+
     assert endpoint.commands == []
 
 

@@ -152,6 +152,36 @@ def test_installs_serial_schedule_and_dataset_webhook(
     assert len(api.webhooks) == 1
 
 
+def test_installs_extra_controller_secrets_for_private_sources(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request(remote_spec).model_copy(
+        update={"secret_names": ["GITHUB_TOKEN"]}
+    )
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    api = FakeApi()
+
+    install_automation(request, token="hf-secret", api=api)
+
+    assert api.job["secrets"] == {
+        "HF_TOKEN": "hf-secret",
+        "GITHUB_TOKEN": "github-secret",
+    }
+    assert automation_plan(request).secret_names == ["HF_TOKEN", "GITHUB_TOKEN"]
+
+
+def test_install_rejects_missing_extra_controller_secret(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request(remote_spec).model_copy(
+        update={"secret_names": ["GITHUB_TOKEN"]}
+    )
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    with pytest.raises(AutomationError, match="required secret GITHUB_TOKEN"):
+        install_automation(request, token="hf-secret", api=FakeApi())
+
+
 def test_install_creates_supported_webhook_from_real_api_contract(
     remote_spec: ExperimentSpec,
 ) -> None:

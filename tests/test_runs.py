@@ -1,3 +1,5 @@
+import os
+import subprocess
 from datetime import UTC, datetime
 
 import pytest
@@ -6,6 +8,7 @@ from harbor_hf.models import (
     DeploymentProfile,
     ExperimentSpec,
     GitBenchmarkSource,
+    GitHubTokenCredentials,
     MatrixRule,
     _validate_remote_input_pins,
     _validate_task_pins,
@@ -59,6 +62,131 @@ def test_build_run_lock_preserves_git_benchmark_source(
     assert lock.benchmark_source == source
     assert lock.benchmark_dataset_digest == spec.benchmark.dataset_digest
     assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
+
+
+def test_authenticated_git_source_uses_v1alpha3_lock(
+    remote_spec: ExperimentSpec,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    spec = ExperimentSpec.model_validate(raw)
+
+    lock = build_run_lock(spec)
+
+    assert lock.benchmark_source == source
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha3"
+
+    legacy = lock.model_dump(mode="json")
+    legacy["schema_version"] = "harbor-hf/run-lock/v1alpha2"
+    with pytest.raises(ValueError, match="authenticated source fields"):
+        RunLock.model_validate(legacy)
+
+
+def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    lock = build_run_lock(ExperimentSpec.model_validate(raw))
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+
+    environment = harbor_process_environment(
+        lock, token="hf-secret", inference_base_url="https://endpoint.example"
+    )
+
+    assert environment["GITHUB_TOKEN"] == "github-secret"
+    assert environment["GIT_CONFIG_COUNT"] == "2"
+    assert environment["GIT_CONFIG_KEY_0"] == "credential.useHttpPath"
+    assert environment["GIT_CONFIG_VALUE_0"] == "true"
+    assert environment["GIT_CONFIG_KEY_1"] == (
+        "credential.https://github.com/ShellBench/public-tasks.git.helper"
+    )
+    assert environment["GIT_CONFIG_VALUE_1"] == "harbor-hf"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["HARBOR_HF_GIT_CREDENTIAL_ENV"] == "GITHUB_TOKEN"
+    assert environment["HARBOR_HF_GIT_REPOSITORY"] == "ShellBench/public-tasks"
+
+    monkeypatch.delenv("GITHUB_TOKEN")
+    with pytest.raises(ValueError, match="required secret GITHUB_TOKEN"):
+        harbor_process_environment(
+            lock, token="hf-secret", inference_base_url="https://endpoint.example"
+        )
+
+
+def test_authenticated_git_environment_is_scoped_by_real_git(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    lock = build_run_lock(ExperimentSpec.model_validate(raw))
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    environment = os.environ.copy()
+    environment.update(
+        harbor_process_environment(
+            lock, token="hf-secret", inference_base_url="https://endpoint.example"
+        )
+    )
+    environment.update(
+        {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    )
+
+    allowed = subprocess.run(
+        ["git", "credential", "fill"],
+        input=("protocol=https\nhost=github.com\npath=ShellBench/public-tasks.git\n\n"),
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=True,
+    )
+    refused = subprocess.run(
+        ["git", "credential", "fill"],
+        input="protocol=https\nhost=github.com\npath=other/repo.git\n\n",
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+
+    assert "username=x-access-token" in allowed.stdout
+    assert "password=github-secret" in allowed.stdout
+    assert refused.returncode != 0
+    assert "github-secret" not in refused.stdout + refused.stderr
 
 
 def test_run_lock_preserves_and_renders_hosted_judge(

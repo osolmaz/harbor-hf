@@ -36,6 +36,7 @@ from harbor_hf.coordination import (
     wave_worker_claim_path,
 )
 from harbor_hf.evidence import (
+    SecretValues,
     append_event,
     archive_directory,
     assert_secret_absent,
@@ -69,7 +70,12 @@ from harbor_hf.provider_models import (
 )
 from harbor_hf.provider_proxy import ProviderEvidenceProxy
 from harbor_hf.providers import routed_provider_model
-from harbor_hf.runs import RunLock, harbor_process_environment
+from harbor_hf.runs import (
+    RunLock,
+    harbor_process_environment,
+    require_benchmark_source_secret,
+    run_secret_values,
+)
 from harbor_hf.worker import (
     EndpointManager,
     HarborTrialFailure,
@@ -315,6 +321,11 @@ def run_wave_worker(
         raise WorkerError(
             f"required secret {lock.remote.job.token_secret_name} is not available"
         )
+    try:
+        for run in lock.runs:
+            require_benchmark_source_secret(run.configuration)
+    except ValueError as error:
+        raise WorkerError(str(error)) from error
     os.environ["HF_TOKEN"] = token
 
     with _wave_worker_lease(lock, token, claim_store, clock):
@@ -323,7 +334,13 @@ def run_wave_worker(
         _reject_terminal_wave(destination)
         with tempfile.TemporaryDirectory(prefix="harbor-hf-wave-") as staging_name:
             staging = Path(staging_name) / campaign.artifact_prefix
-            _stage_campaign_records(staging, campaign, lock, token, output_root)
+            _stage_campaign_records(
+                staging,
+                campaign,
+                lock,
+                _wave_secret_values(lock, token),
+                output_root,
+            )
             return _run_staged_wave(
                 manifest_path,
                 campaign,
@@ -411,6 +428,7 @@ def _run_staged_wave(
     cleanup_error: Exception | None = None
     provider_proxy: ProviderEvidenceProxy | None = None
     shard_checksums: dict[str, str] = {}
+    secrets = _wave_secret_values(lock, token)
     try:
         require_executable("git")
         harbor_source = (
@@ -463,27 +481,27 @@ def _run_staged_wave(
     if terminal_error is None:
         append_event(events, "wave_succeeded")
         write_json(wave_root / "wave-summary.json", summary)
-        _finalize_unit(wave_root, token)
+        _finalize_unit(wave_root, secrets)
         (wave_root / "_SUCCESS").write_text("\n", encoding="utf-8")
         _publish_unit(wave_root, output_root / lock.artifact_prefix)
         return output_root / lock.artifact_prefix
 
-    failure_message = str(terminal_error).replace(token, "[REDACTED]")
+    failure_message = _redact_secret_values(str(terminal_error), secrets)
     summary["error_type"] = type(terminal_error).__name__
     summary["message"] = failure_message
     if error is not None and cleanup_error is not None:
         summary["cleanup_error"] = {
             "error_type": type(cleanup_error).__name__,
-            "message": str(cleanup_error).replace(token, "[REDACTED]"),
+            "message": _redact_secret_values(str(cleanup_error), secrets),
         }
     append_event(events, "wave_failed", error_type=type(terminal_error).__name__)
     write_json(wave_root / "wave-summary.json", summary)
-    _finalize_unit(wave_root, token)
+    _finalize_unit(wave_root, secrets)
     write_json(wave_root / "_FAILED", summary)
     _publish_unit(wave_root, output_root / lock.artifact_prefix)
     if error is not None and cleanup_error is not None:
-        failure_message += "; endpoint cleanup failed: " + str(cleanup_error).replace(
-            token, "[REDACTED]"
+        failure_message += "; endpoint cleanup failed: " + _redact_secret_values(
+            str(cleanup_error), secrets
         )
     raise WorkerError(failure_message) from terminal_error
 
@@ -778,7 +796,7 @@ def _execute_shard_with_executor(
     }
     append_event(events, "shard_succeeded")
     write_json(shard_root / "shard-summary.json", summary)
-    _finalize_unit(shard_root, token)
+    _finalize_unit(shard_root, run_secret_values(run.configuration, token))
     (shard_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     _publish_unit(shard_root, output_root / locked_shard.artifact_prefix)
     return _file_digest(shard_root / "checksums.json")
@@ -884,16 +902,17 @@ def _execute_trial(
         error = caught
         append_event(events, "execution_failed", error_type=type(caught).__name__)
     failure_record: dict[str, object] | None = None
+    secrets = run_secret_values(run, token)
     if error is not None:
         failure_record = {
             "category": _execution_failure_category(
                 error, failure_phase, evidence_root=execution_root
             ),
             "error_type": type(error).__name__,
-            "message": str(error).replace(token, "[REDACTED]"),
+            "message": _redact_secret_values(str(error), secrets),
         }
         write_json(execution_root / "failure.json", failure_record)
-    _finalize_execution(execution_root, token, strict_compatibility=error is None)
+    _finalize_execution(execution_root, secrets, strict_compatibility=error is None)
     if error is None:
         (execution_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     else:
@@ -923,7 +942,7 @@ def _execute_trial(
         },
     )
     append_event(trial_root / "events.jsonl", "trial_succeeded")
-    _finalize_unit(trial_root, token)
+    _finalize_unit(trial_root, secrets)
     (trial_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     _publish_unit(
         trial_root,
@@ -1025,13 +1044,13 @@ def _stage_campaign_records(
     campaign_root: Path,
     campaign: CampaignLock,
     wave: WaveLock,
-    token: str,
+    secrets: SecretValues,
     output_root: Path,
 ) -> None:
     campaign_root.mkdir(parents=True)
     campaign_lock_path = campaign_root / "campaign.lock.json"
     write_json(campaign_lock_path, campaign.model_dump(mode="json"))
-    assert_secret_absent(campaign_root, token)
+    assert_secret_absent(campaign_root, secrets)
     _publish_immutable_file(
         campaign_lock_path,
         output_root / campaign.artifact_prefix / "campaign.lock.json",
@@ -1042,7 +1061,7 @@ def _stage_campaign_records(
         run_root.mkdir(parents=True)
         run_lock_path = run_root / "run.lock.json"
         write_json(run_lock_path, run.configuration.model_dump(mode="json"))
-        assert_secret_absent(run_root, token)
+        assert_secret_absent(run_root, secrets)
         destination = output_root / run.artifact_prefix
         _publish_immutable_file(run_lock_path, destination / "run.lock.json")
         _publish_digest_sidecar(run_lock_path, destination)
@@ -1212,7 +1231,7 @@ def _trial_destination(
 
 
 def _finalize_execution(
-    root: Path, token: str, *, strict_compatibility: bool = True
+    root: Path, secrets: SecretValues, *, strict_compatibility: bool = True
 ) -> None:
     attempted = openclaw_execution_was_attempted(root)
     rejection_count = 0
@@ -1225,7 +1244,7 @@ def _finalize_execution(
         )
         (root / "harbor-jobs").mkdir(exist_ok=True)
     session_required = openclaw_execution_started(root, fallback_attempted=attempted)
-    _redact_unit(root, token)
+    _redact_unit(root, secrets)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
     if refresh_error is not None:
         append_event(
@@ -1257,25 +1276,42 @@ def _finalize_execution(
         trust_rejections=not strict_compatibility,
     )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
-    assert_secret_absent(root, token)
+    assert_secret_absent(root, secrets)
     write_checksums(root)
 
 
-def _finalize_unit(root: Path, token: str) -> None:
-    _redact_unit(root, token)
+def _finalize_unit(root: Path, secrets: SecretValues) -> None:
+    _redact_unit(root, secrets)
     write_checksums(root)
 
 
-def _redact_unit(root: Path, token: str) -> None:
-    redacted_paths = scrub_secret_paths(root, token)
+def _redact_unit(root: Path, secrets: SecretValues) -> None:
+    redacted_paths = scrub_secret_paths(root, secrets)
     if redacted_paths:
         append_event(
             root / "events.jsonl", "secret_paths_redacted", count=redacted_paths
         )
-    scrubbed = scrub_secret(root, token)
+    scrubbed = scrub_secret(root, secrets)
     if scrubbed:
         append_event(root / "events.jsonl", "secrets_redacted", files=scrubbed)
-    assert_secret_absent(root, token)
+    assert_secret_absent(root, secrets)
+
+
+def _wave_secret_values(lock: WaveLock, token: str) -> SecretValues:
+    values = [token]
+    for run in lock.runs:
+        run_values = run_secret_values(run.configuration, token)
+        values.extend((run_values,) if isinstance(run_values, str) else run_values)
+    unique = tuple(dict.fromkeys(value for value in values if value))
+    return unique[0] if len(unique) == 1 else unique
+
+
+def _redact_secret_values(value: str, secrets: SecretValues) -> str:
+    values = (secrets,) if isinstance(secrets, str) else tuple(secrets)
+    for secret in values:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    return value
 
 
 def _publish_unit(source: Path, destination: Path) -> None:
