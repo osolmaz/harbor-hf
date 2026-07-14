@@ -52,7 +52,7 @@ class PlannedShard(FrozenModel):
     trials: list[PlannedTrial]
 
 
-class PlannedRun(FrozenModel):
+class RunAdmission(FrozenModel):
     cell_digest: str
     deployment_digest: str
     model: str
@@ -65,6 +65,12 @@ class PlannedRun(FrozenModel):
     spend_cap_microusd: int | None = Field(
         default=None, ge=0, exclude_if=lambda value: value is None
     )
+    estimated_wave_cost_microusd: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+
+
+class PlannedRun(RunAdmission):
     shards: list[PlannedShard]
 
 
@@ -126,20 +132,8 @@ class CampaignShardLock(FrozenModel):
     trials: list[CampaignTrialLock]
 
 
-class CampaignRunLock(FrozenModel):
+class CampaignRunLock(RunAdmission):
     run_id: str
-    cell_digest: str
-    deployment_digest: str
-    model: str
-    deployment: str
-    agent: str
-    provider: str | None = Field(default=None, exclude_if=lambda value: value is None)
-    max_concurrent_requests: int | None = Field(
-        default=None, ge=1, exclude_if=lambda value: value is None
-    )
-    spend_cap_microusd: int | None = Field(
-        default=None, ge=0, exclude_if=lambda value: value is None
-    )
     shards: list[CampaignShardLock]
 
 
@@ -391,9 +385,12 @@ def _plan_run(
         for offset in range(0, len(trials), shard_size)
         if (chunk := trials[offset : offset + shard_size])
     ]
-    provider, max_concurrent_requests, spend_cap_microusd = _target_admission(
-        deployments[cell.deployment]
-    )
+    (
+        provider,
+        max_concurrent_requests,
+        spend_cap_microusd,
+        estimated_wave_cost_microusd,
+    ) = _target_admission(deployments[cell.deployment])
     return PlannedRun(
         cell_digest=cell_digest,
         deployment_digest=resolved_deployment_digest,
@@ -403,6 +400,7 @@ def _plan_run(
         provider=provider,
         max_concurrent_requests=max_concurrent_requests,
         spend_cap_microusd=spend_cap_microusd,
+        estimated_wave_cost_microusd=estimated_wave_cost_microusd,
         shards=shards,
     )
 
@@ -463,6 +461,7 @@ def build_campaign_lock(
                 provider=planned_run.provider,
                 max_concurrent_requests=planned_run.max_concurrent_requests,
                 spend_cap_microusd=planned_run.spend_cap_microusd,
+                estimated_wave_cost_microusd=(planned_run.estimated_wave_cost_microusd),
                 shards=shards,
             )
         )
@@ -770,14 +769,15 @@ def campaign_json_schemas() -> dict[str, dict[str, object]]:
 
 def _target_admission(
     target: DeploymentTarget,
-) -> tuple[str | None, int | None, int | None]:
+) -> tuple[str | None, int | None, int | None, int | None]:
     if isinstance(target, ProviderTarget):
         return (
             target.service,
             target.limits.max_concurrent_requests,
             _usd_to_microusd(target.limits.max_spend_usd),
+            _usd_to_microusd(target.limits.estimated_wave_cost_usd),
         )
-    return None, None, None
+    return None, None, None, None
 
 
 def _wave_target(target: DeploymentTarget) -> EndpointWaveTarget | ProviderWaveTarget:

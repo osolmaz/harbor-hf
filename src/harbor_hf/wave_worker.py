@@ -311,7 +311,7 @@ def _wave_worker_lease(
         "wave_id": lock.wave_id,
         "job_id": job_id,
         "expires_at": (
-            now + timedelta(seconds=lock.duration_seconds, hours=1)
+            now + timedelta(seconds=lock.remote.job.timeout_seconds)
         ).isoformat(),
     }
     path = wave_worker_claim_path(lock.campaign_id, lock.wave_id)

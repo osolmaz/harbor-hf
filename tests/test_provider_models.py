@@ -23,8 +23,6 @@ from harbor_hf.provider_models import (
     provider_json_schemas,
 )
 from harbor_hf.reconciler import (
-    DeploymentAdmission,
-    ReconcileContext,
     plan_reconciliation,
 )
 from harbor_hf.runs import build_run_lock
@@ -39,6 +37,7 @@ def test_provider_target_keeps_admission_and_routing_policy() -> None:
             max_concurrent_requests=8,
             max_attempts=3,
             max_spend_usd=Decimal("12.50"),
+            estimated_wave_cost_usd=Decimal("2.50"),
         ),
     )
 
@@ -48,6 +47,25 @@ def test_provider_target_keeps_admission_and_routing_policy() -> None:
     assert target.routing.provider == "groq"
     assert target.limits.max_concurrent_requests == 8
     assert target.limits.max_spend_usd == Decimal("12.50")
+    assert target.limits.estimated_wave_cost_usd == Decimal("2.50")
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_spend_usd": Decimal("1")},
+        {"estimated_wave_cost_usd": Decimal("1")},
+        {
+            "max_spend_usd": Decimal("1"),
+            "estimated_wave_cost_usd": Decimal("2"),
+        },
+    ],
+)
+def test_provider_spend_admission_requires_a_bounded_estimate(
+    limits: dict[str, Decimal],
+) -> None:
+    with pytest.raises(ValidationError, match="spend cap|spend caps"):
+        ProviderLimits.model_validate(limits)
 
 
 def test_manifest_and_campaign_lock_provider_admission_separately_from_endpoints(
@@ -61,6 +79,7 @@ def test_manifest_and_campaign_lock_provider_admission_separately_from_endpoints
             max_concurrent_requests=3,
             max_attempts=2,
             max_spend_usd=Decimal("1.25"),
+            estimated_wave_cost_usd=Decimal("0.50"),
         ),
     )
     spec = ExperimentSpec.model_validate(
@@ -83,6 +102,7 @@ def test_manifest_and_campaign_lock_provider_admission_separately_from_endpoints
     assert run.provider == "hf-inference-providers"
     assert run.max_concurrent_requests == 3
     assert run.spend_cap_microusd == 1_250_000
+    assert run.estimated_wave_cost_microusd == 500_000
     submitted = new_event(
         subject_type="campaign",
         subject_id=campaign.campaign_id,
@@ -91,18 +111,9 @@ def test_manifest_and_campaign_lock_provider_admission_separately_from_endpoints
         payload=CampaignSubmittedPayload(plan_digest=campaign.plan_digest),
     )
 
-    _projection, blocked = plan_reconciliation(campaign, [submitted])
-    assert blocked.actions == []
-    assert blocked.blocked[0].reason == "spend-estimate-missing"
-
-    context = ReconcileContext(
-        deployments={
-            run.deployment_digest: DeploymentAdmission(
-                estimated_wave_cost_microusd=500_000
-            )
-        }
-    )
-    _projection, admitted = plan_reconciliation(campaign, [submitted], context=context)
+    _projection, admitted = plan_reconciliation(campaign, [submitted])
+    assert admitted.blocked == []
+    assert admitted.actions[0].estimated_cost_microusd == 500_000
     wave = build_wave_lock(campaign, spec, admitted.actions[0])
     assert isinstance(wave.target, ProviderWaveTarget)
     assert wave.target.provider == target

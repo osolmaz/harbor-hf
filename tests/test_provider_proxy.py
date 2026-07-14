@@ -314,6 +314,7 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
             for content in (
                 "PRIVATE_THROTTLE",
                 "PRIVATE_THROTTLE",
+                "PRIVATE_THROTTLE",
                 "PRIVATE_COMPLETE",
                 "PRIVATE_TIMEOUT",
             )
@@ -328,7 +329,10 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
         {"error": "unsupported provider route"},
     )
     assert invalid_message.status_code == 400
-    assert [response.status_code for response in responses] == [429, 429, 200, 504]
+    assert [response.status_code for response in responses] == [429, 429, 400, 200, 504]
+    assert responses[2].json() == {
+        "error": "provider request attempt budget is exhausted"
+    }
     assert len(upstream_calls) == 4
     evidence = [json.loads(line) for line in evidence_path.read_text().splitlines()]
     assert [record["status"] for record in evidence] == [

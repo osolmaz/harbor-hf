@@ -82,6 +82,11 @@ winner may issue the remote side effect. The lease is released after the
 durable outcome and expires after two hours if the reconciler dies. Compatible
 shards are grouped by a digest of their exact model and deployment
 configuration; agent differences do not force a second endpoint startup.
+Namespace-wide reconciliation carries active and ambiguously submitted wave
+usage forward between campaigns in the same pass. Successful actions without
+worker evidence remain admitted until their wave is observed and closed, so
+global, deployment, provider, campaign, and spend limits cannot be exceeded by
+sequential reconciliation of independently stored campaigns.
 
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
 derived from the endpoint namespace and name. They coordinate through one
@@ -113,9 +118,10 @@ Every hosted wave Job acquires a second expiring lease keyed by campaign and
 wave before endpoint or provider work begins. This lease spans benchmark
 execution and terminal evidence publication, so an ambiguously duplicated Job
 cannot race another writer on the Bucket mount. The worker uses the mount's
-supported temporary-file rename while it holds the lease. The lease expires
-one hour after the wave duration bound and is released immediately after the
-terminal marker is published.
+supported temporary-file rename while it holds the lease. The lease expires at
+the complete locked HF Job timeout, including source preparation and cleanup
+headroom, rather than at the shorter benchmark execution duration. It is
+released immediately after the terminal marker is published.
 
 ### Endpoint Provisioner
 

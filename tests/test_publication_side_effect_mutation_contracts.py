@@ -129,6 +129,10 @@ class RecordingDatasetApi:
         )
         return [SimpleNamespace(path=path)] if path in self.files[repo_id] else []
 
+    def list_repo_files(self, repo_id: str, **kwargs: object) -> list[str]:
+        self.calls.append({"method": "list_repo_files", "repo": repo_id, **kwargs})
+        return list(self.files[repo_id])
+
     def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str:
         self.calls.append(
             {"method": "hf_hub_download", "repo": repo_id, "path": filename, **kwargs}
@@ -192,7 +196,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "6547849dceb0b61b639b8d766da4f4468f12620c2d523f79694c66c4b0df4e6c"
+        "e64ce581db9986555aab0762e761306f6224943763cccabaa6e0a03abd007286"
     )
 
 

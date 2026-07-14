@@ -64,6 +64,12 @@ completion time, model and agent identity, result Dataset and exact revision,
 source checksum, and control commit. It contains no trial, execution, metric,
 artifact, session, or task-content data.
 
+Each publication keeps its immutable index row. The publisher also rewrites
+consolidated power-of-two windows containing the newest 1, 2, 4, and so on up
+to 2,048 rows in the same parent-checked commit. Readers choose the smallest
+window covering their configured limit, so public refresh I/O stays bounded
+without deleting the per-publication archive.
+
 The schema review intentionally keeps a few domain-qualified names and repeated
 fields. `logical_attempt` and `physical_attempt` preserve the campaign model's
 benchmark-versus-infrastructure distinction. `hardware`, `model_id`,
@@ -110,6 +116,8 @@ benchmark revision is known. If interruption occurs between commits, retrying
 adopts the benchmark receipt and completes only the missing index commit. No
 remote integration is required to test this behavior; the adapter contract is
 covered with in-memory mocks.
+An existing publication with no consolidated windows is repaired idempotently
+on adoption; later publications update all windows in the normal index commit.
 
 Schema changes require a new table version and a new path. Historical Parquet
 files are never rewritten. Application callers must explicitly select a

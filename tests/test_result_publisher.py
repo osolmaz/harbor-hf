@@ -22,6 +22,7 @@ from harbor_hf.results import (
     ResultTables,
     RunRow,
     build_result_publication,
+    read_index_file,
 )
 
 NOW = datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC)
@@ -73,6 +74,10 @@ class FakeDatasetApi:
         assert kwargs == {"repo_type": "dataset", "revision": self.head(repo_id)}
         path = paths if isinstance(paths, str) else paths[0]
         return [SimpleNamespace(path=path)] if path in self.files[repo_id] else []
+
+    def list_repo_files(self, repo_id: str, **kwargs: object) -> list[str]:
+        assert kwargs == {"repo_type": "dataset", "revision": self.head(repo_id)}
+        return list(self.files[repo_id])
 
     def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str:
         assert kwargs == {"repo_type": "dataset", "revision": self.head(repo_id)}
@@ -196,6 +201,14 @@ def test_serializes_result_and_index_with_parent_checked_leases(
     ).to_pylist()
     assert index[0]["result_revision"] == result.result_revision
     assert "task_name" not in index[0]
+    windows = sorted(path for path in api.files["org/index"] if "/windows/" in path)
+    assert windows == [
+        f"data/index/schema=v1/windows/{2**power:04d}.parquet" for power in range(12)
+    ]
+    assert [
+        row.publication_id
+        for row in read_index_file(api.files["org/index"][windows[-1]])
+    ] == [publication.tables.publication_id]
 
 
 def test_duplicate_publication_is_a_no_op(
@@ -219,6 +232,40 @@ def test_duplicate_publication_is_a_no_op(
 
     assert second == first
     assert len(api.commits) == 2
+
+
+def test_adoption_repairs_missing_bounded_index_windows(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    first = publisher.publish(
+        publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+    for path in list(api.files["org/index"]):
+        if "/windows/" in path:
+            del api.files["org/index"][path]
+
+    repaired = publisher.publish(
+        publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+    adopted = publisher.publish(
+        publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+
+    assert repaired.result_revision == first.result_revision
+    assert repaired.index_revision != first.index_revision
+    assert adopted == repaired
+    assert len(api.commits) == 3
+    assert len([path for path in api.files["org/index"] if "/windows/" in path]) == 12
 
 
 def test_duplicate_publication_adopts_immutable_evidence_after_control_commit_moves(
@@ -312,8 +359,10 @@ def test_duplicate_publication_detects_corrupted_parquet(
         result_dataset="org/results",
         index_dataset="org/index",
     )
-    parquet_path = next(
-        path for path in api.files[dataset] if path.endswith(".parquet")
+    parquet_path = (
+        publication.files[0].path
+        if dataset == "org/results"
+        else f"data/index/schema=v1/{publication.tables.publication_id}.parquet"
     )
     api.files[dataset][parquet_path] = b"corrupted"
 

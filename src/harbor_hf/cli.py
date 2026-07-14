@@ -180,6 +180,8 @@ def campaign_submit(
     try:
         if spec.remote is None:
             raise ValueError("campaign submission requires a remote configuration")
+        if spec.publishing.index_dataset is None:
+            raise ValueError("campaign submission requires publishing.index_dataset")
         resolved = build_campaign_plan(spec)
         resolved_id = campaign_id or new_campaign_id(resolved)
         lock = build_campaign_lock(resolved, resolved_id)

@@ -202,13 +202,14 @@ class ProviderEvidenceProxy:
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         with self._lock:
-            attempt = self._attempts.get(request_digest, 0) + 1
-            self._attempts[request_digest] = attempt
             self._request_counter += 1
-            request_id = f"provider-{self._request_counter}"
-        return _provider_request(payload, request_id), min(
-            attempt, self.target.limits.max_attempts
-        )
+            request = _provider_request(payload, f"provider-{self._request_counter}")
+            previous_attempts = self._attempts.get(request_digest, 0)
+            if previous_attempts >= self.target.limits.max_attempts:
+                raise ProviderProxyError("provider request attempt budget is exhausted")
+            attempt = previous_attempts + 1
+            self._attempts[request_digest] = attempt
+        return request, attempt
 
     def _record(self, value: dict[str, object]) -> None:
         line = json.dumps(

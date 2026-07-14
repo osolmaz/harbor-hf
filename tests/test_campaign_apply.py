@@ -5,6 +5,7 @@ import itertools
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
@@ -64,7 +65,11 @@ from harbor_hf.endpoints import (
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
 from harbor_hf.models import DeploymentProfile, ExperimentSpec
 from harbor_hf.operations import AutomaticCampaignPublisher
-from harbor_hf.provider_models import ExplicitProviderRoute, ProviderTarget
+from harbor_hf.provider_models import (
+    ExplicitProviderRoute,
+    ProviderLimits,
+    ProviderTarget,
+)
 from harbor_hf.reconciler import (
     AdmissionLimits,
     AdmissionUsage,
@@ -653,6 +658,65 @@ def test_apply_all_uses_campaign_listing(remote_spec: ExperimentSpec) -> None:
     assert [result.campaign_id for result in results] == [lock.campaign_id]
 
 
+def test_apply_all_carries_new_admission_into_the_next_campaign(
+    remote_spec: ExperimentSpec,
+) -> None:
+    first, request, first_submitted = _campaign(remote_spec)
+    second = build_campaign_lock(build_campaign_plan(remote_spec), "campaign-two")
+    second_submitted = new_event(
+        subject_type="campaign",
+        subject_id=second.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=second.plan_digest),
+        clock=lambda: NOW,
+        identifier=lambda: "9" * 32,
+    )
+
+    class MultiStore(FakeStore):
+        def list_campaigns(self) -> list[str]:
+            return [first.campaign_id, second.campaign_id]
+
+    class AdmissionReconciler(CampaignReconciler):
+        admitted: set[str] = set()
+
+        def _admission_usage(self, campaign_id: str) -> AdmissionUsage:
+            return AdmissionUsage(global_active_waves=int(campaign_id in self.admitted))
+
+        def apply_campaign(
+            self,
+            campaign_id: str,
+            *,
+            context: ReconcileContext | None = None,
+        ) -> CampaignApplyResult:
+            lock, event = (
+                (first, first_submitted)
+                if campaign_id == first.campaign_id
+                else (second, second_submitted)
+            )
+            _projection, plan = plan_reconciliation(lock, [event], context=context)
+            if plan.actions:
+                self.admitted.add(campaign_id)
+            return CampaignApplyResult(campaign_id=campaign_id, plan=plan, applied=[])
+
+    reconciler = AdmissionReconciler(
+        MultiStore(first, request, [first_submitted]),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    results = reconciler.apply_all(
+        context=ReconcileContext(limits=AdmissionLimits(global_active_waves=1))
+    )
+
+    first_result = cast(CampaignApplyResult, results[0])
+    second_result = cast(CampaignApplyResult, results[1])
+    assert len(first_result.plan.actions) == 1
+    assert second_result.plan.actions == []
+    assert second_result.plan.blocked[0].reason == "global-budget"
+
+
 def test_apply_all_reports_one_failure_and_continues_other_campaigns(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -1026,6 +1090,43 @@ def test_provider_wave_uses_provider_identity_without_endpoint_side_effects(
     assert endpoints.pause_calls == []
     run_evidence = _run_evidence(lock, wave.runs[0].configuration, NOW)
     assert run_evidence.model_revision == "not_observed"
+
+
+def test_spend_capped_provider_wave_uses_locked_estimate_without_cli_context(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec, target = _provider_spec(remote_spec)
+    target = target.model_copy(
+        update={
+            "limits": ProviderLimits(
+                max_attempts=2,
+                max_spend_usd=Decimal("2.00"),
+                estimated_wave_cost_usd=Decimal("0.75"),
+            )
+        }
+    )
+    spec = spec.model_copy(
+        update={"matrix": spec.matrix.model_copy(update={"deployments": [target]})}
+    )
+    lock, request, submitted = _campaign(spec)
+    endpoints = FakeEndpoints()
+    jobs = FakeJobs()
+
+    result = _reconciler(
+        FakeStore(lock, request, [submitted]), endpoints, jobs
+    ).apply_campaign(lock.campaign_id)
+
+    assert result.plan.blocked == []
+    assert result.plan.actions[0].estimated_cost_microusd == 750_000
+    assert len(jobs.submissions) == 1
+    wave, submitted_request, campaign = jobs.submissions[0]
+    assert wave.provider_target == target
+    assert wave.endpoint is None
+    assert submitted_request == request
+    assert campaign == lock
+    assert endpoints.inspect_calls == []
+    assert endpoints.create_calls == []
+    assert endpoints.pause_calls == []
 
 
 def test_provider_wave_adoption_and_cancellation_use_the_same_identity(

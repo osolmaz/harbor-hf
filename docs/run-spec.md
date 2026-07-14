@@ -135,6 +135,13 @@ than claiming that revision was served. Endpoint-backed rows use the revision
 verified in the endpoint configuration. Do not treat provider runs as
 revision-equivalent when the published value is `not_observed`.
 
+Provider `limits.max_spend_usd` and `limits.estimated_wave_cost_usd` must be
+configured together. The estimate is a conservative admission reservation for
+one deployment wave, must not exceed the cap, and is preserved in the campaign
+lock. It is not presented as observed provider billing. Provider
+`limits.max_attempts` is a hard forwarding limit for identical requests, not
+only an evidence label.
+
 The endpoint deployment shape supports independent engines such as vLLM and
 llama.cpp. The discriminated Inference Provider profile covers models that are
 too large or expensive to host on a dedicated endpoint without requiring or
@@ -173,7 +180,9 @@ must equal `remote.harbor.source.revision`, no package version is passed, and
 ### Publishing
 
 `publishing.dataset` identifies the versioned, benchmark-specific publication.
-`index_dataset` optionally identifies the global run catalog.
+`index_dataset` identifies the global run catalog. Single-run planning can omit
+it, but campaign submission requires it because completed campaigns publish
+their normalized result and index atomically.
 
 ### Remote Execution
 

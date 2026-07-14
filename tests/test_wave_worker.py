@@ -1537,6 +1537,7 @@ def _provider_wave_inputs(
             max_concurrent_requests=provider_concurrency,
             max_attempts=2,
             max_spend_usd=Decimal("2.50"),
+            estimated_wave_cost_usd=Decimal("1.00"),
         ),
     )
     spec = remote_spec.model_copy(

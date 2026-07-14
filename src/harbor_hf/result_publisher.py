@@ -11,6 +11,7 @@ from huggingface_hub import CommitOperationAdd, HfApi
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, Field
 
+from harbor_hf.control import CampaignStoreApi
 from harbor_hf.results import (
     DatasetFile,
     GlobalIndexRow,
@@ -18,10 +19,16 @@ from harbor_hf.results import (
     ResultTables,
     build_global_index_row,
     build_index_file,
+    build_index_window_file,
+    read_index_file,
 )
+
+DatasetApi = CampaignStoreApi
 
 _MAX_COMMIT_ATTEMPTS = 8
 _PUBLISHER_LEASE_TTL = timedelta(minutes=15)
+_INDEX_WINDOW_SIZES = tuple(2**power for power in range(12))
+_LARGEST_INDEX_WINDOW = _INDEX_WINDOW_SIZES[-1]
 
 
 class DatasetPublicationError(RuntimeError):
@@ -65,20 +72,6 @@ class IndexReceipt(FrozenModel):
     index_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
-class DatasetApi(Protocol):
-    def repo_info(self, repo_id: str, **kwargs: object) -> object: ...
-
-    def get_paths_info(
-        self, repo_id: str, paths: str | list[str], **kwargs: object
-    ) -> list[object]: ...
-
-    def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str: ...
-
-    def create_commit(
-        self, repo_id: str, operations: list[object], **kwargs: object
-    ) -> object: ...
-
-
 class PublisherLeaseStore(Protocol):
     def acquire(self, path: str, owner: dict[str, str]) -> None: ...
 
@@ -98,14 +91,14 @@ class HubDatasetPublisher:
         *,
         publisher_id: str,
         leases: PublisherLeaseStore,
-        api: DatasetApi | None = None,
+        api: CampaignStoreApi | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if not publisher_id:
             raise ValueError("publisher ID is required")
         self.publisher_id = publisher_id
         self.leases = leases
-        self.api = api or cast(DatasetApi, HfApi())
+        self.api = api or cast(CampaignStoreApi, HfApi())
         self.clock = clock
 
     def publish(
@@ -232,18 +225,33 @@ class HubDatasetPublisher:
                     receipt_path,
                     head,
                 )
-                return receipt.result_revision, head
-            row = build_global_index_row(
-                tables,
-                result_dataset=result_dataset,
-                result_revision=result_revision,
-            )
+                row = self._read_index_row(index_dataset, receipt.index_path, head)
+                indexed_result_revision = receipt.result_revision
+            else:
+                receipt = None
+                indexed_result_revision = result_revision
+                row = build_global_index_row(
+                    tables,
+                    result_dataset=result_dataset,
+                    result_revision=result_revision,
+                )
             index_file = build_index_file(row)
-            receipt = self._index_receipt(row, index_file)
-            try:
-                response = self.api.create_commit(
-                    index_dataset,
-                    [
+            windows = self._index_windows(index_dataset, head, row)
+            if receipt is not None and self._windows_match(
+                index_dataset, head, windows
+            ):
+                return receipt.result_revision, head
+            receipt = receipt or self._index_receipt(row, index_file)
+            operations: list[object] = [
+                CommitOperationAdd(
+                    path_in_repo=window.path,
+                    path_or_fileobj=window.content,
+                )
+                for window in windows
+            ]
+            if not self._exists(index_dataset, receipt_path, head):
+                operations.extend(
+                    (
                         CommitOperationAdd(
                             path_in_repo=index_file.path,
                             path_or_fileobj=index_file.content,
@@ -254,17 +262,72 @@ class HubDatasetPublisher:
                                 receipt.model_dump(mode="json")
                             ),
                         ),
-                    ],
+                    )
+                )
+            try:
+                response = self.api.create_commit(
+                    index_dataset,
+                    operations,
                     commit_message=f"feat: index result {tables.runs[0].run_id}",
                     repo_type="dataset",
                     revision="main",
                     parent_commit=head,
                 )
-                return result_revision, self._commit_oid(response, index_dataset)
+                return indexed_result_revision, self._commit_oid(
+                    response, index_dataset
+                )
             except HfHubHTTPError as error:
                 if not _is_parent_conflict(error):
                     raise
         raise DatasetPublicationError("global index Dataset remained contended")
+
+    def _index_windows(
+        self, dataset: str, revision: str, row: GlobalIndexRow
+    ) -> list[DatasetFile]:
+        largest_path = build_index_window_file([], _LARGEST_INDEX_WINDOW).path
+        if self._exists(dataset, largest_path, revision):
+            existing = read_index_file(self._read(dataset, largest_path, revision))
+        else:
+            existing = self._legacy_index_rows(dataset, revision)
+        by_publication = {item.publication_id: item for item in existing}
+        by_publication[row.publication_id] = row
+        ordered = sorted(
+            by_publication.values(),
+            key=lambda item: (item.completed_at, item.publication_id),
+            reverse=True,
+        )[:_LARGEST_INDEX_WINDOW]
+        return [build_index_window_file(ordered, size) for size in _INDEX_WINDOW_SIZES]
+
+    def _legacy_index_rows(self, dataset: str, revision: str) -> list[GlobalIndexRow]:
+        paths = self.api.list_repo_files(
+            dataset, repo_type="dataset", revision=revision
+        )
+        rows: list[GlobalIndexRow] = []
+        for path in paths:
+            if (
+                path.startswith("data/index/schema=v1/")
+                and path.endswith(".parquet")
+                and "/windows/" not in path
+            ):
+                rows.extend(read_index_file(self._read(dataset, path, revision)))
+        return rows
+
+    def _windows_match(
+        self, dataset: str, revision: str, windows: list[DatasetFile]
+    ) -> bool:
+        return all(
+            self._exists(dataset, window.path, revision)
+            and self._read(dataset, window.path, revision) == window.content
+            for window in windows
+        )
+
+    def _read_index_row(self, dataset: str, path: str, revision: str) -> GlobalIndexRow:
+        rows = read_index_file(self._read(dataset, path, revision))
+        if len(rows) != 1:
+            raise DatasetPublicationError(
+                "global index publication must contain exactly one row"
+            )
+        return rows[0]
 
     def _adopt_index(
         self,

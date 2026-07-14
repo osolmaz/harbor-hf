@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from harbor_hf.campaigns import build_campaign_lock, build_campaign_plan
@@ -108,6 +109,28 @@ def test_campaign_submit_requires_remote_configuration() -> None:
 
     assert result.exit_code == 1
     assert "requires a remote configuration" in result.stderr
+
+
+def test_campaign_submit_rejects_missing_index_before_remote_mutation(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    spec = remote_spec.model_copy(
+        update={
+            "publishing": remote_spec.publishing.model_copy(
+                update={"index_dataset": None}
+            )
+        }
+    )
+    manifest = tmp_path / "missing-index.yaml"
+    manifest.write_text(
+        yaml.safe_dump(spec.model_dump(mode="json", exclude_none=True)),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["campaign", "submit", str(manifest), "--dry-run"])
+
+    assert result.exit_code == 1
+    assert "requires publishing.index_dataset" in result.stderr
 
 
 def test_campaign_status_and_dry_reconcile(

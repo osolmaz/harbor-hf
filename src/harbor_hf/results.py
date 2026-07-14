@@ -556,6 +556,23 @@ def build_index_file(row: GlobalIndexRow) -> DatasetFile:
     )
 
 
+def build_index_window_file(rows: Sequence[GlobalIndexRow], size: int) -> DatasetFile:
+    if size < 1:
+        raise ValueError("index window size must be positive")
+    return DatasetFile(
+        path=f"data/index/schema=v1/windows/{size:04d}.parquet",
+        content=_parquet_bytes(rows[:size], index_parquet_schema()),
+    )
+
+
+def read_index_file(content: bytes) -> list[GlobalIndexRow]:
+    try:
+        values = pq.read_table(pa.BufferReader(content), schema=index_parquet_schema())
+    except (pa.ArrowException, OSError) as error:
+        raise ValueError("global index Parquet is invalid") from error
+    return [GlobalIndexRow.model_validate(value) for value in values.to_pylist()]
+
+
 def rebuild_result_tables(
     reader: EvidenceReader, requests: list[RebuildRequest]
 ) -> list[ResultTables]:

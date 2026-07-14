@@ -160,6 +160,20 @@ class DatasetLoader:
         )
         if not paths:
             raise PresentationError("the configured index has no v1 Parquet rows")
+        window_paths = [path for path in paths if "/windows/" in path]
+        if window_paths:
+            requested = self._config.max_publications
+            paths = [
+                min(
+                    window_paths,
+                    key=lambda path: (
+                        _index_window_size(path) < requested,
+                        abs(_index_window_size(path) - requested),
+                    ),
+                )
+            ]
+        else:
+            paths = paths[: self._config.max_publications]
         parsed = [
             self._validate(GlobalIndexRow, value, path)
             for path in paths
@@ -238,6 +252,13 @@ class DatasetLoader:
                 f"publication {index.publication_id} has a mismatched trace"
             )
         _validate_relations(run, trials, executions, metrics, artifacts)
+
+
+def _index_window_size(path: str) -> int:
+    try:
+        return int(Path(path).stem)
+    except ValueError as error:
+        raise PresentationError(f"invalid index window path: {path}") from error
 
 
 def _read_parquet(path: Path) -> list[Mapping[str, object]]:

@@ -73,12 +73,13 @@ from harbor_hf.models import (
 from harbor_hf.process import ProcessError, SubprocessRunner
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.reconciler import (
+    AdmissionUsage,
     ReconcileAction,
     ReconcileContext,
     ReconcilePlan,
     plan_reconciliation,
 )
-from harbor_hf.recovery import RecoveryProjection, TerminalDecision
+from harbor_hf.recovery import RecoveryProjection, TerminalDecision, project_recovery
 from harbor_hf.submission import (
     BucketApi,
     TextRunner,
@@ -365,23 +366,29 @@ class CampaignReconciler:
             if changed:
                 lock, events = self.store.load_campaign(campaign_id)
         self._last_observed_at = max(event.observed_at for event in events)
-        projection, plan = plan_reconciliation(
-            lock,
-            events,
-            context=context,
-            now=self.clock(),
-        )
         reservations = _validated_reservations(
             self.store.load_action_reservations(campaign_id),
             campaign_id=campaign_id,
         )
+        effective_context = _context_with_unobserved_actions(
+            lock, events, reservations, context
+        )
+        projection, plan = plan_reconciliation(
+            lock,
+            events,
+            context=effective_context,
+            now=self.clock(),
+        )
         if self._recover_terminal_jobs(lock, spec, projection, reservations):
             lock, events = self.store.load_campaign(campaign_id)
             self._last_observed_at = max(event.observed_at for event in events)
+            effective_context = _context_with_unobserved_actions(
+                lock, events, reservations, context
+            )
             projection, plan = plan_reconciliation(
                 lock,
                 events,
-                context=context,
+                context=effective_context,
                 now=self.clock(),
             )
         if (
@@ -392,10 +399,13 @@ class CampaignReconciler:
         ):
             self._record_terminal(lock, plan.terminal_decision)
             lock, events = self.store.load_campaign(campaign_id)
+            effective_context = _context_with_unobserved_actions(
+                lock, events, reservations, context
+            )
             projection, plan = plan_reconciliation(
                 lock,
                 events,
-                context=context,
+                context=effective_context,
                 now=self.clock(),
             )
         pending = _pending_actions(projection.campaign.actions, reservations)
@@ -403,7 +413,7 @@ class CampaignReconciler:
             [*pending, *self._reserve_new(lock, plan.actions)],
             key=lambda action: (_ACTION_PRIORITY[action.kind], action.action_id),
         )
-        limit = (context or ReconcileContext()).limits.action_limit
+        limit = effective_context.limits.action_limit
         allow_billable = projection.campaign.status in {"queued", "active"}
         applied = self._apply_selected(
             lock,
@@ -476,9 +486,46 @@ class CampaignReconciler:
         context: ReconcileContext | None = None,
     ) -> list[CampaignApplyResult | CampaignApplyFailure]:
         results: list[CampaignApplyResult | CampaignApplyFailure] = []
-        for campaign_id in self.store.list_campaigns():
+        campaign_ids = self.store.list_campaigns()
+        observed: dict[str, AdmissionUsage] = {}
+        admission_unknown = False
+        for campaign_id in campaign_ids:
             try:
-                results.append(self.apply_campaign(campaign_id, context=context))
+                observed[campaign_id] = self._admission_usage(campaign_id)
+            except Exception:
+                admission_unknown = True
+                observed[campaign_id] = AdmissionUsage()
+        baseline = context or ReconcileContext()
+        if admission_unknown:
+            baseline = baseline.model_copy(
+                update={
+                    "usage": baseline.usage.model_copy(
+                        update={
+                            "global_active_waves": max(
+                                baseline.usage.global_active_waves,
+                                baseline.limits.global_active_waves,
+                            )
+                        }
+                    )
+                }
+            )
+        for campaign_id in campaign_ids:
+            try:
+                campaign_context = baseline.model_copy(
+                    update={
+                        "usage": _combined_usage(
+                            baseline.usage,
+                            (
+                                contribution
+                                for owner, contribution in observed.items()
+                                if owner != campaign_id
+                            ),
+                        )
+                    }
+                )
+                result = self.apply_campaign(campaign_id, context=campaign_context)
+                results.append(result)
+                observed[campaign_id] = self._admission_usage(campaign_id)
             except Exception as error:
                 results.append(
                     CampaignApplyFailure(
@@ -488,6 +535,15 @@ class CampaignReconciler:
                     )
                 )
         return results
+
+    def _admission_usage(self, campaign_id: str) -> AdmissionUsage:
+        lock, events = self.store.load_campaign(campaign_id)
+        projection = project_recovery(lock, events)
+        reservations = _validated_reservations(
+            self.store.load_action_reservations(campaign_id),
+            campaign_id=campaign_id,
+        )
+        return _build_admission_usage(campaign_id, projection, reservations)
 
     def _recover_terminal_jobs(
         self,
@@ -1113,6 +1169,130 @@ _AMBIGUOUS_ENDPOINT_ERRORS = (
     AmbiguousEndpointDelete,
     EndpointVerificationTimeout,
 )
+
+
+def _context_with_unobserved_actions(
+    lock: CampaignLock,
+    events: list[CampaignEvent],
+    reservations: Mapping[str, ReconcileAction],
+    context: ReconcileContext | None,
+) -> ReconcileContext:
+    baseline = context or ReconcileContext()
+    projection = project_recovery(lock, events)
+    unobserved = [
+        admission
+        for admission in _active_action_admissions(projection, reservations)
+        if admission[0] not in projection.waves
+    ]
+    if not unobserved:
+        return baseline
+    usage = _usage_from_admissions(lock.campaign_id, 0, unobserved)
+    return baseline.model_copy(
+        update={"usage": _combined_usage(baseline.usage, [usage])}
+    )
+
+
+def _build_admission_usage(
+    campaign_id: str,
+    projection: RecoveryProjection,
+    reservations: Mapping[str, ReconcileAction],
+) -> AdmissionUsage:
+    admissions = [
+        (
+            wave.wave_id,
+            wave.deployment_digest,
+            wave.provider,
+            wave.estimated_cost_microusd,
+        )
+        for wave in projection.waves.values()
+        if wave.status != "closed"
+    ]
+    admissions.extend(_active_action_admissions(projection, reservations))
+    return _usage_from_admissions(campaign_id, projection.spend_microusd, admissions)
+
+
+def _usage_from_admissions(
+    campaign_id: str,
+    recorded_spend: int,
+    admissions: Iterable[tuple[str, str, str, int]],
+) -> AdmissionUsage:
+    unique: dict[str, tuple[str, str, int]] = {}
+    for wave_id, deployment, provider, estimate in admissions:
+        unique[wave_id] = (deployment, provider, estimate)
+    deployments: dict[str, int] = {}
+    providers: dict[str, int] = {}
+    estimated_spend = 0
+    for deployment, provider, estimate in unique.values():
+        deployments[deployment] = deployments.get(deployment, 0) + 1
+        providers[provider] = providers.get(provider, 0) + 1
+        estimated_spend += estimate
+    active = len(unique)
+    spend = recorded_spend + estimated_spend
+    return AdmissionUsage(
+        global_active_waves=active,
+        deployment_active_waves=deployments,
+        provider_active_waves=providers,
+        campaign_active_waves={campaign_id: active} if active else {},
+        campaign_spend_microusd={campaign_id: spend} if spend else {},
+    )
+
+
+def _active_action_admissions(
+    projection: RecoveryProjection,
+    reservations: Mapping[str, ReconcileAction],
+) -> list[tuple[str, str, str, int]]:
+    admissions: list[tuple[str, str, str, int]] = []
+    for action_id, state in projection.campaign.actions.items():
+        if state.action_kind not in {
+            "submit-wave",
+            "retry-shard",
+        } or state.status not in {"succeeded", "ambiguous"}:
+            continue
+        action = reservations.get(action_id)
+        if action is None:
+            raise CampaignApplyError(
+                f"action event has no reservation record: {action_id}"
+            )
+        wave_id = action.wave_id or f"wave-{action.action_key}"
+        observed = projection.waves.get(wave_id)
+        if observed is None or observed.status != "closed":
+            admissions.append(
+                (
+                    wave_id,
+                    action.deployment_digest,
+                    action.provider,
+                    action.estimated_cost_microusd or 0,
+                )
+            )
+    return admissions
+
+
+def _combined_usage(
+    baseline: AdmissionUsage, contributions: Iterable[AdmissionUsage]
+) -> AdmissionUsage:
+    global_waves = baseline.global_active_waves
+    deployments = dict(baseline.deployment_active_waves)
+    providers = dict(baseline.provider_active_waves)
+    campaigns = dict(baseline.campaign_active_waves)
+    spend = dict(baseline.campaign_spend_microusd)
+
+    def merge(target: dict[str, int], source: Mapping[str, int]) -> None:
+        for key, value in source.items():
+            target[key] = target.get(key, 0) + value
+
+    for contribution in contributions:
+        global_waves += contribution.global_active_waves
+        merge(deployments, contribution.deployment_active_waves)
+        merge(providers, contribution.provider_active_waves)
+        merge(campaigns, contribution.campaign_active_waves)
+        merge(spend, contribution.campaign_spend_microusd)
+    return AdmissionUsage(
+        global_active_waves=global_waves,
+        deployment_active_waves=deployments,
+        provider_active_waves=providers,
+        campaign_active_waves=campaigns,
+        campaign_spend_microusd=spend,
+    )
 
 
 def hugging_face_campaign_reconciler(

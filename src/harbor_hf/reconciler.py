@@ -143,7 +143,13 @@ class _MutableUsage:
             self.campaigns[campaign_id] = self.campaigns.get(campaign_id, 0) + 1
         campaign_id = projection.campaign.campaign_id
         self.spend[campaign_id] = (
-            self.spend.get(campaign_id, 0) + projection.spend_microusd
+            self.spend.get(campaign_id, 0)
+            + projection.spend_microusd
+            + sum(
+                wave.estimated_cost_microusd
+                for wave in projection.waves.values()
+                if wave.status != "closed"
+            )
         )
 
     def admit(self, candidate: _Candidate, campaign_id: str) -> None:
@@ -640,10 +646,20 @@ def _deployment(
     locked = _run_admission(lock, deployment_digest)
     observed = context.deployments.get(deployment_digest)
     if observed is None:
-        return DeploymentAdmission(provider=locked.provider or "hf-inference-endpoints")
+        return DeploymentAdmission(
+            provider=locked.provider or "hf-inference-endpoints",
+            estimated_wave_cost_microusd=locked.estimated_wave_cost_microusd,
+        )
     return observed.model_copy(
         update={
-            "provider": observed.provider or locked.provider or "hf-inference-endpoints"
+            "provider": observed.provider
+            or locked.provider
+            or "hf-inference-endpoints",
+            "estimated_wave_cost_microusd": (
+                observed.estimated_wave_cost_microusd
+                if observed.estimated_wave_cost_microusd is not None
+                else locked.estimated_wave_cost_microusd
+            ),
         }
     )
 
@@ -663,12 +679,14 @@ def _run_admission(lock: CampaignLock, deployment_digest: str) -> CampaignRunLoc
         first.provider,
         first.max_concurrent_requests,
         first.spend_cap_microusd,
+        first.estimated_wave_cost_microusd,
     )
     if any(
         (
             run.provider,
             run.max_concurrent_requests,
             run.spend_cap_microusd,
+            run.estimated_wave_cost_microusd,
         )
         != identity
         for run in matches[1:]

@@ -27,6 +27,7 @@ _ARTIFACT_CHECKSUM = f"sha256:{'1' * 64}"
 class FakeReader:
     def __init__(self, publications: list[tuple[str, str]]) -> None:
         self.publications = publications
+        self.read_calls: list[str] = []
         self.rows: dict[tuple[str, str, str], list[dict[str, object]]] = {}
         index_rows: list[dict[str, object]] = []
         for offset, (kind, outcome) in enumerate(publications, start=1):
@@ -59,6 +60,7 @@ class FakeReader:
     def read_rows(
         self, dataset: str, revision: str, path: str
     ) -> Sequence[Mapping[str, object]]:
+        self.read_calls.append(path)
         return self.rows[(dataset, revision, path)]
 
 
@@ -200,6 +202,35 @@ def test_loader_builds_all_operational_views_with_explicit_labels() -> None:
     assert [row["Result"] for row in partial.runs] == ["PARTIAL · COMPOSITE"]
     searched = build_views(snapshot, ViewFilters(search="model-3"))
     assert [row["Run"] for row in searched.runs] == ["run-3"]
+
+
+def test_loader_uses_the_smallest_bounded_index_window() -> None:
+    class WindowReader(FakeReader):
+        def list_files(self, dataset: str, revision: str) -> list[str]:
+            assert (dataset, revision) == ("org/index", _INDEX_REVISION)
+            return [
+                "data/index/schema=v1/legacy-one.parquet",
+                "data/index/schema=v1/windows/0001.parquet",
+                "data/index/schema=v1/windows/0002.parquet",
+                "data/index/schema=v1/windows/0004.parquet",
+                "data/index/schema=v1/windows/0008.parquet",
+            ]
+
+    reader = WindowReader(
+        [("ordinary", "complete"), ("ordinary", "complete"), ("ordinary", "complete")]
+    )
+    index_rows = reader.rows[
+        ("org/index", _INDEX_REVISION, "data/index/schema=v1/all.parquet")
+    ]
+    window = "data/index/schema=v1/windows/0004.parquet"
+    reader.rows[("org/index", _INDEX_REVISION, window)] = index_rows
+    snapshot = DatasetLoader(
+        SpaceConfig(index_dataset="org/index", max_publications=3), reader
+    ).load()
+
+    assert len(snapshot.index_rows) == 3
+    assert reader.read_calls[0] == window
+    assert not any("legacy" in path for path in reader.read_calls)
 
 
 def test_loader_fails_closed_on_conflicting_provenance() -> None:

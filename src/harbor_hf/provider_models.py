@@ -74,6 +74,22 @@ class ProviderLimits(FrozenModel):
     max_concurrent_requests: int = Field(default=1, ge=1)
     max_attempts: int = Field(default=1, ge=1)
     max_spend_usd: Decimal | None = Field(default=None, gt=0)
+    estimated_wave_cost_usd: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def spend_cap_has_an_admission_estimate(self) -> ProviderLimits:
+        if (self.max_spend_usd is None) != (self.estimated_wave_cost_usd is None):
+            raise ValueError(
+                "provider spend caps and estimated wave costs must be "
+                "configured together"
+            )
+        if (
+            self.max_spend_usd is not None
+            and self.estimated_wave_cost_usd is not None
+            and self.estimated_wave_cost_usd > self.max_spend_usd
+        ):
+            raise ValueError("estimated provider wave cost exceeds its spend cap")
+        return self
 
 
 class ProviderTarget(FrozenModel):

@@ -108,8 +108,8 @@ recording the durable outcome.
 The submitted wave Job independently acquires a campaign-and-wave lease before
 starting any benchmark work and holds it through terminal Bucket publication.
 This closes the gap after an ambiguous Job submission: a duplicate Job exits
-before inference or evidence writes. The lease expires after the wave timeout
-plus one hour if a Job is killed.
+before inference or evidence writes. The lease expires after the complete
+locked HF Job timeout if a Job is killed.
 
 Do not treat a timed-out create, resume, submit, cancel, or pause request as a
 confirmed failure. The next pass must inspect deterministic remote identities
@@ -161,6 +161,13 @@ contains typed request metadata, response routing and quota headers, retry
 attempt, usage, and latency. It never stores prompts, tool arguments, response
 text, or credentials. The proxy is part of the hosted controller Job and does
 not run inference itself.
+
+A provider spend cap requires an explicit `estimated_wave_cost_usd` in the
+same provider limits block. The reconciler reserves that estimate while a wave
+is active and combines it with observed spend before admitting another wave.
+`max_attempts` is also enforced at the proxy boundary: an identical request
+beyond the configured attempt count is rejected locally and is never forwarded
+or billed.
 
 Do not infer a hidden engine, image, region, hardware, precision, cache policy,
 or token count. Endpoint-only fields must be `not_applicable` and unreported
@@ -254,6 +261,10 @@ versioned Parquet tables for runs, logical trials, physical executions,
 metrics, and safe artifact metadata. It then writes one global index row that
 points to the benchmark Dataset and its exact commit. Retrying adopts an
 existing matching publication receipt instead of duplicating rows.
+The publisher also updates consolidated power-of-two index windows from 1 to
+2,048 rows. The Space reads the smallest window that covers its configured
+publication limit, keeping refresh requests and bytes bounded as the immutable
+per-publication index archive grows.
 
 Ordinary complete runs are the default comparable result class. Partial,
 composite, and manually selected results require an explicit publication path

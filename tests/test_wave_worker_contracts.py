@@ -355,7 +355,7 @@ def test_wave_worker_lease_serializes_the_complete_remote_job(
         "wave_id": wave.wave_id,
         "job_id": "job-one",
         "expires_at": (
-            NOW + timedelta(seconds=wave.duration_seconds, hours=1)
+            NOW + timedelta(seconds=wave.remote.job.timeout_seconds)
         ).isoformat(),
     }
 
