@@ -1,0 +1,41 @@
+{
+  "schema_version": "harbor-hf/harbor-adapter-contract-corpus/v1",
+  "scenarios": [
+    {
+      "name": "successful-trial",
+      "process_exit": 0,
+      "bundle": "terminal",
+      "trial_updates": {},
+      "expected": "verified"
+    },
+    {
+      "name": "handled-trial-failure",
+      "process_exit": 1,
+      "bundle": "terminal",
+      "trial_updates": {"exception_type": "AgentTimeoutError"},
+      "expected": "AgentTimeoutError"
+    },
+    {
+      "name": "infrastructure-failure",
+      "process_exit": 7,
+      "bundle": null,
+      "trial_updates": {},
+      "expected": "process-failure"
+    },
+    {
+      "name": "physical-retry",
+      "process_exit": 0,
+      "bundle": "terminal",
+      "physical_attempt": 2,
+      "trial_updates": {},
+      "expected": "verified"
+    },
+    {
+      "name": "successful-multi-step-trial",
+      "process_exit": 0,
+      "bundle": "terminal",
+      "trial_updates": {"step_exceptions": []},
+      "expected": "verified"
+    }
+  ]
+}

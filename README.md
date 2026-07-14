@@ -137,6 +137,10 @@ documents deterministic endpoint ownership, and the
 Parquet schemas and the evidence-safety boundary. The
 [fully hosted Harbor Cookbook guide](docs/harbor-cookbook.md) covers campaign
 operation and result publication. The
+[Harbor compatibility contract](docs/harbor-integration-contract.md) freezes
+the current checksummed request and typed result boundary. The
+[Harbor integration refactor plan](docs/harbor-integration-refactor.md) tracks
+the migration to a stable Harbor-owned protocol. The
 [implementation plan](docs/implementation-plan.md) tracks the complete path to
 remote execution.
 

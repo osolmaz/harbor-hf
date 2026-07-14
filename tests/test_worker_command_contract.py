@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from harbor_hf.harbor_adapter import build_execution_request
 from harbor_hf.models import DeploymentProfile, ExperimentSpec
 from harbor_hf.provider_models import (
     ExplicitProviderRoute,
@@ -75,12 +76,13 @@ def test_run_command_is_the_complete_ordered_process_contract(
     jobs = tmp_path / "jobs-contract"
     source = tmp_path / "source-contract"
 
-    assert build_harbor_command(
+    command = build_harbor_command(
         lock,
         jobs,
         "https://user:password@host-contract.example:9443/api",
         source,
-    ) == [
+    )
+    assert command == [
         "uv",
         "run",
         "--project",
@@ -91,44 +93,54 @@ def test_run_command_is_the_complete_ordered_process_contract(
         "hf-sandbox",
         "harbor",
         "run",
-        "--dataset",
-        "harbor/dataset-contract@sha256:" + "9" * 64,
-        "--n-attempts",
-        "3",
-        "--agent",
-        "agent-contract",
-        "--model",
-        "openai/served-contract",
-        "--env",
-        "environment-contract",
-        "--environment-kwarg",
-        "flavor=flavor-contract",
-        "--environment-kwarg",
-        "job_timeout=4321",
-        "--jobs-dir",
-        str(jobs),
-        "--n-concurrent",
-        "4",
-        "--n-concurrent-agents",
-        "4",
-        "--max-retries",
-        "0",
-        "--allow-agent-host",
-        "host-contract.example",
+        "--config",
+        str(jobs.parent / "harbor-job.json"),
         "--yes",
-        "--include-task-name",
-        "task-zeta",
-        "--include-task-name",
-        "task-alpha",
-        "--agent-kwarg",
-        'version="3.4.5"',
-        "--agent-kwarg",
-        'alpha=["value",2]',
-        "--agent-kwarg",
-        'middle="quoted-contract"',
-        "--agent-kwarg",
-        'zeta={"nested":7}',
     ]
+    assert (
+        json.loads((tmp_path / "harbor-job.json").read_text())["n_concurrent_trials"]
+        == 4
+    )
+    request = build_execution_request(
+        lock,
+        jobs,
+        "https://user:password@host-contract.example:9443/api",
+        task_names=list(lock.benchmark_tasks),
+        attempts=3,
+        concurrency=4,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    assert request.harbor_config == {
+        "jobs_dir": str(jobs),
+        "n_attempts": 3,
+        "n_concurrent_trials": 4,
+        "retry": {"max_retries": 0},
+        "environment": {
+            "type": "environment-contract",
+            "kwargs": {"flavor": "flavor-contract", "job_timeout": 4321},
+        },
+        "agents": [
+            {
+                "name": "agent-contract",
+                "model_name": "openai/served-contract",
+                "n_concurrent": 4,
+                "extra_allowed_hosts": ["host-contract.example"],
+                "kwargs": {
+                    "alpha": ["value", 2],
+                    "middle": "quoted-contract",
+                    "version": "3.4.5",
+                    "zeta": {"nested": 7},
+                },
+            }
+        ],
+        "datasets": [
+            {
+                "name": "harbor/dataset-contract",
+                "ref": "sha256:" + "9" * 64,
+                "task_names": ["task-zeta", "task-alpha"],
+            }
+        ],
+    }
 
 
 def test_wave_trial_command_overrides_only_attempt_and_concurrency_contract(
@@ -138,13 +150,14 @@ def test_wave_trial_command_overrides_only_attempt_and_concurrency_contract(
     jobs = tmp_path / "trial-jobs"
     source = tmp_path / "trial-source"
 
-    assert build_harbor_trial_command(
+    command = build_harbor_trial_command(
         lock,
         jobs,
         "https://trial-host.example/base",
         source,
         task_name="task-alpha",
-    ) == [
+    )
+    assert command == [
         "uv",
         "run",
         "--project",
@@ -155,52 +168,49 @@ def test_wave_trial_command_overrides_only_attempt_and_concurrency_contract(
         "hf-sandbox",
         "harbor",
         "run",
-        "--dataset",
-        "harbor/dataset-contract@sha256:" + "9" * 64,
-        "--n-attempts",
-        "1",
-        "--agent",
-        "agent-contract",
-        "--model",
-        "openai/served-contract",
-        "--env",
-        "environment-contract",
-        "--environment-kwarg",
-        "flavor=flavor-contract",
-        "--environment-kwarg",
-        "job_timeout=4321",
-        "--jobs-dir",
-        str(jobs),
-        "--n-concurrent",
-        "1",
-        "--n-concurrent-agents",
-        "1",
-        "--max-retries",
-        "0",
-        "--allow-agent-host",
-        "trial-host.example",
+        "--config",
+        str(jobs.parent / "harbor-job.json"),
         "--yes",
-        "--include-task-name",
-        "task-alpha",
-        "--agent-kwarg",
-        'version="3.4.5"',
-        "--agent-kwarg",
-        'alpha=["value",2]',
-        "--agent-kwarg",
-        'middle="quoted-contract"',
-        "--agent-kwarg",
-        'zeta={"nested":7}',
+    ]
+    assert json.loads((tmp_path / "harbor-job.json").read_text())["datasets"][0][
+        "task_names"
+    ] == ["task-alpha"]
+    request = build_execution_request(
+        lock,
+        jobs,
+        "https://trial-host.example/base",
+        task_names=["task-alpha"],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={"task-alpha": lock.benchmark_task_digests["task-alpha"]},
+    )
+    assert request.harbor_config["n_attempts"] == 1
+    assert request.harbor_config["n_concurrent_trials"] == 1
+    assert request.harbor_config["datasets"] == [
+        {
+            "name": "harbor/dataset-contract",
+            "ref": "sha256:" + "9" * 64,
+            "task_names": ["task-alpha"],
+        }
     ]
 
 
 def test_command_uses_empty_host_only_when_base_url_has_no_hostname(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
-    command = build_harbor_command(
-        _contract_lock(remote_spec), tmp_path, "/relative-base", tmp_path
+    lock = _contract_lock(remote_spec)
+    request = build_execution_request(
+        lock,
+        tmp_path,
+        "/relative-base",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
     )
-
-    assert command[command.index("--allow-agent-host") + 1] == ""
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    assert agents[0]["extra_allowed_hosts"] == [""]
 
 
 def test_command_rejects_a_lock_without_an_endpoint_binding(
@@ -240,11 +250,38 @@ def test_command_preserves_an_existing_content_addressed_dataset(
         }
     )
 
-    command = build_harbor_command(lock, tmp_path, "https://endpoint.example", tmp_path)
-
-    assert command[command.index("--dataset") + 1] == (
-        f"harbor/dataset-contract@{digest}"
+    request = build_execution_request(
+        lock,
+        tmp_path,
+        "https://endpoint.example",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
     )
+    assert request.harbor_config["datasets"] == [
+        {
+            "name": "harbor/dataset-contract",
+            "ref": digest,
+            "task_names": ["task-zeta", "task-alpha"],
+        }
+    ]
+
+
+def test_command_resolves_wildcard_task_digests(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _contract_lock(remote_spec).model_copy(update={"benchmark_tasks": ["*"]})
+
+    build_harbor_command(
+        lock,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        tmp_path / "source",
+    )
+
+    config = json.loads((tmp_path / "harbor-job.json").read_text())
+    assert config["datasets"][0]["task_names"] == ["*"]
 
 
 def test_command_rejects_an_invalid_locked_dataset_digest(
@@ -279,21 +316,19 @@ def test_provider_command_applies_locked_openclaw_request_controls(
     )
     lock = build_run_lock(spec, run_id="provider-command-contract", allow_provider=True)
 
-    command = build_harbor_trial_command(
+    task_name = next(iter(lock.benchmark_task_digests))
+    request = build_execution_request(
         lock,
         tmp_path / "jobs",
         "https://router.huggingface.co",
-        tmp_path / "source",
-        task_name=next(iter(lock.benchmark_task_digests)),
+        task_names=[task_name],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={task_name: lock.benchmark_task_digests[task_name]},
     )
-
-    encoded = next(
-        command[index + 1]
-        for index, value in enumerate(command)
-        if value == "--agent-kwarg"
-        and command[index + 1].startswith("openclaw_config=")
-    )
-    config = json.loads(encoded.removeprefix("openclaw_config="))
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    config = agents[0]["kwargs"]["openclaw_config"]
     provider = config["models"]["providers"]["openai"]
     assert provider == {
         "api": "openai-completions",

@@ -1,4 +1,6 @@
-from collections.abc import Mapping
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,93 @@ from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, RemoteExecutionSpec
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
+
+
+def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> None:
+    jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+    output = Path(command[command.index("--output") + 1])
+
+    def digest(path: Path) -> str:
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+    trials: list[dict[str, object]] = []
+    for result_path in sorted(jobs_dir.glob("*/*/result.json")):
+        trial_dir = result_path.parent
+        lock_path = trial_dir / "lock.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        agent = result["agent_info"]
+        model = agent.get("model_info") or {}
+        exception = result.get("exception_info")
+        step_exceptions = [
+            {
+                "step_name": step.get("step_name") or str(index),
+                "exception_type": step["exception_info"].get(
+                    "exception_type", "malformed result"
+                ),
+            }
+            for index, step in enumerate(result.get("step_results") or [], start=1)
+            if isinstance(step, dict) and isinstance(step.get("exception_info"), dict)
+        ]
+        verifier = result.get("verifier_result") or {}
+        artifacts = [
+            {
+                "path": path.relative_to(trial_dir).as_posix(),
+                "size": path.stat().st_size,
+                "digest": digest(path),
+            }
+            for path in sorted(trial_dir.rglob("*"))
+            if path.is_file()
+        ]
+        trials.append(
+            {
+                "path": trial_dir.relative_to(jobs_dir).as_posix(),
+                "trial_id": str(
+                    result.get("id", "00000000-0000-0000-0000-000000000001")
+                ),
+                "trial_name": str(result.get("trial_name", trial_dir.name)),
+                "lock_digest": digest(lock_path),
+                "result_digest": digest(result_path),
+                "task_name": result["task_name"],
+                "task_digest": lock["task"]["digest"],
+                "agent_name": agent["name"],
+                "agent_version": agent["version"],
+                "model_provider": model.get("provider"),
+                "model_name": model.get("name"),
+                "exception_type": (
+                    exception.get("exception_type")
+                    if isinstance(exception, dict)
+                    else None
+                ),
+                "step_exceptions": step_exceptions,
+                "rewards": verifier.get("rewards"),
+                "timing": {
+                    "trial": {"started_at": None, "finished_at": None},
+                    "environment_setup": None,
+                    "agent_setup": None,
+                    "agent_execution": None,
+                    "verifier": None,
+                    "steps": [],
+                },
+                "usage": {
+                    "input_tokens": None,
+                    "cache_tokens": None,
+                    "output_tokens": None,
+                    "cost_usd": None,
+                },
+                "artifacts": artifacts,
+            }
+        )
+    bundle = {
+        "schema_version": "harbor-hf/harbor-compatibility/v1alpha1",
+        "harbor_revision": command[command.index("--harbor-revision") + 1],
+        "harbor_version": "test",
+        "request_digest": command[command.index("--request-digest") + 1],
+        "jobs": [],
+        "trials": trials,
+    }
+    output.write_text(json.dumps(bundle), encoding="utf-8")
+    log_path.write_text("exported\n", encoding="utf-8")
 
 
 class _WaveClaims:

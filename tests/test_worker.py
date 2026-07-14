@@ -11,8 +11,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from conftest import write_fake_compatibility_bundle
 
 from harbor_hf.coordination import ClaimConflict, run_claim_path
+from harbor_hf.harbor_adapter import build_execution_request
 from harbor_hf.models import DeploymentProfile, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
@@ -1611,40 +1613,26 @@ def test_harbor_command_is_pinned_and_bounded(
         "hf-sandbox",
         "harbor",
         "run",
-        "--dataset",
-        "harbor/terminal-bench@sha256:" + "1" * 64,
-        "--n-attempts",
-        "1",
-        "--agent",
-        "openclaw",
-        "--model",
-        "openai//repository",
-        "--env",
-        "hf-sandbox",
-        "--environment-kwarg",
-        "flavor=cpu-basic",
-        "--environment-kwarg",
-        "job_timeout=3600",
-        "--jobs-dir",
-        str(tmp_path),
-        "--n-concurrent",
-        "1",
-        "--n-concurrent-agents",
-        "1",
-        "--max-retries",
-        "0",
-        "--allow-agent-host",
-        "endpoint.example",
+        "--config",
+        str(tmp_path.parent / "harbor-job.json"),
         "--yes",
-        "--include-task-name",
-        "cancel-async-tasks",
-        "--agent-kwarg",
-        'version="2026.7.2"',
-        "--agent-kwarg",
-        "compaction=true",
-        "--agent-kwarg",
-        'thinking="off"',
     ]
+    request = build_execution_request(
+        lock,
+        tmp_path,
+        "https://endpoint.example",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    assert agents[0]["kwargs"] == {
+        "compaction": True,
+        "thinking": "off",
+        "version": "2026.7.2",
+    }
     assert _expected_agent_version(lock) == "2026.7.2"
 
 
@@ -1665,10 +1653,18 @@ def test_harbor_source_agent_uses_reported_identity_without_version_override(
     )
 
     lock = build_run_lock(spec)
-    command = build_harbor_command(lock, tmp_path, "https://endpoint.example", tmp_path)
-
-    assert "version=2.0.0" not in command
-    assert not any(argument.startswith("version=") for argument in command)
+    request = build_execution_request(
+        lock,
+        tmp_path,
+        "https://endpoint.example",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    assert "version" not in agents[0]["kwargs"]
     assert _expected_agent_version(lock) == "2.0.0"
 
 
@@ -1680,12 +1676,19 @@ def test_package_agent_version_is_serialized_as_a_string(
         update={"matrix": remote_spec.matrix.model_copy(update={"agents": [agent]})}
     )
 
-    command = build_harbor_command(
-        build_run_lock(spec), tmp_path, "https://endpoint.example", tmp_path
+    lock = build_run_lock(spec)
+    request = build_execution_request(
+        lock,
+        tmp_path,
+        "https://endpoint.example",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
     )
-
-    assert 'version="1"' in command
-    assert "version=1" not in command
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    assert agents[0]["kwargs"]["version"] == "1"
 
 
 def test_mark_watchdog_ready_publishes_complete_identity() -> None:
@@ -2703,6 +2706,9 @@ def _successful_stream(
     environment: dict[str, str],
     timeout_seconds: int,
 ) -> int:
+    if "--output" in command and "--request-digest" in command:
+        write_fake_compatibility_bundle(command, log_path)
+        return 0
     assert environment == {
         "HF_TOKEN": "test-token",
         "OPENAI_API_KEY": "test-token",
@@ -2710,8 +2716,10 @@ def _successful_stream(
     }
     assert log_path.name == "harbor.log"
     assert timeout_seconds == 60
-    assert command[command.index("--allow-agent-host") + 1] == "endpoint.example"
-    jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+    config_path = Path(command[command.index("--config") + 1])
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["agents"][0]["extra_allowed_hosts"] == ["endpoint.example"]
+    jobs_dir = Path(config["jobs_dir"])
     assert any(part.startswith("harbor-hf-run-") for part in jobs_dir.parts)
     trial = jobs_dir / "job" / "trial"
     trial.mkdir(parents=True)
@@ -2827,7 +2835,11 @@ def test_worker_publishes_success_after_cleanup(
         "endpoint.final.json",
         "endpoint.snapshot.json",
         "events.jsonl",
+        "harbor-compatibility.json",
+        "harbor-export.log",
+        "harbor-job.json",
         "harbor-jobs",
+        "harbor-request.json",
         "harbor.log",
         "manifest.yaml",
         "run.lock.json",
@@ -2871,9 +2883,13 @@ def test_worker_publishes_success_after_cleanup(
         "endpoint.final.json",
         "endpoint.snapshot.json",
         "events.jsonl",
+        "harbor-compatibility.json",
+        "harbor-export.log",
+        "harbor-job.json",
         "harbor-jobs/job/trial/result.json",
         "harbor-jobs/job/trial/lock.json",
         "harbor.log",
+        "harbor-request.json",
         "manifest.yaml",
         "run.lock.json",
         "runtime-environment.json",

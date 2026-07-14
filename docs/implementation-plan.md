@@ -620,6 +620,9 @@ Deliverables:
 - support explicit complete, partial, composite, and manual-result labels;
 - document the workflow in Harbor Cookbook;
 - upstream only generic Harbor lifecycle or artifact extension points;
+- follow the staged [Harbor integration refactor](harbor-integration-refactor.md)
+  so Harbor becomes the sole authority for execution requests and trial result
+  bundles without blocking current campaigns;
 - keep package boundaries compatible with a future Harbor monorepo import.
 
 Exit criteria: an external reader can identify the exact configuration,

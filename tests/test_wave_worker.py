@@ -7,10 +7,11 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import yaml
+from conftest import write_fake_compatibility_bundle
 
 from harbor_hf.campaign_finalizer import BucketCampaignFinalizer
 from harbor_hf.campaign_observer import BucketCampaignObserver
@@ -25,6 +26,7 @@ from harbor_hf.campaigns import (
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import verify_checksums, write_checksums
+from harbor_hf.harbor_adapter import HarborVerificationFailure
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner
 from harbor_hf.provider_models import ProviderLimits, ProviderTarget
@@ -38,14 +40,50 @@ from harbor_hf.results import EvidenceSource, build_result_tables
 from harbor_hf.wave_worker import (
     WorkerError,
     _execute_shard,
+    _execution_failure_category,
     _execution_id,
     _file_digest,
+    _finalize_execution,
     _launch_wave_watchdog,
     _remaining_seconds,
     _valid_terminal_trial,
     _wave_model_name,
     run_wave_worker,
 )
+
+
+def test_verification_failure_is_terminal_benchmark_evidence() -> None:
+    error = HarborVerificationFailure("task digest does not match")
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_failed_execution_retains_malformed_compatibility_evidence(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "harbor-compatibility.json").write_text("{", encoding="utf-8")
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    verify_checksums(tmp_path)
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+    assert _event_payloads(tmp_path / "events.jsonl") == [
+        {
+            "event": "compatibility_refresh_skipped",
+            "error_type": "JSONDecodeError",
+        }
+    ]
+
+
+def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "harbor-compatibility.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        _finalize_execution(tmp_path, "test-token")
 
 
 def endpoint_snapshot(state: str, ready: int) -> dict[str, object]:
@@ -168,6 +206,7 @@ class HarborStream:
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
         self.commands: list[list[str]] = []
+        self.configs: list[dict[str, Any]] = []
         self.base_urls: list[str] = []
         self.active = 0
         self.max_active = 0
@@ -181,6 +220,9 @@ class HarborStream:
         environment: dict[str, str],
         timeout_seconds: int,
     ) -> int:
+        if "--output" in command and "--request-digest" in command:
+            write_fake_compatibility_bundle(command, log_path)
+            return 0
         base_url = environment["OPENAI_BASE_URL"]
         if self.expected_base_url is not None:
             assert base_url == self.expected_base_url
@@ -188,8 +230,11 @@ class HarborStream:
             assert base_url.startswith("http://127.0.0.1:")
             assert base_url.endswith("/v1")
         assert timeout_seconds > 0
+        config_path = Path(command[command.index("--config") + 1])
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         with self.lock:
             self.commands.append(command)
+            self.configs.append(config)
             self.base_urls.append(base_url)
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -199,8 +244,8 @@ class HarborStream:
             log_path.write_text("completed test-token\n", encoding="utf-8")
             if self.exit_code != 0:
                 return self.exit_code
-            task_name = command[command.index("--include-task-name") + 1]
-            jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+            task_name = config["datasets"][0]["task_names"][0]
+            jobs_dir = Path(config["jobs_dir"])
             trial = jobs_dir / "job" / "trial"
             trial.mkdir(parents=True)
             (trial / "result.json").write_text(
@@ -284,9 +329,8 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     assert harbor.max_active == 2
     assert len(harbor.commands) == 2
     assert all(
-        command[command.index("--n-attempts") + 1] == "1"
-        and command[command.index("--n-concurrent") + 1] == "1"
-        for command in harbor.commands
+        config["n_attempts"] == 1 and config["n_concurrent_trials"] == 1
+        for config in harbor.configs
     )
     assert [command[2] for command in endpoint.commands] == [
         "describe",
@@ -361,7 +405,11 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "checksums.json",
             "events.jsonl",
             "execution.lock.json",
+            "harbor-compatibility.json",
+            "harbor-export.log",
+            "harbor-job.json",
             "harbor-jobs",
+            "harbor-request.json",
             "harbor.log",
             "manifest.yaml",
             "verification.json",
@@ -489,8 +537,8 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     assert len(set(harbor.base_urls)) == 2
     assert all("/scopes/trial-" in base_url for base_url in harbor.base_urls)
     assert all(
-        command[command.index("--model") + 1] == f"openai/{routed_model}"
-        for command in harbor.commands
+        config["agents"][0]["model_name"] == f"openai/{routed_model}"
+        for config in harbor.configs
     )
     assert sorted(path.name for path in destination.iterdir()) == [
         "_SUCCESS",

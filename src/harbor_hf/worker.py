@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import platform
 import shutil
@@ -10,10 +9,8 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
-from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from pathlib import Path
@@ -40,6 +37,26 @@ from harbor_hf.evidence import (
     write_checksums,
     write_json,
 )
+from harbor_hf.harbor_adapter import (
+    FilesystemHarborExecutionAdapter,
+    WorkerError,
+    build_execution_request,
+)
+from harbor_hf.harbor_adapter import (
+    HarborTrialFailure as _HarborTrialFailure,
+)
+from harbor_hf.harbor_adapter.adapter import (
+    effective_agent_parameters,
+    render_harbor_command,
+)
+from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
+from harbor_hf.harbor_adapter.legacy import (
+    validate_harbor_result as _validate_harbor_result,
+)
+from harbor_hf.harbor_adapter.legacy import (
+    validate_task_counts,
+    validate_trial_count,
+)
 from harbor_hf.io import load_experiment
 from harbor_hf.models import (
     DeploymentProfile,
@@ -47,7 +64,6 @@ from harbor_hf.models import (
     ExperimentSpec,
     RemoteExecutionSpec,
     SourcePin,
-    pinned_harbor_dataset_reference,
 )
 from harbor_hf.planner import experiment_digest
 from harbor_hf.process import (
@@ -56,8 +72,6 @@ from harbor_hf.process import (
     SubprocessRunner,
     run_streaming,
 )
-from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import (
     endpoint_lease_label_for,
@@ -70,17 +84,11 @@ _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
 _ENDPOINT_CALL_TIMEOUT_SECONDS = 60.0
 _MAX_CONSECUTIVE_READINESS_ERRORS = 3
 
-
-class WorkerError(RuntimeError):
-    """Raised when a remote benchmark run cannot complete correctly."""
-
-
-class HarborTrialFailure(WorkerError):
-    """A Harbor result reported a typed trial or step exception."""
-
-    def __init__(self, message: str, exception_type: str) -> None:
-        super().__init__(message)
-        self.exception_type = exception_type
+# Historical imports remain stable while new executions use the typed adapter.
+HarborTrialFailure = _HarborTrialFailure
+validate_harbor_result = _validate_harbor_result
+_validate_task_counts = validate_task_counts
+_validate_trial_count = validate_trial_count
 
 
 class JobInspector(Protocol):
@@ -341,116 +349,38 @@ def _build_harbor_command(
     attempts: int,
     concurrency: int,
 ) -> list[str]:
-    harbor = lock.remote.harbor
-    deployment = lock.deployment
-    if isinstance(deployment, ProviderTarget):
-        served_model_name = routed_provider_model(deployment)
-    else:
-        endpoint = deployment.endpoint
-        if endpoint is None:
-            raise WorkerError("run lock has no endpoint binding")
-        served_model_name = endpoint.served_model_name
+    request = build_execution_request(
+        lock,
+        jobs_dir,
+        base_url,
+        task_names=list(task_names),
+        attempts=attempts,
+        concurrency=concurrency,
+        expected_task_digests={
+            task: digest
+            for task, digest in lock.benchmark_task_digests.items()
+            if any(fnmatch(task, selector) for selector in task_names)
+        },
+    )
+    config_path = jobs_dir.parent / "harbor-job.json"
+    _persist_compatibility_config(config_path, request.config_bytes())
+    return render_harbor_command(harbor_source, config_path)
+
+
+def _persist_compatibility_config(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        dataset_reference = pinned_harbor_dataset_reference(
-            lock.benchmark_dataset, lock.benchmark_dataset_digest
-        )
-    except ValueError as error:
-        raise WorkerError(str(error)) from error
-    command = [
-        "uv",
-        "run",
-        "--project",
-        str(harbor_source),
-        "--locked",
-        "--no-dev",
-        "--extra",
-        "hf-sandbox",
-        "harbor",
-        "run",
-        "--dataset",
-        dataset_reference,
-        "--n-attempts",
-        str(attempts),
-        "--agent",
-        lock.agent.name,
-        "--model",
-        f"openai/{served_model_name}",
-        "--env",
-        harbor.environment,
-        "--environment-kwarg",
-        f"flavor={harbor.sandbox_flavor}",
-        "--environment-kwarg",
-        f"job_timeout={harbor.sandbox_idle_timeout_seconds}",
-        "--jobs-dir",
-        str(jobs_dir),
-        "--n-concurrent",
-        str(concurrency),
-        "--n-concurrent-agents",
-        str(concurrency),
-        "--max-retries",
-        "0",
-        "--allow-agent-host",
-        urlparse(base_url).hostname or "",
-        "--yes",
-    ]
-    for task_name in task_names:
-        command.extend(("--include-task-name", task_name))
-    if lock.agent.revision_kind == "package":
-        revision = json.dumps(lock.agent.revision, separators=(",", ":"))
-        command.extend(("--agent-kwarg", f"version={revision}"))
-    for key, value in sorted(_effective_agent_parameters(lock).items()):
-        rendered = json.dumps(value, separators=(",", ":"))
-        command.extend(("--agent-kwarg", f"{key}={rendered}"))
-    return command
+        with path.open("xb") as stream:
+            stream.write(content)
+    except FileExistsError:
+        if path.read_bytes() != content:
+            raise WorkerError(
+                "existing Harbor job config does not match the request"
+            ) from None
 
 
 def _effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
-    parameters = deepcopy(lock.agent.parameters)
-    target = lock.deployment
-    if not isinstance(target, ProviderTarget):
-        return parameters
-    if lock.agent.name != "openclaw":
-        raise WorkerError(
-            "Inference Provider request controls require the OpenClaw Harbor agent"
-        )
-    existing = parameters.get("openclaw_config", {})
-    if not isinstance(existing, dict):
-        raise WorkerError("OpenClaw provider configuration must be a JSON object")
-    config = deepcopy(existing)
-    models = config.setdefault("models", {})
-    if not isinstance(models, dict):
-        raise WorkerError("OpenClaw models configuration must be a JSON object")
-    providers = models.setdefault("providers", {})
-    if not isinstance(providers, dict):
-        raise WorkerError("OpenClaw provider configuration must be a JSON object")
-    provider = providers.setdefault("openai", {})
-    if not isinstance(provider, dict):
-        raise WorkerError(
-            "OpenClaw OpenAI provider configuration must be a JSON object"
-        )
-    routed_model = routed_provider_model(target)
-    request_parameters = dict(target.parameters)
-    request_parameters.update(
-        {
-            "maxRetries": target.limits.max_attempts - 1,
-            "timeoutMs": int(target.timeout_seconds * 1000),
-        }
-    )
-    provider.update(
-        {
-            "api": "openai-completions",
-            "timeoutSeconds": math.ceil(target.timeout_seconds),
-            "models": [
-                {
-                    "id": routed_model,
-                    "name": routed_model,
-                    "params": request_parameters,
-                }
-            ],
-        }
-    )
-    parameters["openclaw_config"] = config
-    return parameters
+    return effective_agent_parameters(lock)
 
 
 def run_worker(
@@ -765,18 +695,25 @@ def _execute_benchmark(
     harbor_source: Path,
 ) -> None:
     base_url = resume_and_probe_endpoint(root, events, lock, manager, token)
-    endpoint = _endpoint_binding(lock)
 
     jobs_dir = root / "harbor-jobs"
-    harbor_command = build_harbor_command(
+    adapter = FilesystemHarborExecutionAdapter()
+    prepared = adapter.prepare(
         lock,
+        root,
         jobs_dir,
         base_url,
         harbor_source,
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
     )
     append_event(events, "harbor_started")
-    exit_code = stream_runner(
-        harbor_command,
+    outcome = adapter.execute(
+        prepared,
+        harbor_source,
+        jobs_dir,
         root / "harbor.log",
         environment={
             "HF_TOKEN": token,
@@ -784,23 +721,14 @@ def _execute_benchmark(
             "OPENAI_BASE_URL": f"{base_url}/v1",
         },
         timeout_seconds=lock.timeout_seconds,
+        stream_runner=stream_runner,
     )
-    append_event(events, "harbor_finished", exit_code=exit_code)
-    if exit_code != 0:
-        raise WorkerError(f"Harbor exited with status {exit_code}")
-    verifier = validate_harbor_result(
-        jobs_dir,
-        expected_trials=_expected_trial_count(lock),
-        expected_task_counts=_expected_task_counts(lock),
-        expected_attempts_per_task=lock.attempts,
-        expected_task_names=lock.benchmark_tasks,
-        expected_task_digests=lock.benchmark_task_digests,
-        expected_agent_name=lock.agent.name,
-        expected_agent_version=_expected_agent_version(lock),
-        expected_model_provider="openai",
-        expected_model_name=endpoint.served_model_name,
-    )
-    write_json(root / "verification.json", verifier)
+    append_event(events, "harbor_finished", exit_code=outcome.exit_code)
+    if outcome.exit_code != 0:
+        raise WorkerError(f"Harbor exited with status {outcome.exit_code}")
+    if outcome.verification is None:
+        raise WorkerError("Harbor produced no validated compatibility bundle")
+    write_json(root / "verification.json", outcome.verification.model_dump(mode="json"))
     append_event(events, "verification_validated")
 
 
@@ -1241,6 +1169,16 @@ def _finalize_evidence(root: Path, token: str) -> None:
     if scrubbed:
         append_event(root / "events.jsonl", "secrets_redacted", files=scrubbed)
     assert_secret_absent(root, token)
+    refresh_error = refresh_retained_bundle(
+        root, strict=not (root / "_FAILED").is_file()
+    )
+    if refresh_error is not None:
+        append_event(
+            root / "events.jsonl",
+            "compatibility_refresh_skipped",
+            error_type=refresh_error,
+        )
+    assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     write_checksums(root)
 
@@ -1308,195 +1246,3 @@ def _expected_agent_version(lock: RunLock) -> str:
         return lock.agent.revision
     assert lock.agent.reported_version is not None
     return lock.agent.reported_version
-
-
-def validate_harbor_result(
-    jobs_dir: Path,
-    expected_trials: int | None = 1,
-    *,
-    expected_task_counts: Mapping[str, int] | None = None,
-    expected_attempts_per_task: int | None = None,
-    expected_task_names: Sequence[str] | None = None,
-    expected_task_digests: Mapping[str, str] | None = None,
-    expected_agent_name: str | None = None,
-    expected_agent_version: str | None = None,
-    expected_model_provider: str | None = None,
-    expected_model_name: str | None = None,
-) -> dict[str, object]:
-    trials: list[dict[str, object]] = []
-    for path in sorted(jobs_dir.glob("*/*/result.json")):
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(value, dict)
-            or not isinstance(value.get("task_name"), str)
-            or not value["task_name"].strip()
-        ):
-            raise WorkerError("Harbor produced a malformed trial result")
-        _validate_trial_task_digest(path, value["task_name"], expected_task_digests)
-        trials.append(value)
-    _validate_trial_count(trials, expected_trials)
-    _validate_task_counts(
-        trials,
-        expected_task_counts,
-        expected_attempts_per_task,
-        expected_task_names,
-    )
-
-    verified: list[dict[str, object]] = []
-    for trial in trials:
-        task_name = str(trial["task_name"])
-        failure = _trial_failure(trial)
-        if failure is not None:
-            location, exception_type = failure
-            rendered = str(exception_type or "an exception")
-            raise HarborTrialFailure(
-                f"Harbor trial {task_name}{location} failed with {rendered}",
-                rendered,
-            )
-        _validate_agent_identity(
-            trial,
-            task_name,
-            expected_agent_name,
-            expected_agent_version,
-            expected_model_provider,
-            expected_model_name,
-        )
-        verifier = trial.get("verifier_result")
-        rewards = verifier.get("rewards") if isinstance(verifier, Mapping) else None
-        if not isinstance(rewards, Mapping) or not rewards:
-            raise WorkerError(f"Harbor trial {task_name} has no verifier rewards")
-        if not all(
-            isinstance(value, int | float)
-            and not isinstance(value, bool)
-            and (not isinstance(value, float) or math.isfinite(value))
-            for value in rewards.values()
-        ):
-            raise WorkerError(
-                f"Harbor trial {task_name} rewards must be finite numbers"
-            )
-        verified.append({"task_name": task_name, "rewards": dict(rewards)})
-    return {
-        "trial_count": len(verified),
-        "trials": verified,
-    }
-
-
-def _validate_trial_task_digest(
-    result_path: Path,
-    task_name: str,
-    expected: Mapping[str, str] | None,
-) -> None:
-    if expected is None:
-        return
-    expected_digest = expected.get(task_name)
-    if expected_digest is None:
-        raise WorkerError(f"Harbor trial {task_name} is not in the resolved task set")
-    lock_path = result_path.with_name("lock.json")
-    try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise WorkerError(f"Harbor trial {task_name} has no valid task lock") from error
-    task = lock.get("task") if isinstance(lock, Mapping) else None
-    if not isinstance(task, Mapping) or task.get("digest") != expected_digest:
-        raise WorkerError(
-            f"Harbor trial {task_name} task digest does not match the lock"
-        )
-
-
-def _validate_task_counts(
-    trials: list[dict[str, object]],
-    expected: Mapping[str, int] | None,
-    attempts_per_observed_task: int | None = None,
-    expected_task_names: Sequence[str] | None = None,
-) -> None:
-    observed = Counter(str(trial["task_name"]) for trial in trials)
-    valid = all(observed[task] == count for task, count in (expected or {}).items())
-    if attempts_per_observed_task is not None:
-        valid = valid and all(
-            count == attempts_per_observed_task for count in observed.values()
-        )
-    if expected_task_names is not None:
-        valid = valid and all(
-            any(fnmatch(task, requested) for requested in expected_task_names)
-            for task in observed
-        )
-    if not valid:
-        raise WorkerError(
-            "Harbor trial task counts do not match the requested attempts"
-        )
-
-
-def _trial_failure(trial: Mapping[str, object]) -> tuple[str, object] | None:
-    exception = trial.get("exception_info")
-    if exception is not None:
-        exception_type = (
-            exception.get("exception_type")
-            if isinstance(exception, Mapping)
-            else type(exception).__name__
-        )
-        return "", exception_type
-    steps = trial.get("step_results")
-    if steps is None:
-        return None
-    if not isinstance(steps, list):
-        return " step results", "malformed result"
-    for ordinal, step in enumerate(steps, start=1):
-        if not isinstance(step, Mapping):
-            return f" step {ordinal}", "malformed result"
-        step_exception = step.get("exception_info")
-        if step_exception is None:
-            continue
-        exception_type = (
-            step_exception.get("exception_type")
-            if isinstance(step_exception, Mapping)
-            else type(step_exception).__name__
-        )
-        step_name = step.get("step_name") or ordinal
-        return f" step {step_name}", exception_type
-    return None
-
-
-def _validate_agent_identity(
-    trial: Mapping[str, object],
-    task_name: str,
-    expected_name: str | None,
-    expected_version: str | None,
-    expected_model_provider: str | None,
-    expected_model_name: str | None,
-) -> None:
-    if (
-        expected_name is None
-        and expected_version is None
-        and expected_model_provider is None
-        and expected_model_name is None
-    ):
-        return
-    agent = trial.get("agent_info")
-    if not isinstance(agent, Mapping):
-        raise WorkerError(f"Harbor trial {task_name} has no agent identity")
-    if agent.get("name") != expected_name or agent.get("version") != expected_version:
-        raise WorkerError(
-            f"Harbor trial {task_name} agent identity does not match the lock"
-        )
-    if expected_model_provider is not None or expected_model_name is not None:
-        model = agent.get("model_info")
-        if not isinstance(model, Mapping):
-            raise WorkerError(f"Harbor trial {task_name} has no model identity")
-        if (
-            model.get("provider") != expected_model_provider
-            or model.get("name") != expected_model_name
-        ):
-            raise WorkerError(
-                f"Harbor trial {task_name} model identity does not match the lock"
-            )
-
-
-def _validate_trial_count(
-    trials: list[dict[str, object]], expected_trials: int | None
-) -> None:
-    if expected_trials is None and not trials:
-        raise WorkerError("Harbor produced no trials")
-    if expected_trials is not None and len(trials) != expected_trials:
-        raise WorkerError(
-            f"expected exactly {expected_trials} Harbor trials, found {len(trials)}"
-        )

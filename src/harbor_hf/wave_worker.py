@@ -46,6 +46,11 @@ from harbor_hf.evidence import (
     write_checksums,
     write_json,
 )
+from harbor_hf.harbor_adapter import (
+    FilesystemHarborExecutionAdapter,
+    HarborVerificationFailure,
+)
+from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
@@ -61,7 +66,6 @@ from harbor_hf.worker import (
     EndpointManager,
     HarborTrialFailure,
     WorkerError,
-    build_harbor_trial_command,
     controller_environment,
     endpoint_state,
     launch_cleanup_watchdog_for,
@@ -70,7 +74,6 @@ from harbor_hf.worker import (
     require_paused_endpoint,
     resume_and_probe_endpoint,
     validate_endpoint_model,
-    validate_harbor_result,
 )
 
 
@@ -800,17 +803,24 @@ def _execute_trial(
             if isinstance(wave.target, ProviderWaveTarget)
             else base_url
         )
-        command = build_harbor_trial_command(
+        adapter = FilesystemHarborExecutionAdapter()
+        prepared = adapter.prepare(
             run,
+            execution_root,
             jobs_dir,
             trial_base_url,
             harbor_source,
-            task_name=trial.task_name,
+            task_names=[trial.task_name],
+            attempts=1,
+            concurrency=1,
+            expected_task_digests={trial.task_name: trial.task_digest},
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
-        exit_code = stream_runner(
-            command,
+        outcome = adapter.execute(
+            prepared,
+            harbor_source,
+            jobs_dir,
             execution_root / "harbor.log",
             environment={
                 "HF_TOKEN": token,
@@ -818,41 +828,20 @@ def _execute_trial(
                 "OPENAI_BASE_URL": f"{trial_base_url}/v1",
             },
             timeout_seconds=timeout,
+            stream_runner=stream_runner,
+            monotonic=monotonic,
+            deadline=deadline,
         )
-        append_event(events, "harbor_finished", exit_code=exit_code)
-        if exit_code != 0:
-            try:
-                validate_harbor_result(
-                    jobs_dir,
-                    expected_trials=1,
-                    expected_task_counts={trial.task_name: 1},
-                    expected_attempts_per_task=1,
-                    expected_task_names=[trial.task_name],
-                    expected_task_digests={trial.task_name: trial.task_digest},
-                    expected_agent_name=run.agent.name,
-                    expected_agent_version=_expected_agent_version(run),
-                    expected_model_provider="openai",
-                    expected_model_name=_wave_model_name(wave),
-                )
-            except HarborTrialFailure:
-                raise
-            except (OSError, ValueError, RuntimeError):
-                raise WorkerError(f"Harbor exited with status {exit_code}") from None
-            raise WorkerError(f"Harbor exited with status {exit_code}")
+        append_event(events, "harbor_finished", exit_code=outcome.exit_code)
+        if outcome.exit_code != 0:
+            raise WorkerError(f"Harbor exited with status {outcome.exit_code}")
         failure_phase = "verification"
-        verifier = validate_harbor_result(
-            jobs_dir,
-            expected_trials=1,
-            expected_task_counts={trial.task_name: 1},
-            expected_attempts_per_task=1,
-            expected_task_names=[trial.task_name],
-            expected_task_digests={trial.task_name: trial.task_digest},
-            expected_agent_name=run.agent.name,
-            expected_agent_version=_expected_agent_version(run),
-            expected_model_provider="openai",
-            expected_model_name=_wave_model_name(wave),
+        if outcome.verification is None:
+            raise WorkerError("Harbor produced no validated compatibility bundle")
+        write_json(
+            execution_root / "verification.json",
+            outcome.verification.model_dump(mode="json"),
         )
-        write_json(execution_root / "verification.json", verifier)
         append_event(events, "execution_succeeded")
     except Exception as caught:
         error = caught
@@ -865,7 +854,7 @@ def _execute_trial(
             "message": str(error).replace(token, "[REDACTED]"),
         }
         write_json(execution_root / "failure.json", failure_record)
-    _finalize_execution(execution_root, token)
+    _finalize_execution(execution_root, token, strict_compatibility=error is None)
     if error is None:
         (execution_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     else:
@@ -912,6 +901,8 @@ def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
 ) -> RetryCategory:
+    if isinstance(error, HarborVerificationFailure):
+        return "benchmark"
     if isinstance(error, HarborTrialFailure):
         name = error.exception_type.lower()
         for category, markers in _TRIAL_FAILURE_MARKERS:
@@ -1121,8 +1112,17 @@ def _trial_destination(
     )
 
 
-def _finalize_execution(root: Path, token: str) -> None:
+def _finalize_execution(
+    root: Path, token: str, *, strict_compatibility: bool = True
+) -> None:
     _redact_unit(root, token)
+    refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
+    if refresh_error is not None:
+        append_event(
+            root / "events.jsonl",
+            "compatibility_refresh_skipped",
+            error_type=refresh_error,
+        )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
     write_checksums(root)
