@@ -113,7 +113,7 @@ class _TrialProbe(BaseModel):
 
     agent_info: _AgentInfo
     agent_execution: _TimingProbe | None = None
-    step_results: list[_StepProbe] = Field(default_factory=list)
+    step_results: list[_StepProbe] | None = None
 
 
 def build_private_artifact_manifest(
@@ -128,7 +128,10 @@ def build_private_artifact_manifest(
     )
     entries: list[PrivateArtifactEntry] = []
     total_bytes = 0
-    for candidate in sorted(root.rglob("*")):
+    candidates = sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    )
+    for candidate in candidates:
         if candidate.is_symlink():
             raise RuntimeError("private artifact evidence cannot contain symlinks")
         if not candidate.is_file():
@@ -201,7 +204,7 @@ def _openclaw_execution_started(root: Path) -> bool:
         except (OSError, ValueError):
             continue
         timings = [probe.agent_execution]
-        timings.extend(step.agent_execution for step in probe.step_results)
+        timings.extend(step.agent_execution for step in probe.step_results or [])
         if probe.agent_info.name == "openclaw" and any(
             timing is not None and timing.started_at is not None for timing in timings
         ):

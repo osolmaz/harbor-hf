@@ -108,6 +108,31 @@ def test_multi_step_agent_timing_requires_session_jsonl(tmp_path: Path) -> None:
         build_private_artifact_manifest(root, strict_session=True)
 
 
+def test_null_step_results_still_requires_session_jsonl(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path, with_session=False)
+    result_path = root / "harbor-jobs" / "job-one" / "trial-one" / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["step_results"] = None
+    result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no session JSONL"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+
+def test_private_manifest_sorts_serialized_relative_paths(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path)
+    nested = root / "foo" / "bar"
+    nested.parent.mkdir()
+    nested.write_text("nested\n", encoding="utf-8")
+    (root / "foo.txt").write_text("sibling\n", encoding="utf-8")
+
+    manifest = build_private_artifact_manifest(root, strict_session=True)
+
+    paths = [entry.path for entry in manifest.entries]
+    assert paths == sorted(paths)
+    assert paths.index("foo.txt") < paths.index("foo/bar")
+
+
 def test_private_manifest_enforces_file_and_bundle_size_limits(tmp_path: Path) -> None:
     root = _execution_root(tmp_path)
 
