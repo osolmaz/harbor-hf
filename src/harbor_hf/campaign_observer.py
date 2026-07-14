@@ -328,7 +328,7 @@ def _wave_events(
         deployment_digest=wave.deployment_digest,
         provider=provider,
         shard_ids=wave.shard_ids,
-        estimated_cost_microusd=0,
+        estimated_cost_microusd=wave.estimated_cost_microusd,
     )
     active = _event_time(records, "wave_started")
     finished = _event_time(records, "wave_succeeded", "wave_failed")

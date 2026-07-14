@@ -164,7 +164,10 @@ not run inference itself.
 
 A provider spend cap requires an explicit `estimated_wave_cost_usd` in the
 same provider limits block. The reconciler reserves that estimate while a wave
-is active and combines it with observed spend before admitting another wave.
+is active and conservatively retains it after the wave closes. Observed spend
+is additive until the provider reports enough attribution to replace a wave's
+reservation safely. This fails closed instead of letting missing billing data
+reset the campaign budget.
 `max_attempts` is also enforced at the proxy boundary: an identical request
 beyond the configured attempt count is rejected locally and is never forwarded
 or billed.

@@ -624,7 +624,9 @@ def test_observe_projects_exact_wave_and_execution_events(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock = _campaign(remote_spec)
-    wave = _wave(lock, remote_spec)
+    wave = _wave(lock, remote_spec).model_copy(
+        update={"estimated_cost_microusd": 123_456}
+    )
     trial = lock.runs[0].shards[0].trials[0]
     shard = lock.runs[0].shards[0]
     files = _observer_files(lock, wave)
@@ -669,7 +671,7 @@ def test_observe_projects_exact_wave_and_execution_events(
         "deployment_digest": wave.deployment_digest,
         "provider": "hf-inference-endpoints",
         "shard_ids": [shard.shard_id],
-        "estimated_cost_microusd": 0,
+        "estimated_cost_microusd": 123_456,
     }
     closed_id = hashlib.sha256(
         f"{lock.campaign_id}:{wave.wave_id}:closed:_SUCCESS".encode()

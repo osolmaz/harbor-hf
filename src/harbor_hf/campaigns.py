@@ -174,6 +174,9 @@ class SubmitWaveAction(Protocol):
     @property
     def trial_ids(self) -> list[str]: ...
 
+    @property
+    def estimated_cost_microusd(self) -> int | None: ...
+
 
 class WaveShardLock(FrozenModel):
     artifact_prefix: str
@@ -224,6 +227,7 @@ class WaveLock(FrozenModel):
     spend_cap_microusd: int | None = Field(
         default=None, ge=0, exclude_if=lambda value: value is None
     )
+    estimated_cost_microusd: int = Field(default=0, ge=0)
     duration_seconds: int
     remote: RemoteExecutionSpec
     shard_ids: list[str]
@@ -581,6 +585,7 @@ def build_wave_lock(
             if provider_target is not None
             else None
         ),
+        estimated_cost_microusd=action.estimated_cost_microusd or 0,
         duration_seconds=spec.execution.timeout_seconds,
         remote=spec.remote,
         shard_ids=action.shard_ids,

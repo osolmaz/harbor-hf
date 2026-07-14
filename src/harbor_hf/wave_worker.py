@@ -127,6 +127,7 @@ class LockedSubmitWaveAction(FrozenModel):
     deployment_digest: str
     shard_ids: list[str]
     trial_ids: list[str] = Field(default_factory=list)
+    estimated_cost_microusd: int | None = None
 
 
 class ExecutionLock(FrozenModel):
@@ -220,6 +221,14 @@ class _EndpointWaveLifecycle:
 def validate_wave_lock(
     spec: ExperimentSpec, campaign: CampaignLock, lock: WaveLock
 ) -> None:
+    matching_runs = [
+        run for run in campaign.runs if run.deployment_digest == lock.deployment_digest
+    ]
+    if not matching_runs:
+        raise WorkerError("wave lock references an unknown deployment")
+    estimates = {run.estimated_wave_cost_microusd for run in matching_runs}
+    if len(estimates) != 1:
+        raise WorkerError("wave deployment has inconsistent spend estimates")
     action = LockedSubmitWaveAction(
         action_id=lock.action_id,
         action_key=lock.action_key,
@@ -228,6 +237,7 @@ def validate_wave_lock(
         deployment_digest=lock.deployment_digest,
         shard_ids=lock.shard_ids,
         trial_ids=lock.trial_ids,
+        estimated_cost_microusd=estimates.pop(),
     )
     try:
         expected = build_wave_lock(campaign, spec, action, endpoint=lock.endpoint)

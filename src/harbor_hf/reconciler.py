@@ -46,7 +46,7 @@ class DeploymentAdmission(FrozenModel):
 class AdmissionLimits(FrozenModel):
     action_limit: int = Field(default=64, ge=1)
     global_active_waves: int = Field(default=_UNBOUNDED, ge=1)
-    deployment_active_waves: int = Field(default=_UNBOUNDED, ge=1)
+    deployment_active_waves: int = Field(default=1, ge=1)
     provider_active_waves: int = Field(default=_UNBOUNDED, ge=1)
     campaign_active_waves: int = Field(default=_UNBOUNDED, ge=1)
 
@@ -145,11 +145,7 @@ class _MutableUsage:
         self.spend[campaign_id] = (
             self.spend.get(campaign_id, 0)
             + projection.spend_microusd
-            + sum(
-                wave.estimated_cost_microusd
-                for wave in projection.waves.values()
-                if wave.status != "closed"
-            )
+            + sum(wave.estimated_cost_microusd for wave in projection.waves.values())
         )
 
     def admit(self, candidate: _Candidate, campaign_id: str) -> None:

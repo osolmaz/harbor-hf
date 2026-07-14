@@ -918,6 +918,7 @@ class CampaignReconciler:
                 deployment_digest=action.deployment_digest,
                 provider=_wave_provider(lock, action.deployment_digest),
                 shard_ids=action.shard_ids,
+                estimated_cost_microusd=action.estimated_cost_microusd or 0,
             )
         else:
             payload = WaveLifecyclePayload(
@@ -1002,7 +1003,7 @@ class CampaignReconciler:
                 deployment_digest=action.deployment_digest,
                 provider=_wave_provider(lock, action.deployment_digest),
                 shard_ids=action.shard_ids,
-                estimated_cost_microusd=0,
+                estimated_cost_microusd=action.estimated_cost_microusd or 0,
             )
         kinds: tuple[Literal["wave.cleaning", "wave.closed"], ...] = ("wave.closed",)
         if observed is not None and observed.status not in {
@@ -1208,7 +1209,16 @@ def _build_admission_usage(
         if wave.status != "closed"
     ]
     admissions.extend(_active_action_admissions(projection, reservations))
-    return _usage_from_admissions(campaign_id, projection.spend_microusd, admissions)
+    closed_estimates = sum(
+        wave.estimated_cost_microusd
+        for wave in projection.waves.values()
+        if wave.status == "closed"
+    )
+    return _usage_from_admissions(
+        campaign_id,
+        projection.spend_microusd + closed_estimates,
+        admissions,
+    )
 
 
 def _usage_from_admissions(

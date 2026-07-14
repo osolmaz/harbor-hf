@@ -966,14 +966,13 @@ def test_admission_allocates_exactly_to_each_scope_limit(
     )
     digest = lock.runs[0].deployment_digest
     values = {
-        "global_active_waves": 2,
-        "deployment_active_waves": 2,
-        "provider_active_waves": 2,
-        "campaign_active_waves": 2,
+        "global_active_waves": 3,
+        "deployment_active_waves": 3,
+        "provider_active_waves": 3,
+        "campaign_active_waves": 3,
     }
-    limits = AdmissionLimits(
-        **{f"{scope}_active_waves": values[f"{scope}_active_waves"]}
-    )
+    values[f"{scope}_active_waves"] = 2
+    limits = AdmissionLimits(**values)
     context = ReconcileContext(
         limits=limits,
         deployments={
@@ -1006,9 +1005,14 @@ def test_existing_wave_counts_toward_each_admission_scope(
     lock, submitted = _campaign(
         remote_spec, tasks=2, max_trials_per_shard=1, max_shards_per_wave=1
     )
-    context = ReconcileContext(
-        limits=AdmissionLimits.model_validate({f"{scope}_active_waves": 1})
-    )
+    values = {
+        "global_active_waves": 2,
+        "deployment_active_waves": 2,
+        "provider_active_waves": 2,
+        "campaign_active_waves": 2,
+    }
+    values[f"{scope}_active_waves"] = 1
+    context = ReconcileContext(limits=AdmissionLimits(**values))
 
     _projection, plan = plan_reconciliation(
         lock, [submitted, _wave_event(lock, 2, "active")], context=context
@@ -1016,6 +1020,57 @@ def test_existing_wave_counts_toward_each_admission_scope(
 
     assert plan.actions == []
     assert [blocked.reason for blocked in plan.blocked] == [reason]
+
+
+def test_default_admission_serializes_one_managed_deployment(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(
+        remote_spec, tasks=3, max_trials_per_shard=1, max_shards_per_wave=1
+    )
+
+    _projection, plan = plan_reconciliation(lock, [submitted])
+
+    assert len(plan.actions) == 1
+    assert [blocked.reason for blocked in plan.blocked] == [
+        "deployment-budget",
+        "deployment-budget",
+    ]
+
+
+@pytest.mark.parametrize("phase", ["active", "closed"])
+def test_wave_estimate_remains_charged_against_campaign_cap(
+    remote_spec: ExperimentSpec,
+    phase: str,
+) -> None:
+    lock, submitted = _campaign(
+        remote_spec,
+        tasks=2,
+        max_trials_per_shard=1,
+        max_shards_per_wave=1,
+        spend_cap_microusd=100,
+    )
+    events = [submitted, _wave_event(lock, 2, "active")]
+    if phase == "closed":
+        events.extend(
+            [
+                _wave_event(lock, 3, "draining"),
+                _wave_event(lock, 4, "cleaning"),
+                _wave_event(lock, 5, "closed"),
+            ]
+        )
+
+    digest = lock.runs[0].deployment_digest
+    context = ReconcileContext(
+        limits=AdmissionLimits(deployment_active_waves=2),
+        deployments={digest: DeploymentAdmission(estimated_wave_cost_microusd=100)},
+    )
+    projection, plan = plan_reconciliation(lock, events, context=context)
+
+    assert projection.waves["wave-one"].estimated_cost_microusd == 100
+    assert plan.actions == []
+    expected = 1 if phase == "active" else 2
+    assert [blocked.reason for blocked in plan.blocked] == ["spend-cap"] * expected
 
 
 def test_closed_wave_releases_all_admission_scopes(

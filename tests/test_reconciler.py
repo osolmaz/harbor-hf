@@ -13,7 +13,12 @@ from harbor_hf.control import (
     new_event,
 )
 from harbor_hf.models import AgentProfile, ExperimentSpec
-from harbor_hf.reconciler import ReconcileAction, plan_reconciliation
+from harbor_hf.reconciler import (
+    AdmissionLimits,
+    ReconcileAction,
+    ReconcileContext,
+    plan_reconciliation,
+)
 
 NOW = datetime(2026, 7, 14, tzinfo=UTC)
 
@@ -78,8 +83,9 @@ def test_reconcile_chunks_waves_and_is_deterministic(
     )
     lock, submitted = _campaign(spec)
 
-    _projection, first = plan_reconciliation(lock, [submitted])
-    _projection, second = plan_reconciliation(lock, [submitted])
+    context = ReconcileContext(limits=AdmissionLimits(deployment_active_waves=2))
+    _projection, first = plan_reconciliation(lock, [submitted], context=context)
+    _projection, second = plan_reconciliation(lock, [submitted], context=context)
 
     assert [len(action.shard_ids) for action in first.actions] == [2, 1]
     assert first == second
@@ -310,7 +316,8 @@ def test_reconcile_closed_wave_routes_retryable_evidence_to_retry(
     projection, plan = plan_reconciliation(lock, events, now=NOW + timedelta(hours=1))
 
     assert projection.shards[failed_shard].status == "retry_wait"
-    assert sorted(item.kind for item in plan.actions) == ["retry-shard", "submit-wave"]
+    assert [item.kind for item in plan.actions] == ["retry-shard"]
     by_kind = {item.kind: item for item in plan.actions}
     assert by_kind["retry-shard"].shard_ids == [failed_shard]
-    assert by_kind["submit-wave"].shard_ids == [untouched_shard]
+    assert plan.blocked[0].reason == "deployment-budget"
+    assert plan.blocked[0].shard_ids == [untouched_shard]

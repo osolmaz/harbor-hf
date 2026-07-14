@@ -1122,6 +1122,7 @@ def test_spend_capped_provider_wave_uses_locked_estimate_without_cli_context(
     wave, submitted_request, campaign = jobs.submissions[0]
     assert wave.provider_target == target
     assert wave.endpoint is None
+    assert wave.estimated_cost_microusd == 750_000
     assert submitted_request == request
     assert campaign == lock
     assert endpoints.inspect_calls == []

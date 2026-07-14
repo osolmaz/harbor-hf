@@ -120,6 +120,7 @@ def test_manifest_and_campaign_lock_provider_admission_separately_from_endpoints
     assert wave.endpoint is None
     assert wave.max_concurrent_shards == 1
     assert wave.spend_cap_microusd == 1_250_000
+    assert wave.estimated_cost_microusd == 500_000
 
 
 @pytest.mark.parametrize("key", ["api_key", "nestedToken", "provider-secret"])

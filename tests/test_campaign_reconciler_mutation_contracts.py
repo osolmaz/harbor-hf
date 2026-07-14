@@ -104,7 +104,7 @@ def test_campaign_plan_lock_reconcile_and_wave_have_one_canonical_output(
     }
 
     assert _hash(corpus) == (
-        "e3ef370fb7e32c6d8094f2b16886cca1bdbb41d9d654055c59c8c4b8d7ef416f"
+        "0752fb7f5233778e548dc5b581eb3cc7e8837a0376a43fcab39c1f0e3bd9211a"
     )
 
 
@@ -357,7 +357,7 @@ def test_reserved_submit_action_removes_all_assigned_shards_from_candidates(
     }
 
     assert _hash(corpus) == (
-        "9dbcf1a546e886f0f227b7d2c106ac884a191b3a482b075c23d85de9aa331aa2"
+        "a22e2bfd592f15502ecb2403c15266bc83d987c27d8509ecc10d7cfb4ef1596c"
     )
     assert _assigned_shards(lock, projection) == set(reserved_action.shard_ids)
     assert {

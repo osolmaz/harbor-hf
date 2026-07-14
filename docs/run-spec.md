@@ -138,7 +138,9 @@ revision-equivalent when the published value is `not_observed`.
 Provider `limits.max_spend_usd` and `limits.estimated_wave_cost_usd` must be
 configured together. The estimate is a conservative admission reservation for
 one deployment wave, must not exceed the cap, and is preserved in the campaign
-lock. It is not presented as observed provider billing. Provider
+and wave locks. It remains charged after closure when provider billing is not
+attributable, so missing observations cannot reopen spent budget. It is not
+presented as observed provider billing. Provider
 `limits.max_attempts` is a hard forwarding limit for identical requests, not
 only an evidence label.
 
