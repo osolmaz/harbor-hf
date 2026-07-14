@@ -53,7 +53,7 @@ class _ObservedResponse:
     headers: httpx.Headers
     content: bytes
     total_ms: float
-    first_byte_ms: float | None
+    semantic_output_ms: float | None
 
 
 class ProviderEvidenceProxy:
@@ -141,7 +141,7 @@ class ProviderEvidenceProxy:
             headers=observed.headers,
             content=observed.content,
             total_ms=observed.total_ms,
-            time_to_first_token_ms=observed.first_byte_ms,
+            time_to_first_token_ms=observed.semantic_output_ms,
         )
         self._record(result.model_dump(mode="json", exclude={"message"}))
 
@@ -161,7 +161,7 @@ class ProviderEvidenceProxy:
         forwarded: dict[str, JsonValue],
     ) -> _ObservedResponse:
         started = perf_counter()
-        first_byte_ms: float | None = None
+        semantic_output_ms: float | None = None
         captured = bytearray()
         status_code = 502
         response_headers = httpx.Headers()
@@ -177,7 +177,9 @@ class ProviderEvidenceProxy:
                 status_code = response.status_code
                 response_headers = response.headers
                 response_started = True
-                captured, first_byte_ms = _relay_response(handler, response, started)
+                captured, semantic_output_ms = _relay_response(
+                    handler, response, started
+                )
         except httpx.TimeoutException:
             if not response_started:
                 self._send_json(handler, 504, {"error": "provider request timed out"})
@@ -192,7 +194,7 @@ class ProviderEvidenceProxy:
             headers=response_headers,
             content=bytes(captured),
             total_ms=total_ms,
-            first_byte_ms=first_byte_ms,
+            semantic_output_ms=semantic_output_ms,
         )
 
     def _request(
@@ -253,16 +255,83 @@ def _relay_response(
     handler.send_header("Connection", "close")
     handler.end_headers()
     captured = bytearray()
-    first_byte_ms: float | None = None
+    semantic_output_ms: float | None = None
+    probe = _SseSemanticOutputProbe()
     for chunk in response.iter_raw():
-        if first_byte_ms is None and chunk:
-            first_byte_ms = (perf_counter() - started) * 1000
+        if semantic_output_ms is None and probe.feed(chunk):
+            semantic_output_ms = (perf_counter() - started) * 1000
         if len(captured) + len(chunk) <= _MAX_EVIDENCE_RESPONSE_BYTES:
             captured.extend(chunk)
         handler.wfile.write(chunk)
         handler.wfile.flush()
+    if semantic_output_ms is None and probe.finish():
+        semantic_output_ms = (perf_counter() - started) * 1000
     handler.close_connection = True
-    return captured, first_byte_ms
+    return captured, semantic_output_ms
+
+
+class _SseSemanticOutputProbe:
+    """Observe semantic OpenAI deltas without changing relayed stream bytes."""
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._stopped = False
+
+    def feed(self, chunk: bytes) -> bool:
+        if self._stopped or not chunk:
+            return False
+        self._pending.extend(chunk)
+        if len(self._pending) > _MAX_EVIDENCE_RESPONSE_BYTES:
+            self._pending.clear()
+            self._stopped = True
+            return False
+        while (newline := self._pending.find(b"\n")) >= 0:
+            line = bytes(self._pending[:newline]).removesuffix(b"\r")
+            del self._pending[: newline + 1]
+            if _sse_line_has_semantic_output(line):
+                self._stopped = True
+                return True
+        return False
+
+    def finish(self) -> bool:
+        if self._stopped or not self._pending:
+            return False
+        line = bytes(self._pending).removesuffix(b"\r")
+        self._pending.clear()
+        return _sse_line_has_semantic_output(line)
+
+
+def _sse_line_has_semantic_output(line: bytes) -> bool:
+    if not line.startswith(b"data:"):
+        return False
+    data = line.removeprefix(b"data:").strip()
+    if not data or data == b"[DONE]":
+        return False
+    try:
+        payload = _json_object(data)
+    except (UnicodeDecodeError, json.JSONDecodeError, ProviderProxyError):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return False
+    return any(_choice_has_semantic_output(choice) for choice in choices)
+
+
+def _choice_has_semantic_output(choice: JsonValue) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return False
+    text_values = (
+        delta.get("content"),
+        delta.get("reasoning_content"),
+        delta.get("reasoning"),
+    )
+    if any(isinstance(value, str) and bool(value) for value in text_values):
+        return True
+    tool_calls = delta.get("tool_calls")
+    return isinstance(tool_calls, list) and bool(tool_calls)
 
 
 def _provider_request(

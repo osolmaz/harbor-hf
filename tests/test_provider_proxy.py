@@ -120,6 +120,9 @@ def test_proxy_forwards_stream_and_records_content_free_provider_evidence(
         "output_tokens": {"detail": None, "status": "observed", "value": 4},
         "total_tokens": {"detail": None, "status": "observed", "value": 15},
     }
+    ttft = evidence["evidence"]["latency"]["time_to_first_token_ms"]
+    assert ttft["status"] == "observed"
+    assert ttft["value"] >= 0
 
 
 def test_proxy_request_translation_preserves_openai_tool_contract() -> None:

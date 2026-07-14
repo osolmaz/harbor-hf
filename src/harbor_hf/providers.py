@@ -81,6 +81,8 @@ class _RawStreamToolCall(BoundaryModel):
 
 class _RawDelta(BoundaryModel):
     content: str | None = None
+    reasoning_content: str | None = None
+    reasoning: str | None = None
     tool_calls: list[_RawStreamToolCall] = Field(default_factory=list)
 
 
@@ -140,8 +142,10 @@ class _StreamState:
             if choice.finish_reason is not None:
                 self.finish_reason = choice.finish_reason
             delta = choice.delta
-            if delta.content is not None:
+            if delta.content:
                 self.content.append(delta.content)
+                self._record_first_token(elapsed_ms)
+            if delta.reasoning_content or delta.reasoning:
                 self._record_first_token(elapsed_ms)
             for tool in delta.tool_calls:
                 state = self.tools.setdefault(tool.index, _StreamToolState())
@@ -373,12 +377,11 @@ def observe_provider_response(
         return _http_failure(target, request, attempt, response, total_ms)
     if request.stream:
         state = _StreamState()
-        elapsed = (
-            time_to_first_token_ms if time_to_first_token_ms is not None else total_ms
-        )
+        elapsed = time_to_first_token_ms or 0.0
         try:
             for line in content.decode("utf-8").splitlines():
                 _consume_stream_line(line, state, 0.0, lambda: elapsed / 1000)
+            state.first_token_ms = time_to_first_token_ms
             return _stream_result(target, request, attempt, response, state, total_ms)
         except (UnicodeDecodeError, ValidationError, ValueError):
             return _stream_malformed_result(target, request, attempt, state, total_ms)

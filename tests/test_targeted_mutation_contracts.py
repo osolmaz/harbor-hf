@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -382,6 +383,21 @@ class _Handler:
         self.ended += 1
 
 
+class _TimedChunkStream(httpx.SyncByteStream):
+    def __init__(
+        self,
+        chunks: list[tuple[float, bytes]],
+        current_time: list[float],
+    ) -> None:
+        self._chunks = chunks
+        self._current_time = current_time
+
+    def __iter__(self) -> Iterator[bytes]:
+        for observed_at, chunk in self._chunks:
+            self._current_time[0] = observed_at
+            yield chunk
+
+
 def test_provider_proxy_request_reader_enforces_exact_size_boundary(
     tmp_path: Path,
 ) -> None:
@@ -399,11 +415,7 @@ def test_provider_proxy_request_reader_enforces_exact_size_boundary(
     proxy.client.close()
 
 
-def test_provider_proxy_response_relay_forwards_allowlist_and_all_bytes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ticks = iter([10.125])
-    monkeypatch.setattr("harbor_hf.provider_proxy.perf_counter", lambda: next(ticks))
+def test_provider_proxy_response_relay_forwards_allowlist_and_all_bytes() -> None:
     handler = _Handler()
     content = b"first-second"
     response = httpx.Response(
@@ -417,10 +429,10 @@ def test_provider_proxy_response_relay_forwards_allowlist_and_all_bytes(
         stream=httpx.ByteStream(content),
     )
 
-    captured, first_byte_ms = _relay_response(cast(Any, handler), response, 10.0)
+    captured, semantic_output_ms = _relay_response(cast(Any, handler), response, 10.0)
 
     assert captured == content
-    assert first_byte_ms == pytest.approx(125)
+    assert semantic_output_ms is None
     assert handler.responses == [206]
     assert handler.response_headers == [
         ("content-type", "application/json"),
@@ -434,6 +446,66 @@ def test_provider_proxy_response_relay_forwards_allowlist_and_all_bytes(
     assert handler.close_connection is True
 
 
+@pytest.mark.parametrize(
+    "semantic_chunks",
+    [
+        [
+            (10.1, b'data: {"choices":[{"delta":{"cont'),
+            (10.125, b'ent":"answer"}}]}\n\n'),
+        ],
+        [
+            (
+                10.125,
+                b'data: {"choices":[{"delta":{"tool_calls":['
+                b'{"index":0,"id":"call-1","type":"function"}]}}]}\n\n',
+            )
+        ],
+        [
+            (
+                10.125,
+                b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n',
+            )
+        ],
+    ],
+    ids=["content", "tool-call", "reasoning-content"],
+)
+def test_provider_proxy_response_relay_times_first_semantic_sse_delta(
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_chunks: list[tuple[float, bytes]],
+) -> None:
+    current_time = [10.0]
+    chunks = [
+        (10.01, b": keepalive\n\n"),
+        (
+            10.025,
+            b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+        ),
+        (
+            10.075,
+            b'data: {"choices":[],"usage":{"prompt_tokens":2}}\n\n',
+        ),
+        (10.1, b""),
+        *semantic_chunks,
+        (10.15, b"data: [DONE]\n\n"),
+    ]
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_TimedChunkStream(chunks, current_time),
+    )
+    monkeypatch.setattr(
+        "harbor_hf.provider_proxy.perf_counter", lambda: current_time[0]
+    )
+    handler = _Handler()
+
+    captured, semantic_output_ms = _relay_response(cast(Any, handler), response, 10.0)
+
+    expected = b"".join(chunk for _, chunk in chunks)
+    assert semantic_output_ms == pytest.approx(125)
+    assert captured == expected
+    assert handler.wfile.getvalue() == expected
+
+
 def test_provider_proxy_response_relay_caps_evidence_without_truncating_client() -> (
     None
 ):
@@ -441,10 +513,10 @@ def test_provider_proxy_response_relay_caps_evidence_without_truncating_client()
     content = b"x" * (_MAX_EVIDENCE_RESPONSE_BYTES + 1)
     response = httpx.Response(200, stream=httpx.ByteStream(content))
 
-    captured, first_byte_ms = _relay_response(cast(Any, handler), response, 0)
+    captured, semantic_output_ms = _relay_response(cast(Any, handler), response, 0)
 
     assert captured == b""
-    assert first_byte_ms is not None
+    assert semantic_output_ms is None
     assert handler.wfile.getvalue() == content
 
 
@@ -529,7 +601,7 @@ def test_provider_proxy_forward_observes_exact_upstream_exchange(
         evidence_path=tmp_path / "evidence.jsonl",
         client=client,
     )
-    ticks = iter([20.0, 20.007, 20.025])
+    ticks = iter([20.0, 20.025])
     monkeypatch.setattr("harbor_hf.provider_proxy.perf_counter", lambda: next(ticks))
     handler = _Handler()
 
@@ -550,7 +622,7 @@ def test_provider_proxy_forward_observes_exact_upstream_exchange(
     }
     assert observed.content == b'{"accepted":true}'
     assert observed.total_ms == 25.0
-    assert observed.first_byte_ms == pytest.approx(7)
+    assert observed.semantic_output_ms is None
     assert handler.wfile.getvalue() == b'{"accepted":true}'
     client.close()
 
@@ -592,7 +664,7 @@ def test_provider_proxy_forward_maps_pre_response_transport_failures(
     assert dict(observed.headers) == {}
     assert observed.content == b""
     assert observed.total_ms == 10.0
-    assert observed.first_byte_ms is None
+    assert observed.semantic_output_ms is None
     assert handler.responses == [status]
     assert json.loads(handler.wfile.getvalue()) == body
     client.close()
