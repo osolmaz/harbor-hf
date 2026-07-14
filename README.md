@@ -7,6 +7,8 @@ queryable results without running model inference locally.
 
 The project is in early development. The CLI validates and expands experiment
 matrices, submits individual runs, and operates durable multi-shard campaigns.
+Benchmark tasks can come from content-addressed Harbor packages or from a
+GitHub repository pinned to an exact commit and repository-relative task path.
 Stateless reconciler Jobs provision or adopt Inference Endpoints, submit bounded
 deployment waves, run Harbor tasks in HF Sandboxes, verify canonical evidence,
 and publish normalized result Datasets. The remote worker archives evidence to

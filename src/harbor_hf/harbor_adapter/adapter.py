@@ -265,13 +265,26 @@ def build_execution_request(
     ):
         raise WorkerError("Harbor request contains a task outside the resolved run set")
     served_model_name = _served_model_name(lock)
-    try:
-        dataset_reference = pinned_harbor_dataset_reference(
-            lock.benchmark_dataset, lock.benchmark_dataset_digest
-        )
-    except ValueError as error:
-        raise WorkerError(str(error)) from error
-    dataset_name, dataset_ref = dataset_reference.rsplit("@", 1)
+    if lock.benchmark_source is None:
+        try:
+            dataset_reference = pinned_harbor_dataset_reference(
+                lock.benchmark_dataset, lock.benchmark_dataset_digest
+            )
+        except ValueError as error:
+            raise WorkerError(str(error)) from error
+        dataset_name, dataset_ref = dataset_reference.rsplit("@", 1)
+        dataset: dict[str, JsonValue] = {
+            "name": dataset_name,
+            "ref": dataset_ref,
+            "task_names": task_names,
+        }
+    else:
+        source = lock.benchmark_source
+        dataset = {
+            "repo": f"{source.repository}@{source.revision}",
+            "path": source.path,
+            "task_names": task_names,
+        }
     agent_kwargs = effective_agent_parameters(lock)
     if lock.agent.revision_kind == "package":
         agent_kwargs["version"] = lock.agent.revision
@@ -297,13 +310,7 @@ def build_execution_request(
                 "kwargs": agent_kwargs,
             }
         ],
-        "datasets": [
-            {
-                "name": dataset_name,
-                "ref": dataset_ref,
-                "task_names": task_names,
-            }
-        ],
+        "datasets": [dataset],
     }
     expected_trials = len(expected_task_digests) * attempts
     policy = HarborVerificationPolicy(

@@ -93,6 +93,28 @@ at least one pinned task, and every pinned task must match a selection. A task
 content digest covers its instructions, environment, verifier, and other task
 files.
 
+A benchmark may instead use Harbor's native Git dataset source. This keeps the
+task repository separate from `harbor-hf` while preserving an immutable source:
+
+```yaml
+benchmark:
+  dataset: shellbench/public-115
+  source:
+    type: git
+    repository: ShellBench/public-tasks
+    revision: 0000000000000000000000000000000000000000
+    path: tasks/115-tasks
+  task_names: ["*"]
+  task_digests:
+    example-task: sha256:0000000000000000000000000000000000000000000000000000000000000000
+```
+
+Git sources require a GitHub repository, full commit, and safe repository-relative
+path. `dataset_digest` is derived from those canonical fields and is rejected if
+an explicitly supplied value differs. The worker renders the source as Harbor's
+`repo` and `path` dataset configuration, so Harbor still owns cloning, task
+resolution, and task checksum calculation.
+
 ### Matrix
 
 The initial candidate set is the Cartesian product of `models`, `deployments`,
