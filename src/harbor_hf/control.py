@@ -19,6 +19,15 @@ from harbor_hf.coordination import coordination_repository
 
 _MAX_COMMIT_ATTEMPTS = 8
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_RECONCILER_DURABLE_EVENT_KINDS = {
+    "campaign.draining",
+    "campaign.manual-intervention-required",
+    "execution.failed",
+    "execution.cancelled",
+    "wave.draining",
+    "wave.cleaning",
+    "wave.closed",
+}
 
 SubjectType = Literal["campaign", "run", "shard", "trial", "execution", "wave"]
 Producer = Literal["cli", "reconciler", "wave-controller", "watchdog", "publisher"]
@@ -767,6 +776,13 @@ class HubCampaignStore:
 def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> bool:
     """Adopt the same deterministic event even when reconcilers used new clocks."""
     if not isinstance(observed, dict):
+        return False
+    if observed == expected:
+        return True
+    if (
+        expected.get("producer") != "reconciler"
+        or expected.get("kind") not in _RECONCILER_DURABLE_EVENT_KINDS
+    ):
         return False
     observed_request = dict(observed)
     expected_request = dict(expected)

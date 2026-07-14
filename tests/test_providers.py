@@ -1,3 +1,5 @@
+import hashlib
+import json
 from collections.abc import Callable
 
 import httpx
@@ -7,6 +9,7 @@ from pydantic import JsonValue, TypeAdapter
 from harbor_hf.provider_models import (
     ExplicitProviderRoute,
     PolicyRoute,
+    ProviderCallResult,
     ProviderChatRequest,
     ProviderLimits,
     ProviderMessage,
@@ -76,6 +79,12 @@ def _adapter(
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         clock=clock or TickClock(),
     )
+
+
+def _result_digest(result: ProviderCallResult) -> str:
+    value = result.model_dump(mode="json")
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def test_records_successful_response_usage_quota_and_latency() -> None:
@@ -264,6 +273,95 @@ def test_timeout_is_ambiguous_and_requires_inspection() -> None:
     assert result.error_code == "timeout"
     assert result.evidence.retry.disposition == "inspect"
     assert result.evidence.latency.time_to_first_token_ms.status == "not_observed"
+
+
+def test_interrupted_response_body_is_ambiguous_even_after_success_headers() -> None:
+    result = observe_provider_response(
+        _target(),
+        _request(),
+        attempt=1,
+        status_code=200,
+        headers=httpx.Headers({"x-request-id": "upstream-one"}),
+        content=b'{"id":"partial"',
+        total_ms=12.5,
+        transport_interrupted=True,
+    )
+
+    assert result.status == "provider_error"
+    assert result.remote_outcome == "ambiguous"
+    assert result.error_code == "transport_interrupted"
+    assert result.evidence.retry.disposition == "inspect"
+    assert result.evidence.request.provider_request_id.value == "upstream-one"
+
+
+@pytest.mark.parametrize(
+    ("stream", "ttft", "digest"),
+    [
+        (
+            False,
+            None,
+            "7d1ace571f577618de94d57c4bc98ad7c0542569a134eafb1d07ff804e204cf7",
+        ),
+        (
+            True,
+            None,
+            "72983856756099c61558f6b3ddfeaa985a5ad83268e6532b09c7e19cd9345a9e",
+        ),
+        (
+            True,
+            4.5,
+            "583b967c55a8cf8caa52640188c5f248793aed9eb617c5de4b8f07a1510f7c0f",
+        ),
+    ],
+)
+def test_interrupted_response_evidence_contract_is_stable(
+    stream: bool, ttft: float | None, digest: str
+) -> None:
+    result = observe_provider_response(
+        _target(),
+        _request(stream=stream),
+        attempt=1,
+        status_code=200,
+        headers=httpx.Headers({"x-request-id": "upstream-one"}),
+        content=b'{"id":"partial"',
+        total_ms=12.5,
+        time_to_first_token_ms=ttft,
+        transport_interrupted=True,
+    )
+
+    assert _result_digest(result) == digest
+
+
+@pytest.mark.parametrize(
+    ("stream", "digest"),
+    [
+        (
+            False,
+            "9b2037399c55e1e33404fdedf98219f546158070989091643a102f5259eb572e",
+        ),
+        (
+            True,
+            "cd13ccb2499ba232366919824f55604bd36d7e6a0a18191228f8b640fef11945",
+        ),
+    ],
+)
+def test_malformed_content_encoding_is_ambiguous_and_stable(
+    stream: bool, digest: str
+) -> None:
+    result = observe_provider_response(
+        _target(),
+        _request(stream=stream),
+        attempt=1,
+        status_code=200,
+        headers=httpx.Headers({"content-encoding": "gzip"}),
+        content=b"not-gzip",
+        total_ms=12.5,
+    )
+
+    assert result.status == "malformed_response"
+    assert result.remote_outcome == "ambiguous"
+    assert result.error_code == "invalid_content_encoding"
+    assert _result_digest(result) == digest
 
 
 @pytest.mark.parametrize(

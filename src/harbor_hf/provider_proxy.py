@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import re
@@ -61,6 +60,7 @@ class _ObservedResponse:
     content: bytes
     total_ms: float
     semantic_output_ms: float | None
+    transport_interrupted: bool
 
 
 class ProviderEvidenceProxy:
@@ -147,15 +147,19 @@ class ProviderEvidenceProxy:
             self._send_json(handler, 400, {"error": str(error)})
             return
         observed = self._forward(handler, forwarded)
+        evidence_headers, evidence_content = _decode_evidence_response(
+            observed.headers, observed.content
+        )
         result = observe_provider_response(
             self.target,
             request,
             attempt=attempt,
             status_code=observed.status_code,
-            headers=_evidence_headers(observed.headers),
-            content=_decode_evidence_content(observed.headers, observed.content),
+            headers=evidence_headers,
+            content=evidence_content,
             total_ms=observed.total_ms,
             time_to_first_token_ms=observed.semantic_output_ms,
+            transport_interrupted=observed.transport_interrupted,
         )
         self._record(result.model_dump(mode="json", exclude={"message"}))
 
@@ -180,6 +184,7 @@ class ProviderEvidenceProxy:
         status_code = 502
         response_headers = httpx.Headers()
         response_started = False
+        transport_interrupted = False
         try:
             with self.client.stream(
                 "POST",
@@ -198,10 +203,14 @@ class ProviderEvidenceProxy:
             if not response_started:
                 self._send_json(handler, 504, {"error": "provider request timed out"})
                 status_code = 504
+            else:
+                transport_interrupted = True
         except httpx.HTTPError:
             if not response_started:
                 self._send_json(handler, 502, {"error": "provider transport failed"})
                 status_code = 502
+            else:
+                transport_interrupted = True
         total_ms = round((perf_counter() - started) * 1000, 3)
         return _ObservedResponse(
             status_code=status_code,
@@ -209,6 +218,7 @@ class ProviderEvidenceProxy:
             content=bytes(captured),
             total_ms=total_ms,
             semantic_output_ms=semantic_output_ms,
+            transport_interrupted=transport_interrupted,
         )
 
     def _request(
@@ -251,25 +261,25 @@ class ProviderEvidenceProxy:
         handler.close_connection = True
 
 
-def _decode_evidence_content(headers: httpx.Headers, content: bytes) -> bytes:
+def _decode_evidence_response(
+    headers: httpx.Headers, content: bytes
+) -> tuple[httpx.Headers, bytes]:
     encoding = headers.get("content-encoding", "").lower().strip()
-    if encoding == "gzip":
-        try:
-            decoded = gzip.decompress(content)
-        except (OSError, EOFError):
-            return content
-        return decoded[:_MAX_EVIDENCE_RESPONSE_BYTES]
-    return content
-
-
-def _evidence_headers(headers: httpx.Headers) -> httpx.Headers:
-    return httpx.Headers(
+    encodings = {value.strip() for value in encoding.split(",") if value.strip()}
+    if not encodings or not encodings.issubset({"gzip", "deflate", "br"}):
+        return headers, content
+    try:
+        decoded = httpx.Response(200, headers=headers, content=content).content
+    except httpx.DecodingError:
+        return headers, content
+    decoded_headers = httpx.Headers(
         [
             (name, value)
             for name, value in headers.multi_items()
             if name.lower() != "content-encoding"
         ]
     )
+    return decoded_headers, decoded[:_MAX_EVIDENCE_RESPONSE_BYTES]
 
 
 def _json_object(content: bytes) -> dict[str, JsonValue]:

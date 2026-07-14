@@ -376,9 +376,22 @@ def observe_provider_response(
     content: bytes,
     total_ms: float,
     time_to_first_token_ms: float | None = None,
+    transport_interrupted: bool = False,
 ) -> ProviderCallResult:
     """Normalize evidence from a transparently forwarded provider response."""
-    response = httpx.Response(status_code, headers=headers, content=content)
+    if transport_interrupted:
+        return _transport_interrupted_result(
+            target,
+            request,
+            attempt,
+            headers,
+            total_ms,
+            time_to_first_token_ms,
+        )
+    try:
+        response = httpx.Response(status_code, headers=headers, content=content)
+    except httpx.DecodingError:
+        return _malformed_encoding_result(target, request, attempt, headers, total_ms)
     if not response.is_success:
         return _http_failure(target, request, attempt, response, total_ms)
     if request.stream:
@@ -417,6 +430,73 @@ def observe_provider_response(
         response_id=_optional_string(raw.id),
         finish_reason=_optional_string(choice.finish_reason),
         message=message,
+        evidence=evidence,
+    )
+
+
+def _transport_interrupted_result(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    attempt: int,
+    headers: httpx.Headers,
+    total_ms: float,
+    time_to_first_token_ms: float | None,
+) -> ProviderCallResult:
+    if request.stream and time_to_first_token_ms is not None:
+        ttft = observed(time_to_first_token_ms)
+    elif request.stream:
+        ttft = unavailable("not_observed")
+    else:
+        ttft = unavailable("not_applicable")
+    evidence = _evidence(
+        target,
+        request,
+        attempt,
+        headers,
+        total_ms,
+        ttft,
+        None,
+        None,
+        "inspect",
+    )
+    return ProviderCallResult(
+        status="provider_error",
+        remote_outcome="ambiguous",
+        response_id=unavailable("not_observed"),
+        finish_reason=unavailable("not_observed"),
+        error_code="transport_interrupted",
+        evidence=evidence,
+    )
+
+
+def _malformed_encoding_result(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    attempt: int,
+    headers: httpx.Headers,
+    total_ms: float,
+) -> ProviderCallResult:
+    evidence = _evidence(
+        target,
+        request,
+        attempt,
+        headers,
+        total_ms,
+        (
+            unavailable("not_observed")
+            if request.stream
+            else unavailable("not_applicable")
+        ),
+        None,
+        None,
+        "inspect",
+    )
+    return ProviderCallResult(
+        status="malformed_response",
+        remote_outcome="ambiguous",
+        response_id=unavailable("not_observed"),
+        finish_reason=unavailable("not_observed"),
+        error_code="invalid_content_encoding",
         evidence=evidence,
     )
 

@@ -27,6 +27,7 @@ from harbor_hf.control import (
     EventKind,
     HubCampaignStore,
     LifecyclePayload,
+    Producer,
     TerminalPayload,
     new_event,
     project_campaign,
@@ -460,6 +461,45 @@ def test_hub_store_adopts_deterministic_event_with_a_new_observation_time(
         lock.campaign_id,
         event.model_copy(update={"observed_at": NOW + timedelta(minutes=5)}),
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "producer"),
+    [
+        ("campaign.draining", "wave-controller"),
+        ("action.succeeded", "reconciler"),
+    ],
+)
+def test_hub_store_rejects_timestamp_conflicts_outside_reconciler_durable_events(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    kind: EventKind,
+    producer: Producer,
+) -> None:
+    lock = _lock(remote_spec)
+    store = HubCampaignStore("org", api=FakeCampaignApi(tmp_path))
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    payload: LifecyclePayload | ActionOutcomePayload
+    if kind == "action.succeeded":
+        payload = ActionOutcomePayload(action_id="action-one")
+    else:
+        payload = LifecyclePayload(message="draining")
+    event = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind=kind,
+        producer=producer,
+        payload=payload,
+        clock=lambda: NOW,
+        identifier=lambda: "8" * 32,
+    )
+
+    assert store.ensure_event(lock.campaign_id, event)
+    with pytest.raises(CampaignConflict, match="event conflicts"):
+        store.ensure_event(
+            lock.campaign_id,
+            event.model_copy(update={"observed_at": NOW + timedelta(minutes=5)}),
+        )
 
 
 def test_hub_store_reports_malformed_records(

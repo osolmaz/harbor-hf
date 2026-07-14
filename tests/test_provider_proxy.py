@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import gzip
 import json
-from collections.abc import Iterator
+import zlib
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
+import brotli
 import httpx
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -18,6 +20,7 @@ from harbor_hf.provider_models import (
 from harbor_hf.provider_proxy import (
     ProviderEvidenceProxy,
     ProviderProxyError,
+    _decode_evidence_response,
     _forwarded_payload,
     _json_object,
     _provider_message,
@@ -373,7 +376,17 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
         assert private not in serialized
 
 
-def test_proxy_preserves_gzip_encoding_and_decodes_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("encoding", "encoded"),
+    [
+        ("gzip", gzip.compress),
+        ("deflate", zlib.compress),
+        ("br", brotli.compress),
+    ],
+)
+def test_proxy_preserves_encoding_and_decodes_evidence(
+    tmp_path: Path, encoding: str, encoded: Callable[[bytes], bytes]
+) -> None:
     payload = (
         b'{"id":"complete-one","model":"org/model","choices":['
         b'{"finish_reason":"stop","message":{"role":"assistant",'
@@ -385,9 +398,9 @@ def test_proxy_preserves_gzip_encoding_and_decodes_evidence(tmp_path: Path) -> N
             200,
             headers={
                 "content-type": "application/json",
-                "content-encoding": "gzip",
+                "content-encoding": encoding,
             },
-            stream=httpx.ByteStream(gzip.compress(payload)),
+            stream=httpx.ByteStream(encoded(payload)),
         )
 
     client = httpx.Client(transport=httpx.MockTransport(upstream))
@@ -409,8 +422,17 @@ def test_proxy_preserves_gzip_encoding_and_decodes_evidence(tmp_path: Path) -> N
         client.close()
 
     assert response.content == payload
-    assert response.headers["content-encoding"] == "gzip"
+    assert response.headers["content-encoding"] == encoding
     assert json.loads(evidence.read_text())["status"] == "succeeded"
+
+
+def test_evidence_decoder_preserves_unknown_or_malformed_encoding() -> None:
+    for encoding, content in (("custom", b"encoded"), ("gzip", b"truncated")):
+        headers = httpx.Headers({"content-encoding": encoding})
+        observed_headers, observed_content = _decode_evidence_response(headers, content)
+
+        assert observed_headers["content-encoding"] == encoding
+        assert observed_content == content
 
 
 def test_mid_relay_transport_error_keeps_provider_status_and_partial_body(
@@ -454,3 +476,4 @@ def test_mid_relay_transport_error_keeps_provider_status_and_partial_body(
 
     assert observed.status_code == 200
     assert observed.content == b"partial"
+    assert observed.transport_interrupted is True
