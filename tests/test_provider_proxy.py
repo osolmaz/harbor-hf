@@ -12,6 +12,7 @@ import httpx
 import pytest
 from pydantic import JsonValue, ValidationError
 
+import harbor_hf.provider_proxy as provider_proxy
 from harbor_hf.provider_models import (
     ExplicitProviderRoute,
     ProviderLimits,
@@ -444,10 +445,16 @@ def test_ttft_probe_decodes_compression_and_accepts_bare_cr(
     )
     content = gzip.compress(stream) if encoding == "gzip" else stream
     headers = {"content-encoding": encoding} if encoding is not None else {}
+
+    class FragmentedStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            for value in content:
+                yield bytes([value])
+
     response = httpx.Response(
         200,
         headers=headers,
-        stream=httpx.ByteStream(content),
+        stream=FragmentedStream(),
     )
 
     class Handler:
@@ -469,6 +476,20 @@ def test_ttft_probe_decodes_compression_and_accepts_bare_cr(
 
     assert bytes(captured) == content
     assert semantic_output_ms is not None
+
+
+def test_evidence_decoder_bounds_high_ratio_compressed_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_proxy, "_MAX_EVIDENCE_RESPONSE_BYTES", 64)
+    headers = httpx.Headers({"content-encoding": "gzip"})
+
+    decoded_headers, decoded = _decode_evidence_response(
+        headers, gzip.compress(b"x" * 4096)
+    )
+
+    assert "content-encoding" not in decoded_headers
+    assert decoded == b"x" * 64
 
 
 def test_evidence_decoder_preserves_unknown_or_malformed_encoding() -> None:
