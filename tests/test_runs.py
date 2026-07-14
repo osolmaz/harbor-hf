@@ -121,15 +121,20 @@ def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
         credential_file = environment["HARBOR_HF_GIT_CREDENTIAL_FILE"]
         assert environment["GITHUB_TOKEN"] == ""
         assert Path(credential_file).read_text(encoding="utf-8") == "github-secret"
-        assert environment["GIT_CONFIG_COUNT"] == "2"
+        assert environment["GIT_CONFIG_COUNT"] == "3"
         assert environment["GIT_CONFIG_KEY_0"] == "credential.useHttpPath"
         assert environment["GIT_CONFIG_VALUE_0"] == "true"
         assert environment["GIT_CONFIG_KEY_1"] == (
             "credential.https://github.com/ShellBench/public-tasks.git.helper"
         )
         assert environment["GIT_CONFIG_VALUE_1"] == "harbor-hf"
+        assert environment["GIT_CONFIG_KEY_2"] == (
+            "credential.https://github.com/ShellBench/public-tasks.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_2"] == "harbor-hf"
         assert environment["GIT_TERMINAL_PROMPT"] == "0"
         assert environment["HARBOR_HF_GIT_REPOSITORY"] == "ShellBench/public-tasks"
+        assert environment["HARBOR_HF_REDACTION_SECRET_FILE"] == credential_file
     assert not os.path.exists(credential_file)
 
     monkeypatch.delenv("GITHUB_TOKEN")
@@ -173,16 +178,18 @@ def test_authenticated_git_environment_is_scoped_by_real_git(
             {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
         )
 
-        allowed = subprocess.run(
-            ["git", "credential", "fill"],
-            input=(
-                "protocol=https\nhost=github.com\npath=ShellBench/public-tasks.git\n\n"
-            ),
-            text=True,
-            capture_output=True,
-            env=environment,
-            check=True,
-        )
+        allowed = []
+        for path in ("ShellBench/public-tasks", "ShellBench/public-tasks.git"):
+            allowed.append(
+                subprocess.run(
+                    ["git", "credential", "fill"],
+                    input=f"protocol=https\nhost=github.com\npath={path}\n\n",
+                    text=True,
+                    capture_output=True,
+                    env=environment,
+                    check=True,
+                )
+            )
         refused = subprocess.run(
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\npath=other/repo.git\n\n",
@@ -194,8 +201,8 @@ def test_authenticated_git_environment_is_scoped_by_real_git(
         assert environment["GITHUB_TOKEN"] == ""
         assert environment["OTHER_GITHUB_TOKEN"] == ""
 
-    assert "username=x-access-token" in allowed.stdout
-    assert "password=github-secret" in allowed.stdout
+    assert all("username=x-access-token" in result.stdout for result in allowed)
+    assert all("password=github-secret" in result.stdout for result in allowed)
     assert refused.returncode != 0
     assert "github-secret" not in refused.stdout + refused.stderr
 

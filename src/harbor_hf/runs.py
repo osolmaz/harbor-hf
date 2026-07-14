@@ -31,6 +31,7 @@ RUN_LOCK_V1ALPHA2 = "harbor-hf/run-lock/v1alpha2"
 RUN_LOCK_V1ALPHA3 = "harbor-hf/run-lock/v1alpha3"
 _GIT_CREDENTIAL_FILE_ENV = "HARBOR_HF_GIT_CREDENTIAL_FILE"
 _GIT_REPOSITORY_ENV = "HARBOR_HF_GIT_REPOSITORY"
+_REDACTION_SECRET_FILE_ENV = "HARBOR_HF_REDACTION_SECRET_FILE"
 
 
 class Clock(Protocol):
@@ -228,16 +229,21 @@ def harbor_process_environment(
                 stream.write(source_token)
             environment.update(
                 {
-                    "GIT_CONFIG_COUNT": "2",
+                    "GIT_CONFIG_COUNT": "3",
                     "GIT_CONFIG_KEY_0": "credential.useHttpPath",
                     "GIT_CONFIG_VALUE_0": "true",
                     "GIT_CONFIG_KEY_1": (
                         f"credential.https://github.com/{source.repository}.git.helper"
                     ),
                     "GIT_CONFIG_VALUE_1": "harbor-hf",
+                    "GIT_CONFIG_KEY_2": (
+                        f"credential.https://github.com/{source.repository}.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_2": "harbor-hf",
                     "GIT_TERMINAL_PROMPT": "0",
                     _GIT_CREDENTIAL_FILE_ENV: str(credential_path),
                     _GIT_REPOSITORY_ENV: source.repository,
+                    _REDACTION_SECRET_FILE_ENV: str(credential_path),
                 }
             )
         for secret_name in blocked:

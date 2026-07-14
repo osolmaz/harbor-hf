@@ -134,7 +134,8 @@ helper scoped to that exact repository. The helper reads the token from a
 mode-`0600` temporary file that is deleted after Harbor exits; source-token
 environment variables are blanked in Harbor and its task sandboxes. Terminal
 prompting is disabled, and final evidence scrubbing covers both the Hugging Face
-and GitHub token values.
+and GitHub token values. Live Harbor output also reads the temporary file as a
+redaction source, so credential text is removed before it reaches HF Job logs.
 
 `benchmark.judge` optionally pins an OpenAI-compatible verifier judge on
 `router.huggingface.co`. Its API URL, model, protocol, and secret name are

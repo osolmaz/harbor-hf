@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 from pathlib import Path
@@ -225,6 +226,13 @@ def _secret_arguments(lock: RunLock | WaveLock) -> list[str]:
     ]
 
 
+def require_source_secrets(lock: RunLock | WaveLock) -> None:
+    token_name = lock.remote.job.token_secret_name
+    for name in job_secret_names(lock):
+        if name != token_name and not os.environ.get(name, ""):
+            raise ValueError(f"required secret {name} is not available")
+
+
 def build_submit_command(
     lock: RunLock,
     *,
@@ -341,6 +349,7 @@ def submit(
     runner: TextRunner,
     bucket_api: BucketApi | None = None,
 ) -> Submission:
+    require_source_secrets(lock)
     if bucket_api is None:
         from huggingface_hub import HfApi
 
@@ -377,6 +386,7 @@ def submit_wave(
     runner: TextRunner,
     bucket_api: BucketApi | None = None,
 ) -> WaveSubmission:
+    require_source_secrets(lock)
     if bucket_api is None:
         from huggingface_hub import HfApi
 
