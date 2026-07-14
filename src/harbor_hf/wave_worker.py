@@ -963,14 +963,7 @@ def _harbor_trial_failure_category(
     if category is not None:
         return category
     if exception_type == "nonzeroagentexitcodeerror":
-        message_category = _retry_category_from_text(
-            (error.exception_message or "").lower()
-        )
-        return (
-            message_category
-            or _openclaw_transport_failure_category(evidence_root)
-            or "benchmark"
-        )
+        return _openclaw_transport_failure_category(evidence_root) or "benchmark"
     return "benchmark"
 
 

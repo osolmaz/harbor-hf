@@ -58,14 +58,14 @@ def test_verification_failure_is_terminal_benchmark_evidence() -> None:
     assert _execution_failure_category(error, "execution") == "benchmark"
 
 
-def test_wrapped_endpoint_server_error_is_retryable_infrastructure() -> None:
+def test_wrapped_endpoint_server_error_without_log_remains_benchmark_failure() -> None:
     error = HarborTrialFailure(
         "agent failed",
         "NonZeroAgentExitCodeError",
         'provider response status=500: "500 Internal Server Error"',
     )
 
-    assert _execution_failure_category(error, "execution") == "transient"
+    assert _execution_failure_category(error, "execution") == "benchmark"
 
 
 def test_plain_nonzero_agent_exit_remains_benchmark_failure() -> None:
@@ -79,6 +79,16 @@ def test_plain_nonzero_agent_exit_remains_benchmark_failure() -> None:
 def test_benchmark_exception_message_does_not_trigger_transport_retry() -> None:
     error = HarborTrialFailure(
         "verifier failed", "AssertionError", "expected timeout handling"
+    )
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_agent_output_keywords_do_not_trigger_transport_retry() -> None:
+    error = HarborTrialFailure(
+        "agent failed",
+        "NonZeroAgentExitCodeError",
+        "command asked to diagnose a timeout and quota issue; exit status 1",
     )
 
     assert _execution_failure_category(error, "execution") == "benchmark"
@@ -531,7 +541,9 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _route: {"probes": {"health": {"http_status": 200}}},
+        lambda _url, _token, _route, *_deadline: {
+            "probes": {"health": {"http_status": 200}}
+        },
     )
     endpoint = EndpointRunner(
         [
@@ -834,7 +846,9 @@ def test_terminal_wave_evidence_closes_and_normalizes_campaign(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _route: {"probes": {"health": {"http_status": 200}}},
+        lambda _url, _token, _route, *_deadline: {
+            "probes": {"health": {"http_status": 200}}
+        },
     )
     output = tmp_path / "output"
     run_wave_worker(

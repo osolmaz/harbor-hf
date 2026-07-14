@@ -751,6 +751,7 @@ def resume_and_probe_endpoint(
     readiness_timeout_seconds: int = 3600,
     compatible_locks: Sequence[RunLock] = (),
 ) -> str:
+    deadline = manager.monotonic() + readiness_timeout_seconds
     _endpoint_binding(lock)
     append_event(events, "endpoint_resume_requested")
     manager.resume()
@@ -761,13 +762,17 @@ def resume_and_probe_endpoint(
     append_event(events, "endpoint_ready", state=endpoint_state(snapshot)[0])
     write_json(root / "endpoint.snapshot.json", redact(snapshot))
     base_url = endpoint_url(snapshot)
+    remaining = deadline - manager.monotonic()
+    if remaining <= 0:
+        raise WorkerError("endpoint runtime readiness deadline expired")
     runtime = {
         "controller": controller_environment(lock),
         "endpoint": wait_for_runtime(
             base_url,
             token,
             endpoint_health_route(snapshot),
-            timeout_seconds=min(300, readiness_timeout_seconds),
+            timeout_seconds=min(300, remaining),
+            monotonic=manager.monotonic,
         ),
     }
     write_json(root / "runtime-environment.json", redact(runtime))
@@ -1405,7 +1410,12 @@ def controller_environment(lock: RunLock) -> dict[str, object]:
 
 
 def probe_runtime(
-    base_url: str, token: str, health_route: str = "/health"
+    base_url: str,
+    token: str,
+    health_route: str = "/health",
+    request_timeout_seconds: float = 60,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     probes: dict[str, object] = {}
     for name, path in (
@@ -1413,12 +1423,21 @@ def probe_runtime(
         ("version", "/version"),
         ("models", "/v1/models"),
     ):
+        timeout = _runtime_probe_timeout(
+            name, request_timeout_seconds, deadline, monotonic
+        )
+        if timeout is None:
+            probes[name] = {
+                "status": "unknown",
+                "error_type": "TimeoutError",
+            }
+            continue
         request = urllib.request.Request(
             f"{base_url}{path}",
             headers={"Authorization": f"Bearer {token}"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read(1024 * 1024).decode("utf-8", errors="replace")
                 try:
                     parsed: object = json.loads(body)
@@ -1441,20 +1460,49 @@ def probe_runtime(
     return {"probes": probes}
 
 
+def _runtime_probe_timeout(
+    name: str,
+    request_timeout_seconds: float,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float | None:
+    if deadline is None:
+        return request_timeout_seconds
+    remaining = deadline - monotonic()
+    if remaining > 0:
+        return min(request_timeout_seconds, remaining)
+    if name == "health":
+        raise WorkerError("endpoint runtime probe deadline expired")
+    return None
+
+
 def wait_for_runtime(
     base_url: str,
     token: str,
     health_route: str,
     *,
-    timeout_seconds: int,
+    timeout_seconds: float,
     poll_seconds: float = 15,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     deadline = monotonic() + timeout_seconds
     while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            cause = WorkerError("endpoint runtime timeout expired before probe")
+            raise WorkerError(
+                "endpoint runtime did not become healthy before timeout"
+            ) from cause
         try:
-            return probe_runtime(base_url, token, health_route)
+            return probe_runtime(
+                base_url,
+                token,
+                health_route,
+                min(60, remaining),
+                deadline,
+                monotonic,
+            )
         except WorkerError as error:
             remaining = deadline - monotonic()
             if remaining <= 0:

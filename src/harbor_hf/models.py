@@ -95,7 +95,13 @@ class BenchmarkJudgeSpec(StrictModel):
     @field_validator("api_url")
     @classmethod
     def api_url_is_secure(cls, value: AnyHttpUrl) -> AnyHttpUrl:
-        if value.scheme != "https" or value.username is not None or value.password:
+        if (
+            value.scheme != "https"
+            or value.username is not None
+            or value.password
+            or value.query is not None
+            or value.fragment is not None
+        ):
             raise ValueError("benchmark judge API URL must be credential-free HTTPS")
         return value
 

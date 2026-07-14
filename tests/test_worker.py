@@ -2534,6 +2534,42 @@ def test_runtime_probe_requires_healthy_endpoint(
     ]
 
 
+def test_runtime_probe_shares_deadline_across_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    requests: list[tuple[str, float]] = []
+
+    def open_url(request: urllib.request.Request, *, timeout: float) -> FakeResponse:
+        requests.append((request.full_url, timeout))
+        if request.full_url.endswith("/health"):
+            now[0] += 0.4
+            return FakeResponse(b'{"ok": true}', 200)
+        now[0] += timeout
+        raise TimeoutError
+
+    monkeypatch.setattr("urllib.request.urlopen", open_url)
+
+    result = probe_runtime(
+        "https://endpoint.example",
+        "token",
+        request_timeout_seconds=60,
+        deadline=11.0,
+        monotonic=lambda: now[0],
+    )
+
+    assert [request for request, _timeout in requests] == [
+        "https://endpoint.example/health",
+        "https://endpoint.example/version",
+    ]
+    assert [timeout for _request, timeout in requests] == pytest.approx([1.0, 0.6])
+    probes = cast(dict[str, dict[str, object]], result["probes"])
+    assert probes["models"] == {
+        "status": "unknown",
+        "error_type": "TimeoutError",
+    }
+
+
 def test_runtime_readiness_retries_gateway_race(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2582,6 +2618,40 @@ def test_runtime_readiness_timeout_preserves_cause(
         )
 
     assert isinstance(caught.value.__cause__, WorkerError)
+
+
+def test_runtime_readiness_bounds_each_probe_by_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    captured: list[tuple[float, float | None]] = []
+
+    def bounded_probe(
+        _base_url: str,
+        _token: str,
+        _health_route: str,
+        timeout: float,
+        deadline: float | None,
+        _monotonic: object,
+    ) -> dict[str, object]:
+        captured.append((timeout, deadline))
+        now[0] += 0.6
+        raise WorkerError("not ready")
+
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", bounded_probe)
+
+    with pytest.raises(WorkerError, match="before timeout"):
+        wait_for_runtime(
+            "https://endpoint.example",
+            "token",
+            "/health",
+            timeout_seconds=1,
+            poll_seconds=1,
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            monotonic=lambda: now[0],
+        )
+
+    assert captured == [(1.0, 11.0)]
 
 
 def test_finalize_evidence_scrubs_and_archives(tmp_path: Path) -> None:
@@ -3140,7 +3210,9 @@ def test_worker_publishes_success_after_cleanup(
     _write_lock(lock_path, lock)
     monkeypatch.setenv("HF_TOKEN", "test-token")
 
-    def fake_probe(url: str, token: str, health_route: str) -> dict[str, object]:
+    def fake_probe(
+        url: str, token: str, health_route: str, *_deadline: object
+    ) -> dict[str, object]:
         assert url == "https://endpoint.example"
         assert token == "test-token"
         assert health_route == "/ready"
@@ -3449,7 +3521,7 @@ def test_worker_rejects_incomplete_explicit_task_set(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _health_route: {"probes": {}},
+        lambda _url, _token, _health_route, *_deadline: {"probes": {}},
     )
     runner = EndpointRunner(
         [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
@@ -3483,7 +3555,7 @@ def test_worker_failure_still_pauses_endpoint(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _health_route: {"probes": {}},
+        lambda _url, _token, _health_route, *_deadline: {"probes": {}},
     )
     runner = EndpointRunner(
         [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
@@ -3564,7 +3636,7 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _health_route: {"probes": {}},
+        lambda _url, _token, _health_route, *_deadline: {"probes": {}},
     )
     staged_roots: list[Path] = []
 
@@ -3704,7 +3776,7 @@ def test_cleanup_failure_prevents_success_and_redacts_failure(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _health_route: {"probes": {}},
+        lambda _url, _token, _health_route, *_deadline: {"probes": {}},
     )
     runner = CleanupFailureRunner([snapshot("paused", 0), snapshot("running", 1)])
 
@@ -3751,7 +3823,7 @@ def test_worker_preserves_execution_and_cleanup_failures(
     monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
-        lambda _url, _token, _health_route: {"probes": {}},
+        lambda _url, _token, _health_route, *_deadline: {"probes": {}},
     )
     runner = CleanupFailureRunner([snapshot("paused", 0), snapshot("running", 1)])
 
