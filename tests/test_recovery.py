@@ -378,6 +378,28 @@ def test_cancellation_terminalizes_drained_retry_wait_trials(
     assert plan.terminal_decision.counts.retrying == 0
     assert plan.terminal_decision.counts.cancelled == len(projection.trials)
 
+    recorded = project_recovery(
+        lock,
+        [
+            submitted,
+            *failed,
+            _cancel_event(lock, sequence=4),
+            _event(
+                lock,
+                5,
+                "campaign",
+                lock.campaign_id,
+                "campaign.cancelled",
+                TerminalPayload(summary_path="campaign-summary.json"),
+            ),
+        ],
+    )
+
+    assert recorded.counts.retrying == 0
+    assert recorded.counts.cancelled == len(recorded.trials)
+    assert recorded.terminal_decision is not None
+    assert recorded.terminal_decision.counts == recorded.counts
+
 
 def test_active_execution_is_cancelled_before_wave_cleanup(
     remote_spec: ExperimentSpec,

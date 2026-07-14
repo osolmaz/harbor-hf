@@ -260,9 +260,6 @@ def project_recovery(
     shards = _derive_shards(shards, trials)
     runs = _derive_runs(runs, shards)
     counts = _counts(trials)
-    if campaign.status == "queued" and (executions or waves):
-        campaign = campaign.model_copy(update={"status": "active"})
-    terminal = _terminal_decision(lock, campaign, trials, waves, counts)
     cancel_requested_at = next(
         (
             event.observed_at
@@ -271,6 +268,11 @@ def project_recovery(
         ),
         None,
     )
+    if campaign.status == "queued" and (executions or waves):
+        campaign = campaign.model_copy(update={"status": "active"})
+    if cancel_requested_at is not None and campaign.status in {"partial", "cancelled"}:
+        counts = _cancelled_counts(counts)
+    terminal = _terminal_decision(lock, campaign, trials, waves, counts)
     return RecoveryProjection(
         campaign=campaign,
         runs=runs,
@@ -735,6 +737,10 @@ def _terminal_counts(
 ) -> ProjectionCounts:
     if campaign.status not in {"cancel_requested", "draining"}:
         return counts
+    return _cancelled_counts(counts)
+
+
+def _cancelled_counts(counts: ProjectionCounts) -> ProjectionCounts:
     return counts.model_copy(
         update={
             "planned": 0,
