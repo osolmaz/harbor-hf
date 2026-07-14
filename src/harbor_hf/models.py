@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import (
+    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
@@ -85,10 +86,34 @@ def git_benchmark_source_digest(source: GitBenchmarkSource) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+class BenchmarkJudgeSpec(StrictModel):
+    protocol: Literal["openai-compatible"] = "openai-compatible"
+    api_url: AnyHttpUrl
+    model: str = Field(min_length=1)
+    api_key_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
+
+    @field_validator("api_url")
+    @classmethod
+    def api_url_is_secure(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        if value.scheme != "https" or value.username is not None or value.password:
+            raise ValueError("benchmark judge API URL must be credential-free HTTPS")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def model_is_canonical(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("benchmark judge model cannot have surrounding whitespace")
+        return value
+
+
 class BenchmarkSpec(StrictModel):
     dataset: str = Field(min_length=1)
     dataset_digest: ContentDigest | None = None
     source: GitBenchmarkSource | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    judge: BenchmarkJudgeSpec | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)

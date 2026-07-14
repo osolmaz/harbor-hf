@@ -17,6 +17,11 @@ benchmark:
   task_names: [example-task]
   task_digests:
     example-task: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  judge:
+    protocol: openai-compatible
+    api_url: https://router.example/v1/chat/completions
+    model: organization/judge-model
+    api_key_secret_name: HF_TOKEN
 matrix:
   models:
     - id: model
@@ -114,6 +119,12 @@ path. `dataset_digest` is derived from those canonical fields and is rejected if
 an explicitly supplied value differs. The worker renders the source as Harbor's
 `repo` and `path` dataset configuration, so Harbor still owns cloning, task
 resolution, and task checksum calculation.
+
+`benchmark.judge` optionally pins an OpenAI-compatible verifier judge. Its API
+URL, model, protocol, and secret name are preserved in the run lock. The remote
+worker maps the existing `HF_TOKEN` secret to `AGENT_JUDGE_API_KEY` and passes
+the public URL and model as `AGENT_JUDGE_API_URL` and `AGENT_JUDGE_MODEL` to
+Harbor. The credential value never appears in the manifest or lock.
 
 ### Matrix
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harbor_hf.models import (
     AgentProfile,
+    BenchmarkJudgeSpec,
     DeploymentTarget,
     ExperimentSpec,
     GitBenchmarkSource,
@@ -42,6 +43,9 @@ class RunLock(BaseModel):
     benchmark_dataset: str
     benchmark_dataset_digest: str
     benchmark_source: GitBenchmarkSource | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    benchmark_judge: BenchmarkJudgeSpec | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
     benchmark_tasks: list[str]
@@ -127,6 +131,7 @@ def build_run_lock(
         benchmark_dataset=spec.benchmark.dataset,
         benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
         benchmark_source=spec.benchmark.source,
+        benchmark_judge=spec.benchmark.judge,
         benchmark_tasks=spec.benchmark.task_names,
         benchmark_task_digests=spec.benchmark.task_digests,
         model=model,
@@ -139,6 +144,25 @@ def build_run_lock(
         artifact_prefix=f"runs/{spec.metadata.name}/{resolved_id}",
         remote=spec.remote,
     )
+
+
+def harbor_process_environment(
+    lock: RunLock, *, token: str, inference_base_url: str
+) -> dict[str, str]:
+    environment = {
+        "HF_TOKEN": token,
+        "OPENAI_API_KEY": token,
+        "OPENAI_BASE_URL": f"{inference_base_url.rstrip('/')}/v1",
+    }
+    if lock.benchmark_judge is not None:
+        environment.update(
+            {
+                "AGENT_JUDGE_API_KEY": token,
+                "AGENT_JUDGE_API_URL": str(lock.benchmark_judge.api_url),
+                "AGENT_JUDGE_MODEL": lock.benchmark_judge.model,
+            }
+        )
+    return environment
 
 
 def _new_run_id(name: str, digest: str, created_at: datetime) -> str:

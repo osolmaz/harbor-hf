@@ -175,6 +175,46 @@ def test_git_benchmark_source_is_canonical_and_content_addressed() -> None:
     assert benchmark.dataset_digest == git_benchmark_source_digest(source)
 
 
+def test_benchmark_judge_round_trips_without_a_credential() -> None:
+    benchmark = BenchmarkSpec.model_validate(
+        {
+            "dataset": "harbor/terminal-bench@2.0",
+            "dataset_digest": "sha256:" + "1" * 64,
+            "judge": {
+                "api_url": "https://router.huggingface.co/v1/chat/completions",
+                "model": "deepseek-ai/DeepSeek-V3.2",
+            },
+        }
+    )
+
+    payload = benchmark.model_dump(mode="json", exclude_none=True)
+
+    assert payload["judge"] == {
+        "api_key_secret_name": "HF_TOKEN",
+        "api_url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "deepseek-ai/DeepSeek-V3.2",
+        "protocol": "openai-compatible",
+    }
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://router.example/v1/chat/completions",
+        "https://credential@router.example/v1/chat/completions",
+    ],
+)
+def test_benchmark_judge_requires_secure_credential_free_url(api_url: str) -> None:
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        BenchmarkSpec.model_validate(
+            {
+                "dataset": "harbor/terminal-bench@2.0",
+                "dataset_digest": "sha256:" + "1" * 64,
+                "judge": {"api_url": api_url, "model": "judge/model"},
+            }
+        )
+
+
 @pytest.mark.parametrize("path", ["../tasks", "/tasks", "tasks/../other", "."])
 def test_git_benchmark_source_rejects_unsafe_paths(path: str) -> None:
     with pytest.raises(ValueError, match="safely relative"):

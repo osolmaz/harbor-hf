@@ -80,7 +80,7 @@ from harbor_hf.process import (
     SubprocessRunner,
     run_streaming,
 )
-from harbor_hf.runs import RunLock, build_run_lock
+from harbor_hf.runs import RunLock, build_run_lock, harbor_process_environment
 from harbor_hf.submission import (
     endpoint_lease_label_for,
     github_repository,
@@ -723,11 +723,9 @@ def _execute_benchmark(
         harbor_source,
         jobs_dir,
         root / "harbor.log",
-        environment={
-            "HF_TOKEN": token,
-            "OPENAI_API_KEY": token,
-            "OPENAI_BASE_URL": f"{base_url}/v1",
-        },
+        environment=harbor_process_environment(
+            lock, token=token, inference_base_url=base_url
+        ),
         timeout_seconds=lock.timeout_seconds,
         stream_runner=stream_runner,
     )

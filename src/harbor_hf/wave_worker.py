@@ -69,7 +69,7 @@ from harbor_hf.provider_models import (
 )
 from harbor_hf.provider_proxy import ProviderEvidenceProxy
 from harbor_hf.providers import routed_provider_model
-from harbor_hf.runs import RunLock
+from harbor_hf.runs import RunLock, harbor_process_environment
 from harbor_hf.worker import (
     EndpointManager,
     HarborTrialFailure,
@@ -831,11 +831,9 @@ def _execute_trial(
             harbor_source,
             jobs_dir,
             execution_root / "harbor.log",
-            environment={
-                "HF_TOKEN": token,
-                "OPENAI_API_KEY": token,
-                "OPENAI_BASE_URL": f"{trial_base_url}/v1",
-            },
+            environment=harbor_process_environment(
+                run, token=token, inference_base_url=trial_base_url
+            ),
             timeout_seconds=timeout,
             stream_runner=stream_runner,
             monotonic=monotonic,
