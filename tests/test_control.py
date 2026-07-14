@@ -181,6 +181,68 @@ def test_projection_tracks_reserved_and_completed_actions(
     assert projection.actions["act-one"].remote_id == "job-one"
 
 
+def test_repeated_ambiguous_outcome_preserves_new_remote_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _lock(remote_spec)
+    reserved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id="act-one",
+            action_key="key-one",
+            action_kind="submit-wave",
+            target_ids=[lock.runs[0].shards[0].shard_id],
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "2" * 32,
+    )
+    first = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.ambiguous",
+        producer="reconciler",
+        payload=ActionOutcomePayload(action_id="act-one", message="job lookup failed"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "3" * 32,
+    )
+    second = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.ambiguous",
+        producer="reconciler",
+        payload=ActionOutcomePayload(
+            action_id="act-one",
+            message="endpoint pause was ambiguous",
+            remote_id="managed-endpoint",
+        ),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "4" * 32,
+    )
+
+    action = project_campaign(
+        lock, [_submitted(lock), reserved, first, second]
+    ).actions["act-one"]
+
+    assert action.status == "ambiguous"
+    assert action.remote_id == "managed-endpoint"
+    assert action.message == "endpoint pause was ambiguous"
+
+    conflicting = second.model_copy(
+        update={
+            "event_id": "evt-" + "5" * 32,
+            "observed_at": NOW + timedelta(seconds=4),
+            "payload": ActionOutcomePayload(
+                action_id="act-one", remote_id="different-endpoint"
+            ),
+        }
+    )
+    with pytest.raises(ControlError, match="changed remote identity"):
+        project_campaign(lock, [_submitted(lock), reserved, first, second, conflicting])
+
+
 @pytest.mark.parametrize(
     "events,message",
     [

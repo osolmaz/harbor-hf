@@ -551,6 +551,47 @@ def test_active_endpoint_is_paused_only_after_endpoint_provisioning_was_ambiguou
     assert len(jobs.submissions) == 1
 
 
+def test_endpoint_provenance_survives_consecutive_ambiguous_outcomes(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    endpoints = FakeEndpoints()
+    jobs = FakeJobs()
+    jobs.submit_error = AmbiguousActionOutcome("job submission timed out")
+
+    first = _reconciler(store, endpoints, jobs).apply_campaign(lock.campaign_id)
+
+    action_id = first.applied[0].action_id
+    assert first.applied[0].status == "ambiguous"
+    assert project_campaign(lock, store.events).actions[action_id].remote_id is None
+
+    endpoints.active = True
+    endpoints.create_error = AmbiguousEndpointPause("endpoint pause timed out")
+    second = _reconciler(
+        store, endpoints, FakeJobs(), identifier_start=10
+    ).apply_campaign(lock.campaign_id)
+
+    endpoint_name = second.applied[0].remote_id
+    assert second.applied[0].status == "ambiguous"
+    assert endpoint_name is not None
+    assert (
+        project_campaign(lock, store.events).actions[action_id].remote_id
+        == endpoint_name
+    )
+
+    endpoints.create_error = None
+    recovered_jobs = FakeJobs()
+    recovered = _reconciler(
+        store, endpoints, recovered_jobs, identifier_start=20
+    ).apply_campaign(lock.campaign_id)
+
+    assert recovered.applied[0].status == "succeeded"
+    assert len(endpoints.pause_calls) == 1
+    assert endpoints.active is False
+    assert len(recovered_jobs.submissions) == 1
+
+
 def test_active_endpoint_without_orphan_provenance_is_never_paused(
     remote_spec: ExperimentSpec,
 ) -> None:

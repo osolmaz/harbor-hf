@@ -401,6 +401,31 @@ def test_cancellation_converts_retry_wait_trials_to_terminal_cancelled_counts(
     assert projection.terminal_decision.counts.cancelled == 1
 
 
+def test_recorded_cancellation_keeps_normalized_retry_counts_after_reload(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock, 2, execution_id="execution-one", attempt=1, category="transient"
+    )
+    cancelled = _cancel_event(lock, sequence=5)
+    terminal = _event(
+        lock,
+        6,
+        "campaign",
+        lock.campaign_id,
+        "campaign.cancelled",
+        TerminalPayload(message="cancellation drained and cleaned"),
+    )
+
+    projection = project_recovery(lock, [submitted, *failed, cancelled, terminal])
+
+    assert projection.terminal_decision is not None
+    assert projection.terminal_decision.status == "cancelled"
+    assert projection.terminal_decision.counts.retrying == 0
+    assert projection.terminal_decision.counts.cancelled == 1
+
+
 def test_valid_completed_trial_is_not_retried_after_reconcile_kill(
     remote_spec: ExperimentSpec,
 ) -> None:

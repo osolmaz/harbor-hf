@@ -25,6 +25,7 @@ from harbor_hf.provider_proxy import (
     _json_object,
     _provider_message,
     _provider_request,
+    _relay_response,
 )
 
 
@@ -424,6 +425,50 @@ def test_proxy_preserves_encoding_and_decodes_evidence(
     assert response.content == payload
     assert response.headers["content-encoding"] == encoding
     assert json.loads(evidence.read_text())["status"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("encoding", "delimiter"),
+    [("gzip", b"\n"), (None, b"\r")],
+)
+def test_ttft_probe_decodes_compression_and_accepts_bare_cr(
+    encoding: str | None, delimiter: bytes
+) -> None:
+    stream = delimiter.join(
+        [
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}',
+            b"",
+            b"data: [DONE]",
+            b"",
+        ]
+    )
+    content = gzip.compress(stream) if encoding == "gzip" else stream
+    headers = {"content-encoding": encoding} if encoding is not None else {}
+    response = httpx.Response(
+        200,
+        headers=headers,
+        stream=httpx.ByteStream(content),
+    )
+
+    class Handler:
+        close_connection = False
+        wfile = type(
+            "Output", (), {"write": lambda *_: None, "flush": lambda *_: None}
+        )()
+
+        def send_response(self, _status: int) -> None:
+            pass
+
+        def send_header(self, _name: str, _value: str) -> None:
+            pass
+
+        def end_headers(self) -> None:
+            pass
+
+    captured, semantic_output_ms = _relay_response(cast(Any, Handler()), response, 0)
+
+    assert bytes(captured) == content
+    assert semantic_output_ms is not None
 
 
 def test_evidence_decoder_preserves_unknown_or_malformed_encoding() -> None:

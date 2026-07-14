@@ -415,6 +415,22 @@ def _apply_action_event(
         raise ControlError("action has multiple outcomes")
     outcome = cast(ActionStatus, event.kind.removeprefix("action."))
     if action.status == "ambiguous" and outcome == "ambiguous":
+        if (
+            action.remote_id is not None
+            and payload.remote_id is not None
+            and action.remote_id != payload.remote_id
+        ):
+            raise ControlError("ambiguous action changed remote identity")
+        actions[payload.action_id] = action.model_copy(
+            update={
+                "message": payload.message,
+                "remote_id": (
+                    payload.remote_id
+                    if payload.remote_id is not None
+                    else action.remote_id
+                ),
+            }
+        )
         return
     actions[payload.action_id] = action.model_copy(
         update={

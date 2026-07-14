@@ -303,7 +303,7 @@ def _relay_response(
     evidence = captured if captured is not None else bytearray()
     downstream_connected = _start_downstream_response(handler, response)
     semantic_output_ms: float | None = None
-    probe = _SseSemanticOutputProbe()
+    probe = _SseSemanticOutputProbe(response.headers)
     for chunk in response.iter_raw():
         if semantic_output_ms is None and probe.feed(chunk):
             semantic_output_ms = (perf_counter() - started) * 1000
@@ -345,23 +345,49 @@ def _write_downstream_chunk(handler: BaseHTTPRequestHandler, chunk: bytes) -> bo
 class _SseSemanticOutputProbe:
     """Observe semantic OpenAI deltas without changing relayed stream bytes."""
 
-    def __init__(self) -> None:
+    def __init__(self, headers: httpx.Headers | None = None) -> None:
         self._pending = bytearray()
+        self._encoded = bytearray()
+        self._decoded_size = 0
+        self._headers = headers or httpx.Headers()
+        encoding = self._headers.get("content-encoding", "").lower().strip()
+        encodings = {value.strip() for value in encoding.split(",") if value.strip()}
+        self._compressed = bool(encodings) and encodings.issubset(
+            {"gzip", "deflate", "br"}
+        )
         self._stopped = False
 
     def feed(self, chunk: bytes) -> bool:
         if self._stopped or not chunk:
             return False
+        if self._compressed:
+            self._encoded.extend(chunk)
+            if len(self._encoded) > _MAX_EVIDENCE_RESPONSE_BYTES:
+                self._stop()
+                return False
+            decoded_headers, decoded = _decode_evidence_response(
+                self._headers, bytes(self._encoded)
+            )
+            if "content-encoding" in decoded_headers:
+                return False
+            if len(decoded) < self._decoded_size:
+                self._stop()
+                return False
+            chunk = decoded[self._decoded_size :]
+            self._decoded_size = len(decoded)
+        return self._feed_decoded(chunk)
+
+    def _feed_decoded(self, chunk: bytes) -> bool:
         self._pending.extend(chunk)
         if len(self._pending) > _MAX_EVIDENCE_RESPONSE_BYTES:
-            self._pending.clear()
-            self._stopped = True
+            self._stop()
             return False
-        while (newline := self._pending.find(b"\n")) >= 0:
-            line = bytes(self._pending[:newline]).removesuffix(b"\r")
-            del self._pending[: newline + 1]
+        while (boundary := _sse_line_boundary(self._pending)) is not None:
+            newline, width = boundary
+            line = bytes(self._pending[:newline])
+            del self._pending[: newline + width]
             if _sse_line_has_semantic_output(line):
-                self._stopped = True
+                self._stop()
                 return True
         return False
 
@@ -369,8 +395,24 @@ class _SseSemanticOutputProbe:
         if self._stopped or not self._pending:
             return False
         line = bytes(self._pending).removesuffix(b"\r")
-        self._pending.clear()
+        self._stop()
         return _sse_line_has_semantic_output(line)
+
+    def _stop(self) -> None:
+        self._pending.clear()
+        self._encoded.clear()
+        self._stopped = True
+
+
+def _sse_line_boundary(content: bytearray) -> tuple[int, int] | None:
+    carriage = content.find(b"\r")
+    newline = content.find(b"\n")
+    candidates = [index for index in (carriage, newline) if index >= 0]
+    if not candidates:
+        return None
+    index = min(candidates)
+    width = 2 if content[index : index + 2] == b"\r\n" else 1
+    return index, width
 
 
 def _sse_line_has_semantic_output(line: bytes) -> bool:

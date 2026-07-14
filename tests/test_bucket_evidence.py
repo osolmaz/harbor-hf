@@ -10,6 +10,7 @@ from harbor_hf.bucket_evidence import (
     HubBucketEvidenceReader,
     HubBucketEvidenceWriter,
 )
+from harbor_hf.coordination import CoordinationError
 
 
 class FakeBucketApi:
@@ -242,6 +243,26 @@ def test_writer_serializes_check_and_write_with_distributed_claim() -> None:
     assert len(claims.acquired) == len(claims.released) == 1
     assert claims.acquired == claims.released
     assert claims.acquired[0][0].startswith("bucket-evidence-leases/")
+
+
+def test_writer_does_not_fail_completed_write_when_claim_release_fails() -> None:
+    class FailingReleaseClaims(FakeClaims):
+        def release(self, path: str, owner: Mapping[str, str]) -> None:
+            super().release(path, owner)
+            raise CoordinationError("claim release timed out")
+
+    api = FakeBucketWriterApi()
+    claims = FailingReleaseClaims()
+    writer = HubBucketEvidenceWriter(api=api, claims=claims)
+
+    created = writer.write_immutable(
+        bucket="org/evidence",
+        path="campaigns/campaign-one/_SUCCESS",
+        content=b"new evidence",
+    )
+
+    assert created is True
+    assert len(claims.acquired) == len(claims.released) == 1
 
 
 def test_writer_adopts_only_byte_identical_immutable_object() -> None:

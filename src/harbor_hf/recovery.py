@@ -761,7 +761,7 @@ def _terminal_decision(
 ) -> TerminalDecision | None:
     if campaign.status in _CAMPAIGN_TERMINAL:
         status = cast(TerminalStatus, campaign.status)
-        return _decision(lock, status, counts, "recorded")
+        return _decision(lock, status, _terminal_counts(campaign, counts), "recorded")
     if not _cleanup_is_complete(campaign, waves):
         return None
     decision_counts = _terminal_counts(campaign, counts)
@@ -795,7 +795,12 @@ def _terminal_decision(
 def _terminal_counts(
     campaign: CampaignProjection, counts: ProjectionCounts
 ) -> ProjectionCounts:
-    if campaign.status not in {"cancel_requested", "draining"}:
+    if campaign.status not in {
+        "cancel_requested",
+        "draining",
+        "cancelled",
+        "partial",
+    }:
         return counts
     return counts.model_copy(
         update={
