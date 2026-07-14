@@ -11,7 +11,9 @@ from harbor_hf.private_artifacts import (
     PrivateArtifactManifest,
     build_private_artifact_manifest,
     openclaw_execution_started,
+    sanitize_private_artifact_directory_files,
     sanitize_private_artifact_tree,
+    validate_private_artifact_directory_files,
     write_private_artifact_manifest,
 )
 from harbor_hf.results import ArtifactEvidence
@@ -85,6 +87,21 @@ def test_successful_openclaw_execution_requires_session_jsonl(tmp_path: Path) ->
 
     retained = build_private_artifact_manifest(root, strict_session=False)
     assert retained.requirements[0].required is True
+    assert retained.requirements[0].satisfied is False
+
+
+@pytest.mark.parametrize("content", ["", "{}\n{", '"not-an-object"\n'])
+def test_session_requirement_rejects_unusable_jsonl(
+    tmp_path: Path, content: str
+) -> None:
+    root = _execution_root(tmp_path)
+    session = next(root.rglob("session-one.jsonl"))
+    session.write_text(content, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no session JSONL"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+    retained = build_private_artifact_manifest(root, strict_session=False)
     assert retained.requirements[0].satisfied is False
 
 
@@ -227,6 +244,33 @@ def test_private_artifact_sanitizer_records_and_removes_rejected_files(
         root, strict_session=False, trust_rejections=True
     )
     assert retained.rejections == rejected
+
+
+def test_directory_file_limits_do_not_charge_child_trial_bundles(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "job"
+    trial = job / "trial"
+    trial.mkdir(parents=True)
+    (job / "job.log").write_text("small", encoding="utf-8")
+    (trial / "session.jsonl").write_text("x" * 100, encoding="utf-8")
+
+    validate_private_artifact_directory_files(
+        job, max_file_bytes=10, max_bundle_bytes=10
+    )
+
+    (job / "job.log").write_text("x" * 20, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="file size limit: job.log"):
+        validate_private_artifact_directory_files(
+            job, max_file_bytes=10, max_bundle_bytes=10
+        )
+
+    rejected = sanitize_private_artifact_directory_files(
+        job, max_file_bytes=10, max_bundle_bytes=10
+    )
+    assert [(item.path, item.reason) for item in rejected] == [("job.log", "file_size")]
+    assert not (job / "job.log").exists()
+    assert (trial / "session.jsonl").stat().st_size == 100
 
 
 def test_private_manifest_rejects_controller_reserved_paths(tmp_path: Path) -> None:

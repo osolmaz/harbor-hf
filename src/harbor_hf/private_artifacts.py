@@ -208,6 +208,7 @@ def build_private_artifact_manifest(
         if entry.kind == "session"
         and entry.path.endswith(".jsonl")
         and not entry.path.endswith(".trajectory.jsonl")
+        and _valid_jsonl_objects(root / entry.path)
     ]
     required = (
         openclaw_execution_started(root)
@@ -284,6 +285,62 @@ def sanitize_private_artifact_symlinks(
     """Remove symlinks without applying an aggregate size limit to child trials."""
     rejected = _remove_symlinks(root, max_depth=max_depth)
     rejected.extend(_consume_existing_rejections(root, trust_existing=False))
+    _write_rejections(root, rejected)
+    return rejected
+
+
+def validate_private_artifact_directory_files(
+    root: Path,
+    *,
+    max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
+    max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+) -> None:
+    """Validate only files directly inside a directory, excluding child bundles."""
+    total_bytes = 0
+    for candidate in sorted(root.iterdir()):
+        if candidate.is_symlink():
+            raise RuntimeError("private artifact evidence cannot contain symlinks")
+        if not candidate.is_file() or candidate.name == _REJECTION_FILE:
+            continue
+        size = candidate.stat().st_size
+        if size > max_file_bytes:
+            raise RuntimeError(
+                f"private artifact exceeds file size limit: {candidate.name}"
+            )
+        total_bytes += size
+        if total_bytes > max_bundle_bytes:
+            raise RuntimeError("private artifact bundle exceeds size limit")
+
+
+def sanitize_private_artifact_directory_files(
+    root: Path,
+    *,
+    max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
+    max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+    trust_existing_rejections: bool = False,
+) -> list[PrivateArtifactRejection]:
+    """Bound direct files without charging independently bounded child bundles."""
+    rejected = _consume_existing_rejections(
+        root, trust_existing=trust_existing_rejections
+    )
+    files: list[tuple[Path, str, int, PrivateArtifactKind]] = []
+    for candidate in sorted(root.iterdir()):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        relative = candidate.name
+        size = candidate.stat().st_size
+        if size > max_file_bytes:
+            candidate.unlink()
+            rejected.append(
+                PrivateArtifactRejection(
+                    path=relative,
+                    reason="file_size",
+                    size=size,
+                )
+            )
+            continue
+        files.append((candidate, relative, size, classify_private_artifact(relative)))
+    rejected.extend(_trim_bundle(files, max_bundle_bytes))
     _write_rejections(root, rejected)
     return rejected
 
@@ -523,6 +580,21 @@ def _safe_relative_path(value: str) -> PurePosixPath:
     ):
         raise ValueError("private artifact path is not safely relative")
     return path
+
+
+def _valid_jsonl_objects(path: Path) -> bool:
+    found = False
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                if not isinstance(json.loads(line), dict):
+                    return False
+                found = True
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return found
 
 
 def _digest(path: Path) -> str:

@@ -70,8 +70,10 @@ from harbor_hf.private_artifacts import (
     build_private_artifact_manifest,
     openclaw_execution_started,
     openclaw_execution_was_attempted,
+    sanitize_private_artifact_directory_files,
     sanitize_private_artifact_symlinks,
     sanitize_private_artifact_tree,
+    validate_private_artifact_directory_files,
     write_private_artifact_manifest,
 )
 from harbor_hf.process import (
@@ -1233,6 +1235,8 @@ def _write_direct_private_artifact_manifests(
 
 
 def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
+    for job_root in _direct_job_roots(root):
+        validate_private_artifact_directory_files(job_root)
     for trial_root in _direct_trial_roots(root):
         build_private_artifact_manifest(
             trial_root,
@@ -1280,6 +1284,13 @@ def _sanitize_direct_trial_artifacts(
     root: Path, *, trust_existing_rejections: bool = False
 ) -> int:
     rejection_count = 0
+    for job_root in _direct_job_roots(root):
+        rejection_count += len(
+            sanitize_private_artifact_directory_files(
+                job_root,
+                trust_existing_rejections=trust_existing_rejections,
+            )
+        )
     for trial_root in _direct_trial_roots(root):
         rejection_count += len(
             sanitize_private_artifact_tree(
@@ -1290,15 +1301,26 @@ def _sanitize_direct_trial_artifacts(
     return rejection_count
 
 
-def _direct_trial_roots(root: Path) -> list[Path]:
+def _direct_job_roots(root: Path) -> list[Path]:
     jobs_root = root / "harbor-jobs"
     if jobs_root.is_symlink() or not jobs_root.is_dir():
         return []
     resolved_jobs_root = jobs_root.resolve()
-    trials: list[Path] = []
+    jobs: list[Path] = []
     for job_root in sorted(jobs_root.iterdir()):
         if job_root.is_symlink() or not job_root.is_dir():
             continue
+        if not job_root.resolve().is_relative_to(resolved_jobs_root):
+            raise WorkerError("direct job root escapes Harbor jobs directory")
+        jobs.append(job_root)
+    return jobs
+
+
+def _direct_trial_roots(root: Path) -> list[Path]:
+    jobs_root = root / "harbor-jobs"
+    resolved_jobs_root = jobs_root.resolve()
+    trials: list[Path] = []
+    for job_root in _direct_job_roots(root):
         for trial_root in sorted(job_root.iterdir()):
             if trial_root.is_symlink() or not trial_root.is_dir():
                 continue
