@@ -172,8 +172,6 @@ class DatasetLoader:
                     ),
                 )
             ]
-        else:
-            paths = paths[: self._config.max_publications]
         parsed = [
             self._validate(GlobalIndexRow, value, path)
             for path in paths

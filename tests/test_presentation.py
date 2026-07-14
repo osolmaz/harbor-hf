@@ -233,6 +233,71 @@ def test_loader_uses_the_smallest_bounded_index_window() -> None:
     assert not any("legacy" in path for path in reader.read_calls)
 
 
+def test_loader_bounds_legacy_index_after_sorting_all_candidate_rows() -> None:
+    paths = [
+        f"data/index/schema=v1/{'8' * 64}.parquet",
+        f"data/index/schema=v1/{'f' * 64}.parquet",
+        f"data/index/schema=v1/{'0' * 64}.parquet",
+    ]
+
+    class LegacyReader(FakeReader):
+        def list_files(self, dataset: str, revision: str) -> list[str]:
+            assert (dataset, revision) == ("org/index", _INDEX_REVISION)
+            return paths
+
+    reader = LegacyReader(
+        [("ordinary", "complete"), ("ordinary", "complete"), ("ordinary", "complete")]
+    )
+    index_rows = reader.rows[
+        ("org/index", _INDEX_REVISION, "data/index/schema=v1/all.parquet")
+    ]
+    for path, row in zip(sorted(paths), index_rows, strict=True):
+        reader.rows[("org/index", _INDEX_REVISION, path)] = [row]
+
+    snapshot = DatasetLoader(
+        SpaceConfig(index_dataset="org/index", max_publications=2), reader
+    ).load()
+
+    assert [row.publication_id for row in snapshot.index_rows] == [
+        "publication-3",
+        "publication-2",
+    ]
+    assert reader.read_calls[:3] == sorted(paths)
+
+
+def test_loader_deduplicates_all_legacy_rows_before_bounding() -> None:
+    paths = [
+        f"data/index/schema=v1/{'0' * 64}.parquet",
+        f"data/index/schema=v1/{'1' * 64}.parquet",
+        f"data/index/schema=v1/{'f' * 64}.parquet",
+    ]
+
+    class LegacyReader(FakeReader):
+        def list_files(self, dataset: str, revision: str) -> list[str]:
+            assert (dataset, revision) == ("org/index", _INDEX_REVISION)
+            return paths
+
+    reader = LegacyReader(
+        [("ordinary", "complete"), ("ordinary", "complete"), ("ordinary", "complete")]
+    )
+    index_rows = reader.rows[
+        ("org/index", _INDEX_REVISION, "data/index/schema=v1/all.parquet")
+    ]
+    reader.rows[("org/index", _INDEX_REVISION, paths[0])] = [index_rows[2]]
+    reader.rows[("org/index", _INDEX_REVISION, paths[1])] = [index_rows[2]]
+    reader.rows[("org/index", _INDEX_REVISION, paths[2])] = [index_rows[1]]
+
+    snapshot = DatasetLoader(
+        SpaceConfig(index_dataset="org/index", max_publications=2), reader
+    ).load()
+
+    assert [row.publication_id for row in snapshot.index_rows] == [
+        "publication-3",
+        "publication-2",
+    ]
+    assert reader.read_calls[:3] == paths
+
+
 def test_loader_fails_closed_on_conflicting_provenance() -> None:
     reader = FakeReader([("ordinary", "complete")])
     path = "data/runs/schema=v1/campaign=campaign-1/publication-1.parquet"
