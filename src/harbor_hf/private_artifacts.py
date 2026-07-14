@@ -27,6 +27,10 @@ _DERIVED_FILES = frozenset(
 )
 
 
+class PrivateArtifactRequirementError(RuntimeError):
+    """Raised when required terminal private evidence is missing."""
+
+
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -98,11 +102,18 @@ class _TimingProbe(BaseModel):
     started_at: str | None = None
 
 
+class _StepProbe(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    agent_execution: _TimingProbe | None = None
+
+
 class _TrialProbe(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
 
     agent_info: _AgentInfo
     agent_execution: _TimingProbe | None = None
+    step_results: list[_StepProbe] = Field(default_factory=list)
 
 
 def build_private_artifact_manifest(
@@ -152,7 +163,9 @@ def build_private_artifact_manifest(
         paths=session_paths,
     )
     if strict_session and session_required and not requirement.satisfied:
-        raise RuntimeError("successful OpenClaw execution has no session JSONL")
+        raise PrivateArtifactRequirementError(
+            "successful OpenClaw execution has no session JSONL"
+        )
     return PrivateArtifactManifest(
         execution_id=identity.execution_id,
         trial_id=identity.trial_id,
@@ -187,10 +200,10 @@ def _openclaw_execution_started(root: Path) -> bool:
             )
         except (OSError, ValueError):
             continue
-        if (
-            probe.agent_info.name == "openclaw"
-            and probe.agent_execution is not None
-            and probe.agent_execution.started_at is not None
+        timings = [probe.agent_execution]
+        timings.extend(step.agent_execution for step in probe.step_results)
+        if probe.agent_info.name == "openclaw" and any(
+            timing is not None and timing.started_at is not None for timing in timings
         ):
             return True
     return False

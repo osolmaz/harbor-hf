@@ -203,12 +203,14 @@ class HarborStream:
         synchronize: bool = False,
         expected_base_url: str | None = "https://endpoint.example/v1",
         expected_model_name: str = "/repository",
+        agent_started: bool = False,
     ) -> None:
         self.task_digests = task_digests
         self.barrier = threading.Barrier(expected_calls) if synchronize else None
         self.exit_code = exit_code
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
+        self.agent_started = agent_started
         self.commands: list[list[str]] = []
         self.configs: list[dict[str, Any]] = []
         self.base_urls: list[str] = []
@@ -264,6 +266,11 @@ class HarborStream:
                                 "name": self.expected_model_name,
                             },
                         },
+                        "agent_execution": (
+                            {"started_at": "2026-07-14T00:00:00Z"}
+                            if self.agent_started
+                            else None
+                        ),
                         "verifier_result": {"rewards": {"reward": 1.0}},
                     }
                 ),
@@ -750,6 +757,65 @@ def test_wave_failure_still_pauses_and_publishes_failed_execution(
         {"event": "execution_failed", "error_type": "WorkerError"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
     ]
+
+
+def test_missing_required_session_publishes_terminal_failed_evidence(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", lambda *_args: {"probes": {}})
+    output = tmp_path / "output"
+
+    with pytest.raises(WorkerError, match="no session JSONL"):
+        run_wave_worker(
+            manifest,
+            campaign_path,
+            wave_path,
+            output,
+            runner=EndpointRunner(
+                [
+                    endpoint_snapshot("paused", 0),
+                    endpoint_snapshot("running", 1),
+                    endpoint_snapshot("paused", 0),
+                ]
+            ),
+            stream_runner=HarborStream(
+                spec.benchmark.task_digests,
+                expected_calls=1,
+                agent_started=True,
+            ),
+            source_preparer=prepare_source,
+            watchdog_launcher=launch_watchdog,
+            identifier=IdentifierSequence(),
+        )
+
+    run = wave.runs[0]
+    trial_id = run.shards[0].shard.trials[0].trial_id
+    executions = output / run.artifact_prefix / "trials" / trial_id / "executions"
+    execution = next(executions.iterdir())
+    failure = json.loads((execution / "_FAILED").read_text(encoding="utf-8"))
+    private = json.loads(
+        (execution / "private-artifacts.json").read_text(encoding="utf-8")
+    )
+    assert failure == {
+        "category": "configuration",
+        "error_type": "PrivateArtifactRequirementError",
+        "message": "successful OpenClaw execution has no session JSONL",
+    }
+    assert private["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": True,
+            "satisfied": False,
+        }
+    ]
+    verify_checksums(execution)
     assert not (execution.parent.parent / "_SUCCESS").exists()
 
 

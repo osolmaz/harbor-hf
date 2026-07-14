@@ -53,7 +53,11 @@ from harbor_hf.harbor_adapter import (
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
-from harbor_hf.private_artifacts import write_private_artifact_manifest
+from harbor_hf.private_artifacts import (
+    PrivateArtifactRequirementError,
+    build_private_artifact_manifest,
+    write_private_artifact_manifest,
+)
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
 from harbor_hf.provider_models import (
     ProviderEndpointEvidence,
@@ -843,6 +847,7 @@ def _execute_trial(
             execution_root / "verification.json",
             outcome.verification.model_dump(mode="json"),
         )
+        build_private_artifact_manifest(execution_root, strict_session=True)
         append_event(events, "execution_succeeded")
     except Exception as caught:
         error = caught
@@ -902,6 +907,8 @@ def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
 ) -> RetryCategory:
+    if isinstance(error, PrivateArtifactRequirementError):
+        return "configuration"
     if isinstance(error, HarborVerificationFailure):
         return "benchmark"
     if isinstance(error, HarborTrialFailure):

@@ -95,6 +95,19 @@ def test_session_is_not_required_before_agent_execution_starts(tmp_path: Path) -
     assert manifest.requirements[0].satisfied is False
 
 
+def test_multi_step_agent_timing_requires_session_jsonl(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path, started=False, with_session=False)
+    result_path = root / "harbor-jobs" / "job-one" / "trial-one" / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["step_results"] = [
+        {"agent_execution": {"started_at": "2026-07-14T00:00:00Z"}}
+    ]
+    result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no session JSONL"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+
 def test_private_manifest_enforces_file_and_bundle_size_limits(tmp_path: Path) -> None:
     root = _execution_root(tmp_path)
 
