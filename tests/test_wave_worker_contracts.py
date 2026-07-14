@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,18 +9,23 @@ from typing import cast
 
 import pytest
 from pydantic import ValidationError
+from test_wave_worker import _provider_wave_inputs
 
 import harbor_hf.wave_worker as wave_worker
-from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveRunLock
+from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveLock, WaveRunLock
 from harbor_hf.evidence import write_checksums
+from harbor_hf.models import ExperimentSpec
+from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import RunLock
 from harbor_hf.wave_worker import (
     ExecutionLock,
     LockedSubmitWaveAction,
     WorkerError,
+    _cleanup_wave_transport,
     _expected_agent_version,
     _file_digest,
     _prepare_trial_recovery,
+    _prepare_wave_transport,
     _publish_digest_sidecar,
     _publish_immutable_file,
     _publish_unit,
@@ -306,6 +312,45 @@ def test_publish_immutable_file_avoids_hf_mount_reserved_prefix(
     assert temporary_names[0].endswith("-_SUCCESS.tmp")
 
 
+def test_publish_immutable_file_compares_concurrent_create_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.json"
+    source.write_bytes(b"first-writer")
+    destination = tmp_path / "published" / "evidence.json"
+
+    def lose_race(_source_path: Path, destination_path: Path) -> None:
+        destination_path.write_bytes(b"concurrent-writer")
+        raise FileExistsError
+
+    monkeypatch.setattr(wave_worker.os, "link", lose_race)
+
+    with pytest.raises(WorkerError, match="already has different contents"):
+        _publish_immutable_file(source, destination)
+
+    assert destination.read_bytes() == b"concurrent-writer"
+    assert [path.name for path in destination.parent.iterdir()] == ["evidence.json"]
+
+
+def test_publish_immutable_file_rejects_non_atomic_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.json"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "published" / "evidence.json"
+
+    def unsupported(_source: Path, _destination: Path) -> None:
+        raise OSError("hard links unsupported")
+
+    monkeypatch.setattr(wave_worker.os, "link", unsupported)
+
+    with pytest.raises(WorkerError, match="cannot be created atomically"):
+        _publish_immutable_file(source, destination)
+
+    assert not destination.exists()
+    assert list(destination.parent.iterdir()) == []
+
+
 def test_publish_digest_sidecar_writes_exact_digest_line(tmp_path: Path) -> None:
     source = tmp_path / "campaign.lock.json"
     source.write_bytes(b"wave-contract\n")
@@ -511,3 +556,102 @@ def test_execution_lock_schema_and_action_defaults() -> None:
                 "unexpected": "extra",
             }
         )
+
+
+def test_provider_transport_start_and_cleanup_are_exact(
+    remote_spec: ExperimentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _spec, _campaign, wave, *_paths = _provider_wave_inputs(
+        remote_spec,
+        tmp_path,
+        attempts=1,
+        concurrency=1,
+        provider_concurrency=1,
+    )
+    events = tmp_path / "events.jsonl"
+    calls: list[tuple[object, ...]] = []
+    target = wave.provider_target
+    assert target is not None
+
+    class FakeProxy:
+        def __init__(
+            self, target: ProviderTarget, *, token: str, evidence_path: Path
+        ) -> None:
+            calls.append(("init", target, token, evidence_path))
+            self.error: Exception | None = None
+
+        def start(self) -> str:
+            calls.append(("start",))
+            return "http://127.0.0.1:12345"
+
+        def close(self) -> None:
+            calls.append(("close",))
+            if self.error is not None:
+                raise self.error
+
+    monkeypatch.setattr(wave_worker, "ProviderEvidenceProxy", FakeProxy)
+
+    base_url, proxy = _prepare_wave_transport(
+        wave,
+        tmp_path,
+        events,
+        None,
+        "test-token",
+        100.0,
+        lambda: 0.0,
+    )
+
+    assert base_url == "http://127.0.0.1:12345"
+    assert isinstance(proxy, FakeProxy)
+    assert calls == [
+        (
+            "init",
+            target,
+            "test-token",
+            tmp_path / "provider-requests.jsonl",
+        ),
+        ("start",),
+    ]
+    assert (
+        _cleanup_wave_transport(None, cast(wave_worker.ProviderEvidenceProxy, proxy))
+        is None
+    )
+    assert calls[-1] == ("close",)
+    proxy.error = RuntimeError("close failed")
+    assert (
+        str(
+            _cleanup_wave_transport(
+                None, cast(wave_worker.ProviderEvidenceProxy, proxy)
+            )
+        )
+        == "close failed"
+    )
+    assert _cleanup_wave_transport(None, None) is None
+
+
+def test_endpoint_transport_delegates_prepare_and_cleanup() -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class Lifecycle:
+        def prepare(self, deadline: float, monotonic: Callable[[], float]) -> str:
+            calls.append(("prepare", deadline, monotonic()))
+            return "https://endpoint.example"
+
+        def cleanup(self) -> Exception | None:
+            calls.append(("cleanup",))
+            return RuntimeError("cleanup failed")
+
+    lifecycle = cast(wave_worker._EndpointWaveLifecycle, Lifecycle())
+    base_url, proxy = _prepare_wave_transport(
+        cast(WaveLock, None),
+        cast(Path, None),
+        cast(Path, None),
+        lifecycle,
+        "test-token",
+        50.0,
+        lambda: 2.0,
+    )
+
+    assert (base_url, proxy) == ("https://endpoint.example", None)
+    assert str(_cleanup_wave_transport(lifecycle, None)) == "cleanup failed"
+    assert calls == [("prepare", 50.0, 2.0), ("cleanup",)]

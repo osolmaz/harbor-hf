@@ -99,6 +99,12 @@ them, records outcomes, and exits. A Hub webhook reduces latency; a scheduled
 CPU Job is the recovery path. Correctness does not depend on either retaining
 memory.
 
+Each pending action also requires a distributed action lease before any remote
+side effect. Concurrent webhook and scheduled passes can see the same
+reservation, but only one can submit, cancel, provision, clean up, or publish.
+Abandoned leases expire after two hours; successful passes release them after
+recording the durable outcome.
+
 Do not treat a timed-out create, resume, submit, cancel, or pause request as a
 confirmed failure. The next pass must inspect deterministic remote identities
 and adopt the observed resource or action before retrying.
@@ -136,6 +142,11 @@ physical-execution, Harbor, and artifact contracts. It does not create or lease
 an Inference Endpoint. Record the requested provider and model, routing data,
 request identity when exposed, retry and throttle observations, reported usage,
 latency, and quoted or observed cost.
+
+HF Inference Providers do not bind requests to or report a Hub model commit.
+The private run lock preserves the selected model-profile revision, while the
+published `model_revision` is `not_observed`. Never present it as equivalent to
+an endpoint run whose served revision was verified.
 
 The remote wave controller starts a loopback OpenAI-compatible evidence proxy.
 OpenClaw sends its normal requests to that local address; the proxy forwards
@@ -250,7 +261,7 @@ Every published score must be traceable through these fields:
 | Layer | Required provenance |
 | --- | --- |
 | Index row | publication, run and campaign IDs; result kind and outcome; result Dataset and exact revision; source checksum; control commit |
-| Run row | benchmark, model and agent revisions; deployment identity; provider, region and hardware; source Bucket and prefix; run-lock checksum |
+| Run row | benchmark, observed model revision or `not_observed`, and agent revision; deployment identity; provider, region and hardware; source Bucket and prefix; run-lock checksum |
 | Trial row | task digest, logical attempt, selected physical execution and verifier metric owner |
 | Execution row | physical attempt, runtime kind, remote Job identity when reported, timestamps, status and retry reason |
 | Metric row | stable metric ID, typed owner, name, value, unit and aggregation |

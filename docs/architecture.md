@@ -76,10 +76,12 @@ The stateless reconciler reads campaign locks and append-only typed events from
 the private coordination Dataset, rebuilds projections, and derives
 deterministic actions. Action reservations and their events are committed
 atomically with the repository head as the expected parent. A repeated or
-concurrent pass adopts an existing reservation instead of duplicating a remote
-side effect. Compatible shards are grouped by a digest of their exact model and
-deployment configuration; agent differences do not force a second endpoint
-startup.
+concurrent pass adopts an existing reservation. Before executing a pending
+action, it acquires a parent-checked, expiring action lease; only the lease
+winner may issue the remote side effect. The lease is released after the
+durable outcome and expires after two hours if the reconciler dies. Compatible
+shards are grouped by a digest of their exact model and deployment
+configuration; agent differences do not force a second endpoint startup.
 
 Endpoint-backed controller and watchdog Jobs carry a deterministic label
 derived from the endpoint namespace and name. They coordinate through one
@@ -99,6 +101,13 @@ run from inheriting an endpoint whose state is unknown.
 If publishing the readiness label returns an ambiguous provider error, the
 watchdog also retains the lease, waits for the controller to exit or time out,
 verifies endpoint pause, and only then releases ownership.
+
+If a controller Job terminates after publishing successful trial evidence but
+before its wave marker, recovery closes the abandoned wave and may submit a
+replacement. The replacement accepts checksum-valid successful trial evidence
+from an earlier wave only when campaign, run, shard, trial, task, and logical
+attempt identities all match. This avoids rerunning completed work without
+allowing evidence from another campaign or task to cross the boundary.
 
 ### Endpoint Provisioner
 

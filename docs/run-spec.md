@@ -127,13 +127,18 @@ such as prefix caching, speculation or MTP, CUDA graphs, attention backend, and
 MoE backend. Values observed after startup are stored separately from requested
 values so a provider default cannot silently change the run definition.
 
-The current `v1alpha1` deployment shape represents Hugging Face Inference
-Endpoints. vLLM and llama.cpp are independent engine choices within that
-endpoint type. A planned discriminated Inference Providers profile will cover
-models that are too large or expensive to host on a dedicated endpoint; it will
-not require or imply a particular serving engine. Until that profile is
-implemented, provider-routed manifests are rejected rather than silently
-treated as endpoint deployments.
+Inference Provider requests identify a model repository, but the provider API
+does not expose or accept a Hub commit for the weights it serves. The locked
+model profile still preserves the selected repository revision for source
+metadata. Published provider rows set `model_revision` to `not_observed` rather
+than claiming that revision was served. Endpoint-backed rows use the revision
+verified in the endpoint configuration. Do not treat provider runs as
+revision-equivalent when the published value is `not_observed`.
+
+The endpoint deployment shape supports independent engines such as vLLM and
+llama.cpp. The discriminated Inference Provider profile covers models that are
+too large or expensive to host on a dedicated endpoint without requiring or
+implying a particular serving engine.
 
 ### Execution
 

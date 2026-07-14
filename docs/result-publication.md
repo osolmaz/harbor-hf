@@ -52,6 +52,12 @@ value, unit, and optional aggregation. `artifacts` adds a deterministic artifact
 identity, typed owner, safe artifact kind, private canonical path, checksum,
 media type, and size. Artifact rows are metadata and pointers only.
 
+For endpoint-backed runs, `model_revision` is the Hub revision verified in the
+endpoint configuration. HF Inference Providers neither accept nor report a
+served Hub commit, so provider-backed rows use `not_observed`. The selected
+model-profile revision remains available through the checksummed private run
+lock; the public row does not make an unsupported served-weight claim.
+
 The global index uses `harbor-hf/results/index/v1`. It contains one row per
 publication: run and campaign IDs, benchmark, ordinary/complete labels,
 completion time, model and agent identity, result Dataset and exact revision,

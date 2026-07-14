@@ -37,7 +37,6 @@ from harbor_hf.control import (
     ControlError,
     HubCampaignStore,
     new_event,
-    project_campaign,
 )
 from harbor_hf.coordination import CoordinationError, HubClaimStore
 from harbor_hf.io import ManifestError, load_experiment
@@ -53,6 +52,7 @@ from harbor_hf.operations import (
 from harbor_hf.planner import build_plan
 from harbor_hf.process import ProcessError, SubprocessRunner
 from harbor_hf.reconciler import plan_reconciliation
+from harbor_hf.recovery import project_recovery
 from harbor_hf.result_publisher import (
     DatasetApi,
     DatasetPublicationError,
@@ -222,11 +222,13 @@ def campaign_status(
     """Read the durable projection of one campaign."""
     try:
         lock, events = HubCampaignStore(namespace).load_campaign(campaign_id)
-        projection = project_campaign(lock, events)
+        projection = project_recovery(lock, events)
     except (HTTPError, OSError, ValueError, ControlError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
-    typer.echo(json.dumps(projection.model_dump(mode="json"), indent=2, sort_keys=True))
+    payload = projection.model_dump(mode="json")
+    payload["status"] = projection.status
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
 @campaign_app.command("reconcile")

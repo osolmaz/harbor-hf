@@ -1056,11 +1056,21 @@ def test_wave_recovery_skips_checksum_valid_terminal_trial(
     second_trial = run.shards[1].shard.trials[0]
     shutil.rmtree(run_root / "trials" / second_trial.trial_id)
     harbor = HarborStream(spec.benchmark.task_digests, expected_calls=1)
+    replacement = wave.model_copy(
+        update={
+            "wave_id": "wave-" + "e" * 24,
+            "action_id": "act-" + "e" * 24,
+            "action_key": "e" * 24,
+            "artifact_prefix": f"{campaign.artifact_prefix}/waves/wave-" + "e" * 24,
+        }
+    )
+    replacement_path = tmp_path / "replacement-wave.lock.json"
+    replacement_path.write_text(replacement.model_dump_json(), encoding="utf-8")
 
     run_wave_worker(
         manifest,
         campaign_path,
-        wave_path,
+        replacement_path,
         recovery,
         runner=EndpointRunner(
             [
@@ -1194,7 +1204,7 @@ def test_wave_recovery_rejects_invalid_terminal_trial(
     elif corruption == "execution-lock":
         lock_path = execution_root / "execution.lock.json"
         execution = json.loads(lock_path.read_text())
-        execution["wave_id"] = "wave-" + "f" * 24
+        execution["campaign_id"] = "campaign-wrong"
         lock_path.write_text(json.dumps(execution), encoding="utf-8")
         write_checksums(execution_root)
         write_checksums(trial_root)

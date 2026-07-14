@@ -14,6 +14,7 @@ from harbor_hf.coordination import (
     ClaimConflict,
     CoordinationError,
     HubClaimStore,
+    action_claim_path,
     coordination_repository,
     endpoint_claim_path,
     run_claim_path,
@@ -117,6 +118,13 @@ def test_claim_paths_are_stable_and_namespaced() -> None:
     assert path.startswith("run-reservations/")
     assert path.endswith(".json")
     assert path != run_claim_path("org/other", "runs/experiment/run-1")
+    assert action_claim_path("campaign-one", "action-one") == (
+        "action-leases/"
+        "6d9cf2ff3d30d2a0590dad7823cd55b017fa9a44418529e6efcd8617d342336d.json"
+    )
+    assert action_claim_path("campaign-two", "action-one") != action_claim_path(
+        "campaign-one", "action-one"
+    )
 
 
 def test_run_claim_path_canonicalizes_bucket_references() -> None:

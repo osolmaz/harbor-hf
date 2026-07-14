@@ -28,6 +28,7 @@ from harbor_hf.campaign_apply import (
 from harbor_hf.campaign_finalizer import (
     BucketCampaignFinalizer,
     CampaignFinalizationError,
+    _run_evidence,
 )
 from harbor_hf.campaign_observer import BucketCampaignObserver
 from harbor_hf.campaigns import (
@@ -52,7 +53,7 @@ from harbor_hf.control import (
     new_event,
     project_campaign,
 )
-from harbor_hf.coordination import HubClaimStore
+from harbor_hf.coordination import ClaimConflict, HubClaimStore
 from harbor_hf.endpoints import (
     DesiredEndpoint,
     EndpointProvisioner,
@@ -148,6 +149,26 @@ class FakeStore:
         self.reservations[action_id] = dict(action)
         self.events.append(event)
         return True
+
+
+class FakeClaims:
+    def __init__(self) -> None:
+        self.held: dict[str, dict[str, str]] = {}
+        self.acquire_calls: list[tuple[str, dict[str, str]]] = []
+        self.release_calls: list[tuple[str, dict[str, str]]] = []
+        self.conflict = False
+
+    def acquire(self, path: str, owner: Mapping[str, str]) -> None:
+        value = dict(owner)
+        self.acquire_calls.append((path, value))
+        if self.conflict or path in self.held:
+            raise ClaimConflict(f"claim is already held: {path}")
+        self.held[path] = value
+
+    def release(self, path: str, owner: Mapping[str, str]) -> None:
+        value = dict(owner)
+        assert self.held.pop(path) == value
+        self.release_calls.append((path, value))
 
 
 class FakeEndpoints:
@@ -374,12 +395,14 @@ def _reconciler(
     jobs: FakeJobs,
     *,
     identifier_start: int = 2,
+    claims: FakeClaims | None = None,
 ) -> CampaignReconciler:
     identifiers = itertools.count(identifier_start)
     return CampaignReconciler(
         store,
         endpoints=endpoints,
         jobs=jobs,
+        action_claims=claims or FakeClaims(),
         clock=lambda: NOW,
         identifier=lambda: f"{next(identifiers):032x}",
     )
@@ -393,7 +416,10 @@ def test_apply_reserves_provisions_and_submits_managed_wave(
     endpoints = FakeEndpoints()
     jobs = FakeJobs()
 
-    result = _reconciler(store, endpoints, jobs).apply_campaign(lock.campaign_id)
+    claims = FakeClaims()
+    result = _reconciler(store, endpoints, jobs, claims=claims).apply_campaign(
+        lock.campaign_id
+    )
 
     assert result.applied[0].status == "succeeded"
     assert result.applied[0].remote_id == "0123456789abcdef01234567"
@@ -415,6 +441,38 @@ def test_apply_reserves_provisions_and_submits_managed_wave(
     assert project_campaign(lock, store.events).actions[
         result.applied[0].action_id
     ].status == ("succeeded")
+    assert len(claims.acquire_calls) == len(claims.release_calls) == 1
+    path, owner = claims.acquire_calls[0]
+    assert path.startswith("action-leases/") and path.endswith(".json")
+    assert claims.release_calls == [(path, owner)]
+    assert owner == {
+        "campaign_id": lock.campaign_id,
+        "action_id": result.applied[0].action_id,
+        "reconciler_id": "0" * 31 + "3",
+        "expires_at": (NOW + timedelta(hours=2)).isoformat(),
+    }
+
+
+def test_apply_skips_action_held_by_another_reconciler(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    endpoints = FakeEndpoints()
+    jobs = FakeJobs()
+    claims = FakeClaims()
+    claims.conflict = True
+
+    result = _reconciler(store, endpoints, jobs, claims=claims).apply_campaign(
+        lock.campaign_id
+    )
+
+    assert result.applied == []
+    assert endpoints.create_calls == []
+    assert jobs.submissions == []
+    assert len(claims.acquire_calls) == 1
+    assert claims.release_calls == []
+    assert store.events[-1].kind == "action.reserved"
 
 
 def test_ambiguous_submission_is_adopted_by_labels_and_managed_endpoint(
@@ -619,6 +677,7 @@ def test_apply_all_reports_one_failure_and_continues_other_campaigns(
         MultiStore(lock, request, [submitted]),
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         clock=lambda: NOW,
         identifier=lambda: "3" * 32,
     )
@@ -698,6 +757,7 @@ def test_terminal_job_without_wave_marker_fails_active_execution_and_retries(
         store,
         endpoints=endpoints,
         jobs=jobs,
+        action_claims=FakeClaims(),
         clock=lambda: NOW + timedelta(hours=1),
         identifier=lambda: "c" * 32,
     ).apply_campaign(lock.campaign_id)
@@ -720,6 +780,7 @@ def test_apply_observes_durable_event_reloads_and_uses_refreshed_projection(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         observer=RecordingObserver(observed, interactions),
         finalizer=RecordingFinalizer(interactions),
         result_publisher=RecordingCampaignPublisher(interactions),
@@ -747,6 +808,7 @@ def test_apply_does_not_reload_when_observer_event_is_already_durable(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         observer=RecordingObserver(observed, interactions),
         finalizer=RecordingFinalizer(interactions),
         result_publisher=RecordingCampaignPublisher(interactions),
@@ -825,11 +887,12 @@ def test_apply_uses_configured_clock_for_reconciliation_planning(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         clock=clock,
         identifier=lambda: "3" * 32,
     ).apply_campaign(lock.campaign_id)
 
-    assert clock_calls == [None, None, None]
+    assert clock_calls == [None, None, None, None]
     assert result.plan.actions[0].kind == "submit-wave"
 
 
@@ -961,6 +1024,8 @@ def test_provider_wave_uses_provider_identity_without_endpoint_side_effects(
     assert endpoints.inspect_calls == []
     assert endpoints.create_calls == []
     assert endpoints.pause_calls == []
+    run_evidence = _run_evidence(lock, wave.runs[0].configuration, NOW)
+    assert run_evidence.model_revision == "not_observed"
 
 
 def test_provider_wave_adoption_and_cancellation_use_the_same_identity(
@@ -1263,6 +1328,7 @@ def test_forced_cancellation_cancels_active_execution_and_closes_wave(
         store,
         endpoints=FakeEndpoints(),
         jobs=jobs,
+        action_claims=FakeClaims(),
         clock=lambda: (
             NOW
             + timedelta(seconds=lock.recovery_policy.cancellation_grace_seconds + 10)
@@ -1374,6 +1440,7 @@ def test_completed_campaign_finalizes_publishes_and_records_terminal_in_order(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         finalizer=RecordingFinalizer(interactions),
         result_publisher=RecordingCampaignPublisher(interactions),
         clock=lambda: NOW,
@@ -1437,6 +1504,7 @@ def test_completed_campaign_requires_configured_automatic_publisher(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         finalizer=RecordingFinalizer(interactions),
         clock=lambda: NOW,
         identifier=lambda: "3" * 32,
@@ -1464,6 +1532,7 @@ def test_terminal_summary_requires_configured_finalizer(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         result_publisher=RecordingCampaignPublisher([]),
         clock=lambda: NOW,
         identifier=lambda: "3" * 32,
@@ -1509,6 +1578,7 @@ def test_partial_terminal_status_is_recorded_without_result_publication(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         finalizer=RecordingFinalizer(interactions),
         result_publisher=RecordingCampaignPublisher(interactions),
         clock=lambda: NOW,
@@ -1558,6 +1628,7 @@ def test_noncompleted_terminal_status_matrix_skips_result_publication(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         finalizer=RecordingFinalizer(interactions),
         result_publisher=RecordingCampaignPublisher(interactions),
         clock=lambda: NOW,
@@ -1595,6 +1666,7 @@ def test_completed_campaign_publication_failure_matrix_records_exact_outcome(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         finalizer=RecordingFinalizer(interactions),
         result_publisher=RecordingCampaignPublisher(interactions, error=error),
         clock=lambda: NOW,
@@ -1628,6 +1700,7 @@ def test_campaign_finalization_failure_does_not_publish_or_record_terminal(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
+        action_claims=FakeClaims(),
         finalizer=RecordingFinalizer(
             interactions,
             error=CampaignFinalizationError("summary conflict"),
@@ -1702,12 +1775,10 @@ class InspectingRunner:
         return "Job started: 0123456789abcdef01234567"
 
 
-@pytest.mark.parametrize("token", [None, "publication-token"])
 def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    token: str | None,
 ) -> None:
     import huggingface_hub
 
@@ -1727,6 +1798,7 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
 
     cache_root = tmp_path / "evidence-cache"
     monkeypatch.setattr(huggingface_hub, "HfApi", create_api)
+    token = "publication-token"
     monkeypatch.setattr(huggingface_hub, "get_token", lambda: token)
     monkeypatch.setattr(
         campaign_apply_module.tempfile,
@@ -1767,22 +1839,32 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     assert finalizer.reader is reader
     writer = cast(HubBucketEvidenceWriter, finalizer.writer)
     assert writer.api is evidence_api
-    if token is None:
-        assert reconciler.result_publisher is None
-    else:
-        automatic = cast(AutomaticCampaignPublisher, reconciler.result_publisher)
-        assert automatic is not None
-        assert automatic.namespace == "osolmaz"
-        assert automatic.store is store
-        assert automatic.reader is reader
-        assert automatic.repositories is evidence_api
-        publisher = cast(HubDatasetPublisher, automatic.publisher)
-        leases = cast(HubClaimStore, publisher.leases)
-        assert publisher.publisher_id == "reconciler-" + "f" * 32
-        assert publisher.api is evidence_api
-        assert leases.repository == "osolmaz/harbor-hf-coordination"
-        assert leases.token == token
-        assert leases.api is evidence_api
+    automatic = cast(AutomaticCampaignPublisher, reconciler.result_publisher)
+    assert automatic is not None
+    assert automatic.namespace == "osolmaz"
+    assert automatic.store is store
+    assert automatic.reader is reader
+    assert automatic.repositories is evidence_api
+    publisher = cast(HubDatasetPublisher, automatic.publisher)
+    leases = cast(HubClaimStore, publisher.leases)
+    assert publisher.publisher_id == "reconciler-" + "f" * 32
+    assert publisher.api is evidence_api
+    assert leases.repository == "osolmaz/harbor-hf-coordination"
+    assert leases.token == token
+    assert leases.api is evidence_api
+    action_claims = cast(HubClaimStore, reconciler.action_claims)
+    assert action_claims.repository == "osolmaz/harbor-hf-coordination"
+
+
+def test_hugging_face_reconciler_factory_requires_hf_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "get_token", lambda: None)
+
+    with pytest.raises(CampaignApplyError, match="HF token is required"):
+        campaign_apply_module.hugging_face_campaign_reconciler("osolmaz")
 
 
 def test_hf_wave_adapter_submits_staged_locks_through_submission_module(

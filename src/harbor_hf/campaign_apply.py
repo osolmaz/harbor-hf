@@ -5,6 +5,7 @@ import json
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -43,6 +44,12 @@ from harbor_hf.control import (
     TerminalPayload,
     WaveLifecyclePayload,
     new_event,
+)
+from harbor_hf.coordination import (
+    ClaimConflict,
+    ClaimStore,
+    CoordinationError,
+    action_claim_path,
 )
 from harbor_hf.endpoints import (
     AmbiguousEndpointCreate,
@@ -99,6 +106,7 @@ _OUTCOME_KINDS: dict[
     "failed": "action.failed",
     "ambiguous": "action.ambiguous",
 }
+_ACTION_LEASE_DURATION = timedelta(hours=2)
 
 
 class CampaignApplyError(RuntimeError):
@@ -322,6 +330,7 @@ class CampaignReconciler:
         *,
         endpoints: EndpointApplicationPort,
         jobs: WaveJobPort,
+        action_claims: ClaimStore,
         observer: CampaignObserver | None = None,
         finalizer: CampaignFinalizer | None = None,
         result_publisher: CampaignPublicationPort | None = None,
@@ -331,6 +340,7 @@ class CampaignReconciler:
         self.store = store
         self.endpoints = endpoints
         self.jobs = jobs
+        self.action_claims = action_claims
         self.observer = observer
         self.finalizer = finalizer
         self.result_publisher = result_publisher
@@ -395,25 +405,70 @@ class CampaignReconciler:
         )
         limit = (context or ReconcileContext()).limits.action_limit
         allow_billable = projection.campaign.status in {"queued", "active"}
-        applied: list[AppliedAction] = []
-        for action in selected[:limit]:
-            outcome = self._apply_action(
-                lock,
-                spec,
-                request,
-                action,
-                projection=projection,
-                terminal_decision=plan.terminal_decision,
-                allow_billable=allow_billable,
-            )
-            applied.append(outcome)
-            if outcome.status == "ambiguous":
-                break
+        applied = self._apply_selected(
+            lock,
+            spec,
+            request,
+            selected[:limit],
+            projection=projection,
+            terminal_decision=plan.terminal_decision,
+            allow_billable=allow_billable,
+        )
         return CampaignApplyResult(
             campaign_id=campaign_id,
             plan=plan,
             applied=applied,
         )
+
+    def _apply_selected(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        request: bytes,
+        selected: list[ReconcileAction],
+        *,
+        projection: RecoveryProjection,
+        terminal_decision: TerminalDecision | None,
+        allow_billable: bool,
+    ) -> list[AppliedAction]:
+        applied: list[AppliedAction] = []
+        for action in selected:
+            owner = self._action_claim_owner(lock, action)
+            path = action_claim_path(lock.campaign_id, action.action_id)
+            try:
+                self.action_claims.acquire(path, owner)
+            except ClaimConflict:
+                continue
+            try:
+                outcome = self._apply_action(
+                    lock,
+                    spec,
+                    request,
+                    action,
+                    projection=projection,
+                    terminal_decision=terminal_decision,
+                    allow_billable=allow_billable,
+                )
+            finally:
+                # A durable action outcome makes a stale lease harmless; its
+                # expiry remains the crash-recovery path if release is lost.
+                with suppress(CoordinationError):
+                    self.action_claims.release(path, owner)
+            applied.append(outcome)
+            if outcome.status == "ambiguous":
+                break
+        return applied
+
+    def _action_claim_owner(
+        self, lock: CampaignLock, action: ReconcileAction
+    ) -> dict[str, str]:
+        now = self.clock().astimezone(UTC)
+        return {
+            "campaign_id": lock.campaign_id,
+            "action_id": action.action_id,
+            "reconciler_id": self.identifier(),
+            "expires_at": (now + _ACTION_LEASE_DURATION).isoformat(),
+        }
 
     def apply_all(
         self,
@@ -1098,24 +1153,24 @@ def hugging_face_campaign_reconciler(
         api=cast(BucketEvidenceApi, evidence_api),
     )
     writer = HubBucketEvidenceWriter(api=cast(BucketEvidenceWriterApi, evidence_api))
-    result_publisher = None
     token = get_token()
-    if token is not None:
-        result_publisher = AutomaticCampaignPublisher(
-            namespace=namespace,
-            store=store,
-            reader=reader,
-            publisher=HubDatasetPublisher(
-                publisher_id=f"reconciler-{uuid.uuid4().hex}",
-                leases=HubClaimStore(
-                    namespace,
-                    token,
-                    api=cast(CoordinationApi, evidence_api),
-                ),
-                api=cast(DatasetApi, evidence_api),
+    if token is None:
+        raise CampaignApplyError("HF token is required for campaign reconciliation")
+    result_publisher = AutomaticCampaignPublisher(
+        namespace=namespace,
+        store=store,
+        reader=reader,
+        publisher=HubDatasetPublisher(
+            publisher_id=f"reconciler-{uuid.uuid4().hex}",
+            leases=HubClaimStore(
+                namespace,
+                token,
+                api=cast(CoordinationApi, evidence_api),
             ),
-            repositories=cast(DatasetRepositoryApi, evidence_api),
-        )
+            api=cast(DatasetApi, evidence_api),
+        ),
+        repositories=cast(DatasetRepositoryApi, evidence_api),
+    )
     adapter = endpoint_adapter or HuggingFaceEndpointAdapter()
     return CampaignReconciler(
         store,
@@ -1124,6 +1179,11 @@ def hugging_face_campaign_reconciler(
             api=jobs_api,
             runner=runner or SubprocessRunner(),
             bucket_api=bucket_api,
+        ),
+        action_claims=HubClaimStore(
+            namespace,
+            token,
+            api=cast(CoordinationApi, evidence_api),
         ),
         observer=BucketCampaignObserver(reader),
         finalizer=BucketCampaignFinalizer(reader, writer),

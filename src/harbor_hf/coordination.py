@@ -61,6 +61,11 @@ def run_claim_path(artifact_bucket: str, artifact_prefix: str) -> str:
     return f"run-reservations/{identity}.json"
 
 
+def action_claim_path(campaign_id: str, action_id: str) -> str:
+    identity = hashlib.sha256(f"{campaign_id}/{action_id}".encode()).hexdigest()
+    return f"action-leases/{identity}.json"
+
+
 class HubClaimStore:
     """Serialize claims through optimistic commits to a private Hub repository."""
 

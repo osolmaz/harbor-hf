@@ -556,7 +556,7 @@ def _execute_shard(
             destination,
             trial,
             campaign_id=campaign.campaign_id,
-            wave_id=(wave.wave_id if wave.action_kind == "submit-wave" else None),
+            wave_id=None,
             run_id=run.configuration.run_id,
             shard_id=shard.shard_id,
         )
@@ -1027,7 +1027,17 @@ def _publish_immutable_file(source: Path, destination: Path) -> None:
     )
     try:
         shutil.copyfile(source, temporary)
-        os.replace(temporary, destination)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            if destination.read_bytes() != source.read_bytes():
+                raise WorkerError(
+                    f"evidence path already has different contents: {destination}"
+                ) from None
+        except OSError as error:
+            raise WorkerError(
+                f"evidence path cannot be created atomically: {destination}"
+            ) from error
     finally:
         temporary.unlink(missing_ok=True)
 

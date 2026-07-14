@@ -411,7 +411,11 @@ def _run_evidence(
         completed_at=completed_at,
         model_id=lock.model.id,
         model_repo=lock.model.repo,
-        model_revision=lock.model.revision,
+        model_revision=(
+            lock.model.revision
+            if isinstance(deployment, DeploymentProfile)
+            else "not_observed"
+        ),
         deployment_id=deployment.id,
         provider=provider,
         region=region,
