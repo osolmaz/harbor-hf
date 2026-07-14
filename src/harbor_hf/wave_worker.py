@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Executor, Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -505,9 +505,12 @@ def _execute_shards(
     workers = min(lock.max_concurrent_shards, len(shards))
     results: dict[str, str] = {}
     failures: list[Exception] = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with (
+        ThreadPoolExecutor(max_workers=lock.max_concurrent_shards) as trial_executor,
+        ThreadPoolExecutor(max_workers=workers) as shard_executor,
+    ):
         futures = {
-            executor.submit(
+            shard_executor.submit(
                 _execute_shard,
                 manifest_path,
                 campaign,
@@ -524,6 +527,7 @@ def _execute_shards(
                 identifier,
                 clock,
                 monotonic,
+                trial_executor=trial_executor,
             ): shard.shard.shard_id
             for run, shard in shards
         }
@@ -595,6 +599,60 @@ def _execute_shard(
     identifier: IdentifierFactory,
     clock: Clock,
     monotonic: Callable[[], float],
+    *,
+    trial_executor: Executor | None = None,
+) -> str | None:
+    with _trial_execution_pool(
+        trial_executor, wave.max_concurrent_shards
+    ) as selected_executor:
+        return _execute_shard_with_executor(
+            manifest_path,
+            campaign,
+            wave,
+            run,
+            locked_shard,
+            campaign_root,
+            output_root,
+            harbor_source,
+            base_url,
+            token,
+            stream_runner,
+            deadline,
+            identifier,
+            clock,
+            monotonic,
+            selected_executor,
+        )
+
+
+@contextmanager
+def _trial_execution_pool(
+    executor: Executor | None, max_workers: int
+) -> Iterator[Executor]:
+    if executor is not None:
+        yield executor
+        return
+    with ThreadPoolExecutor(max_workers=max_workers) as owned_executor:
+        yield owned_executor
+
+
+def _execute_shard_with_executor(
+    manifest_path: Path,
+    campaign: CampaignLock,
+    wave: WaveLock,
+    run: WaveRunLock,
+    locked_shard: WaveShardLock,
+    campaign_root: Path,
+    output_root: Path,
+    harbor_source: Path,
+    base_url: str,
+    token: str,
+    stream_runner: StreamRunner,
+    deadline: float,
+    identifier: IdentifierFactory,
+    clock: Clock,
+    monotonic: Callable[[], float],
+    trial_executor: Executor,
 ) -> str | None:
     shard = locked_shard.shard
     shard_root = (
@@ -605,10 +663,11 @@ def _execute_shard(
     events = shard_root / "events.jsonl"
     append_event(events, "shard_started", shard_id=shard.shard_id)
     trial_checksums: dict[str, str] = {}
-    failures: list[Exception] = []
+    failures: list[tuple[int, Exception]] = []
+    pending: dict[Future[None], tuple[int, CampaignTrialLock, Path]] = {}
     deferred = False
     selected_trial_ids = set(wave.trial_ids)
-    for trial in shard.trials:
+    for trial_index, trial in enumerate(shard.trials):
         destination = _trial_destination(output_root, campaign, run, trial)
         trial_root = shard_root.parent.parent / "trials" / trial.trial_id
         recovered = _valid_terminal_trial(
@@ -631,39 +690,46 @@ def _execute_shard(
             continue
         else:
             _prepare_trial_recovery(destination, trial_root)
-            try:
-                _execute_trial(
-                    manifest_path,
-                    campaign,
-                    wave,
-                    run.configuration,
-                    shard.shard_id,
-                    trial,
-                    trial_root,
-                    output_root,
-                    harbor_source,
-                    base_url,
-                    token,
-                    stream_runner,
-                    deadline,
-                    identifier,
-                    clock,
-                    monotonic,
-                )
-            except Exception as error:
-                failures.append(error)
-                append_event(
-                    events,
-                    "trial_failed",
-                    trial_id=trial.trial_id,
-                    error_type=type(error).__name__,
-                )
-                continue
-            append_event(events, "trial_completed", trial_id=trial.trial_id)
+            future = trial_executor.submit(
+                _execute_trial,
+                manifest_path,
+                campaign,
+                wave,
+                run.configuration,
+                shard.shard_id,
+                trial,
+                trial_root,
+                output_root,
+                harbor_source,
+                base_url,
+                token,
+                stream_runner,
+                deadline,
+                identifier,
+                clock,
+                monotonic,
+            )
+            pending[future] = (trial_index, trial, trial_root)
+            continue
+        trial_checksums[trial.trial_id] = _file_digest(trial_root / "checksums.json")
+    for future in as_completed(pending):
+        trial_index, trial, trial_root = pending[future]
+        try:
+            future.result()
+        except Exception as error:
+            failures.append((trial_index, error))
+            append_event(
+                events,
+                "trial_failed",
+                trial_id=trial.trial_id,
+                error_type=type(error).__name__,
+            )
+            continue
+        append_event(events, "trial_completed", trial_id=trial.trial_id)
         trial_checksums[trial.trial_id] = _file_digest(trial_root / "checksums.json")
     if failures:
         append_event(events, "shard_failed", failed_trials=len(failures))
-        raise failures[0]
+        raise min(failures, key=lambda item: item[0])[1]
     if deferred:
         append_event(events, "shard_deferred")
         return None

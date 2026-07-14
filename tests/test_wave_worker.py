@@ -1319,15 +1319,20 @@ def test_shard_continues_after_one_trial_fails(
     campaign, wave = _two_trial_wave(remote_spec)
     run = wave.runs[0]
     shard = run.shards[0]
-    calls: list[str] = []
+    barrier = threading.Barrier(2)
+    calls: list[tuple[str, float]] = []
+    calls_lock = threading.Lock()
 
     def execute(*args: object, **kwargs: object) -> None:
         del kwargs
         trial = cast(CampaignTrialLock, args[5])
         trial_id = trial.trial_id
         trial_root = cast(Path, args[6])
-        calls.append(trial_id)
-        if len(calls) == 1:
+        deadline = cast(float, args[12])
+        with calls_lock:
+            calls.append((trial_id, deadline))
+        barrier.wait(timeout=5)
+        if trial_id == shard.shard.trials[0].trial_id:
             raise WorkerError("first trial failed")
         (trial_root / "checksums.json").write_text("{}\n", encoding="utf-8")
 
@@ -1354,7 +1359,10 @@ def test_shard_continues_after_one_trial_fails(
             lambda: 0.0,
         )
 
-    assert calls == [trial.trial_id for trial in shard.shard.trials]
+    assert sorted(trial_id for trial_id, _deadline in calls) == sorted(
+        trial.trial_id for trial in shard.shard.trials
+    )
+    assert {deadline for _trial_id, deadline in calls} == {100.0}
     events = _event_payloads(
         campaign_root
         / "runs"
@@ -1363,12 +1371,77 @@ def test_shard_continues_after_one_trial_fails(
         / shard.shard.shard_id
         / "events.jsonl"
     )
-    assert [event["event"] for event in events] == [
-        "shard_started",
+    assert events[0]["event"] == "shard_started"
+    assert {event["event"] for event in events[1:3]} == {
         "trial_failed",
         "trial_completed",
-        "shard_failed",
+    }
+    assert events[3]["event"] == "shard_failed"
+
+
+def test_one_shard_runs_multiple_trials_at_configured_concurrency(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign, wave = _two_trial_wave(remote_spec)
+    run = wave.runs[0]
+    shard = run.shards[0]
+    barrier = threading.Barrier(2)
+    calls: list[tuple[str, float]] = []
+    calls_lock = threading.Lock()
+
+    def execute(*args: object, **kwargs: object) -> None:
+        del kwargs
+        trial = cast(CampaignTrialLock, args[5])
+        trial_root = cast(Path, args[6])
+        deadline = cast(float, args[12])
+        with calls_lock:
+            calls.append((trial.trial_id, deadline))
+        barrier.wait(timeout=5)
+        (trial_root / "checksums.json").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr("harbor_hf.wave_worker._execute_trial", execute)
+    campaign_root = tmp_path / "staging" / campaign.artifact_prefix
+
+    checksum = _execute_shard(
+        tmp_path / "manifest.yaml",
+        campaign,
+        wave,
+        run,
+        shard,
+        campaign_root,
+        tmp_path / "output",
+        tmp_path / "harbor",
+        "https://endpoint.example",
+        "test-token",
+        lambda *_args, **_kwargs: 0,
+        100.0,
+        IdentifierSequence(),
+        lambda: datetime.now(UTC),
+        lambda: 0.0,
+    )
+
+    assert checksum is not None
+    assert sorted(trial_id for trial_id, _deadline in calls) == sorted(
+        trial.trial_id for trial in shard.shard.trials
+    )
+    assert len(calls) == len(shard.shard.trials)
+    assert {deadline for _trial_id, deadline in calls} == {100.0}
+    events = _event_payloads(
+        campaign_root
+        / "runs"
+        / run.configuration.run_id
+        / "shards"
+        / shard.shard.shard_id
+        / "events.jsonl"
+    )
+    assert events[0]["event"] == "shard_started"
+    assert [event["event"] for event in events[1:3]] == [
+        "trial_completed",
+        "trial_completed",
     ]
+    assert events[3]["event"] == "shard_succeeded"
 
 
 def test_retry_shard_executes_only_admitted_trials(
@@ -1461,7 +1534,11 @@ def _two_trial_spec(remote_spec: ExperimentSpec) -> ExperimentSpec:
                 }
             ),
             "execution": remote_spec.execution.model_copy(
-                update={"attempts": 1, "max_trials_per_shard": 2}
+                update={
+                    "attempts": 1,
+                    "concurrent_trials": 2,
+                    "max_trials_per_shard": 2,
+                }
             ),
         }
     )
