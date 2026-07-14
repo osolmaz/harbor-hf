@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from test_wave_worker import _provider_wave_inputs, _wave_inputs
 
 import harbor_hf.wave_worker as wave_worker
 import harbor_hf.worker as worker
-from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.models import DeploymentProfile, EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner
 from harbor_hf.provider_models import unavailable
 from harbor_hf.runs import RunLock, build_run_lock
@@ -55,8 +56,8 @@ def test_staged_worker_success_has_exact_ordered_side_effects(
     _prepare_evidence_destination(destination)
     runner = _UnusedRunner()
     calls: list[tuple[object, ...]] = []
-    baseline = {"snapshot": "baseline"}
-    final = {
+    baseline: dict[str, object] = {"snapshot": "baseline"}
+    final: dict[str, object] = {
         "status": {
             "state": "paused",
             "readyReplica": 0,
@@ -125,6 +126,7 @@ def test_staged_worker_success_has_exact_ordered_side_effects(
         watchdog_launcher=launch,
     )
 
+    assert isinstance(lock.deployment, DeploymentProfile)
     endpoint = lock.deployment.endpoint
     assert endpoint is not None
     harbor_source = (
@@ -458,7 +460,7 @@ def test_endpoint_wave_prepare_validates_every_run_before_lease_and_resume(
     wave_root.mkdir()
     events = wave_root / "events.jsonl"
     calls: list[tuple[object, ...]] = []
-    baseline = {"baseline": True}
+    baseline: dict[str, object] = {"baseline": True}
 
     class Manager:
         def describe(self) -> dict[str, object]:
@@ -477,7 +479,7 @@ def test_endpoint_wave_prepare_validates_every_run_before_lease_and_resume(
         "contract-token",
         launch,
     )
-    lifecycle.manager = Manager()  # type: ignore[assignment]
+    lifecycle.manager = cast(Any, Manager())
     monkeypatch.setattr(
         wave_worker,
         "validate_endpoint_model",

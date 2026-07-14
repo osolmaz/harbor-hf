@@ -5,7 +5,7 @@ import io
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -31,6 +31,7 @@ from harbor_hf.endpoints import (
     EndpointIdentityMismatch,
     EndpointProviderError,
     EndpointProvisioner,
+    EndpointProvisioningError,
     EndpointSnapshot,
     effective_configuration_mismatches,
     verify_exact_endpoint,
@@ -158,7 +159,7 @@ def test_observer_wave_and_execution_event_projection_is_exact(
     wave = _wave(campaign, remote_spec).model_copy(
         update={"estimated_cost_microusd": 765_432}
     )
-    records = [
+    records: list[dict[str, object]] = [
         {"event": "wave_started", "at": "2026-07-14T09:10:00+08:00"},
         {"event": "wave_succeeded", "at": "2026-07-14T01:15:00+00:00"},
         {"event": "endpoint_pause_requested", "at": "2026-07-14T01:16:00+00:00"},
@@ -389,11 +390,11 @@ def test_provider_proxy_request_reader_enforces_exact_size_boundary(
     proxy = ProviderEvidenceProxy(
         _provider_target(), token="token", evidence_path=tmp_path / "evidence.jsonl"
     )
-    assert proxy._read_request(cast(object, _Handler(b"{}", "2"))) == {}
+    assert proxy._read_request(cast(Any, _Handler(b"{}", "2"))) == {}
 
     for length in (None, "bad", "-1", str(_MAX_REQUEST_BYTES + 1)):
         with pytest.raises(ProviderProxyError, match="invalid request size"):
-            proxy._read_request(cast(object, _Handler(b"{}", length)))
+            proxy._read_request(cast(Any, _Handler(b"{}", length)))
 
     proxy.client.close()
 
@@ -416,7 +417,7 @@ def test_provider_proxy_response_relay_forwards_allowlist_and_all_bytes(
         stream=httpx.ByteStream(content),
     )
 
-    captured, first_byte_ms = _relay_response(cast(object, handler), response, 10.0)
+    captured, first_byte_ms = _relay_response(cast(Any, handler), response, 10.0)
 
     assert captured == content
     assert first_byte_ms == pytest.approx(125)
@@ -440,7 +441,7 @@ def test_provider_proxy_response_relay_caps_evidence_without_truncating_client()
     content = b"x" * (_MAX_EVIDENCE_RESPONSE_BYTES + 1)
     response = httpx.Response(200, stream=httpx.ByteStream(content))
 
-    captured, first_byte_ms = _relay_response(cast(object, handler), response, 0)
+    captured, first_byte_ms = _relay_response(cast(Any, handler), response, 0)
 
     assert captured == b""
     assert first_byte_ms is not None
@@ -484,7 +485,7 @@ def test_provider_proxy_json_response_writer_sets_framing_and_closes() -> None:
 
     handler = _Handler()
     ProviderEvidenceProxy._send_json(
-        cast(object, handler), 418, {"z": "last", "a": "first"}
+        cast(Any, handler), 418, {"z": "last", "a": "first"}
     )
 
     content = b'{"a": "first", "z": "last"}'
@@ -532,7 +533,7 @@ def test_provider_proxy_forward_observes_exact_upstream_exchange(
     monkeypatch.setattr("harbor_hf.provider_proxy.perf_counter", lambda: next(ticks))
     handler = _Handler()
 
-    observed = proxy._forward(cast(object, handler), {"model": "org/model:groq"})
+    observed = proxy._forward(cast(Any, handler), {"model": "org/model:groq"})
 
     assert calls == [
         {
@@ -585,7 +586,7 @@ def test_provider_proxy_forward_maps_pre_response_transport_failures(
     monkeypatch.setattr("harbor_hf.provider_proxy.perf_counter", lambda: next(ticks))
     handler = _Handler()
 
-    observed = proxy._forward(cast(object, handler), {"messages": []})
+    observed = proxy._forward(cast(Any, handler), {"messages": []})
 
     assert observed.status_code == status
     assert dict(observed.headers) == {}
@@ -927,7 +928,7 @@ def test_hf_endpoint_provider_http_error_classification_is_exact(
     def request() -> None:
         raise _http_error(status)
 
-    ambiguous = {
+    ambiguous: type[EndpointProvisioningError] = {
         "create": AmbiguousEndpointCreate,
         "pause": AmbiguousEndpointPause,
         "delete": AmbiguousEndpointDelete,
@@ -945,7 +946,7 @@ def test_hf_endpoint_provider_http_error_classification_is_exact(
     ],
 )
 def test_hf_endpoint_transport_errors_are_always_ambiguous(
-    operation: str, ambiguous: type[Exception]
+    operation: str, ambiguous: type[EndpointProvisioningError]
 ) -> None:
     def request() -> None:
         raise httpx.ConnectError("connection lost")
@@ -1001,7 +1002,7 @@ def test_result_index_windows_are_deduplicated_sorted_and_power_sized(
     publisher = HubDatasetPublisher(
         publisher_id="publisher-one",
         leases=_LeaseStub(),
-        api=cast(object, _ApiStub()),
+        api=cast(Any, _ApiStub()),
     )
     monkeypatch.setattr(publisher, "_exists", lambda *args: False)
     monkeypatch.setattr(
@@ -1042,7 +1043,7 @@ def test_result_index_window_prefers_consolidated_history(
     publisher = HubDatasetPublisher(
         publisher_id="publisher-one",
         leases=_LeaseStub(),
-        api=cast(object, _ApiStub()),
+        api=cast(Any, _ApiStub()),
     )
     monkeypatch.setattr(
         publisher,

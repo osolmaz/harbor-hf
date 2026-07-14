@@ -9,6 +9,7 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -305,7 +306,7 @@ class _FakeProcess:
         outcome = self._waits.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
-        return int(outcome)
+        return cast(int, outcome)
 
 
 def test_stop_process_group_always_sends_term_then_kill(
@@ -319,7 +320,7 @@ def test_stop_process_group_always_sends_term_then_kill(
 
     monkeypatch.setattr(process, "_signal_process_group", record)
 
-    process._stop_process_group(fake)  # type: ignore[arg-type]
+    process._stop_process_group(cast(Any, fake))
 
     assert fake.timeouts == [10, 1]
     assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
@@ -341,7 +342,7 @@ def test_stop_process_group_escalates_after_both_wait_timeouts(
 
     monkeypatch.setattr(process, "_signal_process_group", record)
 
-    process._stop_process_group(fake)  # type: ignore[arg-type]
+    process._stop_process_group(cast(Any, fake))
 
     assert fake.timeouts == [10, 1]
     assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
