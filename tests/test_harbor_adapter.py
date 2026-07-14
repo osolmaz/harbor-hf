@@ -58,6 +58,7 @@ def _bundle(
         "model_provider": policy.expected_model_provider,
         "model_name": policy.expected_model_name,
         "exception_type": None,
+        "exception_message": None,
         "step_exceptions": [],
         "rewards": {"reward": 1.0},
         "timing": {

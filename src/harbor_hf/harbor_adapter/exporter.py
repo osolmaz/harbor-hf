@@ -221,6 +221,7 @@ def export_bundle(
             {
                 "step_name": step.step_name,
                 "exception_type": step.exception_info.exception_type,
+                "exception_message": step.exception_info.exception_message,
             }
             for step in (result.step_results or [])
             if step.exception_info is not None
@@ -246,6 +247,11 @@ def export_bundle(
                 "model_name": model.name if model else None,
                 "exception_type": (
                     result.exception_info.exception_type
+                    if result.exception_info is not None
+                    else None
+                ),
+                "exception_message": (
+                    result.exception_info.exception_message
                     if result.exception_info is not None
                     else None
                 ),
