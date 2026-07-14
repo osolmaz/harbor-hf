@@ -13,12 +13,17 @@ def main() -> None:
     operation = sys.argv[1] if len(sys.argv) > 1 else ""
     request = _credential_request(sys.stdin)
     repository = os.environ.get(_REPOSITORY_ENV, "")
+    path = request.get("path", "").removeprefix("/")
     expected_paths = {repository, f"{repository}.git"}
+    is_lfs_path = path in {
+        f"{repository}/info/lfs",
+        f"{repository}.git/info/lfs",
+    }
     if (
         operation != "get"
         or request.get("protocol") != "https"
         or request.get("host") != "github.com"
-        or request.get("path", "").removeprefix("/") not in expected_paths
+        or (path not in expected_paths and not is_lfs_path)
     ):
         return
     credential_file = os.environ.get(_CREDENTIAL_FILE_ENV, "")

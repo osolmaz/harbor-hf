@@ -121,17 +121,25 @@ def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
         credential_file = environment["HARBOR_HF_GIT_CREDENTIAL_FILE"]
         assert environment["GITHUB_TOKEN"] == ""
         assert Path(credential_file).read_text(encoding="utf-8") == "github-secret"
-        assert environment["GIT_CONFIG_COUNT"] == "3"
+        assert environment["GIT_CONFIG_COUNT"] == "5"
         assert environment["GIT_CONFIG_KEY_0"] == "credential.useHttpPath"
         assert environment["GIT_CONFIG_VALUE_0"] == "true"
         assert environment["GIT_CONFIG_KEY_1"] == (
             "credential.https://github.com/ShellBench/public-tasks.git.helper"
         )
-        assert environment["GIT_CONFIG_VALUE_1"] == "harbor-hf"
+        assert environment["GIT_CONFIG_VALUE_1"] == ""
         assert environment["GIT_CONFIG_KEY_2"] == (
-            "credential.https://github.com/ShellBench/public-tasks.helper"
+            "credential.https://github.com/ShellBench/public-tasks.git.helper"
         )
         assert environment["GIT_CONFIG_VALUE_2"] == "harbor-hf"
+        assert environment["GIT_CONFIG_KEY_3"] == (
+            "credential.https://github.com/ShellBench/public-tasks.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_3"] == ""
+        assert environment["GIT_CONFIG_KEY_4"] == (
+            "credential.https://github.com/ShellBench/public-tasks.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_4"] == "harbor-hf"
         assert environment["GIT_TERMINAL_PROMPT"] == "0"
         assert environment["HARBOR_HF_GIT_REPOSITORY"] == "ShellBench/public-tasks"
         assert environment["HARBOR_HF_REDACTION_SECRET_FILE"] == credential_file
@@ -148,7 +156,9 @@ def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
 
 
 def test_authenticated_git_environment_is_scoped_by_real_git(
-    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     source = GitBenchmarkSource(
         repository="ShellBench/public-tasks",
@@ -166,6 +176,18 @@ def test_authenticated_git_environment_is_scoped_by_real_git(
     raw["benchmark"].pop("dataset_digest", None)
     lock = build_run_lock(ExperimentSpec.model_validate(raw))
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    fallback_log = tmp_path / "fallback.log"
+    fallback_helper = tmp_path / "git-credential-fallback"
+    fallback_helper.write_text(
+        '#!/bin/sh\ncat >> "$FALLBACK_LOG"\n'
+        "echo username=wrong\necho password=wrong-secret\n",
+        encoding="utf-8",
+    )
+    fallback_helper.chmod(0o700)
+    global_config = tmp_path / "gitconfig"
+    global_config.write_text(
+        f"[credential]\n\thelper = {fallback_helper}\n", encoding="utf-8"
+    )
     with harbor_process_environment(
         lock,
         token="hf-secret",
@@ -175,11 +197,20 @@ def test_authenticated_git_environment_is_scoped_by_real_git(
         environment = os.environ.copy()
         environment.update(additions)
         environment.update(
-            {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+            {
+                "FALLBACK_LOG": str(fallback_log),
+                "GIT_CONFIG_GLOBAL": str(global_config),
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+            }
         )
 
         allowed = []
-        for path in ("ShellBench/public-tasks", "ShellBench/public-tasks.git"):
+        for path in (
+            "ShellBench/public-tasks",
+            "ShellBench/public-tasks.git",
+            "ShellBench/public-tasks/info/lfs",
+            "ShellBench/public-tasks.git/info/lfs",
+        ):
             allowed.append(
                 subprocess.run(
                     ["git", "credential", "fill"],
@@ -190,6 +221,7 @@ def test_authenticated_git_environment_is_scoped_by_real_git(
                     check=True,
                 )
             )
+        assert not fallback_log.exists()
         refused = subprocess.run(
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\npath=other/repo.git\n\n",
@@ -203,7 +235,10 @@ def test_authenticated_git_environment_is_scoped_by_real_git(
 
     assert all("username=x-access-token" in result.stdout for result in allowed)
     assert all("password=github-secret" in result.stdout for result in allowed)
-    assert refused.returncode != 0
+    assert all("wrong-secret" not in result.stdout for result in allowed)
+    assert "path=other/repo.git" in fallback_log.read_text(encoding="utf-8")
+    assert refused.returncode == 0
+    assert "password=wrong-secret" in refused.stdout
     assert "github-secret" not in refused.stdout + refused.stderr
 
 

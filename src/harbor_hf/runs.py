@@ -229,17 +229,25 @@ def harbor_process_environment(
                 stream.write(source_token)
             environment.update(
                 {
-                    "GIT_CONFIG_COUNT": "3",
+                    "GIT_CONFIG_COUNT": "5",
                     "GIT_CONFIG_KEY_0": "credential.useHttpPath",
                     "GIT_CONFIG_VALUE_0": "true",
                     "GIT_CONFIG_KEY_1": (
                         f"credential.https://github.com/{source.repository}.git.helper"
                     ),
-                    "GIT_CONFIG_VALUE_1": "harbor-hf",
+                    "GIT_CONFIG_VALUE_1": "",
                     "GIT_CONFIG_KEY_2": (
-                        f"credential.https://github.com/{source.repository}.helper"
+                        f"credential.https://github.com/{source.repository}.git.helper"
                     ),
                     "GIT_CONFIG_VALUE_2": "harbor-hf",
+                    "GIT_CONFIG_KEY_3": (
+                        f"credential.https://github.com/{source.repository}.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_3": "",
+                    "GIT_CONFIG_KEY_4": (
+                        f"credential.https://github.com/{source.repository}.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_4": "harbor-hf",
                     "GIT_TERMINAL_PROMPT": "0",
                     _GIT_CREDENTIAL_FILE_ENV: str(credential_path),
                     _GIT_REPOSITORY_ENV: source.repository,
