@@ -832,7 +832,10 @@ def _execute_trial(
         failure_phase = "verification"
         if outcome.verification is None:
             raise WorkerError("Harbor produced no validated compatibility bundle")
-        write_json(execution_root / "verification.json", outcome.verification)
+        write_json(
+            execution_root / "verification.json",
+            outcome.verification.model_dump(mode="json"),
+        )
         append_event(events, "execution_succeeded")
     except Exception as caught:
         error = caught

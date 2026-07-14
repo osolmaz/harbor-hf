@@ -136,6 +136,16 @@ class HarborCompatibilityBundle(FrozenModel):
     trials: list[HarborCompatibilityTrial]
 
 
+class HarborVerifiedTrial(FrozenModel):
+    task_name: str = Field(min_length=1)
+    rewards: dict[str, int | float]
+
+
+class HarborVerificationResult(FrozenModel):
+    trial_count: int = Field(ge=0)
+    trials: list[HarborVerifiedTrial]
+
+
 def ensure_no_policy_conflicts(
     config: Mapping[str, JsonValue], policy: HarborVerificationPolicy
 ) -> None:

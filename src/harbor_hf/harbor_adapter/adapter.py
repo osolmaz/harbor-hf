@@ -15,6 +15,7 @@ from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
 from harbor_hf.harbor_adapter.models import (
     HarborExecutionRequest,
     HarborVerificationPolicy,
+    HarborVerificationResult,
     canonical_json_bytes,
     ensure_no_policy_conflicts,
     sha256_digest,
@@ -40,7 +41,7 @@ class PreparedHarborExecution:
 @dataclass(frozen=True)
 class HarborExecutionOutcome:
     exit_code: int
-    verification: dict[str, object] | None
+    verification: HarborVerificationResult | None
     compatibility_path: Path | None
 
 

@@ -9,6 +9,7 @@ from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
 from harbor_hf.harbor_adapter.models import (
     HarborExecutionRequest,
     HarborVerificationPolicy,
+    HarborVerificationResult,
 )
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "HarborExecutionRequest",
     "HarborTrialFailure",
     "HarborVerificationPolicy",
+    "HarborVerificationResult",
     "PreparedHarborExecution",
     "WorkerError",
     "build_execution_request",

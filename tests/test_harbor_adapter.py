@@ -150,7 +150,9 @@ def test_typed_bundle_preserves_existing_verification_result(
 ) -> None:
     _, request = _request(remote_spec, tmp_path)
 
-    assert validate_compatibility_bundle(_bundle(request), request) == {
+    assert validate_compatibility_bundle(_bundle(request), request).model_dump(
+        mode="json"
+    ) == {
         "trial_count": 1,
         "trials": [{"task_name": "cancel-async-tasks", "rewards": {"reward": 1.0}}],
     }
@@ -256,7 +258,7 @@ def test_golden_adapter_scenarios_remain_compatible(
             continue
         bundle = _bundle(request, **scenario["trial_updates"])
         if scenario["expected"] == "verified":
-            assert validate_compatibility_bundle(bundle, request)["trial_count"] == 1
+            assert validate_compatibility_bundle(bundle, request).trial_count == 1
         else:
             with pytest.raises(HarborTrialFailure, match=str(scenario["expected"])):
                 validate_compatibility_bundle(bundle, request)

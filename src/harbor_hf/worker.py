@@ -713,7 +713,7 @@ def _execute_benchmark(
         raise WorkerError(f"Harbor exited with status {outcome.exit_code}")
     if outcome.verification is None:
         raise WorkerError("Harbor produced no validated compatibility bundle")
-    write_json(root / "verification.json", outcome.verification)
+    write_json(root / "verification.json", outcome.verification.model_dump(mode="json"))
     append_event(events, "verification_validated")
 
 

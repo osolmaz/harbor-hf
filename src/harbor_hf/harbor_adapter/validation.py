@@ -12,6 +12,8 @@ from harbor_hf.harbor_adapter.models import (
     HarborCompatibilityBundle,
     HarborExecutionRequest,
     HarborStepException,
+    HarborVerificationResult,
+    HarborVerifiedTrial,
     canonical_json_bytes,
     sha256_digest,
 )
@@ -42,12 +44,12 @@ def load_compatibility_bundle(
 
 def validate_compatibility_bundle(
     bundle: HarborCompatibilityBundle, request: HarborExecutionRequest
-) -> dict[str, object]:
+) -> HarborVerificationResult:
     policy = request.verification
     _validate_trial_count(len(bundle.trials), policy.expected_trials)
     observed = Counter(trial.task_name for trial in bundle.trials)
     _validate_task_counts(observed, request)
-    verified: list[dict[str, object]] = []
+    verified: list[HarborVerifiedTrial] = []
     for trial in bundle.trials:
         expected_digest = (policy.expected_task_digests or {}).get(trial.task_name)
         if expected_digest != trial.task_digest:
@@ -88,8 +90,10 @@ def validate_compatibility_bundle(
             raise WorkerError(
                 f"Harbor trial {trial.task_name} rewards must be finite numbers"
             )
-        verified.append({"task_name": trial.task_name, "rewards": dict(rewards)})
-    return {"trial_count": len(verified), "trials": verified}
+        verified.append(
+            HarborVerifiedTrial(task_name=trial.task_name, rewards=dict(rewards))
+        )
+    return HarborVerificationResult(trial_count=len(verified), trials=verified)
 
 
 def _validate_trial_count(observed: int, expected: int | None) -> None:
