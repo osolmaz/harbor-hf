@@ -298,24 +298,24 @@ def _apply_retry_requests(
 ) -> dict[str, TrialProjection]:
     requested_at: dict[tuple[str, int], datetime] = {}
     ordered = ordered_events(events)
-    event_generations = (
-        _retry_event_generations(lock, ordered)
-        if any(event.kind == "campaign.shard-retry-requested" for event in ordered)
+    legacy_generations = (
+        _legacy_retry_generations(lock, ordered)
+        if any(
+            event.kind == "campaign.shard-retry-requested"
+            and not cast(ShardRetryPayload, event.payload).trial_generations
+            for event in ordered
+        )
         else {}
     )
     for event in ordered:
         if event.kind != "campaign.shard-retry-requested":
             continue
         payload = cast(ShardRetryPayload, event.payload)
-        expected = event_generations[event.event_id]
-        if payload.trial_generations and any(
-            expected.get(trial_id) != generation
-            for trial_id, generation in payload.trial_generations.items()
-        ):
-            raise ValueError(
-                "retry request generations do not match the requested shard state"
-            )
-        generations = payload.trial_generations or expected
+        generations = (
+            _validated_retry_generations(lock, payload, trials)
+            if payload.trial_generations
+            else legacy_generations[event.event_id]
+        )
         for trial_id, generation in generations.items():
             key = (trial_id, generation)
             requested_at[key] = max(
@@ -338,10 +338,35 @@ def _apply_retry_requests(
     }
 
 
-def _retry_event_generations(
+def _validated_retry_generations(
+    lock: CampaignLock,
+    payload: ShardRetryPayload,
+    trials: dict[str, TrialProjection],
+) -> dict[str, int]:
+    shard_ids = {
+        shard.shard_id: {trial.trial_id for trial in shard.trials}
+        for run in lock.runs
+        for shard in run.shards
+    }
+    allowed = shard_ids.get(payload.shard_id)
+    if allowed is None:
+        raise ValueError("retry request references an unknown shard")
+    if any(
+        trial_id not in allowed
+        or generation < 1
+        or generation > len(trials[trial_id].executions)
+        for trial_id, generation in payload.trial_generations.items()
+    ):
+        raise ValueError(
+            "retry request generations do not match the requested shard state"
+        )
+    return payload.trial_generations
+
+
+def _legacy_retry_generations(
     lock: CampaignLock, events: list[CampaignEvent]
 ) -> dict[str, dict[str, int]]:
-    """Recover and validate event-time retry bindings in one forward pass."""
+    """Recover generation bindings for legacy retry events in one forward pass."""
     runs, shards, trials = _initial_projections(lock)
     executions: dict[str, ExecutionProjection] = {}
     execution_ids_by_trial: dict[str, list[str]] = {trial_id: [] for trial_id in trials}

@@ -242,6 +242,42 @@ def test_readiness_retries_transient_describe_failure_within_budget() -> None:
     assert sleeps == [2]
 
 
+def test_readiness_aborts_after_bounded_consecutive_describe_failures() -> None:
+    class FailingRunner(EndpointRunner):
+        attempts = 0
+
+        def run_json(
+            self,
+            command: Sequence[str],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
+            self.attempts += 1
+            raise ProcessError("permanent describe failure")
+
+    sleeps: list[float] = []
+    runner = FailingRunner([])
+    manager = EndpointManager(
+        "org",
+        "endpoint",
+        runner,
+        sleep=sleeps.append,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(
+        WorkerError,
+        match=(
+            "^endpoint readiness aborted after 3 consecutive provider errors: "
+            "permanent describe failure$"
+        ),
+    ):
+        manager.wait_ready(3600)
+
+    assert runner.attempts == 3
+    assert sleeps == [15, 15]
+
+
 def test_endpoint_waits_through_transitional_states() -> None:
     sleeps: list[float] = []
     times = iter(float(value) for value in range(9))

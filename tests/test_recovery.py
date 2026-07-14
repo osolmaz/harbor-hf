@@ -802,6 +802,34 @@ def test_retry_request_rejects_generations_outside_its_event_time_shard_state(
             project_recovery(lock, [submitted, *failed, invalid])
 
 
+def test_retry_generation_binding_tolerates_cross_host_clock_skew(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard = lock.runs[0].shards[0]
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard.shard_id,
+        "retry now",
+        clock=lambda: NOW + timedelta(seconds=4),
+    )
+    skewed = request.model_copy(update={"observed_at": NOW + timedelta(seconds=2)})
+
+    projection = project_recovery(lock, [submitted, *failed, skewed])
+
+    trial = projection.trials[shard.trials[0].trial_id]
+    assert trial.status == "retry_wait"
+    assert trial.retry_not_before == skewed.observed_at
+
+
 def test_durable_shard_retry_identity_includes_every_eligible_trial(
     remote_spec: ExperimentSpec,
 ) -> None:

@@ -68,6 +68,7 @@ from harbor_hf.submission import (
 _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
 _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
 _ENDPOINT_CALL_TIMEOUT_SECONDS = 60.0
+_MAX_CONSECUTIVE_READINESS_ERRORS = 3
 
 
 class WorkerError(RuntimeError):
@@ -137,6 +138,7 @@ class EndpointManager:
         self, timeout_seconds: int, poll_seconds: float = 15
     ) -> dict[str, object]:
         deadline = self.monotonic() + timeout_seconds
+        consecutive_errors = 0
         while True:
             remaining = deadline - self.monotonic()
             if remaining <= 0:
@@ -144,6 +146,12 @@ class EndpointManager:
             try:
                 snapshot = self.describe(min(_ENDPOINT_CALL_TIMEOUT_SECONDS, remaining))
             except ProcessError as error:
+                consecutive_errors += 1
+                if consecutive_errors >= _MAX_CONSECUTIVE_READINESS_ERRORS:
+                    raise WorkerError(
+                        "endpoint readiness aborted after "
+                        f"{consecutive_errors} consecutive provider errors: {error}"
+                    ) from error
                 remaining = deadline - self.monotonic()
                 if remaining <= 0:
                     raise WorkerError(
@@ -152,6 +160,7 @@ class EndpointManager:
                     ) from error
                 self.sleep(min(poll_seconds, remaining))
                 continue
+            consecutive_errors = 0
             state, ready, target = endpoint_state(snapshot)
             if state == "running" and target > 0 and ready >= target:
                 return snapshot
