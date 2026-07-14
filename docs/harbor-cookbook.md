@@ -57,7 +57,8 @@ every placeholder with a durable reference:
 - full source commits for Harbor and `harbor-hf`;
 - a full model commit;
 - digest-pinned serving and controller images;
-- a digest-pinned benchmark Dataset and the complete task-name-to-digest map;
+- a digest-pinned Harbor package or commit-pinned Git benchmark source and the
+  complete task-name-to-digest map;
 - exact agent package versions or source commits;
 - an endpoint deployment profile or an Inference Provider target;
 - private control, input, artifact, and unpublished result storage;

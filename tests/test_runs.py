@@ -5,6 +5,7 @@ import pytest
 from harbor_hf.models import (
     DeploymentProfile,
     ExperimentSpec,
+    GitBenchmarkSource,
     MatrixRule,
     _validate_remote_input_pins,
     _validate_task_pins,
@@ -35,6 +36,27 @@ def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     assert lock.attempts == 1
     assert lock.concurrent_trials == 1
     assert lock.timeout_seconds == 60
+
+
+def test_build_run_lock_preserves_git_benchmark_source(
+    remote_spec: ExperimentSpec,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    benchmark = remote_spec.benchmark.model_copy(
+        update={"dataset": "shellbench/public-115", "source": source}
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"] = benchmark.model_dump(mode="python", exclude={"dataset_digest"})
+    spec = ExperimentSpec.model_validate(raw)
+
+    lock = build_run_lock(spec)
+
+    assert lock.benchmark_source == source
+    assert lock.benchmark_dataset_digest == spec.benchmark.dataset_digest
 
 
 def test_run_id_override_is_preserved(remote_spec: ExperimentSpec) -> None:

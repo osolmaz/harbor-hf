@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from harbor_hf.harbor_adapter import build_execution_request
-from harbor_hf.models import DeploymentProfile, ExperimentSpec
+from harbor_hf.models import DeploymentProfile, ExperimentSpec, GitBenchmarkSource
 from harbor_hf.provider_models import (
     ExplicitProviderRoute,
     ProviderLimits,
@@ -264,6 +264,35 @@ def test_command_preserves_an_existing_content_addressed_dataset(
             "name": "harbor/dataset-contract",
             "ref": digest,
             "task_names": ["task-zeta", "task-alpha"],
+        }
+    ]
+
+
+def test_command_renders_pinned_git_dataset_source(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    lock = _contract_lock(remote_spec).model_copy(update={"benchmark_source": source})
+
+    request = build_execution_request(
+        lock,
+        tmp_path,
+        "https://endpoint.example",
+        task_names=["task-alpha"],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={"task-alpha": lock.benchmark_task_digests["task-alpha"]},
+    )
+
+    assert request.harbor_config["datasets"] == [
+        {
+            "repo": f"ShellBench/public-tasks@{'8' * 40}",
+            "path": "tasks/115-tasks",
+            "task_names": ["task-alpha"],
         }
     ]
 

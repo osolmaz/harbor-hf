@@ -6,12 +6,13 @@ import re
 from datetime import UTC, datetime
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from harbor_hf.models import (
     AgentProfile,
     DeploymentTarget,
     ExperimentSpec,
+    GitBenchmarkSource,
     ModelProfile,
     RemoteExecutionSpec,
 )
@@ -40,6 +41,9 @@ class RunLock(BaseModel):
     spec_digest: str
     benchmark_dataset: str
     benchmark_dataset_digest: str
+    benchmark_source: GitBenchmarkSource | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     benchmark_tasks: list[str]
     benchmark_task_digests: dict[str, str]
     model: ModelProfile
@@ -122,6 +126,7 @@ def build_run_lock(
         spec_digest=digest,
         benchmark_dataset=spec.benchmark.dataset,
         benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
+        benchmark_source=spec.benchmark.source,
         benchmark_tasks=spec.benchmark.task_names,
         benchmark_task_digests=spec.benchmark.task_digests,
         model=model,

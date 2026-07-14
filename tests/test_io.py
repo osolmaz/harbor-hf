@@ -9,11 +9,13 @@ from harbor_hf.models import (
     DeploymentProfile,
     EngineSpec,
     ExperimentSpec,
+    GitBenchmarkSource,
     MatrixRule,
     MatrixSpec,
     PublishingSpec,
     RemoteJobSpec,
     SourcePin,
+    git_benchmark_source_digest,
 )
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
@@ -159,6 +161,42 @@ def test_benchmark_requires_distinct_nonempty_task_names(
 ) -> None:
     with pytest.raises(ValueError):
         BenchmarkSpec(dataset="dataset", task_names=task_names)
+
+
+def test_git_benchmark_source_is_canonical_and_content_addressed() -> None:
+    source = GitBenchmarkSource(
+        repository="https://github.com/ShellBench/public-tasks.git",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    benchmark = BenchmarkSpec(dataset="shellbench/public-115", source=source)
+
+    assert source.repository == "ShellBench/public-tasks"
+    assert benchmark.dataset_digest == git_benchmark_source_digest(source)
+
+
+@pytest.mark.parametrize("path", ["../tasks", "/tasks", "tasks/../other", "."])
+def test_git_benchmark_source_rejects_unsafe_paths(path: str) -> None:
+    with pytest.raises(ValueError, match="safely relative"):
+        GitBenchmarkSource(
+            repository="ShellBench/public-tasks",
+            revision="8" * 40,
+            path=path,
+        )
+
+
+def test_git_benchmark_source_rejects_conflicting_identity_digest() -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+    )
+    with pytest.raises(ValueError, match="match its immutable Git source"):
+        BenchmarkSpec(
+            dataset="shellbench/public-115",
+            dataset_digest="sha256:" + "1" * 64,
+            source=source,
+        )
 
 
 def test_matrix_rule_requires_a_dimension() -> None:
