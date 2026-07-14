@@ -96,11 +96,11 @@ publications/<publication-id>.json
 ```
 
 The receipt path makes repeated publication a no-op. Rebuilding regenerates the
-same row models and paths from canonical evidence. Adoption validates the
-receipt identity and every receipt-declared file checksum, which also permits a
-one-time adoption of pre-fix publications whose only difference was a moving
-control head. Auditing compares rows while checking referential and
-evidence-trace invariants.
+same row models and paths from canonical evidence. Adoption requires the
+existing receipt and every receipt-declared file to match the newly generated
+canonical bytes exactly. Conflicting historical publications are rejected
+instead of being silently adopted. Auditing compares rows while checking
+referential and evidence-trace invariants.
 
 ## Serialized commits and interruption recovery
 
