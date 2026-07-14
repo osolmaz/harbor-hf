@@ -425,12 +425,8 @@ class EndpointProvisioner:
     ) -> ProvisioningResult:
         existing = self.inspect(desired)
         if existing is not None:
-            paused = self.pause_and_verify(
-                desired,
-                timeout_seconds=timeout_seconds,
-                poll_seconds=poll_seconds,
-            )
-            return ProvisioningResult(action="adopted", snapshot=paused)
+            require_paused_zero_ready(existing)
+            return ProvisioningResult(action="adopted", snapshot=existing)
         action: Literal["created", "adopted"] = "created"
         try:
             snapshot = self.port.create(desired)
@@ -456,6 +452,18 @@ class EndpointProvisioner:
                 timeout_seconds=timeout_seconds,
                 poll_seconds=poll_seconds,
             )
+        except (EndpointIdentityMismatch, EndpointConfigurationMismatch):
+            try:
+                self._pause_created_identity(
+                    desired.identity,
+                    timeout_seconds=timeout_seconds,
+                    poll_seconds=poll_seconds,
+                )
+            except EndpointProvisioningError as cleanup_error:
+                raise AmbiguousEndpointPause(
+                    "created endpoint cleanup is not verified and must be retried"
+                ) from cleanup_error
+            raise
         except EndpointProvisioningError:
             try:
                 paused = self._pause_created_identity(

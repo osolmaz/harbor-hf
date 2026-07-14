@@ -2557,6 +2557,22 @@ def test_prepare_evidence_destination_is_exclusive_and_creates_parents(
         _prepare_evidence_destination(destination)
 
 
+def test_adopting_reserved_evidence_removes_stale_partial_files(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "bucket" / "runs" / "run-1"
+    destination.mkdir(parents=True)
+    (destination / "_RESERVED").write_text("\n", encoding="utf-8")
+    (destination / "failure.json").write_text("{}\n", encoding="utf-8")
+    nested = destination / "harbor-jobs"
+    nested.mkdir()
+    (nested / "stale.txt").write_text("stale", encoding="utf-8")
+
+    _prepare_evidence_destination(destination, adopt_reserved=True)
+
+    assert [path.name for path in destination.iterdir()] == ["_RESERVED"]
+
+
 def test_publish_evidence_preserves_nested_terminal_markers(tmp_path: Path) -> None:
     source = tmp_path / "source"
     nested = source / "nested"

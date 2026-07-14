@@ -726,6 +726,13 @@ def _prepare_evidence_destination(
                 (destination / marker).exists() for marker in ("_FAILED", "_SUCCESS")
             )
         ):
+            for path in destination.iterdir():
+                if path.name == "_RESERVED":
+                    continue
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
             return
         raise FileExistsError(destination)
     destination.mkdir()

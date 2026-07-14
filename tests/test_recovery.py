@@ -622,6 +622,37 @@ def test_durable_shard_retry_request_skips_current_backoff(
     assert [action.kind for action in plan.actions] == ["retry-shard"]
 
 
+def test_legacy_shard_retry_request_preserves_its_event_time_generation(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard_id = lock.runs[0].shards[0].shard_id
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard_id,
+        "operator retry",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+    legacy = request.model_copy(
+        update={"payload": request.payload.model_copy(update={"trial_generations": {}})}
+    )
+
+    projection, plan = plan_reconciliation(
+        lock, [submitted, *failed, legacy], now=NOW + timedelta(seconds=5)
+    )
+
+    assert projection.counts.retrying == 1
+    assert [action.kind for action in plan.actions] == ["retry-shard"]
+
+
 def test_durable_shard_retry_request_has_generation_identity_and_exact_payload(
     remote_spec: ExperimentSpec,
 ) -> None:

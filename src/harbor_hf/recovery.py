@@ -262,7 +262,7 @@ def project_recovery(
     for event in ordered_events(events):
         spend += _apply_recovery_event(event, runs, shards, trials, executions, waves)
     trials = _derive_trials(lock, trials, executions)
-    trials = _apply_retry_requests(events, trials)
+    trials = _apply_retry_requests(lock, events, trials)
     shards = _derive_shards(shards, trials)
     runs = _derive_runs(runs, shards)
     counts = _counts(trials)
@@ -292,14 +292,20 @@ def project_recovery(
 
 
 def _apply_retry_requests(
-    events: list[CampaignEvent], trials: dict[str, TrialProjection]
+    lock: CampaignLock,
+    events: list[CampaignEvent],
+    trials: dict[str, TrialProjection],
 ) -> dict[str, TrialProjection]:
     requested_at: dict[tuple[str, int], datetime] = {}
-    for event in ordered_events(events):
+    ordered = ordered_events(events)
+    for index, event in enumerate(ordered):
         if event.kind != "campaign.shard-retry-requested":
             continue
         payload = cast(ShardRetryPayload, event.payload)
-        for trial_id, generation in payload.trial_generations.items():
+        generations = payload.trial_generations or _legacy_retry_generations(
+            lock, ordered[:index], payload.shard_id
+        )
+        for trial_id, generation in generations.items():
             key = (trial_id, generation)
             requested_at[key] = max(
                 requested_at.get(key, event.observed_at), event.observed_at
@@ -318,6 +324,20 @@ def _apply_retry_requests(
             else trial
         )
         for trial_id, trial in trials.items()
+    }
+
+
+def _legacy_retry_generations(
+    lock: CampaignLock, prior_events: list[CampaignEvent], shard_id: str
+) -> dict[str, int]:
+    projection = project_recovery(lock, prior_events)
+    shard = projection.shards.get(shard_id)
+    if shard is None:
+        return {}
+    return {
+        trial_id: len(projection.trials[trial_id].executions)
+        for trial_id in shard.trial_ids
+        if projection.trials[trial_id].status == "retry_wait"
     }
 
 

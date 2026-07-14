@@ -375,22 +375,16 @@ def test_adopts_only_an_exact_paused_endpoint(remote_spec: ExperimentSpec) -> No
     assert not any(call.startswith(("create:", "pause:")) for call in port.calls)
 
 
-def test_adopts_and_pauses_active_managed_endpoint_from_failed_create(
+def test_rejects_active_endpoint_instead_of_pausing_competing_work(
     remote_spec: ExperimentSpec,
 ) -> None:
     desired = _desired(remote_spec)
-    running = _snapshot(desired, state="running", ready=1)
-    paused = _snapshot(desired)
-    port = FakePort(
-        inspections=[running, running, paused],
-        pause_result=running,
-    )
+    port = FakePort(inspections=[_snapshot(desired, state="running", ready=1)])
 
-    result = _provisioner(port).create_or_adopt(desired)
+    with pytest.raises(EndpointNotPaused, match="state='running'"):
+        _provisioner(port).create_or_adopt(desired)
 
-    assert result.action == "adopted"
-    assert result.snapshot == paused
-    assert sum(call.startswith("pause:") for call in port.calls) == 1
+    assert not any(call.startswith("pause:") for call in port.calls)
 
 
 def test_creates_then_pauses_and_verifies_zero_ready(
@@ -491,6 +485,31 @@ def test_mismatched_create_is_paused_before_rejection(
     port = FakePort(
         inspections=[None, paused],
         create_result=running,
+        pause_result=paused,
+    )
+
+    with pytest.raises(EndpointConfigurationMismatch):
+        _provisioner(port).create_or_adopt(desired)
+
+    assert sum(call.startswith("pause:") for call in port.calls) == 1
+
+
+def test_mismatch_discovered_during_pause_is_cleaned_then_reraised(
+    remote_spec: ExperimentSpec,
+) -> None:
+    desired = _desired(remote_spec)
+    mismatched = desired.configuration.model_copy(update={"access_type": "private"})
+    created = _snapshot(desired, state="running", ready=1)
+    observed = _snapshot(
+        desired,
+        state="running",
+        ready=1,
+        configuration=mismatched,
+    )
+    paused = _snapshot(desired, configuration=mismatched)
+    port = FakePort(
+        inspections=[None, observed, paused],
+        create_result=created,
         pause_result=paused,
     )
 

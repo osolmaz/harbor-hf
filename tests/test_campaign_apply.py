@@ -64,7 +64,9 @@ from harbor_hf.control import (
 )
 from harbor_hf.coordination import ClaimConflict, HubClaimStore
 from harbor_hf.endpoints import (
+    AmbiguousEndpointPause,
     DesiredEndpoint,
+    EndpointNotPaused,
     EndpointProvisioner,
     EndpointSnapshot,
     EndpointStatus,
@@ -203,6 +205,8 @@ class FakeEndpoints:
         self.create_calls.append(desired)
         if self.create_error is not None:
             raise self.create_error
+        if self.present and self.active:
+            raise EndpointNotPaused("active endpoint cannot be adopted")
         action = "adopted" if self.present else "created"
         self.present = True
         self.active = False
@@ -517,6 +521,104 @@ def test_ambiguous_submission_is_adopted_by_labels_and_managed_endpoint(
     assert recovery_jobs.submissions == []
     assert len(endpoints.create_calls) == 1
     assert project_campaign(lock, store.events).actions[action_id].status == "succeeded"
+
+
+def test_active_endpoint_is_paused_only_after_endpoint_provisioning_was_ambiguous(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    endpoints = FakeEndpoints()
+    endpoints.present = True
+    endpoints.active = True
+    endpoints.create_error = AmbiguousEndpointPause("created endpoint cleanup pending")
+
+    first = _reconciler(store, endpoints, FakeJobs()).apply_campaign(lock.campaign_id)
+
+    assert first.applied[0].status == "ambiguous"
+    assert first.applied[0].remote_id is not None
+    assert endpoints.pause_calls == []
+
+    endpoints.create_error = None
+    jobs = FakeJobs()
+    recovered = _reconciler(store, endpoints, jobs).apply_campaign(lock.campaign_id)
+
+    assert recovered.applied[0].status == "succeeded"
+    assert len(endpoints.pause_calls) == 1
+    assert endpoints.active is False
+    assert len(jobs.submissions) == 1
+
+
+def test_active_endpoint_without_orphan_provenance_is_never_paused(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    store = FakeStore(lock, request, [submitted])
+    endpoints = FakeEndpoints()
+    endpoints.present = True
+    endpoints.active = True
+
+    result = _reconciler(store, endpoints, FakeJobs()).apply_campaign(lock.campaign_id)
+
+    assert result.applied[0].status == "failed"
+    assert endpoints.pause_calls == []
+
+
+def test_adopted_durable_event_advances_clock_before_following_transition(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    assert action.wave_id is not None
+    payload = WaveLifecyclePayload(
+        deployment_digest=action.deployment_digest,
+        provider=action.provider,
+        shard_ids=action.shard_ids,
+        estimated_cost_microusd=action.estimated_cost_microusd or 0,
+    )
+    reserved = _reservation(lock, action, 1)
+    succeeded = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.succeeded",
+        producer="reconciler",
+        payload=ActionOutcomePayload(action_id=action.action_id),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "2" * 32,
+    )
+    active = new_event(
+        subject_type="wave",
+        subject_id=action.wave_id,
+        kind="wave.active",
+        producer="wave-controller",
+        payload=payload,
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "3" * 32,
+    )
+
+    class ConcurrentStore(FakeStore):
+        def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool:
+            if event.kind == "wave.cleaning" and not any(
+                record.event_id == event.event_id for record in self.events
+            ):
+                self.events.append(
+                    event.model_copy(update={"observed_at": NOW + timedelta(hours=1)})
+                )
+                return False
+            return super().ensure_event(campaign_id, event)
+
+    store = ConcurrentStore(lock, request, [submitted, reserved, succeeded, active])
+    projection = project_recovery(lock, store.events)
+    reconciler = _reconciler(store, FakeEndpoints(), FakeJobs())
+    reconciler._last_observed_at = projection.campaign.last_observed_at
+
+    reconciler._record_wave_closed(lock, action, projection)
+
+    recovered = project_recovery(lock, store.events)
+    cleaning = next(event for event in store.events if event.kind == "wave.cleaning")
+    closed = next(event for event in store.events if event.kind == "wave.closed")
+    assert recovered.waves[action.wave_id].status == "closed"
+    assert closed.observed_at > cleaning.observed_at
 
 
 def test_losing_atomic_reservation_does_not_execute_side_effect(

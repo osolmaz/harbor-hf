@@ -672,7 +672,18 @@ class CampaignReconciler:
         except AmbiguousActionOutcome as error:
             return self._record_outcome(lock, action, "ambiguous", str(error))
         except _AMBIGUOUS_ENDPOINT_ERRORS as error:
-            return self._record_outcome(lock, action, "ambiguous", str(error))
+            remote_id = None
+            if action.kind in {"submit-wave", "retry-shard"}:
+                target = _deployment_target(lock, spec, action.deployment_digest)
+                if not isinstance(target, ProviderTarget):
+                    remote_id = _desired_endpoint(lock, spec, action).identity.name
+            return self._record_outcome(
+                lock,
+                action,
+                "ambiguous",
+                str(error),
+                remote_id=remote_id,
+            )
         except (
             ActionExecutionError,
             EndpointProvisioningError,
@@ -709,6 +720,7 @@ class CampaignReconciler:
                 spec,
                 request,
                 action,
+                projection=projection,
                 allow_submission=allow_billable,
             )
         return self._execute_lifecycle_action(
@@ -791,6 +803,7 @@ class CampaignReconciler:
         request: bytes,
         action: ReconcileAction,
         *,
+        projection: RecoveryProjection,
         allow_submission: bool,
     ) -> str:
         target = _deployment_target(lock, spec, action.deployment_digest)
@@ -821,6 +834,10 @@ class CampaignReconciler:
             raise ActionExecutionError(
                 "campaign cancellation superseded the unsubmitted wave action"
             )
+        if _can_recover_orphaned_endpoint(lock, action, desired, projection):
+            existing = self.endpoints.inspect(desired)
+            if existing is not None:
+                self.endpoints.pause_and_verify(desired)
         self.endpoints.create_or_adopt(desired)
         wave = build_wave_lock(lock, spec, action, endpoint=endpoint)
         return self.jobs.submit(wave, request=request, campaign=lock).job_id
@@ -1057,8 +1074,8 @@ class CampaignReconciler:
             identity = hashlib.sha256(
                 f"{lock.campaign_id}:{wave_id}:{kind}:reconciler".encode()
             ).hexdigest()[:32]
-            self.store.ensure_event(
-                lock.campaign_id,
+            self._ensure_durable_event(
+                lock,
                 new_event(
                     subject_type="wave",
                     subject_id=wave_id,
@@ -1084,8 +1101,8 @@ class CampaignReconciler:
         event_identity = hashlib.sha256(
             f"{lock.campaign_id}:{identity}".encode()
         ).hexdigest()[:32]
-        self.store.ensure_event(
-            lock.campaign_id,
+        self._ensure_durable_event(
+            lock,
             new_event(
                 subject_type=subject_type,
                 subject_id=subject_id,
@@ -1095,6 +1112,15 @@ class CampaignReconciler:
                 clock=lambda: observed_at,
                 identifier=lambda: event_identity,
             ),
+        )
+
+    def _ensure_durable_event(self, lock: CampaignLock, event: CampaignEvent) -> None:
+        if self.store.ensure_event(lock.campaign_id, event):
+            return
+        _lock, events = self.store.load_campaign(lock.campaign_id)
+        self._last_observed_at = max(
+            event.observed_at,
+            *(record.observed_at for record in events),
         )
 
     def _find_wave(
@@ -1324,6 +1350,55 @@ def _terminal_wave_needs_drain(wave: object) -> bool:
         "cleanup_failed",
         "closed",
     }
+
+
+def _can_recover_orphaned_endpoint(
+    lock: CampaignLock,
+    action: ReconcileAction,
+    desired: DesiredEndpoint,
+    projection: RecoveryProjection,
+) -> bool:
+    current = projection.campaign.actions.get(action.action_id)
+    endpoint_ambiguity = (
+        current is not None
+        and current.status == "ambiguous"
+        and current.remote_id == desired.identity.name
+    )
+    if not endpoint_ambiguity:
+        return False
+    if any(
+        wave.deployment_digest == action.deployment_digest and wave.status != "closed"
+        for wave in projection.waves.values()
+    ):
+        return False
+    return not any(
+        state.action_id != action.action_id
+        and state.status in {"reserved", "succeeded", "ambiguous"}
+        and _action_targets_deployment(lock, state, action.deployment_digest)
+        and (
+            (wave := projection.waves.get(f"wave-{state.action_key}")) is None
+            or wave.status != "closed"
+        )
+        for state in projection.campaign.actions.values()
+    )
+
+
+def _action_targets_deployment(
+    lock: CampaignLock, action: ActionProjection, deployment_digest: str
+) -> bool:
+    targets = set(action.target_ids)
+    for run in lock.runs:
+        if run.deployment_digest != deployment_digest:
+            continue
+        if action.action_kind == "submit-wave":
+            return any(shard.shard_id in targets for shard in run.shards)
+        if action.action_kind == "retry-shard":
+            return any(
+                trial.trial_id in targets
+                for shard in run.shards
+                for trial in shard.trials
+            )
+    return False
 
 
 def _combined_usage(
