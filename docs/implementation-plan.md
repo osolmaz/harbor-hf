@@ -19,7 +19,11 @@ admission control, evidence finalization, normalized publication, and read-only
 presentation layers are implemented. Production adapters are exercised through
 the same application layer as the in-memory fault tests. The remaining work is
 operational hardening through broader remote campaigns and upstream integration,
-not a separate execution architecture.
+not a separate execution architecture. Completed and normally failed executions
+publish complete sanitized evidence, but a worker or Sandbox killed before
+finalization can lose its Job-local in-progress session files. Milestone 8 plans
+incremental private evidence checkpoints for that remaining failure window; it
+is not implemented yet.
 
 ## Starting Point
 
@@ -620,6 +624,57 @@ Deliverables:
 
 Exit criteria: an external reader can identify the exact configuration,
 evidence, result scope, and publication revision behind every displayed score.
+
+### Milestone 8: In-Progress Evidence Checkpointing
+
+Status: planned, not implemented.
+
+The current finalization path preserves complete evidence for executions that
+finish normally or fail through a handled path. A hard kill before finalization
+can still destroy sessions, trajectories, logs, and other files that exist only
+on the Job or Sandbox filesystem. Checkpointing narrows that loss window without
+treating partial evidence as a valid benchmark result.
+
+Deliverables:
+
+- define a public Harbor extension point for consistent live snapshots of
+  session, trajectory, log, and agent-state artifacts from remote environments;
+- periodically sanitize and publish append-only, content-addressed checkpoint
+  bundles under an execution-scoped private Bucket prefix;
+- give every checkpoint a monotonic sequence, creation time, source identity,
+  file manifest, checksums, and explicit `incomplete` classification;
+- publish checkpoint metadata only after all bundle objects are readable and
+  checksum-valid, so recovery never adopts a partially uploaded checkpoint;
+- keep prompts, credentials, task source, and other restricted content behind
+  the same redaction and path-safety boundary as terminal evidence;
+- let recovery locate and preserve the newest valid checkpoint after a worker,
+  controller, or Sandbox disappears, without using it for scoring or marking a
+  trial successful;
+- retain terminal execution evidence as canonical and link or compact earlier
+  checkpoints after successful finalization without rewriting historical run
+  identity;
+- bound checkpoint frequency, delta size, retained generations, and total bytes
+  per execution so long agent sessions do not create uncontrolled Bucket cost;
+- expose checkpoint age, bytes, failures, and last successful sequence in
+  private operational status without publishing raw session data.
+
+Tests:
+
+- kill workers, controllers, and Sandboxes between successive checkpoint phases
+  and verify that the newest fully committed checkpoint remains readable;
+- inject truncation, missing objects, checksum mismatches, duplicate sequences,
+  delayed writes, and concurrent upload attempts;
+- prove that checkpoint evidence can never produce `_SUCCESS`, verifier scores,
+  normalized result rows, or public artifacts;
+- verify secret redaction, unsafe-path rejection, storage bounds, and idempotent
+  compaction into terminal evidence;
+- run a remote long-session smoke that kills execution after at least two
+  checkpoints and leaves every touched Inference Endpoint paused.
+
+Exit criteria: after an ungraceful remote kill, operators can retrieve the most
+recent checksum-valid private session checkpoint, while campaign recovery still
+reruns or fails the incomplete trial according to policy and publishes no
+partial benchmark result.
 
 ## Quality Gates For Every Milestone
 
