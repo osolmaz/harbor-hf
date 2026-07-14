@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,13 +10,17 @@ from urllib.parse import urlparse
 
 from pydantic import JsonValue
 
-from harbor_hf.harbor_adapter.errors import WorkerError
+from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
 from harbor_hf.harbor_adapter.models import (
     HarborExecutionRequest,
     HarborVerificationPolicy,
     canonical_json_bytes,
     ensure_no_policy_conflicts,
     sha256_digest,
+)
+from harbor_hf.harbor_adapter.validation import (
+    load_compatibility_bundle,
+    validate_compatibility_bundle,
 )
 from harbor_hf.models import DeploymentProfile, pinned_harbor_dataset_reference
 from harbor_hf.provider_models import ProviderTarget
@@ -29,6 +34,13 @@ class PreparedHarborExecution:
     request_path: Path
     config_path: Path
     command: list[str]
+
+
+@dataclass(frozen=True)
+class HarborExecutionOutcome:
+    exit_code: int
+    verification: dict[str, object] | None
+    compatibility_path: Path | None
 
 
 class HarborExecutionAdapter(Protocol):
@@ -45,6 +57,18 @@ class HarborExecutionAdapter(Protocol):
         concurrency: int,
         expected_task_digests: dict[str, str],
     ) -> PreparedHarborExecution: ...
+
+    def execute(
+        self,
+        prepared: PreparedHarborExecution,
+        harbor_source: Path,
+        jobs_dir: Path,
+        log_path: Path,
+        *,
+        environment: dict[str, str],
+        timeout_seconds: int,
+        stream_runner: Callable[..., int],
+    ) -> HarborExecutionOutcome: ...
 
 
 class FilesystemHarborExecutionAdapter:
@@ -80,6 +104,69 @@ class FilesystemHarborExecutionAdapter:
             config_path=config_path,
             command=render_harbor_command(harbor_source, config_path),
         )
+
+    def execute(
+        self,
+        prepared: PreparedHarborExecution,
+        harbor_source: Path,
+        jobs_dir: Path,
+        log_path: Path,
+        *,
+        environment: dict[str, str],
+        timeout_seconds: int,
+        stream_runner: Callable[..., int],
+    ) -> HarborExecutionOutcome:
+        self._validate_inputs(prepared)
+        exit_code = stream_runner(
+            prepared.command,
+            log_path,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+        has_results = any(jobs_dir.glob("*/*/result.json"))
+        if exit_code != 0 and not has_results:
+            return HarborExecutionOutcome(exit_code, None, None)
+        try:
+            compatibility_path = prepared.request_path.with_name(
+                "harbor-compatibility.json"
+            )
+            export_log = prepared.request_path.with_name("harbor-export.log")
+            request_digest = sha256_digest(
+                canonical_json_bytes(prepared.request.model_dump(mode="json"))
+            )
+            exporter_exit = stream_runner(
+                render_export_command(
+                    harbor_source,
+                    jobs_dir,
+                    compatibility_path,
+                    prepared.request.harbor_revision,
+                    request_digest,
+                ),
+                export_log,
+                environment=environment,
+                timeout_seconds=min(timeout_seconds, 300),
+            )
+            if exporter_exit != 0:
+                raise WorkerError(
+                    f"Harbor compatibility exporter exited with status {exporter_exit}"
+                )
+            self._validate_inputs(prepared)
+            bundle = load_compatibility_bundle(compatibility_path, prepared.request)
+            verification = validate_compatibility_bundle(bundle, prepared.request)
+        except HarborTrialFailure:
+            raise
+        except (OSError, ValueError, RuntimeError):
+            if exit_code != 0:
+                return HarborExecutionOutcome(exit_code, None, None)
+            raise
+        return HarborExecutionOutcome(exit_code, verification, compatibility_path)
+
+    @staticmethod
+    def _validate_inputs(prepared: PreparedHarborExecution) -> None:
+        if prepared.config_path.read_bytes() != prepared.request.config_bytes():
+            raise WorkerError("Harbor job config changed after request preparation")
+        if prepared.request_path.read_bytes() != prepared.request.request_bytes():
+            raise WorkerError("Harbor execution request changed after preparation")
 
 
 def build_execution_request(
@@ -174,6 +261,35 @@ def render_harbor_command(harbor_source: Path, config_path: Path) -> list[str]:
         "--config",
         str(config_path),
         "--yes",
+    ]
+
+
+def render_export_command(
+    harbor_source: Path,
+    jobs_dir: Path,
+    output_path: Path,
+    harbor_revision: str,
+    request_digest: str,
+) -> list[str]:
+    return [
+        "uv",
+        "run",
+        "--project",
+        str(harbor_source),
+        "--locked",
+        "--no-dev",
+        "--extra",
+        "hf-sandbox",
+        "python",
+        str(Path(__file__).with_name("exporter.py")),
+        "--jobs-dir",
+        str(jobs_dir),
+        "--output",
+        str(output_path),
+        "--harbor-revision",
+        harbor_revision,
+        "--request-digest",
+        request_digest,
     ]
 
 

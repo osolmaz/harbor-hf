@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from conftest import write_fake_compatibility_bundle
 
 from harbor_hf.coordination import ClaimConflict, run_claim_path
 from harbor_hf.harbor_adapter import build_execution_request
@@ -2705,6 +2706,9 @@ def _successful_stream(
     environment: dict[str, str],
     timeout_seconds: int,
 ) -> int:
+    if "--output" in command and "--request-digest" in command:
+        write_fake_compatibility_bundle(command, log_path)
+        return 0
     assert environment == {
         "HF_TOKEN": "test-token",
         "OPENAI_API_KEY": "test-token",
@@ -2831,6 +2835,8 @@ def test_worker_publishes_success_after_cleanup(
         "endpoint.final.json",
         "endpoint.snapshot.json",
         "events.jsonl",
+        "harbor-compatibility.json",
+        "harbor-export.log",
         "harbor-job.json",
         "harbor-jobs",
         "harbor-request.json",
@@ -2877,6 +2883,8 @@ def test_worker_publishes_success_after_cleanup(
         "endpoint.final.json",
         "endpoint.snapshot.json",
         "events.jsonl",
+        "harbor-compatibility.json",
+        "harbor-export.log",
         "harbor-job.json",
         "harbor-jobs/job/trial/result.json",
         "harbor-jobs/job/trial/lock.json",

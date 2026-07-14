@@ -60,6 +60,65 @@ class HarborExecutionRequest(FrozenModel):
         return canonical_json_bytes(self.model_dump(mode="json")) + b"\n"
 
 
+class HarborArtifactEntry(FrozenModel):
+    path: str = Field(min_length=1)
+    size: int = Field(ge=0)
+    digest: Sha256Digest
+
+
+class HarborTimingSummary(FrozenModel):
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class HarborUsageSummary(FrozenModel):
+    input_tokens: int | None = Field(default=None, ge=0)
+    cache_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+
+
+class HarborStepException(FrozenModel):
+    step_name: str
+    exception_type: str
+
+
+class HarborCompatibilityTrial(FrozenModel):
+    path: str = Field(min_length=1)
+    lock_digest: Sha256Digest
+    result_digest: Sha256Digest
+    task_name: str = Field(min_length=1)
+    task_digest: Sha256Digest
+    agent_name: str = Field(min_length=1)
+    agent_version: str = Field(min_length=1)
+    model_provider: str | None = None
+    model_name: str | None = None
+    exception_type: str | None = None
+    step_exceptions: list[HarborStepException] = Field(default_factory=list)
+    rewards: dict[str, int | float] | None = None
+    timing: HarborTimingSummary
+    usage: HarborUsageSummary
+    artifacts: list[HarborArtifactEntry]
+
+
+class HarborCompatibilityJob(FrozenModel):
+    path: str = Field(min_length=1)
+    lock_digest: Sha256Digest
+    result_digest: Sha256Digest
+    total_trials: int = Field(ge=0)
+    completed_trials: int = Field(ge=0)
+    errored_trials: int = Field(ge=0)
+
+
+class HarborCompatibilityBundle(FrozenModel):
+    schema_version: str = "harbor-hf/harbor-compatibility/v1alpha1"
+    harbor_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    harbor_version: str = Field(min_length=1)
+    request_digest: Sha256Digest
+    jobs: list[HarborCompatibilityJob]
+    trials: list[HarborCompatibilityTrial]
+
+
 def ensure_no_policy_conflicts(
     config: Mapping[str, JsonValue], policy: HarborVerificationPolicy
 ) -> None:

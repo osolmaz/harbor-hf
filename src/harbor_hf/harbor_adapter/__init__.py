@@ -1,6 +1,7 @@
 from harbor_hf.harbor_adapter.adapter import (
     FilesystemHarborExecutionAdapter,
     HarborExecutionAdapter,
+    HarborExecutionOutcome,
     PreparedHarborExecution,
     build_execution_request,
 )
@@ -13,6 +14,7 @@ from harbor_hf.harbor_adapter.models import (
 __all__ = [
     "FilesystemHarborExecutionAdapter",
     "HarborExecutionAdapter",
+    "HarborExecutionOutcome",
     "HarborExecutionRequest",
     "HarborTrialFailure",
     "HarborVerificationPolicy",

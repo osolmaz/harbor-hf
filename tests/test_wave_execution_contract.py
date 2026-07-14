@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from conftest import write_fake_compatibility_bundle
 
 from harbor_hf.campaigns import (
     CampaignLock,
@@ -105,9 +106,15 @@ class HarborStream:
         environment: dict[str, str],
         timeout_seconds: int,
     ) -> int:
+        if "--output" in command and "--request-digest" in command:
+            write_fake_compatibility_bundle(command, log_path)
+            return 0
         self.calls.append((command, log_path, environment, timeout_seconds))
-        task_name = command[command.index("--include-task-name") + 1]
-        jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+        config = json.loads(
+            Path(command[command.index("--config") + 1]).read_text(encoding="utf-8")
+        )
+        task_name = config["datasets"][0]["task_names"][0]
+        jobs_dir = Path(config["jobs_dir"])
         result_root = jobs_dir / "job-contract" / "trial-contract"
         result_root.mkdir(parents=True)
         (result_root / "result.json").write_text(
@@ -289,11 +296,19 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/execution.lock.json",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-compatibility.json",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-export.log",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-job.json",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-jobs/job-contract/trial-contract/lock.json",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-jobs/job-contract/trial-contract/result.json",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor.log",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-request.json",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/manifest.yaml",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
@@ -394,8 +409,11 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
 
     assert len(stream.calls) == 1
     command, log_path, environment, timeout_seconds = stream.calls[0]
-    assert command[command.index("--include-task-name") + 1] == task_name
-    assert Path(command[command.index("--jobs-dir") + 1]).name == "harbor-jobs"
+    config = json.loads(
+        (execution_root / "harbor-job.json").read_text(encoding="utf-8")
+    )
+    assert config["datasets"][0]["task_names"] == [task_name]
+    assert Path(config["jobs_dir"]).name == "harbor-jobs"
     assert log_path.name == "harbor.log"
     assert environment == {
         "HF_TOKEN": "contract-token",

@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 import yaml
+from conftest import write_fake_compatibility_bundle
 
 from harbor_hf.campaign_finalizer import BucketCampaignFinalizer
 from harbor_hf.campaign_observer import BucketCampaignObserver
@@ -182,6 +183,9 @@ class HarborStream:
         environment: dict[str, str],
         timeout_seconds: int,
     ) -> int:
+        if "--output" in command and "--request-digest" in command:
+            write_fake_compatibility_bundle(command, log_path)
+            return 0
         base_url = environment["OPENAI_BASE_URL"]
         if self.expected_base_url is not None:
             assert base_url == self.expected_base_url
@@ -364,6 +368,8 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "checksums.json",
             "events.jsonl",
             "execution.lock.json",
+            "harbor-compatibility.json",
+            "harbor-export.log",
             "harbor-job.json",
             "harbor-jobs",
             "harbor-request.json",

@@ -70,7 +70,6 @@ from harbor_hf.worker import (
     require_paused_endpoint,
     resume_and_probe_endpoint,
     validate_endpoint_model,
-    validate_harbor_result,
 )
 
 
@@ -800,7 +799,8 @@ def _execute_trial(
             if isinstance(wave.target, ProviderWaveTarget)
             else base_url
         )
-        prepared = FilesystemHarborExecutionAdapter().prepare(
+        adapter = FilesystemHarborExecutionAdapter()
+        prepared = adapter.prepare(
             run,
             execution_root,
             jobs_dir,
@@ -813,8 +813,10 @@ def _execute_trial(
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
-        exit_code = stream_runner(
-            prepared.command,
+        outcome = adapter.execute(
+            prepared,
+            harbor_source,
+            jobs_dir,
             execution_root / "harbor.log",
             environment={
                 "HF_TOKEN": token,
@@ -822,41 +824,15 @@ def _execute_trial(
                 "OPENAI_BASE_URL": f"{trial_base_url}/v1",
             },
             timeout_seconds=timeout,
+            stream_runner=stream_runner,
         )
-        append_event(events, "harbor_finished", exit_code=exit_code)
-        if exit_code != 0:
-            try:
-                validate_harbor_result(
-                    jobs_dir,
-                    expected_trials=1,
-                    expected_task_counts={trial.task_name: 1},
-                    expected_attempts_per_task=1,
-                    expected_task_names=[trial.task_name],
-                    expected_task_digests={trial.task_name: trial.task_digest},
-                    expected_agent_name=run.agent.name,
-                    expected_agent_version=_expected_agent_version(run),
-                    expected_model_provider="openai",
-                    expected_model_name=_wave_model_name(wave),
-                )
-            except HarborTrialFailure:
-                raise
-            except (OSError, ValueError, RuntimeError):
-                raise WorkerError(f"Harbor exited with status {exit_code}") from None
-            raise WorkerError(f"Harbor exited with status {exit_code}")
+        append_event(events, "harbor_finished", exit_code=outcome.exit_code)
+        if outcome.exit_code != 0:
+            raise WorkerError(f"Harbor exited with status {outcome.exit_code}")
         failure_phase = "verification"
-        verifier = validate_harbor_result(
-            jobs_dir,
-            expected_trials=1,
-            expected_task_counts={trial.task_name: 1},
-            expected_attempts_per_task=1,
-            expected_task_names=[trial.task_name],
-            expected_task_digests={trial.task_name: trial.task_digest},
-            expected_agent_name=run.agent.name,
-            expected_agent_version=_expected_agent_version(run),
-            expected_model_provider="openai",
-            expected_model_name=_wave_model_name(wave),
-        )
-        write_json(execution_root / "verification.json", verifier)
+        if outcome.verification is None:
+            raise WorkerError("Harbor produced no validated compatibility bundle")
+        write_json(execution_root / "verification.json", outcome.verification)
         append_event(events, "execution_succeeded")
     except Exception as caught:
         error = caught
