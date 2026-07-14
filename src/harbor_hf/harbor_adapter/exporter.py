@@ -282,7 +282,7 @@ def export_bundle(
             }
         )
     bundle = {
-        "schema_version": "harbor-hf/harbor-compatibility/v1alpha2",
+        "schema_version": "harbor-hf/harbor-compatibility/v1alpha3",
         "harbor_revision": harbor_revision,
         "harbor_version": importlib.metadata.version("harbor"),
         "request_digest": request_digest,

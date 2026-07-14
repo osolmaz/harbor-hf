@@ -99,7 +99,7 @@ def write_fake_compatibility_bundle(command: Sequence[str], log_path: Path) -> N
             }
         )
     bundle = {
-        "schema_version": "harbor-hf/harbor-compatibility/v1alpha2",
+        "schema_version": "harbor-hf/harbor-compatibility/v1alpha3",
         "harbor_revision": command[command.index("--harbor-revision") + 1],
         "harbor_version": "test",
         "request_digest": command[command.index("--request-digest") + 1],

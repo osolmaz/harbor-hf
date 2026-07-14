@@ -166,6 +166,35 @@ def test_adapter_models_reject_unknown_schema_versions(
         HarborCompatibilityBundle.model_validate(bundle_value)
 
 
+def test_compatibility_reader_accepts_v1alpha2_without_exception_messages(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    _, request = _request(remote_spec, tmp_path)
+    bundle_value = _bundle(request).model_dump(mode="json")
+    bundle_value["schema_version"] = "harbor-hf/harbor-compatibility/v1alpha2"
+    for trial in bundle_value["trials"]:
+        trial.pop("exception_message", None)
+        for step in trial["step_exceptions"]:
+            step.pop("exception_message", None)
+
+    bundle = HarborCompatibilityBundle.model_validate(bundle_value)
+
+    assert bundle.schema_version == "harbor-hf/harbor-compatibility/v1alpha2"
+    assert bundle.trials[0].exception_message is None
+
+
+def test_compatibility_v1alpha2_rejects_exception_messages(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    _, request = _request(remote_spec, tmp_path)
+    bundle_value = _bundle(request).model_dump(mode="json")
+    bundle_value["schema_version"] = "harbor-hf/harbor-compatibility/v1alpha2"
+    bundle_value["trials"][0]["exception_message"] = None
+
+    with pytest.raises(ValueError, match="v1alpha2 cannot contain"):
+        HarborCompatibilityBundle.model_validate(bundle_value)
+
+
 def test_typed_bundle_preserves_existing_verification_result(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

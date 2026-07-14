@@ -11,7 +11,7 @@ from harbor_hf.models import (
     _validate_task_pins,
 )
 from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.runs import build_run_lock, harbor_process_environment
+from harbor_hf.runs import RunLock, build_run_lock, harbor_process_environment
 
 NOW = datetime(2026, 7, 13, 1, 2, 3, tzinfo=UTC)
 
@@ -36,6 +36,7 @@ def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     assert lock.attempts == 1
     assert lock.concurrent_trials == 1
     assert lock.timeout_seconds == 60
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha1"
 
 
 def test_build_run_lock_preserves_git_benchmark_source(
@@ -57,6 +58,7 @@ def test_build_run_lock_preserves_git_benchmark_source(
 
     assert lock.benchmark_source == source
     assert lock.benchmark_dataset_digest == spec.benchmark.dataset_digest
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
 
 
 def test_run_lock_preserves_and_renders_hosted_judge(
@@ -75,6 +77,7 @@ def test_run_lock_preserves_and_renders_hosted_judge(
     )
 
     assert lock.benchmark_judge == spec.benchmark.judge
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
     assert environment == {
         "AGENT_JUDGE_API_KEY": "secret-token",
         "AGENT_JUDGE_API_URL": "https://router.huggingface.co/v1/chat/completions",
@@ -83,6 +86,30 @@ def test_run_lock_preserves_and_renders_hosted_judge(
         "OPENAI_API_KEY": "secret-token",
         "OPENAI_BASE_URL": "https://endpoint.example/v1",
     }
+
+
+def test_run_lock_reader_accepts_legacy_v1alpha1(remote_spec: ExperimentSpec) -> None:
+    payload = build_run_lock(remote_spec, run_id="legacy-lock").model_dump(mode="json")
+    payload.pop("benchmark_source", None)
+    payload.pop("benchmark_judge", None)
+
+    lock = RunLock.model_validate(payload)
+
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha1"
+    assert lock.benchmark_source is None
+    assert lock.benchmark_judge is None
+
+
+def test_run_lock_v1alpha1_rejects_new_fields(remote_spec: ExperimentSpec) -> None:
+    payload = build_run_lock(remote_spec, run_id="legacy-lock").model_dump(mode="json")
+    payload["benchmark_source"] = {
+        "repository": "ShellBench/public-tasks",
+        "revision": "8" * 40,
+        "path": "tasks/115-tasks",
+    }
+
+    with pytest.raises(ValueError, match="v1alpha1 cannot contain"):
+        RunLock.model_validate(payload)
 
 
 def test_run_id_override_is_preserved(remote_spec: ExperimentSpec) -> None:
