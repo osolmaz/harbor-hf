@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -25,6 +26,19 @@ _DERIVED_FILES = frozenset(
         "private-artifacts.json",
     }
 )
+_REJECTION_FILE = "private-artifact-rejections.json"
+_RETENTION_PRIORITY: dict[PrivateArtifactKind, int] = {
+    "other": 0,
+    "execution_log": 1,
+    "agent_log": 2,
+    "verifier": 3,
+    "trajectory": 4,
+    "session": 5,
+    "runtime": 6,
+    "configuration": 7,
+    "result": 8,
+    "lock": 9,
+}
 
 
 class PrivateArtifactRequirementError(RuntimeError):
@@ -63,6 +77,17 @@ class PrivateArtifactRequirement(FrozenModel):
         return self
 
 
+class PrivateArtifactRejection(FrozenModel):
+    path: str = Field(min_length=1)
+    reason: Literal["symlink", "file_size", "bundle_size"]
+    size: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def path_is_safe(self) -> PrivateArtifactRejection:
+        _safe_relative_path(self.path)
+        return self
+
+
 class PrivateArtifactManifest(FrozenModel):
     schema_version: Literal["harbor-hf/private-artifacts/v1"] = (
         "harbor-hf/private-artifacts/v1"
@@ -72,6 +97,7 @@ class PrivateArtifactManifest(FrozenModel):
     total_bytes: int = Field(ge=0)
     entries: list[PrivateArtifactEntry]
     requirements: list[PrivateArtifactRequirement]
+    rejections: list[PrivateArtifactRejection] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def entries_are_canonical(self) -> PrivateArtifactManifest:
@@ -80,6 +106,11 @@ class PrivateArtifactManifest(FrozenModel):
             raise ValueError("private artifact entries must be sorted and unique")
         if self.total_bytes != sum(entry.size for entry in self.entries):
             raise ValueError("private artifact total does not match its entries")
+        rejection_paths = [rejection.path for rejection in self.rejections]
+        if rejection_paths != sorted(rejection_paths) or len(rejection_paths) != len(
+            set(rejection_paths)
+        ):
+            raise ValueError("private artifact rejections must be sorted and unique")
         return self
 
 
@@ -114,6 +145,18 @@ class _TrialProbe(BaseModel):
     agent_info: _AgentInfo
     agent_execution: _TimingProbe | None = None
     step_results: list[_StepProbe] | None = None
+
+
+class _VerificationProbe(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    expected_agent_name: str | None = None
+
+
+class _RequestProbe(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    verification: _VerificationProbe
 
 
 def build_private_artifact_manifest(
@@ -175,6 +218,7 @@ def build_private_artifact_manifest(
         total_bytes=total_bytes,
         entries=entries,
         requirements=[requirement],
+        rejections=_load_rejections(root),
     )
 
 
@@ -195,7 +239,104 @@ def write_private_artifact_manifest(
     return manifest
 
 
+def sanitize_private_artifact_tree(
+    root: Path,
+    *,
+    max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
+    max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+) -> list[PrivateArtifactRejection]:
+    """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
+    rejected = _remove_symlinks(root)
+    files, file_rejections = _remove_oversized_files(root, max_file_bytes)
+    rejected.extend(file_rejections)
+    rejected.extend(_trim_bundle(files, max_bundle_bytes))
+    rejected.sort(key=lambda rejection: rejection.path)
+    if rejected:
+        write_json(
+            root / _REJECTION_FILE,
+            {
+                "schema_version": "harbor-hf/private-artifact-rejections/v1",
+                "rejections": [item.model_dump(mode="json") for item in rejected],
+            },
+        )
+    return rejected
+
+
+def _remove_symlinks(root: Path) -> list[PrivateArtifactRejection]:
+    rejected: list[PrivateArtifactRejection] = []
+    candidates = sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    )
+    for candidate in candidates:
+        if not candidate.is_symlink():
+            continue
+        relative = candidate.relative_to(root).as_posix()
+        candidate.unlink()
+        rejected.append(PrivateArtifactRejection(path=relative, reason="symlink"))
+    return rejected
+
+
+def _remove_oversized_files(
+    root: Path, max_file_bytes: int
+) -> tuple[
+    list[tuple[Path, str, int, PrivateArtifactKind]],
+    list[PrivateArtifactRejection],
+]:
+    rejected: list[PrivateArtifactRejection] = []
+    files: list[tuple[Path, str, int, PrivateArtifactKind]] = []
+    for candidate in sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    ):
+        if not candidate.is_file():
+            continue
+        relative = candidate.relative_to(root).as_posix()
+        if relative in _DERIVED_FILES or relative == _REJECTION_FILE:
+            continue
+        size = candidate.stat().st_size
+        if size > max_file_bytes:
+            candidate.unlink()
+            rejected.append(
+                PrivateArtifactRejection(
+                    path=relative,
+                    reason="file_size",
+                    size=size,
+                )
+            )
+            continue
+        files.append((candidate, relative, size, classify_private_artifact(relative)))
+    return files, rejected
+
+
+def _trim_bundle(
+    files: list[tuple[Path, str, int, PrivateArtifactKind]], max_bundle_bytes: int
+) -> list[PrivateArtifactRejection]:
+    rejected: list[PrivateArtifactRejection] = []
+    total = sum(item[2] for item in files)
+    removal_order = sorted(
+        files,
+        key=lambda item: (
+            _RETENTION_PRIORITY[item[3]],
+            -item[2],
+            item[1],
+        ),
+    )
+    for candidate, relative, size, _kind in removal_order:
+        if total <= max_bundle_bytes:
+            break
+        candidate.unlink()
+        total -= size
+        rejected.append(
+            PrivateArtifactRejection(
+                path=relative,
+                reason="bundle_size",
+                size=size,
+            )
+        )
+    return rejected
+
+
 def _openclaw_execution_started(root: Path) -> bool:
+    readable_result_found = False
     for result_path in sorted((root / "harbor-jobs").glob("*/*/result.json")):
         try:
             probe = _TrialProbe.model_validate_json(
@@ -203,13 +344,52 @@ def _openclaw_execution_started(root: Path) -> bool:
             )
         except (OSError, ValueError):
             continue
+        readable_result_found = True
         timings = [probe.agent_execution]
         timings.extend(step.agent_execution for step in probe.step_results or [])
         if probe.agent_info.name == "openclaw" and any(
             timing is not None and timing.started_at is not None for timing in timings
         ):
             return True
+    if readable_result_found:
+        return False
+    return _openclaw_execution_was_attempted(root)
+
+
+def _openclaw_execution_was_attempted(root: Path) -> bool:
+    request_path = root / "harbor-request.json"
+    try:
+        request = _RequestProbe.model_validate_json(
+            request_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    if request.verification.expected_agent_name != "openclaw":
+        return False
+    try:
+        event_lines = (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in event_lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "harbor_started":
+            return True
     return False
+
+
+def _load_rejections(root: Path) -> list[PrivateArtifactRejection]:
+    path = root / _REJECTION_FILE
+    if not path.is_file():
+        return []
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not isinstance(value.get("rejections"), list):
+        raise ValueError("private artifact rejection record is malformed")
+    return [
+        PrivateArtifactRejection.model_validate(item) for item in value["rejections"]
+    ]
 
 
 def _safe_relative_path(value: str) -> PurePosixPath:

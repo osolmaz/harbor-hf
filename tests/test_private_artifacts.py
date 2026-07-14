@@ -10,6 +10,7 @@ from harbor_hf.private_artifacts import (
     PrivateArtifactEntry,
     PrivateArtifactManifest,
     build_private_artifact_manifest,
+    sanitize_private_artifact_tree,
     write_private_artifact_manifest,
 )
 from harbor_hf.results import ArtifactEvidence
@@ -119,6 +120,24 @@ def test_null_step_results_still_requires_session_jsonl(tmp_path: Path) -> None:
         build_private_artifact_manifest(root, strict_session=True)
 
 
+def test_started_harbor_openclaw_request_requires_session_without_result(
+    tmp_path: Path,
+) -> None:
+    root = _execution_root(tmp_path, started=False, with_session=False)
+    (root / "harbor-jobs" / "job-one" / "trial-one" / "result.json").unlink()
+    (root / "harbor-request.json").write_text(
+        json.dumps({"verification": {"expected_agent_name": "openclaw"}}) + "\n",
+        encoding="utf-8",
+    )
+    (root / "events.jsonl").write_text(
+        json.dumps({"event": "harbor_started"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="no session JSONL"):
+        build_private_artifact_manifest(root, strict_session=True)
+
+
 def test_private_manifest_sorts_serialized_relative_paths(tmp_path: Path) -> None:
     root = _execution_root(tmp_path)
     nested = root / "foo" / "bar"
@@ -155,6 +174,26 @@ def test_private_manifest_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="cannot contain symlinks"):
         build_private_artifact_manifest(root, strict_session=True)
+
+
+def test_private_artifact_sanitizer_records_and_removes_rejected_files(
+    tmp_path: Path,
+) -> None:
+    root = _execution_root(tmp_path)
+    (root / "linked").symlink_to(root / "events.jsonl")
+    oversized = root / "harbor-jobs" / "oversized.log"
+    oversized.write_text("x" * 200, encoding="utf-8")
+
+    rejected = sanitize_private_artifact_tree(root, max_file_bytes=150)
+
+    assert [(item.path, item.reason) for item in rejected] == [
+        ("harbor-jobs/oversized.log", "file_size"),
+        ("linked", "symlink"),
+    ]
+    assert not oversized.exists()
+    assert not (root / "linked").exists()
+    retained = build_private_artifact_manifest(root, strict_session=False)
+    assert retained.rejections == rejected
 
 
 def test_private_models_reject_unsafe_or_inconsistent_manifests() -> None:

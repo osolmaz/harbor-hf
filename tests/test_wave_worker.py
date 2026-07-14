@@ -81,6 +81,34 @@ def test_failed_execution_retains_malformed_compatibility_evidence(
     ]
 
 
+def test_failed_execution_prunes_unsafe_evidence_and_still_finalizes(
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.mkdir()
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (jobs / "linked").symlink_to(tmp_path / "execution.lock.json")
+    oversized = jobs / "oversized.log"
+    with oversized.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    verify_checksums(tmp_path)
+    manifest = json.loads((tmp_path / "private-artifacts.json").read_text())
+    assert [(item["path"], item["reason"]) for item in manifest["rejections"]] == [
+        ("harbor-jobs/linked", "symlink"),
+        ("harbor-jobs/oversized.log", "file_size"),
+    ]
+    assert not (jobs / "linked").exists()
+    assert not oversized.exists()
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+
+
 def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:
     (tmp_path / "harbor-jobs").mkdir()
     (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
@@ -446,6 +474,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
         }
         assert _event_payloads(execution_root / "events.jsonl") == [
             {"event": "execution_started", "execution_id": execution_root.name},
+            {"event": "harbor_started"},
             {"event": "harbor_finished", "exit_code": 0},
             {"event": "execution_succeeded"},
             {"event": "secrets_redacted", "files": ["harbor.log"]},
@@ -753,6 +782,7 @@ def test_wave_failure_still_pauses_and_publishes_failed_execution(
     assert "failure.json" in json.loads((execution / "checksums.json").read_text())
     assert _event_payloads(execution / "events.jsonl") == [
         {"event": "execution_started", "execution_id": execution.name},
+        {"event": "harbor_started"},
         {"event": "harbor_finished", "exit_code": 7},
         {"event": "execution_failed", "error_type": "WorkerError"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},

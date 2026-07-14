@@ -56,6 +56,7 @@ from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.private_artifacts import (
     PrivateArtifactRequirementError,
     build_private_artifact_manifest,
+    sanitize_private_artifact_tree,
     write_private_artifact_manifest,
 )
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
@@ -822,6 +823,7 @@ def _execute_trial(
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
+        append_event(events, "harbor_started")
         outcome = adapter.execute(
             prepared,
             harbor_source,
@@ -1123,6 +1125,14 @@ def _trial_destination(
 def _finalize_execution(
     root: Path, token: str, *, strict_compatibility: bool = True
 ) -> None:
+    if not strict_compatibility:
+        rejections = sanitize_private_artifact_tree(root)
+        if rejections:
+            append_event(
+                root / "events.jsonl",
+                "private_artifacts_rejected",
+                count=len(rejections),
+            )
     _redact_unit(root, token)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
     if refresh_error is not None:

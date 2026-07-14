@@ -346,6 +346,7 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
     }
     assert _events(execution_root / "events.jsonl") == [
         {"event": "execution_started", "execution_id": execution_id},
+        {"event": "harbor_started"},
         {"event": "harbor_finished", "exit_code": 0},
         {"event": "execution_succeeded"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
