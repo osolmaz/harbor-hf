@@ -175,7 +175,7 @@ def test_observer_wave_and_execution_event_projection_is_exact(
     assert [event.observed_at for event in wave_events] == [
         datetime(2026, 7, 14, 1, 10, tzinfo=UTC),
         datetime(2026, 7, 14, 1, 16, tzinfo=UTC),
-        datetime(2026, 7, 14, 1, 16, tzinfo=UTC),
+        datetime(2026, 7, 14, 1, 16, 0, 1, tzinfo=UTC),
     ]
     assert wave_events[0].payload.model_dump(mode="json") == {
         "deployment_digest": wave.deployment_digest,

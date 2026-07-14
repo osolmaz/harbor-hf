@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
 from typing import cast
 
 import pytest
@@ -24,12 +25,15 @@ from harbor_hf.campaigns import (
     build_wave_lock,
 )
 from harbor_hf.control import (
+    ActionOutcomePayload,
+    ActionReservedPayload,
     CampaignProjection,
     CampaignSubmittedPayload,
     ExecutionOutcomePayload,
     new_event,
 )
 from harbor_hf.models import ExperimentSpec
+from harbor_hf.provider_models import ExplicitProviderRoute, ProviderTarget
 from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.recovery import (
     ProjectionCounts,
@@ -544,8 +548,9 @@ def _observer_files(lock: CampaignLock, wave: WaveLock) -> dict[str, bytes]:
         {"event": "wave_succeeded", "at": "2026-07-14T01:19:00+00:00"},
     )
     wave_lock_bytes = wave.model_dump_json().encode()
-    success = f"{wave_prefix}/executions/execution-one"
-    failed = f"{wave_prefix}/executions/execution-two"
+    execution_prefix = f"runs/{lock.runs[0].run_id}/trials/{trial.trial_id}/executions"
+    success = f"{execution_prefix}/execution-one"
+    failed = f"{execution_prefix}/execution-two"
     lock_one = _execution_lock_for_wave(lock, wave, trial.trial_id, "execution-one")
     lock_two = _execution_lock_for_wave(lock, wave, trial.trial_id, "execution-two")
     events_one = _execution_events(
@@ -657,8 +662,12 @@ def test_observe_projects_exact_wave_and_execution_events(
             "execution-two",
             datetime(2026, 7, 14, 1, 14, tzinfo=UTC),
         ),
-        ("wave.closed", wave.wave_id, datetime(2026, 7, 14, 1, 20, tzinfo=UTC)),
         ("wave.cleaning", wave.wave_id, datetime(2026, 7, 14, 1, 20, tzinfo=UTC)),
+        (
+            "wave.closed",
+            wave.wave_id,
+            datetime(2026, 7, 14, 1, 20, 0, 1, tzinfo=UTC),
+        ),
     ]
     active = events[0]
     assert active.subject_type == "wave"
@@ -738,10 +747,20 @@ def test_observe_skips_non_terminal_units_and_handles_cleanup_failures(
 
     pending = dict(files)
     del pending[f"{wave_prefix}/_SUCCESS"]
-    assert BucketCampaignObserver(_Reader(pending)).observe(lock, remote_spec) == []
+    pending_events = BucketCampaignObserver(_Reader(pending)).observe(lock, remote_spec)
+    assert not any(event.subject_type == "wave" for event in pending_events)
+    assert [event.kind for event in pending_events] == [
+        "execution.started",
+        "execution.completed",
+        "execution.started",
+        "execution.failed",
+    ]
 
     cancelled = dict(files)
-    success = f"{wave_prefix}/executions/execution-one"
+    success = (
+        f"runs/{lock.runs[0].run_id}/trials/"
+        f"{lock.runs[0].shards[0].trials[0].trial_id}/executions/execution-one"
+    )
     del cancelled[f"{success}/_SUCCESS"]
     cancelled[f"{success}/_CANCELLED"] = b"\n"
     events = BucketCampaignObserver(_Reader(cancelled)).observe(lock, remote_spec)
@@ -776,21 +795,6 @@ def test_observe_skips_non_terminal_units_and_handles_cleanup_failures(
     )
     assert cleanup_event.observed_at == datetime(2026, 7, 14, 1, 19, tzinfo=UTC)
 
-    other_wave = dict(files)
-    foreign = json.loads(files[f"{success}/execution.lock.json"])
-    foreign["wave_id"] = "wave-foreign"
-    foreign_bytes = json.dumps(foreign).encode()
-    other_wave[f"{success}/execution.lock.json"] = foreign_bytes
-    other_wave[f"{success}/checksums.json"] = _pretty(
-        {
-            "execution.lock.json": _sha(foreign_bytes),
-            "events.jsonl": _sha(other_wave[f"{success}/events.jsonl"]),
-            "verification.json": _sha(b"{}\n"),
-        }
-    )
-    events = BucketCampaignObserver(_Reader(other_wave)).observe(lock, remote_spec)
-    assert "execution-one" not in {event.subject_id for event in events}
-
     no_pause = dict(files)
     no_pause[f"{wave_prefix}/events.jsonl"] = _wave_events_lines(
         {"event": "wave_started", "at": "2026-07-14T01:10:00+00:00"},
@@ -807,14 +811,174 @@ def test_observe_skips_non_terminal_units_and_handles_cleanup_failures(
     cleaning = next(event for event in events if event.kind == "wave.cleaning")
     closed = next(event for event in events if event.kind == "wave.closed")
     assert cleaning.observed_at == datetime(2026, 7, 14, 1, 19, tzinfo=UTC)
-    assert closed.observed_at == datetime(2026, 7, 14, 1, 19, tzinfo=UTC)
+    assert closed.observed_at == datetime(2026, 7, 14, 1, 19, 0, 1, tzinfo=UTC)
+
+
+def test_observe_recovers_terminal_execution_without_parent_wave_marker(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    submitted = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=lock.plan_digest),
+        clock=lambda: NOW,
+    )
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    wave = build_wave_lock(lock, remote_spec, action)
+    files = _observer_files(lock, wave)
+    files = {
+        path: content
+        for path, content in files.items()
+        if not path.startswith("waves/") and "execution-two" not in path
+    }
+
+    events = BucketCampaignObserver(_Reader(files)).observe(lock, remote_spec)
+
+    assert [event.kind for event in events] == [
+        "execution.started",
+        "execution.completed",
+    ]
+    assert not any(event.kind.startswith("wave.") for event in events)
+    reserved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.reserved",
+        producer="reconciler",
+        payload=ActionReservedPayload(
+            action_id=action.action_id,
+            action_key=action.action_key,
+            action_kind=action.kind,
+            target_ids=action.target_ids,
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    succeeded = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="action.succeeded",
+        producer="reconciler",
+        payload=ActionOutcomePayload(
+            action_id=action.action_id,
+            remote_id="0123456789abcdef01234567",
+        ),
+        clock=lambda: NOW + timedelta(seconds=2),
+    )
+    projection, recovery = plan_reconciliation(
+        lock,
+        [submitted, reserved, succeeded, *events],
+        now=datetime(2026, 7, 14, 1, 30, tzinfo=UTC),
+    )
+    assert projection.executions["execution-one"].status == "completed"
+    assert projection.waves == {}
+    assert recovery.terminal_decision is None
+    assert not any(
+        action.kind in {"submit-wave", "retry-shard"} for action in recovery.actions
+    )
+
+
+def test_orphan_terminal_execution_identity_still_fails_closed(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    wave = _wave(lock, remote_spec)
+    files = _observer_files(lock, wave)
+    execution_path = next(
+        path for path in files if path.endswith("/execution-one/execution.lock.json")
+    )
+    execution_prefix = str(PurePosixPath(execution_path).parent)
+    foreign = json.loads(files[execution_path])
+    foreign["campaign_id"] = "campaign-foreign"
+    foreign_bytes = json.dumps(foreign).encode()
+    files[execution_path] = foreign_bytes
+    files[f"{execution_prefix}/checksums.json"] = _pretty(
+        {
+            "execution.lock.json": _sha(foreign_bytes),
+            "events.jsonl": _sha(files[f"{execution_prefix}/events.jsonl"]),
+            "verification.json": _sha(files[f"{execution_prefix}/verification.json"]),
+        }
+    )
+    files = {
+        path: content
+        for path, content in files.items()
+        if not path.startswith("waves/") and "execution-two" not in path
+    }
+
+    with pytest.raises(
+        CampaignObservationError,
+        match="^execution evidence does not match campaign lock$",
+    ):
+        BucketCampaignObserver(_Reader(files)).observe(lock, remote_spec)
+
+
+def test_provider_wave_without_pause_events_projects_cleaning_before_closed(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(
+        id="provider-one",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="groq"),
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(update={"deployments": [provider]})
+        }
+    )
+    lock = _campaign(spec)
+    submitted = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.submitted",
+        producer="cli",
+        payload=CampaignSubmittedPayload(plan_digest=lock.plan_digest),
+        clock=lambda: NOW,
+    )
+    action = plan_reconciliation(lock, [submitted], now=NOW)[1].actions[0]
+    wave = build_wave_lock(lock, spec, action)
+    files = _observer_files(lock, wave)
+    wave_prefix = f"waves/{wave.wave_id}"
+    events_body = _wave_events_lines(
+        {"event": "wave_started", "at": "2026-07-14T01:10:00+00:00"},
+        {"event": "wave_succeeded", "at": "2026-07-14T01:19:00+00:00"},
+    )
+    files[f"{wave_prefix}/events.jsonl"] = events_body
+    files[f"{wave_prefix}/checksums.json"] = _pretty(
+        {
+            "wave.lock.json": _sha(files[f"{wave_prefix}/wave.lock.json"]),
+            "events.jsonl": _sha(events_body),
+            "wave-summary.json": _sha(b"{}\n"),
+        }
+    )
+    files = {
+        path: content for path, content in files.items() if "/executions/" not in path
+    }
+
+    observed = BucketCampaignObserver(_Reader(files)).observe(lock, spec)
+    wave_events = [event for event in observed if event.subject_type == "wave"]
+
+    assert [event.kind for event in wave_events] == [
+        "wave.active",
+        "wave.cleaning",
+        "wave.closed",
+    ]
+    assert wave_events[1].observed_at < wave_events[2].observed_at
+    projection, _plan = plan_reconciliation(
+        lock, [submitted, *wave_events], now=wave_events[-1].observed_at
+    )
+    assert projection.waves[wave.wave_id].status == "closed"
 
 
 def _mutate_observer(
     files: dict[str, bytes], wave: WaveLock, case: str
 ) -> dict[str, bytes]:
     wave_prefix = f"waves/{wave.wave_id}"
-    success = f"{wave_prefix}/executions/execution-one"
+    execution = next(
+        path for path in files if path.endswith("/execution-one/execution.lock.json")
+    )
+    success = str(PurePosixPath(execution).parent)
     foreign = json.loads(files[f"{wave_prefix}/wave.lock.json"])
     foreign["campaign_id"] = "campaign-foreign"
     wave_event_bodies: dict[str, bytes] = {

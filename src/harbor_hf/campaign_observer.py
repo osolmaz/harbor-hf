@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Protocol, cast
 
@@ -72,7 +72,7 @@ class BucketCampaignObserver:
                 self._read(spec, lock, f"{wave_prefix}/events.jsonl")
             )
             events.extend(_wave_events(lock, wave, marker, raw_wave_events))
-            events.extend(self._execution_events(spec, lock, paths, wave))
+        events.extend(self._execution_events(spec, lock, paths))
         return sorted(events, key=lambda event: (event.observed_at, event.event_id))
 
     def _load_wave_lock(
@@ -130,15 +130,9 @@ class BucketCampaignObserver:
         spec: ExperimentSpec,
         campaign: CampaignLock,
         paths: list[str],
-        wave: WaveLock,
     ) -> list[CampaignEvent]:
         events: list[CampaignEvent] = []
         for path in _execution_lock_paths(paths):
-            execution = ExecutionLock.model_validate_json(
-                self._read(spec, campaign, path)
-            )
-            if execution.wave_id != wave.wave_id:
-                continue
             prefix = str(PurePosixPath(path).parent)
             marker = _terminal_marker(paths, prefix)
             if marker is None:
@@ -149,6 +143,10 @@ class BucketCampaignObserver:
             elif marker == "_FAILED" and f"{prefix}/failure.json" in paths:
                 critical.add("failure.json")
             self._verify_critical_unit(spec, campaign, paths, prefix, critical)
+            execution = ExecutionLock.model_validate_json(
+                self._read(spec, campaign, path)
+            )
+            _validate_execution_identity(campaign, execution, path)
             raw_events = _json_lines(
                 self._read(spec, campaign, f"{prefix}/events.jsonl")
             )
@@ -275,6 +273,41 @@ def _terminal_marker(paths: list[str], prefix: str) -> str | None:
     return markers.pop()
 
 
+def _validate_execution_identity(
+    campaign: CampaignLock, execution: ExecutionLock, path: str
+) -> None:
+    for run in campaign.runs:
+        if run.run_id != execution.run_id:
+            continue
+        for shard in run.shards:
+            if shard.shard_id != execution.shard_id:
+                continue
+            for trial in shard.trials:
+                if trial.trial_id != execution.trial_id:
+                    continue
+                expected_path = (
+                    f"runs/{run.run_id}/trials/{trial.trial_id}/executions/"
+                    f"{execution.execution_id}/execution.lock.json"
+                )
+                observed = (
+                    execution.campaign_id,
+                    execution.task_name,
+                    execution.task_digest,
+                    execution.logical_attempt,
+                    path,
+                )
+                expected = (
+                    campaign.campaign_id,
+                    trial.task_name,
+                    trial.task_digest,
+                    trial.logical_attempt,
+                    expected_path,
+                )
+                if observed == expected:
+                    return
+    raise CampaignObservationError("execution evidence does not match campaign lock")
+
+
 def _json_lines(value: bytes) -> list[dict[str, object]]:
     try:
         records = [
@@ -360,6 +393,7 @@ def _wave_events(
         )
         return events
     cleaning = _optional_event_time(records, "endpoint_pause_requested") or finished
+    closed = max(cleaning, finished) + timedelta(microseconds=1)
     events.extend(
         [
             _event(
@@ -377,7 +411,7 @@ def _wave_events(
                 subject_id=wave.wave_id,
                 kind="wave.closed",
                 payload=payload,
-                observed_at=max(cleaning, finished),
+                observed_at=closed,
                 identity=f"{wave.wave_id}:closed:{marker}",
             ),
         ]
