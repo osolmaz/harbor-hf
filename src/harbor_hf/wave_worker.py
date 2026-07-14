@@ -46,7 +46,11 @@ from harbor_hf.evidence import (
     write_checksums,
     write_json,
 )
-from harbor_hf.harbor_adapter import FilesystemHarborExecutionAdapter
+from harbor_hf.harbor_adapter import (
+    FilesystemHarborExecutionAdapter,
+    HarborVerificationFailure,
+)
+from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner, SubprocessRunner, run_streaming
@@ -825,6 +829,8 @@ def _execute_trial(
             },
             timeout_seconds=timeout,
             stream_runner=stream_runner,
+            monotonic=monotonic,
+            deadline=deadline,
         )
         append_event(events, "harbor_finished", exit_code=outcome.exit_code)
         if outcome.exit_code != 0:
@@ -895,6 +901,8 @@ def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
 ) -> RetryCategory:
+    if isinstance(error, HarborVerificationFailure):
+        return "benchmark"
     if isinstance(error, HarborTrialFailure):
         name = error.exception_type.lower()
         for category, markers in _TRIAL_FAILURE_MARKERS:
@@ -1106,6 +1114,9 @@ def _trial_destination(
 
 def _finalize_execution(root: Path, token: str) -> None:
     _redact_unit(root, token)
+    compatibility = root / "harbor-compatibility.json"
+    if compatibility.is_file():
+        refresh_bundle_artifacts(root / "harbor-jobs", compatibility)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
     write_checksums(root)

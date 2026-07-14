@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -70,6 +71,8 @@ class HarborExecutionAdapter(Protocol):
         environment: dict[str, str],
         timeout_seconds: int,
         stream_runner: Callable[..., int],
+        monotonic: Callable[[], float] = time.monotonic,
+        deadline: float | None = None,
     ) -> HarborExecutionOutcome: ...
 
 
@@ -117,7 +120,10 @@ class FilesystemHarborExecutionAdapter:
         environment: dict[str, str],
         timeout_seconds: int,
         stream_runner: Callable[..., int],
+        monotonic: Callable[[], float] = time.monotonic,
+        deadline: float | None = None,
     ) -> HarborExecutionOutcome:
+        shared_deadline = _shared_deadline(timeout_seconds, deadline, monotonic)
         self._validate_inputs(prepared)
         exit_code = stream_runner(
             prepared.command,
@@ -125,34 +131,38 @@ class FilesystemHarborExecutionAdapter:
             environment=environment,
             timeout_seconds=timeout_seconds,
         )
+        self._validate_inputs(prepared)
         has_results = any(jobs_dir.glob("*/*/result.json"))
         if exit_code != 0 and not has_results:
             return HarborExecutionOutcome(exit_code, None, None)
+        export_timeout = _remaining_export_timeout(shared_deadline, monotonic)
+        compatibility_path = prepared.request_path.with_name(
+            "harbor-compatibility.json"
+        )
+        export_log = prepared.request_path.with_name("harbor-export.log")
+        request_digest = sha256_digest(
+            canonical_json_bytes(prepared.request.model_dump(mode="json"))
+        )
+        exporter_exit = stream_runner(
+            render_export_command(
+                harbor_source,
+                jobs_dir,
+                compatibility_path,
+                prepared.request.harbor_revision,
+                request_digest,
+            ),
+            export_log,
+            environment=environment,
+            timeout_seconds=export_timeout,
+        )
+        self._validate_inputs(prepared)
+        if exporter_exit != 0:
+            if exit_code != 0:
+                return HarborExecutionOutcome(exit_code, None, None)
+            raise WorkerError(
+                f"Harbor compatibility exporter exited with status {exporter_exit}"
+            )
         try:
-            compatibility_path = prepared.request_path.with_name(
-                "harbor-compatibility.json"
-            )
-            export_log = prepared.request_path.with_name("harbor-export.log")
-            request_digest = sha256_digest(
-                canonical_json_bytes(prepared.request.model_dump(mode="json"))
-            )
-            exporter_exit = stream_runner(
-                render_export_command(
-                    harbor_source,
-                    jobs_dir,
-                    compatibility_path,
-                    prepared.request.harbor_revision,
-                    request_digest,
-                ),
-                export_log,
-                environment=environment,
-                timeout_seconds=min(timeout_seconds, 300),
-            )
-            if exporter_exit != 0:
-                raise WorkerError(
-                    f"Harbor compatibility exporter exited with status {exporter_exit}"
-                )
-            self._validate_inputs(prepared)
             bundle = load_compatibility_bundle(compatibility_path, prepared.request)
             verification = validate_compatibility_bundle(bundle, prepared.request)
         except HarborTrialFailure:
@@ -169,6 +179,27 @@ class FilesystemHarborExecutionAdapter:
             raise WorkerError("Harbor job config changed after request preparation")
         if prepared.request_path.read_bytes() != prepared.request.request_bytes():
             raise WorkerError("Harbor execution request changed after preparation")
+
+
+def _shared_deadline(
+    timeout_seconds: int,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float:
+    if timeout_seconds <= 0:
+        raise WorkerError("Harbor execution timeout must be positive")
+    started_at = monotonic()
+    shared_deadline = deadline if deadline is not None else started_at + timeout_seconds
+    if shared_deadline <= started_at:
+        raise WorkerError("Harbor execution deadline was already reached")
+    return shared_deadline
+
+
+def _remaining_export_timeout(deadline: float, monotonic: Callable[[], float]) -> int:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise WorkerError("Harbor execution deadline was reached before export")
+    return min(max(1, math.ceil(remaining)), 300)
 
 
 def build_execution_request(

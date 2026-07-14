@@ -8,3 +8,7 @@ class HarborTrialFailure(WorkerError):
     def __init__(self, message: str, exception_type: str) -> None:
         super().__init__(message)
         self.exception_type = exception_type
+
+
+class HarborVerificationFailure(WorkerError):
+    """Harbor evidence does not satisfy the immutable benchmark contract."""

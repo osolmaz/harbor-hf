@@ -46,6 +46,35 @@ def _artifacts(trial_dir: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _bundle_directory(jobs_dir: Path, relative: object) -> Path:
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("Harbor compatibility path is malformed")
+    candidate = jobs_dir / relative
+    if not candidate.resolve().is_relative_to(jobs_dir.resolve()):
+        raise ValueError("Harbor compatibility path escapes the jobs directory")
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise ValueError("Harbor compatibility path is not a directory")
+    return candidate
+
+
+def refresh_bundle_artifacts(jobs_dir: Path, output: Path) -> None:
+    """Refresh retained-file metadata after evidence redaction."""
+    bundle = json.loads(output.read_text(encoding="utf-8"))
+    for job in bundle.get("jobs", []):
+        job_dir = _bundle_directory(jobs_dir, job.get("path"))
+        job["lock_digest"] = _digest(job_dir / "lock.json")
+        job["result_digest"] = _digest(job_dir / "result.json")
+    for trial in bundle.get("trials", []):
+        trial_dir = _bundle_directory(jobs_dir, trial.get("path"))
+        trial["lock_digest"] = _digest(trial_dir / "lock.json")
+        trial["result_digest"] = _digest(trial_dir / "result.json")
+        trial["artifacts"] = _artifacts(trial_dir)
+    output.write_text(
+        json.dumps(bundle, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _timing(value: TimingValue) -> dict[str, str | None]:
     return {
         "started_at": value.started_at.isoformat() if value.started_at else None,

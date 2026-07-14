@@ -26,6 +26,7 @@ from harbor_hf.campaigns import (
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import verify_checksums, write_checksums
+from harbor_hf.harbor_adapter import HarborVerificationFailure
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.process import CommandRunner
 from harbor_hf.provider_models import ProviderLimits, ProviderTarget
@@ -39,6 +40,7 @@ from harbor_hf.results import EvidenceSource, build_result_tables
 from harbor_hf.wave_worker import (
     WorkerError,
     _execute_shard,
+    _execution_failure_category,
     _execution_id,
     _file_digest,
     _launch_wave_watchdog,
@@ -47,6 +49,12 @@ from harbor_hf.wave_worker import (
     _wave_model_name,
     run_wave_worker,
 )
+
+
+def test_verification_failure_is_terminal_benchmark_evidence() -> None:
+    error = HarborVerificationFailure("task digest does not match")
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
 
 
 def endpoint_snapshot(state: str, ready: int) -> dict[str, object]:

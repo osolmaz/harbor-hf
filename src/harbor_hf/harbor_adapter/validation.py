@@ -7,7 +7,10 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
+from harbor_hf.harbor_adapter.errors import (
+    HarborTrialFailure,
+    HarborVerificationFailure,
+)
 from harbor_hf.harbor_adapter.models import (
     HarborCompatibilityBundle,
     HarborExecutionRequest,
@@ -27,18 +30,20 @@ def load_compatibility_bundle(
             path.read_text(encoding="utf-8")
         )
     except (OSError, ValidationError) as error:
-        raise WorkerError(
+        raise HarborVerificationFailure(
             "Harbor compatibility exporter produced no valid bundle"
         ) from error
     if bundle.harbor_revision != request.harbor_revision:
-        raise WorkerError(
+        raise HarborVerificationFailure(
             "Harbor compatibility bundle revision does not match the request"
         )
     request_digest = sha256_digest(
         canonical_json_bytes(request.model_dump(mode="json"))
     )
     if bundle.request_digest != request_digest:
-        raise WorkerError("Harbor compatibility bundle request digest does not match")
+        raise HarborVerificationFailure(
+            "Harbor compatibility bundle request digest does not match"
+        )
     return bundle
 
 
@@ -53,7 +58,7 @@ def validate_compatibility_bundle(
     for trial in bundle.trials:
         expected_digest = (policy.expected_task_digests or {}).get(trial.task_name)
         if expected_digest != trial.task_digest:
-            raise WorkerError(
+            raise HarborVerificationFailure(
                 f"Harbor trial {trial.task_name} task digest does not match the lock"
             )
         failure = _trial_failure(trial.exception_type, trial.step_exceptions)
@@ -68,26 +73,28 @@ def validate_compatibility_bundle(
             trial.agent_name != policy.expected_agent_name
             or trial.agent_version != policy.expected_agent_version
         ):
-            raise WorkerError(
+            raise HarborVerificationFailure(
                 f"Harbor trial {trial.task_name} agent identity does not match the lock"
             )
         if (
             trial.model_provider != policy.expected_model_provider
             or trial.model_name != policy.expected_model_name
         ):
-            raise WorkerError(
+            raise HarborVerificationFailure(
                 f"Harbor trial {trial.task_name} model identity does not match the lock"
             )
         rewards = trial.rewards
         if not rewards:
-            raise WorkerError(f"Harbor trial {trial.task_name} has no verifier rewards")
+            raise HarborVerificationFailure(
+                f"Harbor trial {trial.task_name} has no verifier rewards"
+            )
         if not all(
             isinstance(value, int | float)
             and not isinstance(value, bool)
             and (not isinstance(value, float) or math.isfinite(value))
             for value in rewards.values()
         ):
-            raise WorkerError(
+            raise HarborVerificationFailure(
                 f"Harbor trial {trial.task_name} rewards must be finite numbers"
             )
         verified.append(
@@ -98,9 +105,9 @@ def validate_compatibility_bundle(
 
 def _validate_trial_count(observed: int, expected: int | None) -> None:
     if expected is None and observed == 0:
-        raise WorkerError("Harbor produced no trials")
+        raise HarborVerificationFailure("Harbor produced no trials")
     if expected is not None and observed != expected:
-        raise WorkerError(
+        raise HarborVerificationFailure(
             f"expected exactly {expected} Harbor trials, found {observed}"
         )
 
@@ -121,7 +128,7 @@ def _validate_task_counts(
             for task in observed
         )
     if not valid:
-        raise WorkerError(
+        raise HarborVerificationFailure(
             "Harbor trial task counts do not match the requested attempts"
         )
 

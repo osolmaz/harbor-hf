@@ -50,6 +50,7 @@ from harbor_hf.harbor_adapter.adapter import (
     effective_agent_parameters,
     render_harbor_command,
 )
+from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
 from harbor_hf.harbor_adapter.legacy import (
     validate_harbor_result as _validate_harbor_result,
 )
@@ -1154,6 +1155,10 @@ def _finalize_evidence(root: Path, token: str) -> None:
     if scrubbed:
         append_event(root / "events.jsonl", "secrets_redacted", files=scrubbed)
     assert_secret_absent(root, token)
+    compatibility = root / "harbor-compatibility.json"
+    if compatibility.is_file():
+        refresh_bundle_artifacts(root / "harbor-jobs", compatibility)
+        assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     write_checksums(root)
 

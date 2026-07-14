@@ -6,14 +6,17 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from harbor_hf.evidence import scrub_secret, scrub_secret_paths
 from harbor_hf.harbor_adapter import (
     FilesystemHarborExecutionAdapter,
     HarborExecutionRequest,
     HarborTrialFailure,
+    HarborVerificationFailure,
     WorkerError,
     build_execution_request,
 )
-from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle
+from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
+from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle, sha256_digest
 from harbor_hf.harbor_adapter.validation import validate_compatibility_bundle
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.runs import RunLock, build_run_lock
@@ -175,8 +178,216 @@ def test_typed_bundle_rejects_policy_mismatches(
 ) -> None:
     _, request = _request(remote_spec, tmp_path)
 
-    with pytest.raises(WorkerError, match=message):
+    with pytest.raises(HarborVerificationFailure, match=message):
         validate_compatibility_bundle(_bundle(request, **updates), request)
+
+
+def test_adapter_revalidates_inputs_before_failed_return(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+
+    def mutate_input(*_args: object, **_kwargs: object) -> int:
+        prepared.config_path.write_text("{}\n", encoding="utf-8")
+        return 7
+
+    with pytest.raises(WorkerError, match="config changed"):
+        adapter.execute(
+            prepared,
+            tmp_path / "harbor",
+            tmp_path / "jobs",
+            tmp_path / "harbor.log",
+            environment={},
+            timeout_seconds=30,
+            stream_runner=mutate_input,
+        )
+
+
+def test_adapter_export_uses_only_remaining_shared_deadline(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    timeouts: list[int] = []
+
+    def run(*_args: object, **kwargs: object) -> int:
+        timeout = kwargs["timeout_seconds"]
+        assert isinstance(timeout, int)
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 0
+        return 1
+
+    times = iter([100.0, 104.25])
+    with pytest.raises(WorkerError, match="exporter exited"):
+        adapter.execute(
+            prepared,
+            tmp_path / "harbor",
+            jobs_dir,
+            tmp_path / "harbor.log",
+            environment={},
+            timeout_seconds=10,
+            stream_runner=run,
+            monotonic=lambda: next(times),
+            deadline=110.0,
+        )
+
+    assert timeouts == [10, 6]
+
+
+def test_adapter_revalidates_inputs_after_failed_export(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(*_args: object, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 7
+        prepared.request_path.write_text("{}\n", encoding="utf-8")
+        return 1
+
+    with pytest.raises(WorkerError, match="request changed"):
+        adapter.execute(
+            prepared,
+            tmp_path / "harbor",
+            jobs_dir,
+            tmp_path / "harbor.log",
+            environment={},
+            timeout_seconds=30,
+            stream_runner=run,
+        )
+
+    assert calls == 2
+
+
+def test_adapter_does_not_start_export_after_shared_deadline(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(*_args: object, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        result = jobs_dir / "job" / "trial" / "result.json"
+        result.parent.mkdir(parents=True)
+        result.write_text("{}\n", encoding="utf-8")
+        return 0
+
+    times = iter([100.0, 110.0])
+    with pytest.raises(WorkerError, match="deadline was reached"):
+        adapter.execute(
+            prepared,
+            tmp_path / "harbor",
+            jobs_dir,
+            tmp_path / "harbor.log",
+            environment={},
+            timeout_seconds=10,
+            stream_runner=run,
+            monotonic=lambda: next(times),
+            deadline=110.0,
+        )
+
+    assert calls == 1
+
+
+def test_compatibility_inventory_refreshes_after_redaction(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "job"
+    trial_dir = job_dir / "secret-trial"
+    trial_dir.mkdir(parents=True)
+    (job_dir / "lock.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+    (job_dir / "result.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+    (trial_dir / "lock.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+    (trial_dir / "result.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+    (trial_dir / "secret-output.txt").write_text("secret\n", encoding="utf-8")
+    output = tmp_path / "harbor-compatibility.json"
+    output.write_text(
+        json.dumps(
+            {
+                "jobs": [{"path": "job"}],
+                "trials": [{"path": "job/secret-trial"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scrub_secret_paths(tmp_path, "secret")
+    scrub_secret(tmp_path, "secret")
+    refresh_bundle_artifacts(jobs_dir, output)
+
+    bundle = json.loads(output.read_text(encoding="utf-8"))
+    trial = bundle["trials"][0]
+    retained = jobs_dir / trial["path"]
+    assert trial["path"] == "job/[REDACTED]-trial"
+    assert {entry["path"] for entry in trial["artifacts"]} == {
+        "[REDACTED]-output.txt",
+        "lock.json",
+        "result.json",
+    }
+    for entry in trial["artifacts"]:
+        path = retained / entry["path"]
+        assert entry["size"] == path.stat().st_size
+        assert entry["digest"] == sha256_digest(path.read_bytes())
 
 
 def test_typed_bundle_reports_trial_and_multistep_failures(
