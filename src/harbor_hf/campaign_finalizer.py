@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from pydantic import TypeAdapter
 
@@ -293,16 +293,27 @@ class BucketCampaignFinalizer:
             self._read(spec, campaign, f"{absolute_prefix}/events.jsonl")
         )
         started = _event_time(raw_events, "execution_started")
-        finished = _event_time(raw_events, "execution_succeeded", "execution_failed")
+        finished = _event_time(
+            raw_events,
+            "execution_succeeded",
+            "execution_failed",
+            "execution_cancelled",
+        )
+        status = cast(
+            Literal["succeeded", "failed_infrastructure", "cancelled"],
+            {
+                "_SUCCESS": "succeeded",
+                "_FAILED": "failed_infrastructure",
+                "_CANCELLED": "cancelled",
+            }[marker],
+        )
         return _ExecutionRecord(
             evidence=ExecutionEvidence(
                 execution_id=execution.execution_id,
                 trial_id=execution.trial_id,
                 physical_attempt=execution.physical_attempt,
                 runtime_kind=runtime_kind,
-                status=(
-                    "succeeded" if marker == "_SUCCESS" else "failed_infrastructure"
-                ),
+                status=status,
                 started_at=started,
                 completed_at=finished,
                 retry_reason=(
@@ -330,6 +341,14 @@ class BucketCampaignFinalizer:
             covered[path] = _sha256(content)
         if set(covered) != expected:
             raise CampaignFinalizationError("run checksums do not cover exact evidence")
+        for path, digest in sorted(covered.items()):
+            content = additions.get(path)
+            if content is None:
+                content = self._read(spec, campaign, f"{run_prefix}/{path}")
+            if _sha256(content) != digest:
+                raise CampaignFinalizationError(
+                    f"child checksum does not match evidence: {path}"
+                )
         return dict(sorted(covered.items()))
 
     def _child_checksums(

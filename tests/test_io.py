@@ -50,6 +50,35 @@ def test_rejects_unknown_fields(tmp_path: Path) -> None:
         load_experiment(manifest)
 
 
+def test_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+    manifest = tmp_path / "duplicate.yaml"
+    manifest.write_text(source + "\nexecution:\n  attempts: 2\n", encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="found duplicate key 'execution'"):
+        load_experiment(manifest)
+
+
+def test_yaml_merge_allows_explicit_override(tmp_path: Path) -> None:
+    source = EXAMPLE.read_text(encoding="utf-8")
+    source = source.replace(
+        "execution:\n  attempts: 1\n  concurrent_trials: 8\n  timeout_seconds: 7200\n",
+        "execution:\n"
+        "  <<: &execution_defaults\n"
+        "    attempts: 1\n"
+        "    concurrent_trials: 8\n"
+        "    timeout_seconds: 7200\n"
+        "  attempts: 2\n",
+    )
+    manifest = tmp_path / "merged.yaml"
+    manifest.write_text(source, encoding="utf-8")
+
+    spec = load_experiment(manifest)
+
+    assert spec.execution.attempts == 2
+    assert spec.execution.concurrent_trials == 8
+
+
 def test_reports_unreadable_path(tmp_path: Path) -> None:
     manifest = tmp_path / "missing.yaml"
 

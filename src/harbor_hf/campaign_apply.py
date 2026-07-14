@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 
 import httpx
-import yaml
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
@@ -64,6 +63,7 @@ from harbor_hf.endpoints import (
     build_desired_endpoint,
 )
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
+from harbor_hf.io import ManifestError, load_experiment_bytes
 from harbor_hf.models import (
     DeploymentProfile,
     DeploymentTarget,
@@ -233,7 +233,7 @@ class HuggingFaceWaveJobAdapter:
             resources = self.api.list_jobs(labels=expected, namespace=namespace)
             jobs = [_validated_remote_job(value, expected) for value in resources]
         except (HfHubHTTPError, httpx.TransportError) as error:
-            raise ActionExecutionError("HF Jobs inspection failed") from error
+            raise AmbiguousActionOutcome("HF Jobs inspection failed") from error
         if len(jobs) > 1:
             active = [job for job in jobs if not job.terminal]
             if len(active) == 1:
@@ -358,7 +358,17 @@ class CampaignReconciler:
         lock, events = self.store.load_campaign(campaign_id)
         request = self.store.load_request(campaign_id)
         spec = _validated_request(lock, request)
-        if self.observer is not None:
+        terminal_recorded = any(
+            event.kind
+            in {
+                "campaign.completed",
+                "campaign.partial",
+                "campaign.failed",
+                "campaign.cancelled",
+            }
+            for event in events
+        )
+        if self.observer is not None and not terminal_recorded:
             observed = self.observer.observe(lock, spec)
             changed = False
             for event in observed:
@@ -379,6 +389,13 @@ class CampaignReconciler:
             context=effective_context,
             now=self.clock(),
         )
+        if projection.campaign.status in {
+            "completed",
+            "partial",
+            "failed",
+            "cancelled",
+        }:
+            return CampaignApplyResult(campaign_id=campaign_id, plan=plan, applied=[])
         if self._recover_terminal_jobs(lock, spec, projection, reservations):
             lock, events = self.store.load_campaign(campaign_id)
             self._last_observed_at = max(event.observed_at for event in events)
@@ -408,6 +425,7 @@ class CampaignReconciler:
                 context=effective_context,
                 now=self.clock(),
             )
+            return CampaignApplyResult(campaign_id=campaign_id, plan=plan, applied=[])
         pending = _pending_actions(projection.campaign.actions, reservations)
         selected = sorted(
             [*pending, *self._reserve_new(lock, plan.actions)],
@@ -465,7 +483,9 @@ class CampaignReconciler:
                 with suppress(CoordinationError):
                     self.action_claims.release(path, owner)
             applied.append(outcome)
-            if outcome.status == "ambiguous":
+            if outcome.status == "ambiguous" or (
+                action.kind == "publish-summary" and outcome.status == "succeeded"
+            ):
                 break
         return applied
 
@@ -568,26 +588,41 @@ class CampaignReconciler:
             job = self._managed_wave_job(lock, spec, action)
             if job is None or not job.terminal:
                 continue
-            for execution in projection.executions.values():
-                if execution.wave_id != wave_id or execution.status != "active":
-                    continue
-                self._record_durable_event(
-                    lock,
-                    subject_type="execution",
-                    subject_id=execution.execution_id,
-                    kind="execution.failed",
-                    payload=ExecutionOutcomePayload(
-                        trial_id=execution.trial_id,
-                        physical_attempt=execution.physical_attempt,
-                        category="lost",
-                        message=(
-                            f"HF Job {job.job_id} reached {job.stage} without "
-                            "terminal execution evidence"
-                        ),
+            changed = (
+                self._recover_lost_executions(lock, projection, wave_id, job) or changed
+            )
+            if _terminal_wave_needs_drain(wave):
+                self._drain_wave(lock, action, projection)
+                changed = True
+        return changed
+
+    def _recover_lost_executions(
+        self,
+        lock: CampaignLock,
+        projection: RecoveryProjection,
+        wave_id: str,
+        job: RemoteWaveJob,
+    ) -> bool:
+        changed = False
+        for execution in projection.executions.values():
+            if execution.wave_id != wave_id or execution.status != "active":
+                continue
+            self._record_durable_event(
+                lock,
+                subject_type="execution",
+                subject_id=execution.execution_id,
+                kind="execution.failed",
+                payload=ExecutionOutcomePayload(
+                    trial_id=execution.trial_id,
+                    physical_attempt=execution.physical_attempt,
+                    category="lost",
+                    message=(
+                        f"HF Job {job.job_id} reached {job.stage} without "
+                        "terminal execution evidence"
                     ),
-                    identity=f"{execution.execution_id}:lost:{job.job_id}",
-                )
-            self._drain_wave(lock, action, projection)
+                ),
+                identity=f"{execution.execution_id}:lost:{job.job_id}",
+            )
             changed = True
         return changed
 
@@ -637,13 +672,32 @@ class CampaignReconciler:
         except AmbiguousActionOutcome as error:
             return self._record_outcome(lock, action, "ambiguous", str(error))
         except _AMBIGUOUS_ENDPOINT_ERRORS as error:
-            return self._record_outcome(lock, action, "ambiguous", str(error))
+            remote_id = None
+            if action.kind in {"submit-wave", "retry-shard"}:
+                target = _deployment_target(lock, spec, action.deployment_digest)
+                if not isinstance(target, ProviderTarget):
+                    remote_id = _desired_endpoint(lock, spec, action).identity.name
+            return self._record_outcome(
+                lock,
+                action,
+                "ambiguous",
+                str(error),
+                remote_id=remote_id,
+            )
         except (
             ActionExecutionError,
             EndpointProvisioningError,
             ValueError,
         ) as error:
-            return self._record_outcome(lock, action, "failed", str(error))
+            return self._record_outcome(
+                lock,
+                action,
+                "failed",
+                str(error),
+                remote_id=_failed_endpoint_remote_id(
+                    lock, spec, action, projection, error
+                ),
+            )
         outcome = self._record_outcome(
             lock,
             action,
@@ -674,6 +728,7 @@ class CampaignReconciler:
                 spec,
                 request,
                 action,
+                projection=projection,
                 allow_submission=allow_billable,
             )
         return self._execute_lifecycle_action(
@@ -756,6 +811,7 @@ class CampaignReconciler:
         request: bytes,
         action: ReconcileAction,
         *,
+        projection: RecoveryProjection,
         allow_submission: bool,
     ) -> str:
         target = _deployment_target(lock, spec, action.deployment_digest)
@@ -786,6 +842,10 @@ class CampaignReconciler:
             raise ActionExecutionError(
                 "campaign cancellation superseded the unsubmitted wave action"
             )
+        if _can_recover_orphaned_endpoint(lock, action, desired, projection):
+            existing = self.endpoints.inspect(desired)
+            if existing is not None:
+                self.endpoints.pause_and_verify(desired)
         self.endpoints.create_or_adopt(desired)
         wave = build_wave_lock(lock, spec, action, endpoint=endpoint)
         return self.jobs.submit(wave, request=request, campaign=lock).job_id
@@ -1022,8 +1082,8 @@ class CampaignReconciler:
             identity = hashlib.sha256(
                 f"{lock.campaign_id}:{wave_id}:{kind}:reconciler".encode()
             ).hexdigest()[:32]
-            self.store.ensure_event(
-                lock.campaign_id,
+            self._ensure_durable_event(
+                lock,
                 new_event(
                     subject_type="wave",
                     subject_id=wave_id,
@@ -1049,8 +1109,8 @@ class CampaignReconciler:
         event_identity = hashlib.sha256(
             f"{lock.campaign_id}:{identity}".encode()
         ).hexdigest()[:32]
-        self.store.ensure_event(
-            lock.campaign_id,
+        self._ensure_durable_event(
+            lock,
             new_event(
                 subject_type=subject_type,
                 subject_id=subject_id,
@@ -1060,6 +1120,15 @@ class CampaignReconciler:
                 clock=lambda: observed_at,
                 identifier=lambda: event_identity,
             ),
+        )
+
+    def _ensure_durable_event(self, lock: CampaignLock, event: CampaignEvent) -> None:
+        if self.store.ensure_event(lock.campaign_id, event):
+            return
+        _lock, events = self.store.load_campaign(lock.campaign_id)
+        self._last_observed_at = max(
+            event.observed_at,
+            *(record.observed_at for record in events),
         )
 
     def _find_wave(
@@ -1261,7 +1330,7 @@ def _active_action_admissions(
         if state.action_kind not in {
             "submit-wave",
             "retry-shard",
-        } or state.status not in {"succeeded", "ambiguous"}:
+        } or state.status not in {"reserved", "succeeded", "ambiguous"}:
             continue
         action = reservations.get(action_id)
         if action is None:
@@ -1280,6 +1349,92 @@ def _active_action_admissions(
                 )
             )
     return admissions
+
+
+def _terminal_wave_needs_drain(wave: object) -> bool:
+    return wave is None or getattr(wave, "status", None) not in {
+        "draining",
+        "cleaning",
+        "cleanup_failed",
+        "closed",
+    }
+
+
+def _failed_endpoint_remote_id(
+    lock: CampaignLock,
+    spec: ExperimentSpec,
+    action: ReconcileAction,
+    projection: RecoveryProjection,
+    error: Exception,
+) -> str | None:
+    if not isinstance(error, EndpointProvisioningError) or action.kind not in {
+        "submit-wave",
+        "retry-shard",
+    }:
+        return None
+    target = _deployment_target(lock, spec, action.deployment_digest)
+    if isinstance(target, ProviderTarget):
+        return None
+    desired = _desired_endpoint(lock, spec, action)
+    if not _can_recover_orphaned_endpoint(lock, action, desired, projection):
+        return None
+    return desired.identity.name
+
+
+def _can_recover_orphaned_endpoint(
+    lock: CampaignLock,
+    action: ReconcileAction,
+    desired: DesiredEndpoint,
+    projection: RecoveryProjection,
+) -> bool:
+    provenance_actions = {
+        state.action_id
+        for state in projection.campaign.actions.values()
+        if state.status in {"ambiguous", "failed"}
+        and state.remote_id == desired.identity.name
+        and _action_targets_deployment(lock, state, action.deployment_digest)
+    }
+    if not provenance_actions:
+        return False
+    exempt_action_ids = {action.action_id} | {
+        state.action_id
+        for state in projection.campaign.actions.values()
+        if state.action_id in provenance_actions and state.status == "failed"
+    }
+    if any(
+        wave.deployment_digest == action.deployment_digest and wave.status != "closed"
+        for wave in projection.waves.values()
+    ):
+        return False
+    return not any(
+        state.action_id != action.action_id
+        and state.action_id not in exempt_action_ids
+        and state.status in {"reserved", "succeeded", "ambiguous"}
+        and _action_targets_deployment(lock, state, action.deployment_digest)
+        and (
+            (wave := projection.waves.get(f"wave-{state.action_key}")) is None
+            or wave.status != "closed"
+        )
+        for state in projection.campaign.actions.values()
+    )
+
+
+def _action_targets_deployment(
+    lock: CampaignLock, action: ActionProjection, deployment_digest: str
+) -> bool:
+    targets = set(action.target_ids)
+    for run in lock.runs:
+        if run.deployment_digest != deployment_digest:
+            continue
+        if action.action_kind == "submit-wave" and any(
+            shard.shard_id in targets for shard in run.shards
+        ):
+            return True
+        if action.action_kind == "retry-shard" and any(
+            trial.trial_id in targets for shard in run.shards for trial in shard.trials
+        ):
+            return True
+    return False
 
 
 def _combined_usage(
@@ -1347,10 +1502,17 @@ def hugging_face_campaign_reconciler(
         Path(tempfile.mkdtemp(prefix="harbor-hf-evidence-")),
         api=cast(BucketEvidenceApi, evidence_api),
     )
-    writer = HubBucketEvidenceWriter(api=cast(BucketEvidenceWriterApi, evidence_api))
     token = get_token()
     if token is None:
         raise CampaignApplyError("HF token is required for campaign reconciliation")
+    claims = HubClaimStore(
+        namespace,
+        token,
+        api=cast(CoordinationApi, evidence_api),
+    )
+    writer = HubBucketEvidenceWriter(
+        api=cast(BucketEvidenceWriterApi, evidence_api), claims=claims
+    )
     result_publisher = AutomaticCampaignPublisher(
         namespace=namespace,
         store=store,
@@ -1375,11 +1537,7 @@ def hugging_face_campaign_reconciler(
             runner=runner or SubprocessRunner(),
             bucket_api=bucket_api,
         ),
-        action_claims=HubClaimStore(
-            namespace,
-            token,
-            api=cast(CoordinationApi, evidence_api),
-        ),
+        action_claims=claims,
         observer=BucketCampaignObserver(reader),
         finalizer=BucketCampaignFinalizer(reader, writer),
         result_publisher=result_publisher,
@@ -1388,11 +1546,8 @@ def hugging_face_campaign_reconciler(
 
 def _validated_request(lock: CampaignLock, request: bytes) -> ExperimentSpec:
     try:
-        raw = yaml.safe_load(request.decode("utf-8"))
-        if not isinstance(raw, dict):
-            raise CampaignApplyError("campaign request must contain a YAML object")
-        spec = ExperimentSpec.model_validate(raw)
-    except (UnicodeDecodeError, yaml.YAMLError, ValidationError) as error:
+        spec = load_experiment_bytes(request, source="campaign request")
+    except ManifestError as error:
         raise CampaignApplyError("campaign request is not a valid manifest") from error
     try:
         expected = build_campaign_lock(

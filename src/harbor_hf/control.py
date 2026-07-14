@@ -19,6 +19,15 @@ from harbor_hf.coordination import coordination_repository
 
 _MAX_COMMIT_ATTEMPTS = 8
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_RECONCILER_DURABLE_EVENT_KINDS = {
+    "campaign.draining",
+    "campaign.manual-intervention-required",
+    "execution.failed",
+    "execution.cancelled",
+    "wave.draining",
+    "wave.cleaning",
+    "wave.closed",
+}
 
 SubjectType = Literal["campaign", "run", "shard", "trial", "execution", "wave"]
 Producer = Literal["cli", "reconciler", "wave-controller", "watchdog", "publisher"]
@@ -116,6 +125,7 @@ class CancellationPayload(FrozenModel):
 class ShardRetryPayload(FrozenModel):
     shard_id: str = Field(min_length=1)
     reason: str = Field(min_length=1)
+    trial_generations: dict[str, int] = Field(default_factory=dict)
 
 
 class TerminalPayload(FrozenModel):
@@ -405,6 +415,22 @@ def _apply_action_event(
         raise ControlError("action has multiple outcomes")
     outcome = cast(ActionStatus, event.kind.removeprefix("action."))
     if action.status == "ambiguous" and outcome == "ambiguous":
+        if (
+            action.remote_id is not None
+            and payload.remote_id is not None
+            and action.remote_id != payload.remote_id
+        ):
+            raise ControlError("ambiguous action changed remote identity")
+        actions[payload.action_id] = action.model_copy(
+            update={
+                "message": payload.message,
+                "remote_id": (
+                    payload.remote_id
+                    if payload.remote_id is not None
+                    else action.remote_id
+                ),
+            }
+        )
         return
     actions[payload.action_id] = action.model_copy(
         update={
@@ -616,7 +642,8 @@ class HubCampaignStore:
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
             head = self._head()
             if self._exists(path, head):
-                if self._read_json(path, head) != expected:
+                observed = self._read_json(path, head)
+                if not _same_event_request(observed, expected):
                     raise CampaignConflict(f"event conflicts: {event.event_id}")
                 return False
             try:
@@ -760,6 +787,24 @@ class HubCampaignStore:
             return Path(local_path).read_bytes()
         except OSError as error:
             raise ControlError(f"control record cannot be read: {path}") from error
+
+
+def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> bool:
+    """Adopt the same deterministic event even when reconcilers used new clocks."""
+    if not isinstance(observed, dict):
+        return False
+    if observed == expected:
+        return True
+    if (
+        expected.get("producer") != "reconciler"
+        or expected.get("kind") not in _RECONCILER_DURABLE_EVENT_KINDS
+    ):
+        return False
+    observed_request = dict(observed)
+    expected_request = dict(expected)
+    observed_request.pop("observed_at", None)
+    expected_request.pop("observed_at", None)
+    return observed_request == expected_request
 
 
 def _campaign_request_path(campaign_id: str) -> str:

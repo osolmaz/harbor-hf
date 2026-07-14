@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from fnmatch import fnmatch
 from itertools import product
 
 from pydantic import BaseModel, ConfigDict
@@ -88,7 +89,10 @@ def _rule_matches(rule: MatrixRule, cell: RunCell) -> bool:
 
 def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
     cells = resolved_cells(spec)
-    task_count = len(spec.benchmark.task_digests) or (
+    task_count = sum(
+        any(fnmatch(task, selection) for selection in spec.benchmark.task_names)
+        for task in spec.benchmark.task_digests
+    ) or (
         None
         if any(is_task_pattern(task) for task in spec.benchmark.task_names)
         else len(spec.benchmark.task_names)

@@ -382,10 +382,19 @@ def _retry_candidates(
     context: ReconcileContext,
     now: datetime,
 ) -> tuple[list[_Candidate], list[BlockedAction]]:
+    reserved_trial_ids = {
+        trial_id
+        for action in projection.campaign.actions.values()
+        if action.action_kind == "retry-shard"
+        and not _action_is_spent(projection, action)
+        for trial_id in action.target_ids
+    }
     ready: dict[str, list[str]] = defaultdict(list)
     waiting: dict[str, list[str]] = defaultdict(list)
     for trial in projection.trials.values():
         if trial.status != "retry_wait":
+            continue
+        if trial.trial_id in reserved_trial_ids:
             continue
         target = ready if retry_is_ready(trial, now) else waiting
         target[trial.shard_id].append(trial.trial_id)

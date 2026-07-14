@@ -1,8 +1,9 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 
 from harbor_hf.bucket_evidence import (
@@ -89,6 +90,18 @@ class FakeBucketWriterApi:
         self.batch_calls.append((bucket_id, add, kwargs))
 
 
+class FakeClaims:
+    def __init__(self) -> None:
+        self.acquired: list[tuple[str, dict[str, str]]] = []
+        self.released: list[tuple[str, dict[str, str]]] = []
+
+    def acquire(self, path: str, owner: Mapping[str, str]) -> None:
+        self.acquired.append((path, dict(owner)))
+
+    def release(self, path: str, owner: Mapping[str, str]) -> None:
+        self.released.append((path, dict(owner)))
+
+
 def test_lists_and_caches_bucket_evidence(tmp_path: Path) -> None:
     prefix = "campaigns/campaign-one/runs/run-one"
     api = FakeBucketApi(
@@ -121,6 +134,58 @@ def test_lists_and_caches_bucket_evidence(tmp_path: Path) -> None:
     )
     assert api.list_calls == [("org/evidence", prefix, True)]
     assert api.downloads == 1
+
+
+def test_interrupted_download_never_becomes_a_cached_evidence_object(
+    tmp_path: Path,
+) -> None:
+    prefix = "campaigns/campaign-one/runs/run-one"
+
+    class InterruptedApi(FakeBucketApi):
+        fail = True
+
+        def download_bucket_files(
+            self,
+            bucket_id: str,
+            files: list[tuple[object, str | Path]],
+            **kwargs: object,
+        ) -> None:
+            if self.fail:
+                self.fail = False
+                Path(files[0][1]).write_bytes(b"truncated")
+                raise OSError("download interrupted")
+            super().download_bucket_files(bucket_id, files, **kwargs)
+
+    api = InterruptedApi({f"{prefix}/record.json": b"complete"})
+    reader = HubBucketEvidenceReader(tmp_path, api=api)
+
+    with pytest.raises(OSError, match="download interrupted"):
+        reader.read_bytes(bucket="org/evidence", prefix=prefix, path="record.json")
+
+    assert (
+        reader.read_bytes(bucket="org/evidence", prefix=prefix, path="record.json")
+        == b"complete"
+    )
+    assert not any(path.read_bytes() == b"truncated" for path in tmp_path.iterdir())
+
+
+def test_refresh_discards_cached_evidence_bytes(tmp_path: Path) -> None:
+    prefix = "campaigns/campaign-one/runs/run-one"
+    path = f"{prefix}/record.json"
+    api = FakeBucketApi({path: b"first"})
+    reader = HubBucketEvidenceReader(tmp_path, api=api)
+    assert (
+        reader.read_bytes(bucket="org/evidence", prefix=prefix, path="record.json")
+        == b"first"
+    )
+
+    api.files[path] = b"second"
+    reader.refresh()
+
+    assert (
+        reader.read_bytes(bucket="org/evidence", prefix=prefix, path="record.json")
+        == b"second"
+    )
 
 
 def test_rejects_missing_and_escaped_bucket_objects(tmp_path: Path) -> None:
@@ -162,6 +227,42 @@ def test_writer_creates_absent_immutable_object_with_exact_batch() -> None:
             {},
         )
     ]
+
+
+def test_writer_serializes_check_and_write_with_distributed_claim() -> None:
+    api = FakeBucketWriterApi()
+    claims = FakeClaims()
+    writer = HubBucketEvidenceWriter(api=api, claims=claims)
+
+    assert writer.write_immutable(
+        bucket="org/evidence",
+        path="campaigns/campaign-one/_SUCCESS",
+        content=b"new evidence",
+    )
+
+    assert len(claims.acquired) == len(claims.released) == 1
+    assert claims.acquired == claims.released
+    assert claims.acquired[0][0].startswith("bucket-evidence-leases/")
+
+
+def test_writer_does_not_fail_completed_write_when_claim_release_fails() -> None:
+    class FailingReleaseClaims(FakeClaims):
+        def release(self, path: str, owner: Mapping[str, str]) -> None:
+            super().release(path, owner)
+            raise httpx.ConnectError("claim release timed out")
+
+    api = FakeBucketWriterApi()
+    claims = FailingReleaseClaims()
+    writer = HubBucketEvidenceWriter(api=api, claims=claims)
+
+    created = writer.write_immutable(
+        bucket="org/evidence",
+        path="campaigns/campaign-one/_SUCCESS",
+        content=b"new evidence",
+    )
+
+    assert created is True
+    assert len(claims.acquired) == len(claims.released) == 1
 
 
 def test_writer_adopts_only_byte_identical_immutable_object() -> None:

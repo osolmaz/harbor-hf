@@ -121,7 +121,7 @@ class ExecutionEvidence(FrozenModel):
     trial_id: EntityId
     physical_attempt: int = Field(ge=1)
     runtime_kind: RuntimeKind
-    status: Literal["succeeded", "failed_infrastructure"]
+    status: Literal["succeeded", "failed_infrastructure", "cancelled"]
     started_at: AwareDatetime
     completed_at: AwareDatetime
     retry_reason: str | None = None
@@ -284,7 +284,7 @@ class ExecutionRow(TraceRow):
     trial_id: str
     physical_attempt: int
     runtime_kind: RuntimeKind
-    status: Literal["succeeded", "failed_infrastructure"]
+    status: Literal["succeeded", "failed_infrastructure", "cancelled"]
     started_at: AwareDatetime
     completed_at: AwareDatetime
     retry_reason: str | None

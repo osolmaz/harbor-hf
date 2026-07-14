@@ -235,6 +235,106 @@ def test_logical_trial_keeps_identity_across_physical_retry(
     assert completed.spend_microusd == 24
 
 
+def test_manual_retry_only_overrides_the_generation_it_requested(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    first = _execution_events(
+        lock, 2, execution_id="execution-one", attempt=1, category="transient"
+    )
+    manual, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *first],
+        lock.runs[0].shards[0].shard_id,
+        "retry now",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+    second = _execution_events(
+        lock, 20, execution_id="execution-two", attempt=2, category="rate-limit"
+    )
+
+    with_manual = project_recovery(lock, [submitted, *first, manual, *second])
+    without_manual = project_recovery(lock, [submitted, *first, *second])
+    trial_id = lock.runs[0].shards[0].trials[0].trial_id
+
+    assert with_manual.trials[trial_id].retry_not_before == (
+        without_manual.trials[trial_id].retry_not_before
+    )
+    retry_not_before = with_manual.trials[trial_id].retry_not_before
+    assert retry_not_before is not None
+    assert retry_not_before > manual.observed_at
+
+
+def test_reserved_retry_targets_are_excluded_from_later_retry_wave(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2, max_trials_per_shard=2)
+    shard = lock.runs[0].shards[0]
+
+    def failure(
+        trial_index: int, sequence: int, execution_id: str
+    ) -> list[CampaignEvent]:
+        trial = shard.trials[trial_index]
+        return [
+            _event(
+                lock,
+                sequence,
+                "execution",
+                execution_id,
+                "execution.started",
+                ExecutionStartedPayload(
+                    trial_id=trial.trial_id,
+                    shard_id=shard.shard_id,
+                    physical_attempt=1,
+                ),
+            ),
+            _event(
+                lock,
+                sequence + 1,
+                "execution",
+                execution_id,
+                "execution.failed",
+                ExecutionOutcomePayload(
+                    trial_id=trial.trial_id,
+                    physical_attempt=1,
+                    category="transient",
+                ),
+            ),
+        ]
+
+    first = failure(0, 2, "execution-one")
+    _projection, first_plan = plan_reconciliation(
+        lock, [submitted, *first], now=NOW + timedelta(seconds=20)
+    )
+    retry = next(
+        action for action in first_plan.actions if action.kind == "retry-shard"
+    )
+    reserved = _event(
+        lock,
+        12,
+        "campaign",
+        lock.campaign_id,
+        "action.reserved",
+        ActionReservedPayload(
+            action_id=retry.action_id,
+            action_key=retry.action_key,
+            action_kind=retry.kind,
+            target_ids=retry.target_ids,
+        ),
+    )
+    second = failure(1, 20, "execution-two")
+
+    _projection, plan = plan_reconciliation(
+        lock,
+        [submitted, *first, reserved, *second],
+        now=NOW + timedelta(seconds=40),
+    )
+
+    later = next(action for action in plan.actions if action.kind == "retry-shard")
+    assert later.trial_ids == [shard.trials[1].trial_id]
+    assert shard.trials[0].trial_id not in later.trial_ids
+
+
 @pytest.mark.parametrize(
     ("category", "expected"),
     [
@@ -281,6 +381,49 @@ def test_retry_budget_exhaustion_is_terminal(
     assert all(action.kind != "retry-shard" for action in plan.actions)
     assert plan.terminal_decision is not None
     assert plan.terminal_decision.status == "failed"
+
+
+def test_cancellation_converts_retry_wait_trials_to_terminal_cancelled_counts(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock, 2, execution_id="execution-one", attempt=1, category="transient"
+    )
+
+    projection = project_recovery(
+        lock, [submitted, *failed, _cancel_event(lock, sequence=5)]
+    )
+
+    assert projection.terminal_decision is not None
+    assert projection.terminal_decision.status == "cancelled"
+    assert projection.terminal_decision.counts.retrying == 0
+    assert projection.terminal_decision.counts.cancelled == 1
+
+
+def test_recorded_cancellation_keeps_normalized_retry_counts_after_reload(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock, 2, execution_id="execution-one", attempt=1, category="transient"
+    )
+    cancelled = _cancel_event(lock, sequence=5)
+    terminal = _event(
+        lock,
+        6,
+        "campaign",
+        lock.campaign_id,
+        "campaign.cancelled",
+        TerminalPayload(message="cancellation drained and cleaned"),
+    )
+
+    projection = project_recovery(lock, [submitted, *failed, cancelled, terminal])
+
+    assert projection.terminal_decision is not None
+    assert projection.terminal_decision.status == "cancelled"
+    assert projection.terminal_decision.counts.retrying == 0
+    assert projection.terminal_decision.counts.cancelled == 1
 
 
 def test_valid_completed_trial_is_not_retried_after_reconcile_kill(
@@ -504,6 +647,80 @@ def test_durable_shard_retry_request_skips_current_backoff(
     assert [action.kind for action in plan.actions] == ["retry-shard"]
 
 
+def test_legacy_shard_retry_request_preserves_its_event_time_generation(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard_id = lock.runs[0].shards[0].shard_id
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard_id,
+        "operator retry",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+    legacy = request.model_copy(
+        update={"payload": request.payload.model_copy(update={"trial_generations": {}})}
+    )
+
+    projection, plan = plan_reconciliation(
+        lock, [submitted, *failed, legacy], now=NOW + timedelta(seconds=5)
+    )
+
+    assert projection.counts.retrying == 1
+    assert [action.kind for action in plan.actions] == ["retry-shard"]
+
+
+def test_multiple_legacy_retry_requests_are_projected_without_recursion(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard_id = lock.runs[0].shards[0].shard_id
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard_id,
+        "operator retry",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+    legacy = request.model_copy(
+        update={"payload": request.payload.model_copy(update={"trial_generations": {}})}
+    )
+    repeated = legacy.model_copy(
+        update={
+            "event_id": "evt-" + "f" * 32,
+            "observed_at": NOW + timedelta(seconds=6),
+        }
+    )
+    monkeypatch.setattr(
+        "harbor_hf.recovery.project_recovery",
+        lambda *_args, **_kwargs: pytest.fail("legacy migration must not re-project"),
+    )
+
+    projection, plan = plan_reconciliation(
+        lock,
+        [submitted, *failed, legacy, repeated],
+        now=repeated.observed_at,
+    )
+
+    assert projection.counts.retrying == 1
+    assert [action.kind for action in plan.actions] == ["retry-shard"]
+
+
 def test_durable_shard_retry_request_has_generation_identity_and_exact_payload(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -539,7 +756,78 @@ def test_durable_shard_retry_request_has_generation_identity_and_exact_payload(
     assert event.payload.model_dump(mode="json") == {
         "shard_id": shard.shard_id,
         "reason": "retry now",
+        "trial_generations": {trial.trial_id: 1},
     }
+
+
+def test_retry_request_rejects_generations_outside_its_event_time_shard_state(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2, max_trials_per_shard=1)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    first_shard, second_shard = lock.runs[0].shards
+    first_trial = first_shard.trials[0]
+    second_trial = second_shard.trials[0]
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        first_shard.shard_id,
+        "retry now",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+
+    invalid_mappings = [
+        {second_trial.trial_id: 0},
+        {"unknown-trial": 0},
+        {first_trial.trial_id: 2},
+    ]
+    for mapping in invalid_mappings:
+        invalid = request.model_copy(
+            update={
+                "payload": request.payload.model_copy(
+                    update={"trial_generations": mapping}
+                )
+            }
+        )
+        with pytest.raises(
+            ValueError,
+            match="retry request generations do not match the requested shard state",
+        ):
+            project_recovery(lock, [submitted, *failed, invalid])
+
+
+def test_retry_generation_binding_tolerates_cross_host_clock_skew(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    shard = lock.runs[0].shards[0]
+    request, _created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed],
+        shard.shard_id,
+        "retry now",
+        clock=lambda: NOW + timedelta(seconds=4),
+    )
+    skewed = request.model_copy(update={"observed_at": NOW + timedelta(seconds=2)})
+
+    projection = project_recovery(lock, [submitted, *failed, skewed])
+
+    trial = projection.trials[shard.trials[0].trial_id]
+    assert trial.status == "retry_wait"
+    assert trial.retry_not_before == skewed.observed_at
 
 
 def test_durable_shard_retry_identity_includes_every_eligible_trial(

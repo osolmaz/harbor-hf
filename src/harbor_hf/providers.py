@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from time import perf_counter
 from typing import Literal
@@ -127,6 +128,7 @@ class _StreamState:
         self.response_id: str | None = None
         self.response_model: str | None = None
         self.content: list[str] = []
+        self.saw_reasoning = False
         self.tools: dict[int, _StreamToolState] = {}
         self.finish_reason: str | None = None
         self.usage: dict[str, JsonValue] | None = None
@@ -146,6 +148,7 @@ class _StreamState:
                 self.content.append(delta.content)
                 self._record_first_token(elapsed_ms)
             if delta.reasoning_content or delta.reasoning:
+                self.saw_reasoning = True
                 self._record_first_token(elapsed_ms)
             for tool in delta.tool_calls:
                 state = self.tools.setdefault(tool.index, _StreamToolState())
@@ -158,7 +161,11 @@ class _StreamState:
             self.first_token_ms = elapsed_ms
 
     def message(self) -> ProviderMessage:
-        content = "".join(self.content) if self.content else None
+        content = (
+            "".join(self.content)
+            if self.content
+            else ("" if self.saw_reasoning else None)
+        )
         tools = [self.tools[index].build() for index in sorted(self.tools)]
         return ProviderMessage(role="assistant", content=content, tool_calls=tools)
 
@@ -212,7 +219,14 @@ class HfInferenceProviderAdapter:
             return self._timeout_result(target, request, attempt, started)
         total_ms = _elapsed_ms(started, self._clock())
         if not response.is_success:
-            return _http_failure(target, request, attempt, response, total_ms)
+            return _http_failure(
+                target,
+                request,
+                attempt,
+                response.status_code,
+                response.headers,
+                total_ms,
+            )
         try:
             raw = _RawCompletion.model_validate_json(response.content)
             choice = raw.choices[0]
@@ -261,7 +275,14 @@ class HfInferenceProviderAdapter:
             ) as response:
                 if not response.is_success:
                     total_ms = _elapsed_ms(started, self._clock())
-                    return _http_failure(target, request, attempt, response, total_ms)
+                    return _http_failure(
+                        target,
+                        request,
+                        attempt,
+                        response.status_code,
+                        response.headers,
+                        total_ms,
+                    )
                 for line in response.iter_lines():
                     _consume_stream_line(line, state, started, self._clock)
                 total_ms = _elapsed_ms(started, self._clock())
@@ -370,16 +391,32 @@ def observe_provider_response(
     content: bytes,
     total_ms: float,
     time_to_first_token_ms: float | None = None,
+    transport_interrupted: bool = False,
+    invalid_content_encoding: bool = False,
 ) -> ProviderCallResult:
     """Normalize evidence from a transparently forwarded provider response."""
-    response = httpx.Response(status_code, headers=headers, content=content)
-    if not response.is_success:
-        return _http_failure(target, request, attempt, response, total_ms)
+    early = _early_provider_response(
+        target,
+        request,
+        attempt,
+        status_code,
+        headers,
+        total_ms,
+        time_to_first_token_ms,
+        transport_interrupted,
+        invalid_content_encoding,
+    )
+    if early is not None:
+        return early
+    try:
+        response = httpx.Response(status_code, headers=headers, content=content)
+    except httpx.DecodingError:
+        return _malformed_encoding_result(target, request, attempt, headers, total_ms)
     if request.stream:
         state = _StreamState()
         elapsed = time_to_first_token_ms or 0.0
         try:
-            for line in content.decode("utf-8").splitlines():
+            for line in re.split(r"\r\n?|\n", content.decode("utf-8")):
                 _consume_stream_line(line, state, 0.0, lambda: elapsed / 1000)
             state.first_token_ms = time_to_first_token_ms
             return _stream_result(target, request, attempt, response, state, total_ms)
@@ -410,6 +447,100 @@ def observe_provider_response(
         response_id=_optional_string(raw.id),
         finish_reason=_optional_string(choice.finish_reason),
         message=message,
+        evidence=evidence,
+    )
+
+
+def _early_provider_response(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    attempt: int,
+    status_code: int,
+    headers: httpx.Headers,
+    total_ms: float,
+    time_to_first_token_ms: float | None,
+    transport_interrupted: bool,
+    invalid_content_encoding: bool,
+) -> ProviderCallResult | None:
+    if not 200 <= status_code < 300:
+        return _http_failure(target, request, attempt, status_code, headers, total_ms)
+    if transport_interrupted:
+        return _transport_interrupted_result(
+            target,
+            request,
+            attempt,
+            headers,
+            total_ms,
+            time_to_first_token_ms,
+        )
+    if invalid_content_encoding:
+        return _malformed_encoding_result(target, request, attempt, headers, total_ms)
+    return None
+
+
+def _transport_interrupted_result(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    attempt: int,
+    headers: httpx.Headers,
+    total_ms: float,
+    time_to_first_token_ms: float | None,
+) -> ProviderCallResult:
+    if request.stream and time_to_first_token_ms is not None:
+        ttft = observed(time_to_first_token_ms)
+    elif request.stream:
+        ttft = unavailable("not_observed")
+    else:
+        ttft = unavailable("not_applicable")
+    evidence = _evidence(
+        target,
+        request,
+        attempt,
+        headers,
+        total_ms,
+        ttft,
+        None,
+        None,
+        "inspect",
+    )
+    return ProviderCallResult(
+        status="provider_error",
+        remote_outcome="ambiguous",
+        response_id=unavailable("not_observed"),
+        finish_reason=unavailable("not_observed"),
+        error_code="transport_interrupted",
+        evidence=evidence,
+    )
+
+
+def _malformed_encoding_result(
+    target: ProviderTarget,
+    request: ProviderChatRequest,
+    attempt: int,
+    headers: httpx.Headers,
+    total_ms: float,
+) -> ProviderCallResult:
+    evidence = _evidence(
+        target,
+        request,
+        attempt,
+        headers,
+        total_ms,
+        (
+            unavailable("not_observed")
+            if request.stream
+            else unavailable("not_applicable")
+        ),
+        None,
+        None,
+        "inspect",
+    )
+    return ProviderCallResult(
+        status="malformed_response",
+        remote_outcome="ambiguous",
+        response_id=unavailable("not_observed"),
+        finish_reason=unavailable("not_observed"),
+        error_code="invalid_content_encoding",
         evidence=evidence,
     )
 
@@ -548,10 +679,11 @@ def _http_failure(
     target: ProviderTarget,
     request: ProviderChatRequest,
     attempt: int,
-    response: httpx.Response,
+    status_code: int,
+    headers: httpx.Headers,
     total_ms: float,
 ) -> ProviderCallResult:
-    status, outcome, code = _classify_status(response.status_code)
+    status, outcome, code = _classify_status(status_code)
     can_retry = attempt < target.limits.max_attempts
     disposition: Literal["no_retry", "retry", "inspect"]
     disposition = "retry" if can_retry and status == "throttled" else "no_retry"
@@ -561,7 +693,7 @@ def _http_failure(
         target,
         request,
         attempt,
-        response.headers,
+        headers,
         total_ms,
         (
             unavailable("not_observed")

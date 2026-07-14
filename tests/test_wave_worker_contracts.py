@@ -372,6 +372,25 @@ def test_wave_worker_lease_serializes_the_complete_remote_job(
     }
 
 
+def test_wave_worker_lease_fails_closed_without_job_identity(
+    remote_spec: ExperimentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _spec, _campaign, wave, *_paths = _provider_wave_inputs(
+        remote_spec,
+        tmp_path,
+        attempts=1,
+        concurrency=1,
+        provider_concurrency=1,
+    )
+    monkeypatch.delenv("JOB_ID", raising=False)
+
+    with (
+        pytest.raises(WorkerError, match="wave worker claim requires JOB_ID"),
+        _wave_worker_lease(wave, "token", None, lambda: NOW),
+    ):
+        raise AssertionError("worker entered without a lease")
+
+
 def test_wave_worker_lease_rejects_duplicate_job_before_execution(
     remote_spec: ExperimentSpec, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

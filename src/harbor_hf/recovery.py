@@ -237,7 +237,13 @@ def durable_shard_retry_event(
             subject_id=lock.campaign_id,
             kind="campaign.shard-retry-requested",
             producer="cli",
-            payload=ShardRetryPayload(shard_id=shard_id, reason=reason),
+            payload=ShardRetryPayload(
+                shard_id=shard_id,
+                reason=reason,
+                trial_generations={
+                    trial.trial_id: len(trial.executions) for trial in eligible
+                },
+            ),
             clock=clock,
             identifier=lambda: identifier,
         ),
@@ -256,7 +262,7 @@ def project_recovery(
     for event in ordered_events(events):
         spend += _apply_recovery_event(event, runs, shards, trials, executions, waves)
     trials = _derive_trials(lock, trials, executions)
-    trials = _apply_retry_requests(events, trials)
+    trials = _apply_retry_requests(lock, events, trials)
     shards = _derive_shards(shards, trials)
     runs = _derive_runs(runs, shards)
     counts = _counts(trials)
@@ -286,24 +292,110 @@ def project_recovery(
 
 
 def _apply_retry_requests(
-    events: list[CampaignEvent], trials: dict[str, TrialProjection]
+    lock: CampaignLock,
+    events: list[CampaignEvent],
+    trials: dict[str, TrialProjection],
 ) -> dict[str, TrialProjection]:
-    requested_at: dict[str, datetime] = {}
-    for event in ordered_events(events):
+    requested_at: dict[tuple[str, int], datetime] = {}
+    ordered = ordered_events(events)
+    legacy_generations = (
+        _legacy_retry_generations(lock, ordered)
+        if any(
+            event.kind == "campaign.shard-retry-requested"
+            and not cast(ShardRetryPayload, event.payload).trial_generations
+            for event in ordered
+        )
+        else {}
+    )
+    for event in ordered:
         if event.kind != "campaign.shard-retry-requested":
             continue
         payload = cast(ShardRetryPayload, event.payload)
-        requested_at[payload.shard_id] = max(
-            requested_at.get(payload.shard_id, event.observed_at), event.observed_at
+        generations = (
+            _validated_retry_generations(lock, payload, trials)
+            if payload.trial_generations
+            else legacy_generations[event.event_id]
         )
+        for trial_id, generation in generations.items():
+            key = (trial_id, generation)
+            requested_at[key] = max(
+                requested_at.get(key, event.observed_at), event.observed_at
+            )
     return {
         trial_id: (
-            trial.model_copy(update={"retry_not_before": requested_at[trial.shard_id]})
-            if trial.status == "retry_wait" and trial.shard_id in requested_at
+            trial.model_copy(
+                update={
+                    "retry_not_before": requested_at[
+                        (trial.trial_id, len(trial.executions))
+                    ]
+                }
+            )
+            if trial.status == "retry_wait"
+            and (trial.trial_id, len(trial.executions)) in requested_at
             else trial
         )
         for trial_id, trial in trials.items()
     }
+
+
+def _validated_retry_generations(
+    lock: CampaignLock,
+    payload: ShardRetryPayload,
+    trials: dict[str, TrialProjection],
+) -> dict[str, int]:
+    shard_ids = {
+        shard.shard_id: {trial.trial_id for trial in shard.trials}
+        for run in lock.runs
+        for shard in run.shards
+    }
+    allowed = shard_ids.get(payload.shard_id)
+    if allowed is None:
+        raise ValueError("retry request references an unknown shard")
+    if any(
+        trial_id not in allowed
+        or generation < 1
+        or generation > len(trials[trial_id].executions)
+        for trial_id, generation in payload.trial_generations.items()
+    ):
+        raise ValueError(
+            "retry request generations do not match the requested shard state"
+        )
+    return payload.trial_generations
+
+
+def _legacy_retry_generations(
+    lock: CampaignLock, events: list[CampaignEvent]
+) -> dict[str, dict[str, int]]:
+    """Recover generation bindings for legacy retry events in one forward pass."""
+    runs, shards, trials = _initial_projections(lock)
+    executions: dict[str, ExecutionProjection] = {}
+    execution_ids_by_trial: dict[str, list[str]] = {trial_id: [] for trial_id in trials}
+    waves: dict[str, WaveProjection] = {}
+    generations: dict[str, dict[str, int]] = {}
+    for event in events:
+        if event.kind == "campaign.shard-retry-requested":
+            payload = cast(ShardRetryPayload, event.payload)
+            shard = shards.get(payload.shard_id)
+            if shard is None:
+                raise ValueError("retry request references an unknown shard")
+            event_generations: dict[str, int] = {}
+            for trial_id in shard.trial_ids:
+                current = _derive_trial(
+                    lock,
+                    trials[trial_id],
+                    [
+                        executions[execution_id]
+                        for execution_id in execution_ids_by_trial[trial_id]
+                    ],
+                )
+                if current.status == "retry_wait":
+                    event_generations[trial_id] = len(current.executions)
+            generations[event.event_id] = event_generations
+        _apply_recovery_event(event, runs, shards, trials, executions, waves)
+        if event.kind == "execution.started":
+            payload = cast(ExecutionStartedPayload, event.payload)
+            execution_ids_by_trial[payload.trial_id].append(event.subject_id)
+    return generations
 
 
 def _apply_recovery_event(
@@ -699,13 +791,14 @@ def _terminal_decision(
 ) -> TerminalDecision | None:
     if campaign.status in _CAMPAIGN_TERMINAL:
         status = cast(TerminalStatus, campaign.status)
-        return _decision(lock, status, counts, "recorded")
+        return _decision(lock, status, _terminal_counts(campaign, counts), "recorded")
     if not _cleanup_is_complete(campaign, waves):
         return None
     decision_counts = _terminal_counts(campaign, counts)
     cancelling = campaign.status in {"cancel_requested", "draining"}
     if not all(
-        trial.status in _TERMINAL_STATUSES or (cancelling and trial.status == "planned")
+        trial.status in _TERMINAL_STATUSES
+        or (cancelling and trial.status in {"planned", "retry_wait"})
         for trial in trials.values()
     ):
         return None
@@ -732,10 +825,19 @@ def _terminal_decision(
 def _terminal_counts(
     campaign: CampaignProjection, counts: ProjectionCounts
 ) -> ProjectionCounts:
-    if campaign.status not in {"cancel_requested", "draining"}:
+    if campaign.status not in {
+        "cancel_requested",
+        "draining",
+        "cancelled",
+        "partial",
+    }:
         return counts
     return counts.model_copy(
-        update={"planned": 0, "cancelled": counts.cancelled + counts.planned}
+        update={
+            "planned": 0,
+            "retrying": 0,
+            "cancelled": counts.cancelled + counts.planned + counts.retrying,
+        }
     )
 
 

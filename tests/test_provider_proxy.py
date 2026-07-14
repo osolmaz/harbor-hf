@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import gzip
 import json
+import zlib
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
 from pydantic import JsonValue, ValidationError
 
+import harbor_hf.provider_proxy as provider_proxy
 from harbor_hf.provider_models import (
     ExplicitProviderRoute,
     ProviderLimits,
@@ -16,10 +20,12 @@ from harbor_hf.provider_models import (
 from harbor_hf.provider_proxy import (
     ProviderEvidenceProxy,
     ProviderProxyError,
+    _decode_evidence_response,
     _forwarded_payload,
     _json_object,
     _provider_message,
     _provider_request,
+    _relay_response,
 )
 
 
@@ -369,3 +375,225 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
         "secret-token",
     ):
         assert private not in serialized
+
+
+@pytest.mark.parametrize(
+    ("encoding", "encoded"),
+    [
+        ("gzip", gzip.compress),
+        ("deflate", zlib.compress),
+    ],
+)
+def test_proxy_preserves_encoding_and_decodes_evidence(
+    tmp_path: Path, encoding: str, encoded: Callable[[bytes], bytes]
+) -> None:
+    payload = (
+        b'{"id":"complete-one","model":"org/model","choices":['
+        b'{"finish_reason":"stop","message":{"role":"assistant",'
+        b'"content":"answer"}}]}'
+    )
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": encoding,
+            },
+            stream=httpx.ByteStream(encoded(payload)),
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    evidence = tmp_path / "evidence.jsonl"
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(id="provider", model="org/model"),
+        token="token",
+        evidence_path=evidence,
+        client=client,
+    )
+    base_url = proxy.start()
+    try:
+        response = httpx.post(
+            f"{proxy.scoped_base_url(base_url, 'trial')}/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "prompt"}]},
+        )
+    finally:
+        proxy.close()
+        client.close()
+
+    assert response.content == payload
+    assert response.headers["content-encoding"] == encoding
+    assert json.loads(evidence.read_text())["status"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("encoding", "delimiter", "compression"),
+    [("gzip", b"\n", "gzip"), ("deflate", b"\n", "raw"), (None, b"\r", None)],
+)
+def test_ttft_probe_decodes_compression_and_accepts_bare_cr(
+    encoding: str | None, delimiter: bytes, compression: str | None
+) -> None:
+    stream = delimiter.join(
+        [
+            b'data: {"choices":[{"delta":{"content":"answer"}}]}',
+            b"",
+            b"data: [DONE]",
+            b"",
+        ]
+    )
+    if compression == "gzip":
+        content = gzip.compress(stream)
+    elif compression == "raw":
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        content = compressor.compress(stream) + compressor.flush()
+    else:
+        content = stream
+    headers = {"content-encoding": encoding} if encoding is not None else {}
+
+    class FragmentedStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            for value in content:
+                yield bytes([value])
+
+    response = httpx.Response(
+        200,
+        headers=headers,
+        stream=FragmentedStream(),
+    )
+
+    class Handler:
+        close_connection = False
+        wfile = type(
+            "Output", (), {"write": lambda *_: None, "flush": lambda *_: None}
+        )()
+
+        def send_response(self, _status: int) -> None:
+            pass
+
+        def send_header(self, _name: str, _value: str) -> None:
+            pass
+
+        def end_headers(self) -> None:
+            pass
+
+    captured, semantic_output_ms = _relay_response(cast(Any, Handler()), response, 0)
+
+    assert bytes(captured) == content
+    assert semantic_output_ms is not None
+
+
+def test_evidence_decoder_bounds_high_ratio_compressed_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_proxy, "_MAX_EVIDENCE_RESPONSE_BYTES", 64)
+    headers = httpx.Headers({"content-encoding": "gzip"})
+
+    content = gzip.compress(b"x" * 4096)
+    decoded_headers, decoded, invalid = _decode_evidence_response(headers, content)
+
+    assert decoded_headers == headers
+    assert decoded == content
+    assert invalid is True
+
+
+def test_evidence_decoder_preserves_unknown_or_malformed_encoding() -> None:
+    for encoding, content in (("custom", b"encoded"), ("gzip", b"truncated")):
+        headers = httpx.Headers({"content-encoding": encoding})
+        observed_headers, observed_content, invalid = _decode_evidence_response(
+            headers, content
+        )
+
+        assert observed_headers["content-encoding"] == encoding
+        assert observed_content == content
+        assert invalid is True
+
+
+@pytest.mark.parametrize("encoding", ["br", "zstd"])
+def test_evidence_decoder_rejects_encodings_without_bounded_decoders(
+    encoding: str,
+) -> None:
+    headers = httpx.Headers({"content-encoding": encoding})
+
+    observed_headers, observed_content, invalid = _decode_evidence_response(
+        headers, b"provider-controlled encoded bytes"
+    )
+
+    assert observed_headers == headers
+    assert observed_content == b"provider-controlled encoded bytes"
+    assert invalid is True
+
+
+@pytest.mark.parametrize(
+    ("encoding", "encoded"),
+    [("gzip", gzip.compress), ("deflate", zlib.compress)],
+)
+def test_evidence_decoder_rejects_compressed_body_without_eof(
+    encoding: str, encoded: Callable[[bytes], bytes]
+) -> None:
+    headers = httpx.Headers({"content-encoding": encoding})
+    content = encoded(b'{"choices":[]}')[:-1]
+
+    observed_headers, observed_content, invalid = _decode_evidence_response(
+        headers, content
+    )
+
+    assert observed_headers == headers
+    assert observed_content == content
+    assert invalid is True
+
+
+def test_evidence_decoder_rejects_trailing_gzip_member() -> None:
+    headers = httpx.Headers({"content-encoding": "gzip"})
+    content = gzip.compress(b'{"first":true}') + gzip.compress(b'{"second":true}')
+
+    observed_headers, observed_content, invalid = _decode_evidence_response(
+        headers, content
+    )
+
+    assert observed_headers == headers
+    assert observed_content == content
+    assert invalid is True
+
+
+def test_mid_relay_transport_error_keeps_provider_status_and_partial_body(
+    tmp_path: Path,
+) -> None:
+    class BrokenStream(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            yield b"partial"
+            raise httpx.ReadError("upstream disconnected")
+
+    def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BrokenStream())
+
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(id="provider", model="org/model"),
+        token="token",
+        evidence_path=tmp_path / "evidence.jsonl",
+        client=client,
+    )
+
+    class Handler:
+        responses: list[int] = []
+        response_headers: list[tuple[str, str]] = []
+        wfile = type(
+            "Output", (), {"write": lambda *_: None, "flush": lambda *_: None}
+        )()
+        close_connection = False
+
+        def send_response(self, status: int) -> None:
+            self.responses.append(status)
+
+        def send_header(self, name: str, value: str) -> None:
+            self.response_headers.append((name, value))
+
+        def end_headers(self) -> None:
+            pass
+
+    observed = proxy._forward(cast(Any, Handler()), {"messages": []})
+    client.close()
+
+    assert observed.status_code == 200
+    assert observed.content == b"partial"
+    assert observed.transport_interrupted is True
