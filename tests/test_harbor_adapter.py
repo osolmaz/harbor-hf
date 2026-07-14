@@ -555,6 +555,41 @@ def test_wildcard_request_counts_resolved_tasks_not_patterns(
     assert dataset["task_names"] == ["task-*"]
 
 
+@pytest.mark.parametrize(
+    "expected_task_digests",
+    [
+        {"task-one": "sha256:" + "6" * 64},
+        {"task-one": "sha256:" + "9" * 64, "task-two": "sha256:" + "7" * 64},
+        {"task-outside": "sha256:" + "9" * 64},
+    ],
+)
+def test_request_rejects_task_maps_that_do_not_match_the_lock(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    expected_task_digests: dict[str, str],
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="task-boundary").model_copy(
+        update={
+            "benchmark_tasks": ["task-*"],
+            "benchmark_task_digests": {
+                "task-one": "sha256:" + "6" * 64,
+                "task-two": "sha256:" + "7" * 64,
+            },
+        }
+    )
+
+    with pytest.raises(WorkerError, match="outside the resolved run set"):
+        build_execution_request(
+            lock,
+            tmp_path / "jobs",
+            "https://endpoint.example",
+            task_names=["task-*"],
+            attempts=1,
+            concurrency=1,
+            expected_task_digests=expected_task_digests,
+        )
+
+
 def test_golden_adapter_scenarios_remain_compatible(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

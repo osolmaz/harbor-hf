@@ -251,9 +251,17 @@ def build_execution_request(
 ) -> HarborExecutionRequest:
     if attempts < 1 or concurrency < 1:
         raise WorkerError("Harbor attempts and concurrency must be positive")
-    if any(
-        not any(fnmatch(task, selector) for task in expected_task_digests)
-        for selector in task_names
+    resolved_task_digests = {
+        task: digest
+        for task, digest in lock.benchmark_task_digests.items()
+        if any(fnmatch(task, selector) for selector in task_names)
+    }
+    if (
+        any(
+            not any(fnmatch(task, selector) for task in lock.benchmark_task_digests)
+            for selector in task_names
+        )
+        or expected_task_digests != resolved_task_digests
     ):
         raise WorkerError("Harbor request contains a task outside the resolved run set")
     served_model_name = _served_model_name(lock)
