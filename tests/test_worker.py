@@ -16,6 +16,7 @@ from conftest import write_fake_compatibility_bundle
 from harbor_hf.coordination import ClaimConflict, run_claim_path
 from harbor_hf.harbor_adapter import build_execution_request
 from harbor_hf.models import DeploymentProfile, ExperimentSpec, SourcePin
+from harbor_hf.private_artifacts import sanitize_private_artifact_symlinks
 from harbor_hf.process import CommandRunner, ProcessError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.worker import (
@@ -2555,7 +2556,7 @@ def test_failed_direct_run_sanitizes_each_trial_independently(
     seen: list[Path] = []
     monkeypatch.setattr(
         "harbor_hf.worker.sanitize_private_artifact_tree",
-        lambda root: seen.append(root),
+        lambda root, **_kwargs: seen.append(root),
     )
 
     _sanitize_direct_trial_artifacts(tmp_path)
@@ -2575,6 +2576,29 @@ def test_failed_direct_run_does_not_follow_symlinked_job_root(tmp_path: Path) ->
     _sanitize_direct_trial_artifacts(tmp_path)
 
     assert outside_artifact.read_bytes() == b"x" * 1024
+
+
+def test_failed_direct_run_keeps_nested_symlink_rejection_with_trial(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "harbor-jobs" / "job" / "trial"
+    trial.mkdir(parents=True)
+    outside = tmp_path / "outside.log"
+    outside.write_text("outside", encoding="utf-8")
+    linked = trial / "linked.log"
+    linked.symlink_to(outside)
+
+    sanitize_private_artifact_symlinks(tmp_path, max_depth=3)
+    assert linked.is_symlink()
+    _sanitize_direct_trial_artifacts(tmp_path)
+
+    rejection = json.loads(
+        (trial / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "linked.log", "reason": "symlink", "size": None}
+    ]
+    assert outside.read_text(encoding="utf-8") == "outside"
 
 
 def test_publish_evidence_requires_one_terminal_marker(

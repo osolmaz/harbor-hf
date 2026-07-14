@@ -124,7 +124,7 @@ def test_failed_execution_preserves_attempt_state_before_sanitizing(
     events = tmp_path / "events.jsonl"
     events.write_text('{"event":"harbor_started"}\n', encoding="utf-8")
 
-    def trim_attempt_event(root: Path) -> list[object]:
+    def trim_attempt_event(root: Path, **_kwargs: object) -> list[object]:
         (root / "events.jsonl").unlink(missing_ok=True)
         return []
 
@@ -143,6 +143,35 @@ def test_failed_execution_preserves_attempt_state_before_sanitizing(
             "satisfied": False,
         }
     ]
+
+
+def test_failed_execution_sanitizes_result_before_session_probe(tmp_path: Path) -> None:
+    trial = tmp_path / "harbor-jobs" / "job" / "trial"
+    trial.mkdir(parents=True)
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "harbor-request.json").write_text(
+        '{"verification":{"expected_agent_name":"openclaw"}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "events.jsonl").write_text(
+        '{"event":"harbor_started"}\n', encoding="utf-8"
+    )
+    outside = tmp_path.parent / "oversized-result.json"
+    with outside.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+    (trial / "result.json").symlink_to(outside)
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    manifest = json.loads((tmp_path / "private-artifacts.json").read_text())
+    assert manifest["requirements"][0]["required"] is True
+    assert ("harbor-jobs/job/trial/result.json", "symlink") in {
+        (item["path"], item["reason"]) for item in manifest["rejections"]
+    }
+    assert outside.stat().st_size == 64 * 1024 * 1024 + 1
 
 
 def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:

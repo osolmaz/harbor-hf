@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -80,7 +81,7 @@ class PrivateArtifactRequirement(FrozenModel):
 
 class PrivateArtifactRejection(FrozenModel):
     path: str = Field(min_length=1)
-    reason: Literal["symlink", "file_size", "bundle_size"]
+    reason: Literal["symlink", "file_size", "bundle_size", "reserved_path"]
     size: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -167,6 +168,7 @@ def build_private_artifact_manifest(
     execution_id: str | None = None,
     trial_id: str | None = None,
     session_required: bool | None = None,
+    trust_rejections: bool = False,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
 ) -> PrivateArtifactManifest:
@@ -224,7 +226,7 @@ def build_private_artifact_manifest(
         total_bytes=total_bytes,
         entries=entries,
         requirements=[requirement],
-        rejections=_load_rejections(root),
+        rejections=_manifest_rejections(root, trust_rejections=trust_rejections),
     )
 
 
@@ -235,6 +237,7 @@ def write_private_artifact_manifest(
     execution_id: str | None = None,
     trial_id: str | None = None,
     session_required: bool | None = None,
+    trust_rejections: bool = False,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
 ) -> PrivateArtifactManifest:
@@ -244,6 +247,7 @@ def write_private_artifact_manifest(
         execution_id=execution_id,
         trial_id=trial_id,
         session_required=session_required,
+        trust_rejections=trust_rejections,
         max_file_bytes=max_file_bytes,
         max_bundle_bytes=max_bundle_bytes,
     )
@@ -256,10 +260,13 @@ def sanitize_private_artifact_tree(
     *,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
+    trust_existing_rejections: bool = False,
 ) -> list[PrivateArtifactRejection]:
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
     rejected = _remove_symlinks(root)
-    rejected.extend(_load_rejections(root))
+    rejected.extend(
+        _consume_existing_rejections(root, trust_existing=trust_existing_rejections)
+    )
     files, file_rejections = _remove_oversized_files(root, max_file_bytes)
     rejected.extend(file_rejections)
     rejected.extend(_trim_bundle(files, max_bundle_bytes))
@@ -268,11 +275,11 @@ def sanitize_private_artifact_tree(
 
 
 def sanitize_private_artifact_symlinks(
-    root: Path,
+    root: Path, *, max_depth: int | None = None
 ) -> list[PrivateArtifactRejection]:
     """Remove symlinks without applying an aggregate size limit to child trials."""
-    rejected = _remove_symlinks(root)
-    rejected.extend(_load_rejections(root))
+    rejected = _remove_symlinks(root, max_depth=max_depth)
+    rejected.extend(_consume_existing_rejections(root, trust_existing=False))
     _write_rejections(root, rejected)
     return rejected
 
@@ -292,18 +299,44 @@ def _write_rejections(root: Path, rejected: list[PrivateArtifactRejection]) -> N
         )
 
 
-def _remove_symlinks(root: Path) -> list[PrivateArtifactRejection]:
+def _remove_symlinks(
+    root: Path, *, max_depth: int | None = None
+) -> list[PrivateArtifactRejection]:
     rejected: list[PrivateArtifactRejection] = []
     candidates = sorted(
         root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
     )
     for candidate in candidates:
+        if max_depth is not None and len(candidate.relative_to(root).parts) > max_depth:
+            continue
         if not candidate.is_symlink():
             continue
         relative = candidate.relative_to(root).as_posix()
         candidate.unlink()
         rejected.append(PrivateArtifactRejection(path=relative, reason="symlink"))
     return rejected
+
+
+def _consume_existing_rejections(
+    root: Path, *, trust_existing: bool
+) -> list[PrivateArtifactRejection]:
+    path = root / _REJECTION_FILE
+    if not path.exists():
+        return []
+    if trust_existing:
+        return _load_rejections(root)
+    size = path.stat().st_size
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return [
+        PrivateArtifactRejection(
+            path=_REJECTION_FILE,
+            reason="reserved_path",
+            size=size,
+        )
+    ]
 
 
 def _remove_oversized_files(
@@ -438,6 +471,16 @@ def _load_rejections(root: Path) -> list[PrivateArtifactRejection]:
     return [
         PrivateArtifactRejection.model_validate(item) for item in value["rejections"]
     ]
+
+
+def _manifest_rejections(
+    root: Path, *, trust_rejections: bool
+) -> list[PrivateArtifactRejection]:
+    if not (root / _REJECTION_FILE).exists():
+        return []
+    if not trust_rejections:
+        raise RuntimeError("private artifact rejection path is controller-reserved")
+    return _load_rejections(root)
 
 
 def _safe_relative_path(value: str) -> PurePosixPath:

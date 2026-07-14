@@ -1169,7 +1169,7 @@ def require_executable(name: str) -> None:
 def _finalize_evidence(root: Path, token: str) -> None:
     failed = (root / "_FAILED").is_file()
     if failed:
-        sanitize_private_artifact_symlinks(root)
+        sanitize_private_artifact_symlinks(root, max_depth=3)
         _sanitize_direct_trial_artifacts(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
@@ -1192,7 +1192,7 @@ def _finalize_evidence(root: Path, token: str) -> None:
             error_type=refresh_error,
         )
     if failed:
-        _sanitize_direct_trial_artifacts(root)
+        _sanitize_direct_trial_artifacts(root, trust_existing_rejections=True)
     _write_direct_private_artifact_manifests(root, strict_session=not failed)
     assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
@@ -1216,6 +1216,7 @@ def _write_direct_private_artifact_manifests(
             session_required=openclaw_execution_started(
                 trial_root, fallback_attempted=attempted
             ),
+            trust_rejections=not strict_session,
         )
 
 
@@ -1229,9 +1230,14 @@ def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
         )
 
 
-def _sanitize_direct_trial_artifacts(root: Path) -> None:
+def _sanitize_direct_trial_artifacts(
+    root: Path, *, trust_existing_rejections: bool = False
+) -> None:
     for trial_root in _direct_trial_roots(root):
-        sanitize_private_artifact_tree(trial_root)
+        sanitize_private_artifact_tree(
+            trial_root,
+            trust_existing_rejections=trust_existing_rejections,
+        )
 
 
 def _direct_trial_roots(root: Path) -> list[Path]:

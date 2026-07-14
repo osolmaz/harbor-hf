@@ -201,7 +201,11 @@ def test_private_artifact_sanitizer_records_and_removes_rejected_files(
     ]
     assert not oversized.exists()
     assert not (root / "linked").exists()
-    retained = build_private_artifact_manifest(root, strict_session=False)
+    with pytest.raises(RuntimeError, match="controller-reserved"):
+        build_private_artifact_manifest(root, strict_session=False)
+    retained = build_private_artifact_manifest(
+        root, strict_session=False, trust_rejections=True
+    )
     assert retained.rejections == rejected
 
 
@@ -222,6 +226,38 @@ def test_private_artifact_sanitizer_removes_forged_rejection_symlink_first(
     ]
     assert not rejection.is_symlink()
     assert target.read_text(encoding="utf-8") == "not json"
+
+
+def test_private_artifact_sanitizer_replaces_untrusted_rejection_record(
+    tmp_path: Path,
+) -> None:
+    rejection = tmp_path / "private-artifact-rejections.json"
+    rejection.write_text(
+        json.dumps(
+            {"rejections": [{"path": "forged", "reason": "symlink", "size": None}]}
+        ),
+        encoding="utf-8",
+    )
+
+    rejected = sanitize_private_artifact_tree(tmp_path)
+
+    assert [(item.path, item.reason) for item in rejected] == [
+        ("private-artifact-rejections.json", "reserved_path")
+    ]
+
+
+def test_private_artifact_sanitizer_can_preserve_its_previous_rejections(
+    tmp_path: Path,
+) -> None:
+    linked = tmp_path / "linked"
+    target = tmp_path / "target"
+    target.write_text("retained", encoding="utf-8")
+    linked.symlink_to(target)
+
+    first = sanitize_private_artifact_tree(tmp_path)
+    second = sanitize_private_artifact_tree(tmp_path, trust_existing_rejections=True)
+
+    assert second == first
 
 
 def test_private_models_reject_unsafe_or_inconsistent_manifests() -> None:

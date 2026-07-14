@@ -57,6 +57,7 @@ from harbor_hf.private_artifacts import (
     PrivateArtifactRequirementError,
     build_private_artifact_manifest,
     openclaw_execution_started,
+    openclaw_execution_was_attempted,
     sanitize_private_artifact_tree,
     write_private_artifact_manifest,
 )
@@ -1126,9 +1127,10 @@ def _trial_destination(
 def _finalize_execution(
     root: Path, token: str, *, strict_compatibility: bool = True
 ) -> None:
-    session_required = openclaw_execution_started(root)
+    attempted = openclaw_execution_was_attempted(root)
     if not strict_compatibility:
         sanitize_private_artifact_tree(root)
+    session_required = openclaw_execution_started(root, fallback_attempted=attempted)
     _redact_unit(root, token)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
     if refresh_error is not None:
@@ -1138,11 +1140,12 @@ def _finalize_execution(
             error_type=refresh_error,
         )
     if not strict_compatibility:
-        sanitize_private_artifact_tree(root)
+        sanitize_private_artifact_tree(root, trust_existing_rejections=True)
     write_private_artifact_manifest(
         root,
         strict_session=strict_compatibility,
         session_required=session_required,
+        trust_rejections=not strict_compatibility,
     )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
