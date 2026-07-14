@@ -20,12 +20,13 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 def _construct_unique_mapping(
     loader: _UniqueKeyLoader, node: MappingNode, deep: bool = False
 ) -> dict[object, object]:
-    loader.flatten_mapping(node)
-    mapping: dict[object, object] = {}
-    for key_node, value_node in node.value:
+    explicit_keys: set[object] = set()
+    for key_node, _value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
         key = loader.construct_object(key_node, deep=deep)
         try:
-            duplicate = key in mapping
+            duplicate = key in explicit_keys
         except TypeError as error:
             raise ConstructorError(
                 "while constructing a mapping",
@@ -40,8 +41,8 @@ def _construct_unique_mapping(
                 f"found duplicate key {key!r}",
                 key_node.start_mark,
             )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+        explicit_keys.add(key)
+    return super(_UniqueKeyLoader, loader).construct_mapping(node, deep=deep)
 
 
 _UniqueKeyLoader.add_constructor(

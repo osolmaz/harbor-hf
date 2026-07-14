@@ -298,13 +298,19 @@ def _apply_retry_requests(
 ) -> dict[str, TrialProjection]:
     requested_at: dict[tuple[str, int], datetime] = {}
     ordered = ordered_events(events)
-    for index, event in enumerate(ordered):
+    has_legacy_requests = any(
+        event.kind == "campaign.shard-retry-requested"
+        and not cast(ShardRetryPayload, event.payload).trial_generations
+        for event in ordered
+    )
+    legacy_generations = (
+        _legacy_retry_generations(lock, ordered) if has_legacy_requests else {}
+    )
+    for event in ordered:
         if event.kind != "campaign.shard-retry-requested":
             continue
         payload = cast(ShardRetryPayload, event.payload)
-        generations = payload.trial_generations or _legacy_retry_generations(
-            lock, ordered[:index], payload.shard_id
-        )
+        generations = payload.trial_generations or legacy_generations[event.event_id]
         for trial_id, generation in generations.items():
             key = (trial_id, generation)
             requested_at[key] = max(
@@ -328,17 +334,38 @@ def _apply_retry_requests(
 
 
 def _legacy_retry_generations(
-    lock: CampaignLock, prior_events: list[CampaignEvent], shard_id: str
-) -> dict[str, int]:
-    projection = project_recovery(lock, prior_events)
-    shard = projection.shards.get(shard_id)
-    if shard is None:
-        return {}
-    return {
-        trial_id: len(projection.trials[trial_id].executions)
-        for trial_id in shard.trial_ids
-        if projection.trials[trial_id].status == "retry_wait"
-    }
+    lock: CampaignLock, events: list[CampaignEvent]
+) -> dict[str, dict[str, int]]:
+    """Recover generation bindings for legacy retry events in one forward pass."""
+    runs, shards, trials = _initial_projections(lock)
+    executions: dict[str, ExecutionProjection] = {}
+    execution_ids_by_trial: dict[str, list[str]] = {trial_id: [] for trial_id in trials}
+    waves: dict[str, WaveProjection] = {}
+    generations: dict[str, dict[str, int]] = {}
+    for event in events:
+        if event.kind == "campaign.shard-retry-requested":
+            payload = cast(ShardRetryPayload, event.payload)
+            if not payload.trial_generations:
+                shard = shards.get(payload.shard_id)
+                event_generations: dict[str, int] = {}
+                if shard is not None:
+                    for trial_id in shard.trial_ids:
+                        current = _derive_trial(
+                            lock,
+                            trials[trial_id],
+                            [
+                                executions[execution_id]
+                                for execution_id in execution_ids_by_trial[trial_id]
+                            ],
+                        )
+                        if current.status == "retry_wait":
+                            event_generations[trial_id] = len(current.executions)
+                generations[event.event_id] = event_generations
+        _apply_recovery_event(event, runs, shards, trials, executions, waves)
+        if event.kind == "execution.started":
+            payload = cast(ExecutionStartedPayload, event.payload)
+            execution_ids_by_trial[payload.trial_id].append(event.subject_id)
+    return generations
 
 
 def _apply_recovery_event(
