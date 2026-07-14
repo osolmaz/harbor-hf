@@ -169,6 +169,7 @@ class HarborStream:
         self.expected_model_name = expected_model_name
         self.commands: list[list[str]] = []
         self.base_urls: list[str] = []
+        self.environments: list[dict[str, str]] = []
         self.active = 0
         self.max_active = 0
         self.lock = threading.Lock()
@@ -191,6 +192,7 @@ class HarborStream:
         with self.lock:
             self.commands.append(command)
             self.base_urls.append(base_url)
+            self.environments.append(environment)
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
@@ -283,6 +285,14 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     assert not (destination / "_FAILED").exists()
     assert harbor.max_active == 2
     assert len(harbor.commands) == 2
+    homes = [environment["HOME"] for environment in harbor.environments]
+    assert len(set(homes)) == 2
+    assert all(Path(home).name.startswith("harbor-hf-shard-home-") for home in homes)
+    assert all(
+        not environment["UV_CACHE_DIR"].startswith(environment["HOME"])
+        and not environment["UV_PYTHON_INSTALL_DIR"].startswith(environment["HOME"])
+        for environment in harbor.environments
+    )
     assert all(
         command[command.index("--n-attempts") + 1] == "1"
         and command[command.index("--n-concurrent") + 1] == "1"

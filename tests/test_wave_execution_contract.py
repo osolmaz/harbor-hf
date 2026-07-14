@@ -397,11 +397,17 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
     assert command[command.index("--include-task-name") + 1] == task_name
     assert Path(command[command.index("--jobs-dir") + 1]).name == "harbor-jobs"
     assert log_path.name == "harbor.log"
-    assert environment == {
+    assert {
+        key: environment[key]
+        for key in ("HF_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL")
+    } == {
         "HF_TOKEN": "contract-token",
         "OPENAI_API_KEY": "contract-token",
         "OPENAI_BASE_URL": "https://endpoint.example/v1",
     }
+    assert Path(environment["HOME"]).name.startswith("harbor-hf-shard-home-")
+    assert not environment["UV_CACHE_DIR"].startswith(environment["HOME"])
+    assert not environment["UV_PYTHON_INSTALL_DIR"].startswith(environment["HOME"])
     assert timeout_seconds == wave.duration_seconds
     assert [call[0][2] for call in runner.calls] == [
         "describe",

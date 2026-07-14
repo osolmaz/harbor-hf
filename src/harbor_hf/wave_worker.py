@@ -812,16 +812,30 @@ def _execute_trial(
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
-        exit_code = stream_runner(
-            command,
-            execution_root / "harbor.log",
-            environment={
-                "HF_TOKEN": token,
-                "OPENAI_API_KEY": token,
-                "OPENAI_BASE_URL": f"{trial_base_url}/v1",
-            },
-            timeout_seconds=timeout,
-        )
+        # Each shard runs Harbor in a separate process. Harbor's task cache is
+        # rooted under HOME and is not safe for concurrent writers, so isolate
+        # that mutable state while preserving uv's concurrency-safe shared
+        # package and Python caches.
+        controller_home = Path.home()
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-shard-home-") as home:
+            exit_code = stream_runner(
+                command,
+                execution_root / "harbor.log",
+                environment={
+                    "HOME": home,
+                    "HF_TOKEN": token,
+                    "OPENAI_API_KEY": token,
+                    "OPENAI_BASE_URL": f"{trial_base_url}/v1",
+                    "UV_CACHE_DIR": os.environ.get(
+                        "UV_CACHE_DIR", str(controller_home / ".cache" / "uv")
+                    ),
+                    "UV_PYTHON_INSTALL_DIR": os.environ.get(
+                        "UV_PYTHON_INSTALL_DIR",
+                        str(controller_home / ".local" / "share" / "uv" / "python"),
+                    ),
+                },
+                timeout_seconds=timeout,
+            )
         append_event(events, "harbor_finished", exit_code=exit_code)
         if exit_code != 0:
             try:
