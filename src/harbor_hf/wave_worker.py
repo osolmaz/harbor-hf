@@ -958,12 +958,19 @@ def _execution_failure_category(
 def _harbor_trial_failure_category(
     error: HarborTrialFailure, evidence_root: Path | None
 ) -> RetryCategory:
-    details = f"{error.exception_type} {error.exception_message or ''}".lower()
-    category = _retry_category_from_text(details)
+    exception_type = error.exception_type.lower()
+    category = _retry_category_from_text(exception_type)
     if category is not None:
         return category
-    if error.exception_type.lower() == "nonzeroagentexitcodeerror":
-        return _openclaw_transport_failure_category(evidence_root) or "benchmark"
+    if exception_type == "nonzeroagentexitcodeerror":
+        message_category = _retry_category_from_text(
+            (error.exception_message or "").lower()
+        )
+        return (
+            message_category
+            or _openclaw_transport_failure_category(evidence_root)
+            or "benchmark"
+        )
     return "benchmark"
 
 
