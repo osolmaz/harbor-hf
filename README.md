@@ -114,10 +114,11 @@ names, provider region, hardware, accelerator count, and declared scaling
 limits while the endpoint is paused and again after every target replica is
 ready. It then probes the endpoint's reported health route before Harbor starts.
 Harbor writes raw sessions and logs only to Job-local storage. The controller
-redacts and validates that staging tree before publishing it to the bucket. Each
-physical execution receives a bounded `private-artifacts.json` inventory with a
-logical kind, size, and SHA-256 digest for every retained file. A successful
-OpenClaw execution cannot publish success without a captured session JSONL.
+redacts and validates that staging tree before publishing it to the bucket.
+Each direct Harbor trial and each campaign physical execution receives a
+bounded `private-artifacts.json` inventory with a logical kind, size, and
+SHA-256 digest for every retained file. A successful OpenClaw execution cannot
+publish success without a captured session JSONL.
 Failed executions retain an explicit missing-session requirement for diagnosis,
 and the controller copies `_SUCCESS` or `_FAILED` last.
 Submission creates or verifies the namespace-level coordination repository and

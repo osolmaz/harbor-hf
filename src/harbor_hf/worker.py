@@ -66,6 +66,12 @@ from harbor_hf.models import (
     SourcePin,
 )
 from harbor_hf.planner import experiment_digest
+from harbor_hf.private_artifacts import (
+    build_private_artifact_manifest,
+    openclaw_execution_was_attempted,
+    sanitize_private_artifact_tree,
+    write_private_artifact_manifest,
+)
 from harbor_hf.process import (
     CommandRunner,
     ProcessError,
@@ -729,6 +735,7 @@ def _execute_benchmark(
     if outcome.verification is None:
         raise WorkerError("Harbor produced no validated compatibility bundle")
     write_json(root / "verification.json", outcome.verification.model_dump(mode="json"))
+    _validate_direct_private_artifacts(root, lock)
     append_event(events, "verification_validated")
 
 
@@ -1158,6 +1165,9 @@ def require_executable(name: str) -> None:
 
 
 def _finalize_evidence(root: Path, token: str) -> None:
+    failed = (root / "_FAILED").is_file()
+    if failed:
+        sanitize_private_artifact_tree(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
         append_event(
@@ -1178,9 +1188,50 @@ def _finalize_evidence(root: Path, token: str) -> None:
             "compatibility_refresh_skipped",
             error_type=refresh_error,
         )
+    if failed:
+        sanitize_private_artifact_tree(root)
+    _write_direct_private_artifact_manifests(root, strict_session=not failed)
     assert_secret_absent(root, token)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     write_checksums(root)
+
+
+def _write_direct_private_artifact_manifests(
+    root: Path, *, strict_session: bool
+) -> None:
+    lock_path = root / "run.lock.json"
+    if not lock_path.is_file():
+        return
+    lock = RunLock.model_validate_json(lock_path.read_text(encoding="utf-8"))
+    attempted = openclaw_execution_was_attempted(root)
+    for trial_root in _direct_trial_roots(root):
+        write_private_artifact_manifest(
+            trial_root,
+            strict_session=strict_session,
+            execution_id=lock.run_id,
+            trial_id=trial_root.name,
+            session_required=(
+                None if (trial_root / "result.json").is_file() else attempted
+            ),
+        )
+
+
+def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
+    for trial_root in _direct_trial_roots(root):
+        build_private_artifact_manifest(
+            trial_root,
+            strict_session=True,
+            execution_id=lock.run_id,
+            trial_id=trial_root.name,
+        )
+
+
+def _direct_trial_roots(root: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted((root / "harbor-jobs").glob("*/*"))
+        if not path.is_symlink() and path.is_dir()
+    ]
 
 
 def controller_environment(lock: RunLock) -> dict[str, object]:

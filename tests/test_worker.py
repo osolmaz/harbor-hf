@@ -2888,6 +2888,7 @@ def test_worker_publishes_success_after_cleanup(
         "harbor-job.json",
         "harbor-jobs/job/trial/result.json",
         "harbor-jobs/job/trial/lock.json",
+        "harbor-jobs/job/trial/private-artifacts.json",
         "harbor.log",
         "harbor-request.json",
         "manifest.yaml",
@@ -2907,6 +2908,76 @@ def test_worker_publishes_success_after_cleanup(
             "json",
         ]
         for operation in ("describe", "resume", "describe", "pause", "describe")
+    ]
+
+
+def test_direct_worker_fails_and_publishes_when_openclaw_session_is_missing(
+    remote_spec: ExperimentSpec,
+    remote_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = build_run_lock(remote_spec, run_id="missing-session")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime",
+        lambda *_args: {"probes": {"health": {"http_status": 200}}},
+    )
+
+    def stream(
+        command: Sequence[str],
+        log_path: Path,
+        *,
+        environment: dict[str, str],
+        timeout_seconds: int,
+    ) -> int:
+        exit_code = _successful_stream(
+            command,
+            log_path,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+        if "--config" in command:
+            config_path = Path(command[command.index("--config") + 1])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            result_path = Path(config["jobs_dir"]) / "job" / "trial" / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["agent_execution"] = {"started_at": "2026-07-14T00:00:00Z"}
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+        return exit_code
+
+    runner = EndpointRunner(
+        [snapshot("paused", 0), snapshot("running", 1), snapshot("paused", 0)]
+    )
+
+    with pytest.raises(WorkerError, match="no session JSONL"):
+        run_worker(
+            remote_manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=runner,
+            stream_runner=stream,
+            source_preparer=_prepare_source,
+            watchdog_launcher=_launch_watchdog,
+            claim_store=FakeClaimStore(),
+        )
+
+    root = tmp_path / "output" / lock.artifact_prefix
+    assert (root / "_FAILED").is_file()
+    manifest = json.loads(
+        (root / "harbor-jobs/job/trial/private-artifacts.json").read_text()
+    )
+    assert manifest["execution_id"] == lock.run_id
+    assert manifest["trial_id"] == "trial"
+    assert manifest["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": True,
+            "satisfied": False,
+        }
     ]
 
 

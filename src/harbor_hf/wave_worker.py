@@ -1126,13 +1126,7 @@ def _finalize_execution(
     root: Path, token: str, *, strict_compatibility: bool = True
 ) -> None:
     if not strict_compatibility:
-        rejections = sanitize_private_artifact_tree(root)
-        if rejections:
-            append_event(
-                root / "events.jsonl",
-                "private_artifacts_rejected",
-                count=len(rejections),
-            )
+        sanitize_private_artifact_tree(root)
     _redact_unit(root, token)
     refresh_error = refresh_retained_bundle(root, strict=strict_compatibility)
     if refresh_error is not None:
@@ -1141,6 +1135,8 @@ def _finalize_execution(
             "compatibility_refresh_skipped",
             error_type=refresh_error,
         )
+    if not strict_compatibility:
+        sanitize_private_artifact_tree(root)
     write_private_artifact_manifest(root, strict_session=strict_compatibility)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)

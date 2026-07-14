@@ -66,12 +66,13 @@ The exporter log is retained as `harbor-export.log`. The normal evidence
 redaction, secret scan, checksums, and terminal-marker rules apply to the input,
 bundle, log, and raw Harbor artifacts together.
 
-The controller then writes `private-artifacts.json` for the complete physical
-execution. Entries are sorted, private-only, size-bounded, and checksummed. A
-successful OpenClaw trial whose agent execution started must include a session
-JSONL. Failed and timed-out trials retain the same requirement record without
-turning incomplete evidence into a score. Raw files and this private manifest
-cannot cross the normalized result publication boundary.
+The controller writes `private-artifacts.json` for every direct Harbor trial and
+for each complete campaign physical execution. Entries are sorted,
+private-only, size-bounded, and checksummed. A successful OpenClaw trial whose
+agent execution started must include a session JSONL. Failed and timed-out
+trials retain the same requirement record without turning incomplete evidence
+into a score. Raw files and this private manifest cannot cross the normalized
+result publication boundary.
 
 ## Additional Policy
 

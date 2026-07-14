@@ -23,6 +23,7 @@ _DERIVED_FILES = frozenset(
         "_SUCCESS",
         "artifacts.tar.gz",
         "checksums.json",
+        "private-artifact-rejections.json",
         "private-artifacts.json",
     }
 )
@@ -163,12 +164,13 @@ def build_private_artifact_manifest(
     root: Path,
     *,
     strict_session: bool,
+    execution_id: str | None = None,
+    trial_id: str | None = None,
+    session_required: bool | None = None,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
 ) -> PrivateArtifactManifest:
-    identity = _ExecutionIdentity.model_validate_json(
-        (root / "execution.lock.json").read_text(encoding="utf-8")
-    )
+    identity = _artifact_identity(root, execution_id, trial_id)
     entries: list[PrivateArtifactEntry] = []
     total_bytes = 0
     candidates = sorted(
@@ -202,13 +204,17 @@ def build_private_artifact_manifest(
         for entry in entries
         if entry.kind == "session" and entry.path.endswith(".jsonl")
     ]
-    session_required = _openclaw_execution_started(root)
+    required = (
+        _openclaw_execution_started(root)
+        if session_required is None
+        else session_required
+    )
     requirement = PrivateArtifactRequirement(
-        required=session_required,
+        required=required,
         satisfied=bool(session_paths),
         paths=session_paths,
     )
-    if strict_session and session_required and not requirement.satisfied:
+    if strict_session and required and not requirement.satisfied:
         raise PrivateArtifactRequirementError(
             "successful OpenClaw execution has no session JSONL"
         )
@@ -226,12 +232,18 @@ def write_private_artifact_manifest(
     root: Path,
     *,
     strict_session: bool,
+    execution_id: str | None = None,
+    trial_id: str | None = None,
+    session_required: bool | None = None,
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
 ) -> PrivateArtifactManifest:
     manifest = build_private_artifact_manifest(
         root,
         strict_session=strict_session,
+        execution_id=execution_id,
+        trial_id=trial_id,
+        session_required=session_required,
         max_file_bytes=max_file_bytes,
         max_bundle_bytes=max_bundle_bytes,
     )
@@ -246,7 +258,8 @@ def sanitize_private_artifact_tree(
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
 ) -> list[PrivateArtifactRejection]:
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
-    rejected = _remove_symlinks(root)
+    rejected = _load_rejections(root)
+    rejected.extend(_remove_symlinks(root))
     files, file_rejections = _remove_oversized_files(root, max_file_bytes)
     rejected.extend(file_rejections)
     rejected.extend(_trim_bundle(files, max_bundle_bytes))
@@ -337,7 +350,7 @@ def _trim_bundle(
 
 def _openclaw_execution_started(root: Path) -> bool:
     readable_result_found = False
-    for result_path in sorted((root / "harbor-jobs").glob("*/*/result.json")):
+    for result_path in _trial_result_paths(root):
         try:
             probe = _TrialProbe.model_validate_json(
                 result_path.read_text(encoding="utf-8")
@@ -353,10 +366,28 @@ def _openclaw_execution_started(root: Path) -> bool:
             return True
     if readable_result_found:
         return False
-    return _openclaw_execution_was_attempted(root)
+    return openclaw_execution_was_attempted(root)
 
 
-def _openclaw_execution_was_attempted(root: Path) -> bool:
+def _trial_result_paths(root: Path) -> list[Path]:
+    direct = root / "result.json"
+    nested = sorted((root / "harbor-jobs").glob("*/*/result.json"))
+    return ([direct] if direct.is_file() else []) + nested
+
+
+def _artifact_identity(
+    root: Path, execution_id: str | None, trial_id: str | None
+) -> _ExecutionIdentity:
+    if (execution_id is None) != (trial_id is None):
+        raise ValueError("private artifact identity must be provided together")
+    if execution_id is not None and trial_id is not None:
+        return _ExecutionIdentity(execution_id=execution_id, trial_id=trial_id)
+    return _ExecutionIdentity.model_validate_json(
+        (root / "execution.lock.json").read_text(encoding="utf-8")
+    )
+
+
+def openclaw_execution_was_attempted(root: Path) -> bool:
     request_path = root / "harbor-request.json"
     try:
         request = _RequestProbe.model_validate_json(
