@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from huggingface_hub import WebhookInfo, WebhookWatchedItem
+from huggingface_hub._jobs_api import JobSpec
 
 from harbor_hf.automation import (
     AutomationError,
@@ -24,7 +26,7 @@ class FakeApi:
         self.job: dict[str, object] = {}
         self.webhook: dict[str, object] = {}
         self.scheduled_jobs: list[SimpleNamespace] = []
-        self.webhooks: list[SimpleNamespace] = []
+        self.webhooks: list[SimpleNamespace | WebhookInfo] = []
 
     def list_scheduled_jobs(self, **kwargs: object) -> list[object]:
         assert kwargs == {"namespace": "osolmaz"}
@@ -76,6 +78,30 @@ def _request(spec: ExperimentSpec) -> AutomationRequest:
     )
 
 
+def _provider_webhook(request: AutomationRequest) -> WebhookInfo:
+    return WebhookInfo(
+        id="webhook-1",
+        url=None,
+        job=JobSpec(
+            docker_image=request.remote.job.image,
+            command=scheduled_reconciler_command(request),
+            labels={
+                "harbor-hf-role": "campaign-reconciler",
+                "harbor-hf-namespace": request.namespace,
+            },
+        ),
+        watched=[
+            WebhookWatchedItem(
+                type="dataset",
+                name="osolmaz/harbor-hf-coordination",
+            )
+        ],
+        domains=["repo"],
+        secret=None,
+        disabled=False,
+    )
+
+
 def test_builds_digest_pinned_scheduled_reconciler(remote_spec: ExperimentSpec) -> None:
     request = _request(remote_spec)
 
@@ -115,7 +141,7 @@ def test_installs_serial_schedule_and_dataset_webhook(
     assert api.webhook == {
         "job_id": "scheduled-1",
         "watched": [{"type": "dataset", "name": "osolmaz/harbor-hf-coordination"}],
-        "domains": ["repo.content"],
+        "domains": ["repo"],
     }
 
     repeated = install_automation(_request(remote_spec), token="test-only", api=api)
@@ -124,6 +150,44 @@ def test_installs_serial_schedule_and_dataset_webhook(
     assert not repeated.webhook_created
     assert len(api.scheduled_jobs) == 1
     assert len(api.webhooks) == 1
+
+
+def test_install_creates_supported_webhook_from_real_api_contract(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec)
+
+    class RealShapedApi(FakeApi):
+        def create_webhook(self, **kwargs: object) -> object:
+            self.webhook = kwargs
+            webhook = _provider_webhook(request)
+            self.webhooks.append(webhook)
+            return webhook
+
+    api = RealShapedApi()
+
+    result = install_automation(request, token="test-only", api=api)
+
+    assert result.webhook_created is True
+    assert api.webhook == {
+        "job_id": "scheduled-1",
+        "watched": [{"type": "dataset", "name": "osolmaz/harbor-hf-coordination"}],
+        "domains": ["repo"],
+    }
+
+
+def test_install_adopts_real_api_webhook_with_supported_domain(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec)
+    api = FakeApi()
+    api.webhooks.append(_provider_webhook(request))
+
+    result = install_automation(request, token="test-only", api=api)
+
+    assert result.webhook_created is False
+    assert result.webhook_id == "webhook-1"
+    assert api.webhook == {}
 
 
 def test_rejects_cross_namespace_automation(remote_spec: ExperimentSpec) -> None:
@@ -162,7 +226,7 @@ def test_rejects_managed_resource_drift(
     if resource == "schedule":
         api.scheduled_jobs[0].schedule = "@daily"
     else:
-        api.webhooks[0].domains = ["repo"]
+        api.webhooks[0].domains = ["discussions"]
 
     with pytest.raises(AutomationError, match="configuration drift"):
         install_automation(request, token="test-only", api=api)
@@ -277,7 +341,7 @@ def test_every_managed_schedule_field_participates_in_drift_detection(
             "watched",
             [SimpleNamespace(type="model", name="osolmaz/harbor-hf-coordination")],
         ),
-        lambda webhook: setattr(webhook, "domains", ["repo"]),
+        lambda webhook: setattr(webhook, "domains", ["discussions"]),
         lambda webhook: setattr(webhook, "disabled", 0),
         lambda webhook: setattr(webhook.job, "docker_image", "wrong-image"),
         lambda webhook: setattr(webhook.job, "command", ["wrong-command"]),
@@ -452,7 +516,7 @@ def test_webhook_matching_handles_sparse_provider_objects_as_contract_data(
             watched=[
                 SimpleNamespace(type="dataset", name="osolmaz/harbor-hf-coordination")
             ],
-            domains=["repo.content"],
+            domains=["repo"],
         ),
     ]
     assert [_webhook_matches(value, request) for value in incomplete] == [

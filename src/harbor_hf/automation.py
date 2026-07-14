@@ -10,6 +10,8 @@ from harbor_hf.coordination import coordination_repository
 from harbor_hf.models import RemoteExecutionSpec
 from harbor_hf.submission import locked_source_command
 
+_WEBHOOK_DOMAINS = ("repo",)
+
 
 class AutomationError(RuntimeError):
     """Raised when campaign reconciliation automation is malformed."""
@@ -154,7 +156,7 @@ def _install_webhook(
                     "name": coordination_repository(request.namespace),
                 }
             ],
-            domains=["repo.content"],
+            domains=list(_WEBHOOK_DOMAINS),
         )
     return webhook, created_webhook
 
@@ -227,7 +229,7 @@ def _webhook_matches(value: object, request: AutomationRequest) -> bool:
     }
     return (
         watched == {("dataset", coordination_repository(request.namespace))}
-        and set(getattr(value, "domains", [])) == {"repo.content"}
+        and getattr(value, "domains", None) == list(_WEBHOOK_DOMAINS)
         and getattr(value, "disabled", False) is False
         and _scheduled_spec_matches(getattr(value, "job", None), request)
     )
