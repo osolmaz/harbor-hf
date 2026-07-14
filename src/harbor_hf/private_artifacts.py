@@ -300,7 +300,7 @@ def validate_private_artifact_directory_files(
     for candidate in sorted(root.iterdir()):
         if candidate.is_symlink():
             raise RuntimeError("private artifact evidence cannot contain symlinks")
-        if not candidate.is_file() or candidate.name == _REJECTION_FILE:
+        if not candidate.is_file():
             continue
         size = candidate.stat().st_size
         if size > max_file_bytes:
