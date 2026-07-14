@@ -120,11 +120,13 @@ an explicitly supplied value differs. The worker renders the source as Harbor's
 `repo` and `path` dataset configuration, so Harbor still owns cloning, task
 resolution, and task checksum calculation.
 
-`benchmark.judge` optionally pins an OpenAI-compatible verifier judge. Its API
-URL, model, protocol, and secret name are preserved in the run lock. The remote
-worker maps the existing `HF_TOKEN` secret to `AGENT_JUDGE_API_KEY` and passes
-the public URL and model as `AGENT_JUDGE_API_URL` and `AGENT_JUDGE_MODEL` to
-Harbor. The credential value never appears in the manifest or lock.
+`benchmark.judge` optionally pins an OpenAI-compatible verifier judge on
+`router.huggingface.co`. Its API URL, model, protocol, and secret name are
+preserved in the run lock. The remote worker maps the existing `HF_TOKEN`
+secret to `AGENT_JUDGE_API_KEY` only for that trusted host and passes the public
+URL and model as `AGENT_JUDGE_API_URL` and `AGENT_JUDGE_MODEL` to Harbor. The
+credential value never appears in the manifest or lock. Arbitrary judge hosts
+require a separate credential mechanism and are rejected by this schema.
 
 ### Matrix
 
