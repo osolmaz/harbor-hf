@@ -12,6 +12,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO, Protocol, TextIO, cast
 
+_REDACTION_SECRET_FILE_ENV = "HARBOR_HF_REDACTION_SECRET_FILE"
+
 
 class ProcessError(RuntimeError):
     """Raised when an external command fails."""
@@ -76,7 +78,7 @@ def run_streaming(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     process_environment = os.environ.copy()
     process_environment.update(environment)
-    secret_values = tuple(
+    secret_values = list(
         value.encode()
         for key, value in environment.items()
         if value
@@ -85,6 +87,11 @@ def run_streaming(
             for part in ("authorization", "password", "secret", "token", "api_key")
         )
     )
+    redaction_file = environment.get(_REDACTION_SECRET_FILE_ENV, "")
+    if redaction_file:
+        value = Path(redaction_file).read_bytes()
+        if value:
+            secret_values.append(value)
     with log_path.open("w", encoding="utf-8") as log:  # pragma: no mutate
         process = subprocess.Popen(
             command,
@@ -99,7 +106,7 @@ def run_streaming(
         deadline = (
             None if timeout_seconds is None else time.monotonic() + timeout_seconds
         )
-        writer = _RedactingWriter(log, secret_values)
+        writer = _RedactingWriter(log, tuple(dict.fromkeys(secret_values)))
         try:
             _drain_output(
                 stdout,

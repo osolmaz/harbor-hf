@@ -9,7 +9,11 @@ from typer.testing import CliRunner
 from harbor_hf.campaigns import build_campaign_lock, build_campaign_plan
 from harbor_hf.cli import _write_lock, app
 from harbor_hf.control import CampaignSubmittedPayload, new_event
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import (
+    ExperimentSpec,
+    GitBenchmarkSource,
+    GitHubTokenCredentials,
+)
 from harbor_hf.operations import (
     ArtifactVerificationReport,
     CampaignEventResult,
@@ -439,6 +443,43 @@ def test_automation_install_dry_run_is_secret_safe(remote_manifest: Path) -> Non
     assert payload["installed"] is False
     assert payload["secret_names"] == ["HF_TOKEN"]
     assert "test-only" not in result.stdout
+
+
+def test_automation_install_derives_private_source_secret(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {"dataset": "shellbench/public-115", "source": source.model_dump()}
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    manifest = tmp_path / "private-source.yaml"
+    manifest.write_text(
+        yaml.safe_dump(ExperimentSpec.model_validate(raw).model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "automation",
+            "install",
+            str(manifest),
+            "--schedule",
+            "*/10 * * * *",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["secret_names"] == ["HF_TOKEN", "GITHUB_TOKEN"]
 
 
 def test_invalid_manifest_reports_stderr_and_exit_two(tmp_path: Path) -> None:

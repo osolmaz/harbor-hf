@@ -72,6 +72,24 @@ def test_streaming_runner_redacts_secret_values(
     assert capsys.readouterr().out == "[REDACTED]\n"
 
 
+def test_streaming_runner_redacts_secret_loaded_from_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    credential = tmp_path / "credential"
+    credential.write_text("credential-value", encoding="utf-8")
+    log = tmp_path / "credential-file.log"
+
+    code = run_streaming(
+        ["cat", str(credential)],
+        log,
+        environment={"HARBOR_HF_REDACTION_SECRET_FILE": str(credential)},
+    )
+
+    assert code == 0
+    assert log.read_text() == "[REDACTED]"
+    assert capsys.readouterr().out == "[REDACTED]"
+
+
 def test_streaming_runner_redacts_secrets_split_across_reads(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

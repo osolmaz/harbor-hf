@@ -49,11 +49,26 @@ class Metadata(StrictModel):
     labels: dict[str, str] = Field(default_factory=dict)
 
 
+class GitHubTokenCredentials(StrictModel):
+    type: Literal["github-token"] = "github-token"
+    secret_name: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,120}_TOKEN$")
+
+    @field_validator("secret_name")
+    @classmethod
+    def secret_is_separate_from_hugging_face_token(cls, value: str) -> str:
+        if value == "HF_TOKEN":
+            raise ValueError("GitHub credentials must not reuse HF_TOKEN")
+        return value
+
+
 class GitBenchmarkSource(StrictModel):
     type: Literal["git"] = "git"
     repository: GitHubRepository
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     path: str = Field(min_length=1)
+    credentials: GitHubTokenCredentials | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("repository", mode="before")
     @classmethod
@@ -79,7 +94,7 @@ class GitBenchmarkSource(StrictModel):
 
 def git_benchmark_source_digest(source: GitBenchmarkSource) -> str:
     payload = json.dumps(
-        source.model_dump(mode="json"),
+        source.model_dump(mode="json", exclude={"credentials"}),
         sort_keys=True,
         separators=(",", ":"),
     ).encode()

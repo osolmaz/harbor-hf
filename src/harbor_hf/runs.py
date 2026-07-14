@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -23,6 +28,10 @@ from harbor_hf.provider_models import ProviderTarget
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 RUN_LOCK_V1ALPHA1 = "harbor-hf/run-lock/v1alpha1"
 RUN_LOCK_V1ALPHA2 = "harbor-hf/run-lock/v1alpha2"
+RUN_LOCK_V1ALPHA3 = "harbor-hf/run-lock/v1alpha3"
+_GIT_CREDENTIAL_FILE_ENV = "HARBOR_HF_GIT_CREDENTIAL_FILE"
+_GIT_REPOSITORY_ENV = "HARBOR_HF_GIT_REPOSITORY"
+_REDACTION_SECRET_FILE_ENV = "HARBOR_HF_REDACTION_SECRET_FILE"
 
 
 class Clock(Protocol):
@@ -38,7 +47,9 @@ class RunLock(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[
-        "harbor-hf/run-lock/v1alpha1", "harbor-hf/run-lock/v1alpha2"
+        "harbor-hf/run-lock/v1alpha1",
+        "harbor-hf/run-lock/v1alpha2",
+        "harbor-hf/run-lock/v1alpha3",
     ] = RUN_LOCK_V1ALPHA1
     run_id: str
     created_at: datetime
@@ -70,6 +81,14 @@ class RunLock(BaseModel):
             self.benchmark_source is not None or self.benchmark_judge is not None
         ):
             raise ValueError("run-lock/v1alpha1 cannot contain source or judge fields")
+        if (
+            self.schema_version != RUN_LOCK_V1ALPHA3
+            and self.benchmark_source is not None
+            and self.benchmark_source.credentials is not None
+        ):
+            raise ValueError(
+                f"{self.schema_version} cannot contain authenticated source fields"
+            )
         return self
 
 
@@ -137,9 +156,14 @@ def build_run_lock(
     resolved_id = run_id or _new_run_id(spec.metadata.name, digest, created_at)
     return RunLock(
         schema_version=(
-            RUN_LOCK_V1ALPHA2
-            if spec.benchmark.source is not None or spec.benchmark.judge is not None
-            else RUN_LOCK_V1ALPHA1
+            RUN_LOCK_V1ALPHA3
+            if spec.benchmark.source is not None
+            and spec.benchmark.source.credentials is not None
+            else (
+                RUN_LOCK_V1ALPHA2
+                if spec.benchmark.source is not None or spec.benchmark.judge is not None
+                else RUN_LOCK_V1ALPHA1
+            )
         ),
         run_id=resolved_id,
         created_at=created_at,
@@ -163,9 +187,14 @@ def build_run_lock(
     )
 
 
+@contextmanager
 def harbor_process_environment(
-    lock: RunLock, *, token: str, inference_base_url: str
-) -> dict[str, str]:
+    lock: RunLock,
+    *,
+    token: str,
+    inference_base_url: str,
+    blocked_secret_names: Iterable[str] = (),
+) -> Iterator[dict[str, str]]:
     environment = {
         "HF_TOKEN": token,
         "OPENAI_API_KEY": token,
@@ -179,7 +208,78 @@ def harbor_process_environment(
                 "AGENT_JUDGE_MODEL": lock.benchmark_judge.model,
             }
         )
-    return environment
+    blocked = set(blocked_secret_names)
+    source = lock.benchmark_source
+    credential_path: Path | None = None
+    try:
+        if source is not None and source.credentials is not None:
+            secret_name = source.credentials.secret_name
+            source_token = os.environ.get(secret_name, "")
+            if not source_token:
+                raise ValueError(f"required secret {secret_name} is not available")
+            blocked.add(secret_name)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="harbor-hf-git-credential-",
+                delete=False,
+            ) as stream:
+                credential_path = Path(stream.name)
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(source_token)
+            environment.update(
+                {
+                    "GIT_CONFIG_COUNT": "5",
+                    "GIT_CONFIG_KEY_0": "credential.useHttpPath",
+                    "GIT_CONFIG_VALUE_0": "true",
+                    "GIT_CONFIG_KEY_1": (
+                        f"credential.https://github.com/{source.repository}.git.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_1": "",
+                    "GIT_CONFIG_KEY_2": (
+                        f"credential.https://github.com/{source.repository}.git.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_2": "harbor-hf",
+                    "GIT_CONFIG_KEY_3": (
+                        f"credential.https://github.com/{source.repository}.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_3": "",
+                    "GIT_CONFIG_KEY_4": (
+                        f"credential.https://github.com/{source.repository}.helper"
+                    ),
+                    "GIT_CONFIG_VALUE_4": "harbor-hf",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    _GIT_CREDENTIAL_FILE_ENV: str(credential_path),
+                    _GIT_REPOSITORY_ENV: source.repository,
+                    _REDACTION_SECRET_FILE_ENV: str(credential_path),
+                }
+            )
+        for secret_name in blocked:
+            environment[secret_name] = ""
+        yield environment
+    finally:
+        if credential_path is not None:
+            credential_path.unlink(missing_ok=True)
+
+
+def require_benchmark_source_secret(lock: RunLock) -> None:
+    source = lock.benchmark_source
+    if source is None or source.credentials is None:
+        return
+    secret_name = source.credentials.secret_name
+    if not os.environ.get(secret_name, ""):
+        raise ValueError(f"required secret {secret_name} is not available")
+
+
+def run_secret_values(lock: RunLock, token: str) -> str | tuple[str, ...]:
+    values = [token]
+    source = lock.benchmark_source
+    if source is not None and source.credentials is not None:
+        source_token = os.environ.get(source.credentials.secret_name, "")
+        if source_token:
+            values.append(source_token)
+    unique = tuple(dict.fromkeys(value for value in values if value))
+    return unique[0] if len(unique) == 1 else unique
 
 
 def _new_run_id(name: str, digest: str, created_at: datetime) -> str:

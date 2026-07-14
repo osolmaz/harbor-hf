@@ -1,4 +1,7 @@
+import os
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -6,6 +9,7 @@ from harbor_hf.models import (
     DeploymentProfile,
     ExperimentSpec,
     GitBenchmarkSource,
+    GitHubTokenCredentials,
     MatrixRule,
     _validate_remote_input_pins,
     _validate_task_pins,
@@ -61,6 +65,183 @@ def test_build_run_lock_preserves_git_benchmark_source(
     assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
 
 
+def test_authenticated_git_source_uses_v1alpha3_lock(
+    remote_spec: ExperimentSpec,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    spec = ExperimentSpec.model_validate(raw)
+
+    lock = build_run_lock(spec)
+
+    assert lock.benchmark_source == source
+    assert lock.schema_version == "harbor-hf/run-lock/v1alpha3"
+
+    legacy = lock.model_dump(mode="json")
+    legacy["schema_version"] = "harbor-hf/run-lock/v1alpha2"
+    with pytest.raises(ValueError, match="authenticated source fields"):
+        RunLock.model_validate(legacy)
+
+
+def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    lock = build_run_lock(ExperimentSpec.model_validate(raw))
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+
+    with harbor_process_environment(
+        lock, token="hf-secret", inference_base_url="https://endpoint.example"
+    ) as environment:
+        credential_file = environment["HARBOR_HF_GIT_CREDENTIAL_FILE"]
+        assert environment["GITHUB_TOKEN"] == ""
+        assert Path(credential_file).read_text(encoding="utf-8") == "github-secret"
+        assert environment["GIT_CONFIG_COUNT"] == "5"
+        assert environment["GIT_CONFIG_KEY_0"] == "credential.useHttpPath"
+        assert environment["GIT_CONFIG_VALUE_0"] == "true"
+        assert environment["GIT_CONFIG_KEY_1"] == (
+            "credential.https://github.com/ShellBench/public-tasks.git.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_1"] == ""
+        assert environment["GIT_CONFIG_KEY_2"] == (
+            "credential.https://github.com/ShellBench/public-tasks.git.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_2"] == "harbor-hf"
+        assert environment["GIT_CONFIG_KEY_3"] == (
+            "credential.https://github.com/ShellBench/public-tasks.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_3"] == ""
+        assert environment["GIT_CONFIG_KEY_4"] == (
+            "credential.https://github.com/ShellBench/public-tasks.helper"
+        )
+        assert environment["GIT_CONFIG_VALUE_4"] == "harbor-hf"
+        assert environment["GIT_TERMINAL_PROMPT"] == "0"
+        assert environment["HARBOR_HF_GIT_REPOSITORY"] == "ShellBench/public-tasks"
+        assert environment["HARBOR_HF_REDACTION_SECRET_FILE"] == credential_file
+    assert not os.path.exists(credential_file)
+
+    monkeypatch.delenv("GITHUB_TOKEN")
+    with (
+        pytest.raises(ValueError, match="required secret GITHUB_TOKEN"),
+        harbor_process_environment(
+            lock, token="hf-secret", inference_base_url="https://endpoint.example"
+        ),
+    ):
+        pass
+
+
+def test_authenticated_git_environment_is_scoped_by_real_git(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    lock = build_run_lock(ExperimentSpec.model_validate(raw))
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    fallback_log = tmp_path / "fallback.log"
+    fallback_helper = tmp_path / "git-credential-fallback"
+    fallback_helper.write_text(
+        '#!/bin/sh\ncat >> "$FALLBACK_LOG"\n'
+        "echo username=wrong\necho password=wrong-secret\n",
+        encoding="utf-8",
+    )
+    fallback_helper.chmod(0o700)
+    global_config = tmp_path / "gitconfig"
+    global_config.write_text(
+        f"[credential]\n\thelper = {fallback_helper}\n", encoding="utf-8"
+    )
+    with harbor_process_environment(
+        lock,
+        token="hf-secret",
+        inference_base_url="https://endpoint.example",
+        blocked_secret_names=["OTHER_GITHUB_TOKEN"],
+    ) as additions:
+        environment = os.environ.copy()
+        environment.update(additions)
+        environment.update(
+            {
+                "FALLBACK_LOG": str(fallback_log),
+                "GIT_CONFIG_GLOBAL": str(global_config),
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+            }
+        )
+
+        allowed = []
+        for path in (
+            "ShellBench/public-tasks",
+            "ShellBench/public-tasks.git",
+            "ShellBench/public-tasks/info/lfs",
+            "ShellBench/public-tasks.git/info/lfs",
+        ):
+            allowed.append(
+                subprocess.run(
+                    ["git", "credential", "fill"],
+                    input=f"protocol=https\nhost=github.com\npath={path}\n\n",
+                    text=True,
+                    capture_output=True,
+                    env=environment,
+                    check=True,
+                )
+            )
+        assert not fallback_log.exists()
+        refused = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\npath=other/repo.git\n\n",
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+        assert environment["GITHUB_TOKEN"] == ""
+        assert environment["OTHER_GITHUB_TOKEN"] == ""
+
+    assert all("username=x-access-token" in result.stdout for result in allowed)
+    assert all("password=github-secret" in result.stdout for result in allowed)
+    assert all("wrong-secret" not in result.stdout for result in allowed)
+    assert "path=other/repo.git" in fallback_log.read_text(encoding="utf-8")
+    assert refused.returncode == 0
+    assert "password=wrong-secret" in refused.stdout
+    assert "github-secret" not in refused.stdout + refused.stderr
+
+
 def test_run_lock_preserves_and_renders_hosted_judge(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -72,13 +253,14 @@ def test_run_lock_preserves_and_renders_hosted_judge(
     spec = ExperimentSpec.model_validate(raw)
 
     lock = build_run_lock(spec, run_id="judge-lock")
-    environment = harbor_process_environment(
+    with harbor_process_environment(
         lock, token="secret-token", inference_base_url="https://endpoint.example/"
-    )
+    ) as environment:
+        observed_environment = environment.copy()
 
     assert lock.benchmark_judge == spec.benchmark.judge
     assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
-    assert environment == {
+    assert observed_environment == {
         "AGENT_JUDGE_API_KEY": "secret-token",
         "AGENT_JUDGE_API_URL": "https://router.huggingface.co/v1/chat/completions",
         "AGENT_JUDGE_MODEL": "deepseek-ai/DeepSeek-V3.2",

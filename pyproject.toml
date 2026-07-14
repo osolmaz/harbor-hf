@@ -21,6 +21,7 @@ Issues = "https://github.com/osolmaz/harbor-hf/issues"
 
 [project.scripts]
 harbor-hf = "harbor_hf.cli:app"
+git-credential-harbor-hf = "harbor_hf.git_credential:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]

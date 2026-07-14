@@ -7,7 +7,7 @@ import os
 import re
 import tarfile
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -151,47 +151,53 @@ def verify_checksums(root: Path) -> dict[str, str]:
     return value
 
 
-def assert_secret_absent(root: Path, secret: str) -> None:
-    if not secret:
-        return
-    needle = secret.encode()
-    for path in _evidence_paths(root):
-        if secret in str(path.relative_to(root)):
-            raise RuntimeError("secret value found in artifact path")
-        if path.is_file() and _file_contains(path, needle):
-            relative = path.relative_to(root)
-            raise RuntimeError(f"secret value found in artifact {relative}")
+SecretValues = str | Iterable[str]
 
 
-def scrub_secret_paths(root: Path, secret: str) -> int:
-    if not secret:
-        return 0
+def assert_secret_absent(root: Path, secrets: SecretValues) -> None:
+    for secret in _secret_values(secrets):
+        needle = secret.encode()
+        for path in _evidence_paths(root):
+            if secret in str(path.relative_to(root)):
+                raise RuntimeError("secret value found in artifact path")
+            if path.is_file() and _file_contains(path, needle):
+                relative = path.relative_to(root)
+                raise RuntimeError(f"secret value found in artifact {relative}")
+
+
+def scrub_secret_paths(root: Path, secrets: SecretValues) -> int:
     changed = 0
-    paths = sorted(
-        _evidence_paths(root), key=lambda path: len(path.parts), reverse=True
-    )
-    for path in paths:
-        if secret not in path.name:
-            continue
-        destination = path.with_name(path.name.replace(secret, "[REDACTED]"))
-        if destination.exists():
-            raise RuntimeError("secret path redaction would overwrite an artifact")
-        path.rename(destination)
-        changed += 1
+    for secret in _secret_values(secrets):
+        paths = sorted(
+            _evidence_paths(root), key=lambda path: len(path.parts), reverse=True
+        )
+        for path in paths:
+            if secret not in path.name:
+                continue
+            destination = path.with_name(path.name.replace(secret, "[REDACTED]"))
+            if destination.exists():
+                raise RuntimeError("secret path redaction would overwrite an artifact")
+            path.rename(destination)
+            changed += 1
     return changed
 
 
-def scrub_secret(root: Path, secret: str) -> list[str]:
-    if not secret:
-        return []
-    needle = secret.encode()
+def scrub_secret(root: Path, secrets: SecretValues) -> list[str]:
     changed: list[str] = []
-    for path in _evidence_paths(root):
-        if not path.is_file():
-            continue
-        if _scrub_file(path, needle):
-            changed.append(str(path.relative_to(root)))
-    return changed
+    for secret in _secret_values(secrets):
+        needle = secret.encode()
+        for path in _evidence_paths(root):
+            if not path.is_file():
+                continue
+            relative = str(path.relative_to(root))
+            if _scrub_file(path, needle) and relative not in changed:
+                changed.append(relative)
+    return sorted(changed)
+
+
+def _secret_values(secrets: SecretValues) -> tuple[str, ...]:
+    values = (secrets,) if isinstance(secrets, str) else tuple(secrets)
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def _evidence_paths(root: Path) -> list[Path]:

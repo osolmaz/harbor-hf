@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Protocol, cast
 
 from huggingface_hub import HfApi
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from harbor_hf.coordination import coordination_repository
 from harbor_hf.models import RemoteExecutionSpec
@@ -25,7 +26,19 @@ class AutomationRequest(FrozenModel):
     namespace: str = Field(min_length=1)
     schedule: str = Field(min_length=1)
     remote: RemoteExecutionSpec
+    secret_names: list[str] = Field(default_factory=list)
     suspended: bool = False
+
+    @field_validator("secret_names")
+    @classmethod
+    def extra_secrets_are_canonical(cls, value: list[str]) -> list[str]:
+        if "HF_TOKEN" in value:
+            raise ValueError("automation secret_names must not repeat HF_TOKEN")
+        if len(value) != len(set(value)):
+            raise ValueError("automation secret names must be unique")
+        if any(not name or name != name.strip() or "=" in name for name in value):
+            raise ValueError("automation secret names must be environment variables")
+        return value
 
 
 class AutomationInstallation(FrozenModel):
@@ -119,7 +132,7 @@ def _install_scheduled_job(
             schedule=request.schedule,
             suspend=request.suspended,
             concurrency=False,
-            secrets={request.remote.job.token_secret_name: token},
+            secrets=_automation_secrets(request, token),
             flavor=request.remote.job.flavor,
             timeout=request.remote.job.timeout_seconds,
             labels=_managed_labels(request.namespace),
@@ -170,7 +183,10 @@ def automation_plan(request: AutomationRequest) -> AutomationPlan:
         suspended=request.suspended,
         image=request.remote.job.image,
         command=scheduled_reconciler_command(request),
-        secret_names=[request.remote.job.token_secret_name],
+        secret_names=[
+            request.remote.job.token_secret_name,
+            *request.secret_names,
+        ],
         control_repository=coordination_repository(request.namespace),
     )
 
@@ -209,7 +225,8 @@ def _scheduled_job_matches(value: object, request: AutomationRequest) -> bool:
         and getattr(spec, "command", None) == scheduled_reconciler_command(request)
         and flavor_value == request.remote.job.flavor
         and getattr(spec, "timeout", None) == request.remote.job.timeout_seconds
-        and secret_names == {request.remote.job.token_secret_name}
+        and secret_names
+        == {request.remote.job.token_secret_name, *request.secret_names}
     )
 
 
@@ -248,3 +265,13 @@ def _required_id(value: object, resource: str) -> str:
     if not isinstance(identifier, str) or not identifier:
         raise AutomationError(f"{resource} creation returned no ID")
     return identifier
+
+
+def _automation_secrets(request: AutomationRequest, token: str) -> dict[str, str]:
+    secrets = {request.remote.job.token_secret_name: token}
+    for name in request.secret_names:
+        value = os.environ.get(name, "")
+        if not value:
+            raise AutomationError(f"required secret {name} is not available")
+        secrets[name] = value
+    return secrets

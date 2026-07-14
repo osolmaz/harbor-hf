@@ -11,11 +11,18 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 from conftest import write_fake_compatibility_bundle
 
 from harbor_hf.coordination import ClaimConflict, run_claim_path
 from harbor_hf.harbor_adapter import build_execution_request
-from harbor_hf.models import DeploymentProfile, ExperimentSpec, SourcePin
+from harbor_hf.models import (
+    DeploymentProfile,
+    ExperimentSpec,
+    GitBenchmarkSource,
+    GitHubTokenCredentials,
+    SourcePin,
+)
 from harbor_hf.private_artifacts import (
     PrivateArtifactRejection,
     sanitize_private_artifact_directory_files,
@@ -3987,6 +3994,49 @@ def test_worker_requires_named_secret(
         WorkerError, match="^required secret HF_TOKEN is not available$"
     ):
         run_worker(remote_manifest, lock_path, tmp_path / "output")
+
+
+def test_worker_requires_git_source_secret_before_claim_or_remote_work(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    spec = ExperimentSpec.model_validate(raw)
+    lock = build_run_lock(spec, run_id="missing-git-secret")
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump(spec.model_dump(mode="json")), encoding="utf-8")
+    lock_path = tmp_path / "lock.json"
+    _write_lock(lock_path, lock)
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    claims = FakeClaimStore()
+
+    with pytest.raises(
+        WorkerError, match="^required secret GITHUB_TOKEN is not available$"
+    ):
+        run_worker(
+            manifest,
+            lock_path,
+            tmp_path / "output",
+            runner=EndpointRunner([]),
+            claim_store=claims,
+        )
+
+    assert claims.acquired == []
 
 
 def test_worker_rejects_lock_without_endpoint_binding(

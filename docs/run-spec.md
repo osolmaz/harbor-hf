@@ -109,16 +109,33 @@ benchmark:
     repository: ShellBench/public-tasks
     revision: 0000000000000000000000000000000000000000
     path: tasks/115-tasks
+    credentials:
+      type: github-token
+      secret_name: GITHUB_TOKEN
   task_names: ["*"]
   task_digests:
     example-task: sha256:0000000000000000000000000000000000000000000000000000000000000000
 ```
 
 Git sources require a GitHub repository, full commit, and safe repository-relative
-path. `dataset_digest` is derived from those canonical fields and is rejected if
-an explicitly supplied value differs. The worker renders the source as Harbor's
-`repo` and `path` dataset configuration, so Harbor still owns cloning, task
-resolution, and task checksum calculation.
+path. Public repositories omit `credentials`. Private repositories declare a
+separate HF Job secret containing a GitHub token; `HF_TOKEN` cannot be reused.
+Set `GITHUB_TOKEN` in the environment that submits a run or installs scheduled
+automation. HF Jobs stores it as a remote secret, while the manifest and locks
+store only the secret name. Automation derives the required secret names from
+the experiment manifest and forwards them to campaign waves.
+
+`dataset_digest` is derived from the canonical repository, revision, and path.
+Credential metadata does not change content identity. The worker renders the
+source as Harbor's `repo` and `path` dataset configuration, so Harbor still owns
+cloning, task resolution, and task checksum calculation. For private sources,
+the controller passes a credential-free GitHub URL and installs a Git credential
+helper scoped to that exact repository. The helper reads the token from a
+mode-`0600` temporary file that is deleted after Harbor exits; source-token
+environment variables are blanked in Harbor and its task sandboxes. Terminal
+prompting is disabled, and final evidence scrubbing covers both the Hugging Face
+and GitHub token values. Live Harbor output also reads the temporary file as a
+redaction source, so credential text is removed before it reaches HF Job logs.
 
 `benchmark.judge` optionally pins an OpenAI-compatible verifier judge on
 `router.huggingface.co`. Its API URL, model, protocol, and secret name are

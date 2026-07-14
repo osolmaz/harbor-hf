@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 from pathlib import Path
@@ -205,6 +206,33 @@ def endpoint_lease_label_for(namespace: str, name: str) -> str:
     return hashlib.sha256(identity).hexdigest()[:32]
 
 
+def job_secret_names(lock: RunLock | WaveLock) -> list[str]:
+    names = {lock.remote.job.token_secret_name}
+    run_locks = (
+        [lock]
+        if isinstance(lock, RunLock)
+        else [run.configuration for run in lock.runs]
+    )
+    for run_lock in run_locks:
+        source = run_lock.benchmark_source
+        if source is not None and source.credentials is not None:
+            names.add(source.credentials.secret_name)
+    return [lock.remote.job.token_secret_name, *sorted(names - {"HF_TOKEN"})]
+
+
+def _secret_arguments(lock: RunLock | WaveLock) -> list[str]:
+    return [
+        argument for name in job_secret_names(lock) for argument in ("--secrets", name)
+    ]
+
+
+def require_source_secrets(lock: RunLock | WaveLock) -> None:
+    token_name = lock.remote.job.token_secret_name
+    for name in job_secret_names(lock):
+        if name != token_name and not os.environ.get(name, ""):
+            raise ValueError(f"required secret {name} is not available")
+
+
 def build_submit_command(
     lock: RunLock,
     *,
@@ -223,8 +251,7 @@ def build_submit_command(
         job.flavor,
         "--timeout",
         f"{job.timeout_seconds}s",
-        "--secrets",
-        job.token_secret_name,
+        *_secret_arguments(lock),
         "--label",
         f"harbor-hf-run={lock.run_id}",
         "--label",
@@ -286,8 +313,7 @@ def build_submit_wave_command(
         job.flavor,
         "--timeout",
         f"{job.timeout_seconds}s",
-        "--secrets",
-        job.token_secret_name,
+        *_secret_arguments(lock),
         *labels,
         "--volume",
         f"{input_dir}:/input:ro",
@@ -323,6 +349,7 @@ def submit(
     runner: TextRunner,
     bucket_api: BucketApi | None = None,
 ) -> Submission:
+    require_source_secrets(lock)
     if bucket_api is None:
         from huggingface_hub import HfApi
 
@@ -359,6 +386,7 @@ def submit_wave(
     runner: TextRunner,
     bucket_api: BucketApi | None = None,
 ) -> WaveSubmission:
+    require_source_secrets(lock)
     if bucket_api is None:
         from huggingface_hub import HfApi
 

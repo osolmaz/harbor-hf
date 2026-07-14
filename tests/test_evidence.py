@@ -116,6 +116,19 @@ def test_secret_scan_names_the_bad_artifact(tmp_path: Path) -> None:
     assert "[REDACTED]" in (tmp_path / "log.txt").read_text()
 
 
+def test_secret_scrubbing_covers_multiple_credentials(tmp_path: Path) -> None:
+    artifact = tmp_path / "hf-secret-and-github-secret.log"
+    artifact.write_text("hf-secret github-secret", encoding="utf-8")
+    secrets = ("hf-secret", "github-secret")
+
+    assert scrub_secret_paths(tmp_path, secrets) == 2
+    assert scrub_secret(tmp_path, secrets) == ["[REDACTED]-and-[REDACTED].log"]
+    assert_secret_absent(tmp_path, secrets)
+    assert (tmp_path / "[REDACTED]-and-[REDACTED].log").read_text() == (
+        "[REDACTED] [REDACTED]"
+    )
+
+
 def test_secret_path_components_are_redacted_deepest_first(tmp_path: Path) -> None:
     directory = tmp_path / "secret-value-directory"
     directory.mkdir()

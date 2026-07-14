@@ -13,7 +13,7 @@ from harbor_hf.campaigns import (
     build_wave_lock,
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import ExperimentSpec, GitBenchmarkSource, GitHubTokenCredentials
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.runs import build_run_lock
@@ -28,6 +28,7 @@ from harbor_hf.submission import (
     ensure_private_job_input_bucket,
     github_archive,
     github_repository,
+    job_secret_names,
     locked_source_command,
     require_private_bucket,
     stage_job_input,
@@ -202,6 +203,92 @@ def test_build_submit_wave_command_targets_hidden_worker(
         "/output",
     ]
     assert "test-token" not in " ".join(command)
+
+
+def test_authenticated_source_adds_named_secret_to_controller_jobs(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {
+            "dataset": "shellbench/public-115",
+            "source": source.model_dump(mode="python"),
+        }
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    spec = ExperimentSpec.model_validate(raw)
+    run_lock = build_run_lock(spec, run_id="private-source")
+    wave_lock = _wave_lock(spec)
+
+    run_command = build_submit_command(
+        run_lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
+    )
+    wave_command = build_submit_wave_command(
+        wave_lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
+    )
+
+    assert job_secret_names(run_lock) == ["HF_TOKEN", "GITHUB_TOKEN"]
+    assert job_secret_names(wave_lock) == ["HF_TOKEN", "GITHUB_TOKEN"]
+    assert run_command.count("--secrets") == 2
+    assert wave_command.count("--secrets") == 2
+    assert run_command[10:14] == [
+        "--secrets",
+        "HF_TOKEN",
+        "--secrets",
+        "GITHUB_TOKEN",
+    ]
+    assert "github-secret" not in " ".join(run_command + wave_command)
+
+
+def test_private_source_submission_requires_local_secret_before_staging(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = GitBenchmarkSource(
+        repository="ShellBench/public-tasks",
+        revision="8" * 40,
+        path="tasks/115-tasks",
+        credentials=GitHubTokenCredentials(secret_name="GITHUB_TOKEN"),
+    )
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"].update(
+        {"dataset": "shellbench/public-115", "source": source.model_dump()}
+    )
+    raw["benchmark"].pop("dataset_digest", None)
+    spec = ExperimentSpec.model_validate(raw)
+    run_lock = build_run_lock(spec, run_id="private-source")
+    wave_lock = _wave_lock(spec)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    runner = FakeRunner("a" * 24)
+    api = FakeBucketApi()
+
+    with pytest.raises(ValueError, match="required secret GITHUB_TOKEN"):
+        submit(
+            run_lock,
+            input_dir=tmp_path,
+            bucket="osolmaz/benchmark-runs",
+            runner=runner,
+            bucket_api=api,
+        )
+    with pytest.raises(ValueError, match="required secret GITHUB_TOKEN"):
+        submit_wave(
+            wave_lock,
+            input_dir=tmp_path,
+            bucket="osolmaz/benchmark-runs",
+            runner=runner,
+            bucket_api=api,
+        )
+
+    assert runner.command is None
+    assert api.created == []
+    assert api.created_repositories == []
 
 
 def test_provider_wave_submission_has_no_endpoint_lease_label(
