@@ -56,6 +56,7 @@ from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.private_artifacts import (
     PrivateArtifactRequirementError,
     build_private_artifact_manifest,
+    openclaw_execution_started,
     sanitize_private_artifact_tree,
     write_private_artifact_manifest,
 )
@@ -1125,6 +1126,7 @@ def _trial_destination(
 def _finalize_execution(
     root: Path, token: str, *, strict_compatibility: bool = True
 ) -> None:
+    session_required = openclaw_execution_started(root)
     if not strict_compatibility:
         sanitize_private_artifact_tree(root)
     _redact_unit(root, token)
@@ -1137,7 +1139,11 @@ def _finalize_execution(
         )
     if not strict_compatibility:
         sanitize_private_artifact_tree(root)
-    write_private_artifact_manifest(root, strict_session=strict_compatibility)
+    write_private_artifact_manifest(
+        root,
+        strict_session=strict_compatibility,
+        session_required=session_required,
+    )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, token)
     write_checksums(root)

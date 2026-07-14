@@ -205,6 +205,25 @@ def test_private_artifact_sanitizer_records_and_removes_rejected_files(
     assert retained.rejections == rejected
 
 
+def test_private_artifact_sanitizer_removes_forged_rejection_symlink_first(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "malformed-target"
+    target.write_text("not json", encoding="utf-8")
+    root = tmp_path / "evidence"
+    root.mkdir()
+    rejection = root / "private-artifact-rejections.json"
+    rejection.symlink_to(target)
+
+    rejected = sanitize_private_artifact_tree(root)
+
+    assert [(item.path, item.reason) for item in rejected] == [
+        ("private-artifact-rejections.json", "symlink")
+    ]
+    assert not rejection.is_symlink()
+    assert target.read_text(encoding="utf-8") == "not json"
+
+
 def test_private_models_reject_unsafe_or_inconsistent_manifests() -> None:
     with pytest.raises(ValidationError, match="safely relative"):
         PrivateArtifactEntry(

@@ -109,6 +109,42 @@ def test_failed_execution_prunes_unsafe_evidence_and_still_finalizes(
     assert (tmp_path / "artifacts.tar.gz").is_file()
 
 
+def test_failed_execution_preserves_attempt_state_before_sanitizing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "harbor-jobs").mkdir()
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "harbor-request.json").write_text(
+        '{"verification":{"expected_agent_name":"openclaw"}}\n',
+        encoding="utf-8",
+    )
+    events = tmp_path / "events.jsonl"
+    events.write_text('{"event":"harbor_started"}\n', encoding="utf-8")
+
+    def trim_attempt_event(root: Path) -> list[object]:
+        (root / "events.jsonl").unlink(missing_ok=True)
+        return []
+
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker.sanitize_private_artifact_tree", trim_attempt_event
+    )
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    manifest = json.loads((tmp_path / "private-artifacts.json").read_text())
+    assert manifest["requirements"] == [
+        {
+            "name": "openclaw_session_jsonl",
+            "paths": [],
+            "required": True,
+            "satisfied": False,
+        }
+    ]
+
+
 def test_success_rejects_malformed_compatibility_evidence(tmp_path: Path) -> None:
     (tmp_path / "harbor-jobs").mkdir()
     (tmp_path / "events.jsonl").write_text("", encoding="utf-8")

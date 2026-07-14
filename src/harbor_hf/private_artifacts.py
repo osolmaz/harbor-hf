@@ -258,8 +258,8 @@ def sanitize_private_artifact_tree(
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
 ) -> list[PrivateArtifactRejection]:
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
-    rejected = _load_rejections(root)
-    rejected.extend(_remove_symlinks(root))
+    rejected = _remove_symlinks(root)
+    rejected.extend(_load_rejections(root))
     files, file_rejections = _remove_oversized_files(root, max_file_bytes)
     rejected.extend(file_rejections)
     rejected.extend(_trim_bundle(files, max_bundle_bytes))
@@ -271,8 +271,8 @@ def sanitize_private_artifact_symlinks(
     root: Path,
 ) -> list[PrivateArtifactRejection]:
     """Remove symlinks without applying an aggregate size limit to child trials."""
-    rejected = _load_rejections(root)
-    rejected.extend(_remove_symlinks(root))
+    rejected = _remove_symlinks(root)
+    rejected.extend(_load_rejections(root))
     _write_rejections(root, rejected)
     return rejected
 
