@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 STATS = re.compile(
     r"(?P<done>\d+)/(?P<total>\d+)\s+.*? (?P<killed>\d+)\s+.*? "
@@ -28,11 +30,16 @@ def main() -> int:
     parser.add_argument("--min-kill-rate", type=float, required=True)
     arguments = parser.parse_args()
 
+    repository = Path(__file__).resolve().parents[1]
+    mutant_workspace = repository / "mutants"
+    if mutant_workspace.exists():
+        shutil.rmtree(mutant_workspace)
     completed = subprocess.run(
         ["mutmut", "run"],
         capture_output=True,
         text=True,
         check=False,
+        cwd=repository,
     )
     output = completed.stdout + completed.stderr
     if completed.returncode != 0:
