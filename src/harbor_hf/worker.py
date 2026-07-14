@@ -11,7 +11,6 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 from pathlib import Path
