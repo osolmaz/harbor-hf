@@ -1219,11 +1219,12 @@ def _write_direct_private_artifact_manifests(
     lock = RunLock.model_validate_json(lock_path.read_text(encoding="utf-8"))
     attempted = openclaw_execution_was_attempted(root)
     for trial_root in _direct_trial_roots(root):
+        trial_id = _direct_trial_id(root, trial_root, strict=strict_session)
         write_private_artifact_manifest(
             trial_root,
             strict_session=strict_session,
             execution_id=lock.run_id,
-            trial_id=trial_root.name,
+            trial_id=trial_id,
             session_required=openclaw_execution_started(
                 trial_root, fallback_attempted=attempted
             ),
@@ -1237,8 +1238,42 @@ def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
             trial_root,
             strict_session=True,
             execution_id=lock.run_id,
-            trial_id=trial_root.name,
+            trial_id=_direct_trial_id(root, trial_root, strict=True),
         )
+
+
+def _direct_trial_id(root: Path, trial_root: Path, *, strict: bool) -> str:
+    result = _read_json_object(trial_root / "result.json")
+    trial_id = _nonempty_string(result.get("id"))
+    if trial_id is not None:
+        return trial_id
+
+    compatibility = _read_json_object(root / "harbor-compatibility.json")
+    trials = compatibility.get("trials")
+    if isinstance(trials, list):
+        path = trial_root.relative_to(root / "harbor-jobs").as_posix()
+        for trial in trials:
+            if not isinstance(trial, dict) or trial.get("path") != path:
+                continue
+            trial_id = _nonempty_string(trial.get("trial_id"))
+            if trial_id is not None:
+                return trial_id
+
+    if strict:
+        raise WorkerError("Harbor trial has no canonical trial ID")
+    return trial_root.name
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _nonempty_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _sanitize_direct_trial_artifacts(

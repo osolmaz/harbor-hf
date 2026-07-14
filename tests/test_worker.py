@@ -3064,7 +3064,7 @@ def test_direct_worker_fails_and_publishes_when_openclaw_session_is_missing(
         (root / "harbor-jobs/job/trial/private-artifacts.json").read_text()
     )
     assert manifest["execution_id"] == lock.run_id
-    assert manifest["trial_id"] == "trial"
+    assert manifest["trial_id"] == "00000000-0000-0000-0000-000000000001"
     assert manifest["requirements"] == [
         {
             "name": "openclaw_session_jsonl",
