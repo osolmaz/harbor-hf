@@ -1173,8 +1173,16 @@ def _finalize_evidence(root: Path, token: str) -> None:
     rejection_count = 0
     if failed:
         sanitize_private_artifact_symlinks(root, max_depth=3)
+        rejection_count = len(
+            sanitize_private_artifact_directory_files(
+                root,
+                trust_existing_rejections=True,
+                required_directories=("harbor-jobs",),
+                preserved_files=("_FAILED",),
+            )
+        )
         (root / "harbor-jobs").mkdir(exist_ok=True)
-        rejection_count = _sanitize_direct_trial_artifacts(root)
+        rejection_count += _sanitize_direct_trial_artifacts(root)
     redacted_paths = scrub_secret_paths(root, token)
     if redacted_paths:
         append_event(
@@ -1196,7 +1204,16 @@ def _finalize_evidence(root: Path, token: str) -> None:
             error_type=refresh_error,
         )
     if failed:
-        final_rejection_count = _sanitize_direct_trial_artifacts(
+        final_rejection_count = len(
+            sanitize_private_artifact_directory_files(
+                root,
+                trust_existing_rejections=True,
+                required_directories=("harbor-jobs",),
+                preserved_files=("_FAILED",),
+            )
+        )
+        (root / "harbor-jobs").mkdir(exist_ok=True)
+        final_rejection_count += _sanitize_direct_trial_artifacts(
             root, trust_existing_rejections=True
         )
         if final_rejection_count > rejection_count:
@@ -1236,6 +1253,11 @@ def _write_direct_private_artifact_manifests(
 
 
 def _validate_direct_private_artifacts(root: Path, lock: RunLock) -> None:
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        raise RuntimeError("private artifact Harbor jobs root is not a directory")
+    validate_private_artifact_directory_files(root)
+    validate_private_artifact_directory_files(jobs_root)
     for job_root in _direct_job_roots(root):
         validate_private_artifact_directory_files(job_root)
     for trial_root in _direct_trial_roots(root):
@@ -1284,7 +1306,15 @@ def _nonempty_string(value: object) -> str | None:
 def _sanitize_direct_trial_artifacts(
     root: Path, *, trust_existing_rejections: bool = False
 ) -> int:
-    rejection_count = 0
+    jobs_root = root / "harbor-jobs"
+    if jobs_root.is_symlink() or not jobs_root.is_dir():
+        return 0
+    rejection_count = len(
+        sanitize_private_artifact_directory_files(
+            jobs_root,
+            trust_existing_rejections=trust_existing_rejections,
+        )
+    )
     for job_root in _direct_job_roots(root):
         rejection_count += len(
             sanitize_private_artifact_directory_files(

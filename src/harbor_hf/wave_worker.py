@@ -1130,7 +1130,12 @@ def _finalize_execution(
     attempted = openclaw_execution_was_attempted(root)
     rejection_count = 0
     if not strict_compatibility:
-        rejection_count = len(sanitize_private_artifact_tree(root))
+        rejection_count = len(
+            sanitize_private_artifact_tree(
+                root,
+                required_directories=("harbor-jobs",),
+            )
+        )
         (root / "harbor-jobs").mkdir(exist_ok=True)
     session_required = openclaw_execution_started(root, fallback_attempted=attempted)
     _redact_unit(root, token)
@@ -1143,8 +1148,13 @@ def _finalize_execution(
         )
     if not strict_compatibility:
         final_rejection_count = len(
-            sanitize_private_artifact_tree(root, trust_existing_rejections=True)
+            sanitize_private_artifact_tree(
+                root,
+                trust_existing_rejections=True,
+                required_directories=("harbor-jobs",),
+            )
         )
+        (root / "harbor-jobs").mkdir(exist_ok=True)
         if final_rejection_count > rejection_count:
             refresh_error = refresh_retained_bundle(root, strict=False)
             if refresh_error is not None:

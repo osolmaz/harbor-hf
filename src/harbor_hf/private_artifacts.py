@@ -265,9 +265,11 @@ def sanitize_private_artifact_tree(
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
     trust_existing_rejections: bool = False,
+    required_directories: tuple[str, ...] = (),
 ) -> list[PrivateArtifactRejection]:
     """Remove unsafe or over-limit evidence while retaining a typed rejection log."""
     rejected = _remove_symlinks(root)
+    rejected.extend(_remove_required_directory_collisions(root, required_directories))
     rejected.extend(_remove_reserved_paths(root))
     existing_rejections, omitted_count = _consume_existing_rejections(
         root, trust_existing=trust_existing_rejections
@@ -330,17 +332,22 @@ def sanitize_private_artifact_directory_files(
     max_file_bytes: int = DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES,
     max_bundle_bytes: int = DEFAULT_MAX_PRIVATE_BUNDLE_BYTES,
     trust_existing_rejections: bool = False,
+    required_directories: tuple[str, ...] = (),
+    preserved_files: tuple[str, ...] = (),
 ) -> list[PrivateArtifactRejection]:
     """Bound direct files without charging independently bounded child bundles."""
-    rejected, omitted_count = _consume_existing_rejections(
+    preserved = {_direct_file_name(relative) for relative in preserved_files}
+    rejected = _remove_required_directory_collisions(root, required_directories)
+    existing_rejections, omitted_count = _consume_existing_rejections(
         root, trust_existing=trust_existing_rejections
     )
+    rejected.extend(existing_rejections)
     files: list[tuple[Path, str, int, PrivateArtifactKind]] = []
     for candidate in sorted(root.iterdir()):
         if candidate.is_symlink() or not candidate.is_file():
             continue
         relative = candidate.name
-        if relative == _REJECTION_FILE:
+        if relative == _REJECTION_FILE or relative in preserved:
             continue
         size = candidate.stat().st_size
         if size > max_file_bytes:
@@ -462,6 +469,43 @@ def _remove_symlinks(
         candidate.unlink()
         rejected.append(PrivateArtifactRejection(path=relative, reason="symlink"))
     return rejected
+
+
+def _remove_required_directory_collisions(
+    root: Path, required_directories: tuple[str, ...]
+) -> list[PrivateArtifactRejection]:
+    rejected: list[PrivateArtifactRejection] = []
+    for relative in sorted(set(required_directories)):
+        path = _direct_child(root, relative)
+        if path.is_dir() and not path.is_symlink():
+            continue
+        if not path.exists() and not path.is_symlink():
+            continue
+        is_symlink = path.is_symlink()
+        size = path.stat().st_size if path.is_file() and not is_symlink else None
+        path.unlink()
+        rejected.append(
+            PrivateArtifactRejection(
+                path=relative,
+                reason="symlink" if is_symlink else "reserved_path",
+                size=size,
+            )
+        )
+    return rejected
+
+
+def _direct_child(root: Path, relative: str) -> Path:
+    path = _safe_relative_path(relative)
+    if len(path.parts) != 1 or relative in _DERIVED_FILES:
+        raise ValueError("required artifact directory must be a direct child")
+    return root / relative
+
+
+def _direct_file_name(relative: str) -> str:
+    path = _safe_relative_path(relative)
+    if len(path.parts) != 1 or relative == _REJECTION_FILE:
+        raise ValueError("preserved artifact file must be a direct child")
+    return relative
 
 
 def _consume_existing_rejections(

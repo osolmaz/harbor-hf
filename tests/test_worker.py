@@ -31,6 +31,7 @@ from harbor_hf.worker import (
     _prepare_evidence_destination,
     _publish_evidence,
     _sanitize_direct_trial_artifacts,
+    _validate_direct_private_artifacts,
     _validate_endpoint_compute,
     _validate_task_counts,
     _validate_trial_count,
@@ -2565,6 +2566,55 @@ def test_failed_finalize_recreates_rejected_jobs_symlink(tmp_path: Path) -> None
         {"path": "harbor-jobs", "reason": "symlink", "size": None}
     ]
     assert (tmp_path / "artifacts.tar.gz").is_file()
+
+
+def test_failed_finalize_recreates_rejected_jobs_file(tmp_path: Path) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.write_text("collision", encoding="utf-8")
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+
+    _finalize_evidence(tmp_path, "test-token")
+
+    assert jobs.is_dir()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "harbor-jobs", "reason": "reserved_path", "size": 9}
+    ]
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+
+
+def test_direct_jobs_root_files_are_bounded(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.mkdir()
+    oversized = jobs / "oversized.log"
+    with oversized.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+    lock = build_run_lock(remote_spec, run_id="jobs-root-limits")
+
+    with pytest.raises(RuntimeError, match="file size limit: oversized.log"):
+        _validate_direct_private_artifacts(tmp_path, lock)
+
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "_FAILED").write_text("\n", encoding="utf-8")
+    _finalize_evidence(tmp_path, "test-token")
+
+    assert not oversized.exists()
+    rejection = json.loads(
+        (jobs / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {
+            "path": "oversized.log",
+            "reason": "file_size",
+            "size": 64 * 1024 * 1024 + 1,
+        }
+    ]
 
 
 def test_failed_direct_run_sanitizes_each_trial_independently(

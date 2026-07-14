@@ -105,6 +105,27 @@ def test_failed_execution_recreates_rejected_jobs_symlink(tmp_path: Path) -> Non
     ]
 
 
+def test_failed_execution_recreates_rejected_jobs_file(tmp_path: Path) -> None:
+    jobs = tmp_path / "harbor-jobs"
+    jobs.write_text("collision", encoding="utf-8")
+    (tmp_path / "events.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "execution.lock.json").write_text(
+        '{"execution_id":"execution-one","trial_id":"trial-one"}\n',
+        encoding="utf-8",
+    )
+
+    _finalize_execution(tmp_path, "test-token", strict_compatibility=False)
+
+    assert jobs.is_dir()
+    assert (tmp_path / "artifacts.tar.gz").is_file()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "harbor-jobs", "reason": "reserved_path", "size": 9}
+    ]
+
+
 def test_failed_execution_prunes_unsafe_evidence_and_still_finalizes(
     tmp_path: Path,
 ) -> None:
