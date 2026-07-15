@@ -4,10 +4,11 @@
 
 - Space: <https://huggingface.co/spaces/osolmaz/harbor-results>
 - Runtime: public Docker Space on `cpu-basic`
-- Space revision: `c13f87a8629a89dc13a690938e706261b64edd9e`
+- Source revision: `c5fef6b0c025f90098a40c7fe1c337716a473a1d`
+- Space revision: `4facb5778f1239fe9578d1eff36d09255df4a36e`
 - Credentials: none
 - Index Dataset: `osolmaz/benchmark-run-index`
-- Catalog revision: `5ec3b7276330a81020c67d2218e4e9db15f08de4`
+- Catalog revision: `d2708c4b379f1886d53409c09dcb771538fbaf09`
 - ShellBench result revision: `3ca396225803d5ce65dcf58ad41d7e0f719b3d0d`
 - Smoke result revision: `05720340ef06c19f035bd7a71e46cdf67d93a975`
 
@@ -49,11 +50,12 @@ leaderboard and comparison patterns only.
 
 ## Verification
 
-- Python: 1,417 tests with branch coverage above the required 85% gate.
+- Python: 1,436 tests with 92.73% coverage.
 - Frontend: TypeScript and Vite production build.
 - Hosted API: health, catalog, run detail, comparison, restricted content, and
   permanent-route smoke requests.
-- Hosted browser: Playwright on desktop Chrome and iPhone 13 profiles.
+- Hosted browser: four Playwright tests passed on desktop Chrome and iPhone 13
+  profiles.
 - Runtime: Space reached `RUNNING`; application startup completed cleanly.
 - Privacy: Space variables are public configuration only and the secret list is
   empty.
