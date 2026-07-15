@@ -208,6 +208,21 @@ def test_typed_bundle_preserves_existing_verification_result(
     }
 
 
+def test_typed_bundle_resolves_internal_task_name_by_locked_digest(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    _, request = _request(remote_spec, tmp_path)
+
+    result = validate_compatibility_bundle(
+        _bundle(request, task_name="task/internal-canonical-name"), request
+    )
+
+    assert result.model_dump(mode="json") == {
+        "trial_count": 1,
+        "trials": [{"task_name": "cancel-async-tasks", "rewards": {"reward": 1.0}}],
+    }
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [

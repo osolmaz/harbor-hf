@@ -277,12 +277,13 @@ v1 paths. Datasets from the superseded dual-publication format must be archived
 and rebuilt from verified private evidence before they are configured as the
 active Results Dataset; there is no mixed-version reader or migration shim.
 
-Ordinary complete runs are the default comparable result class. Partial,
-composite, and manually selected results require an explicit publication path
-and must retain their labels. They must never be inserted into an ordinary
-complete leaderboard cohort. Raw Harbor sessions, trajectories, task bodies,
-logs, manifests, and archives remain in the private Bucket and are never copied
-to a public Dataset.
+Ordinary complete runs are the default comparable result class. A complete run
+may contain exhausted task failures; each contributes zero to the fixed task
+denominator and retains its failure and retry metadata. Partial, composite, and
+manually selected results require an explicit publication path and must retain
+their labels. They must never be inserted into an ordinary complete leaderboard
+cohort. Raw Harbor sessions, trajectories, task bodies, logs, manifests, and
+archives remain in the private Bucket and are never copied to a public Dataset.
 
 Every published score must be traceable through these fields:
 
@@ -337,6 +338,7 @@ routes can be shared without granting access to private canonical evidence.
   digests.
 - Publication receipts, Dataset revisions, control commits, and evidence
   checksums are recorded.
+- Exhausted task failures are scored as zero and remain separately auditable.
 - Partial, composite, and manual results are labeled and excluded from the
   ordinary-complete cohort.
 - The result Space has no credentials and remains a replaceable read-only view.

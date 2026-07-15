@@ -52,15 +52,14 @@ def validate_compatibility_bundle(
 ) -> HarborVerificationResult:
     policy = request.verification
     _validate_trial_count(len(bundle.trials), policy.expected_trials)
-    observed = Counter(trial.task_name for trial in bundle.trials)
+    resolved_names = [
+        _resolved_task_name(trial.task_name, trial.task_digest, request)
+        for trial in bundle.trials
+    ]
+    observed = Counter(resolved_names)
     _validate_task_counts(observed, request)
     verified: list[HarborVerifiedTrial] = []
-    for trial in bundle.trials:
-        expected_digest = (policy.expected_task_digests or {}).get(trial.task_name)
-        if expected_digest != trial.task_digest:
-            raise HarborVerificationFailure(
-                f"Harbor trial {trial.task_name} task digest does not match the lock"
-            )
+    for trial, task_name in zip(bundle.trials, resolved_names, strict=True):
         failure = _trial_failure(
             trial.exception_type, trial.exception_message, trial.step_exceptions
         )
@@ -100,10 +99,22 @@ def validate_compatibility_bundle(
             raise HarborVerificationFailure(
                 f"Harbor trial {trial.task_name} rewards must be finite numbers"
             )
-        verified.append(
-            HarborVerifiedTrial(task_name=trial.task_name, rewards=dict(rewards))
-        )
+        verified.append(HarborVerifiedTrial(task_name=task_name, rewards=dict(rewards)))
     return HarborVerificationResult(trial_count=len(verified), trials=verified)
+
+
+def _resolved_task_name(
+    observed_name: str, observed_digest: str, request: HarborExecutionRequest
+) -> str:
+    expected = request.verification.expected_task_digests or {}
+    if expected.get(observed_name) == observed_digest:
+        return observed_name
+    matches = [name for name, digest in expected.items() if digest == observed_digest]
+    if len(matches) != 1:
+        raise HarborVerificationFailure(
+            f"Harbor trial {observed_name} task digest does not match the lock"
+        )
+    return matches[0]
 
 
 def _validate_trial_count(observed: int, expected: int | None) -> None:

@@ -31,7 +31,7 @@ from harbor_hf.publication_envelope import (
     object_reference,
     profile_digest,
 )
-from harbor_hf.recovery import RecoveryProjection, TerminalDecision
+from harbor_hf.recovery import RecoveryProjection, TerminalDecision, TrialStatus
 from harbor_hf.results import (
     ArtifactEvidence,
     ArtifactKind,
@@ -94,7 +94,7 @@ class BucketCampaignFinalizer:
         for run in lock.runs:
             if projection.runs[run.run_id].status != "complete":
                 continue
-            checksum = self._finalize_run(lock, spec, run, paths)
+            checksum = self._finalize_run(lock, spec, run, paths, projection)
             run_checksums[run.run_id] = checksum
         if decision.status == "completed" and len(run_checksums) != len(lock.runs):
             raise CampaignFinalizationError(
@@ -127,6 +127,7 @@ class BucketCampaignFinalizer:
         spec: ExperimentSpec,
         run: CampaignRunLock,
         campaign_paths: list[str],
+        projection: RecoveryProjection,
     ) -> str:
         prefix = f"runs/{run.run_id}"
         run_paths = _under(campaign_paths, prefix)
@@ -153,6 +154,7 @@ class BucketCampaignFinalizer:
                     run_paths,
                     trial,
                     runtime_kind,
+                    projection.trials[trial.trial_id].status,
                 )
                 trials.append(records.trial)
                 executions.extend(records.executions)
@@ -268,9 +270,20 @@ class BucketCampaignFinalizer:
         run_paths: list[str],
         trial: CampaignTrialLock,
         runtime_kind: RuntimeKind,
+        status: TrialStatus,
     ) -> _TrialRecords:
         prefix = f"{run_prefix}/trials/{trial.trial_id}"
         relative_prefix = prefix.removeprefix(f"{run_prefix}/")
+        if status != "complete":
+            return self._failed_trial_records(
+                spec,
+                campaign,
+                run_prefix,
+                run_paths,
+                trial,
+                runtime_kind,
+                status,
+            )
         if f"{relative_prefix}/_SUCCESS" not in run_paths:
             raise CampaignFinalizationError(
                 f"complete trial has no success marker: {trial.trial_id}"
@@ -331,6 +344,80 @@ class BucketCampaignFinalizer:
             metrics=_reward_metrics(trial.trial_id, verifier),
             verification_trials=[dict(verifier)],
             completed_at=selected[1],
+        )
+
+    def _failed_trial_records(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        run_prefix: str,
+        run_paths: list[str],
+        trial: CampaignTrialLock,
+        runtime_kind: RuntimeKind,
+        status: TrialStatus,
+    ) -> _TrialRecords:
+        if status not in {"invalid", "failed_infrastructure"}:
+            raise CampaignFinalizationError(
+                f"scored run contains a nonterminal trial: {trial.trial_id}"
+            )
+        relative_prefix = f"trials/{trial.trial_id}"
+        execution_paths = sorted(
+            path
+            for path in run_paths
+            if path.startswith(f"{relative_prefix}/executions/")
+            and path.endswith("/execution.lock.json")
+        )
+        if not execution_paths:
+            raise CampaignFinalizationError(
+                f"failed trial has no execution evidence: {trial.trial_id}"
+            )
+        records: list[ExecutionEvidence] = []
+        physical_executions: list[PhysicalExecutionReference] = []
+        for relative in execution_paths:
+            execution_prefix = str(PurePosixPath(relative).parent)
+            absolute_prefix = f"{run_prefix}/{execution_prefix}"
+            record = self._execution_record(
+                spec,
+                campaign,
+                run_paths,
+                execution_prefix,
+                absolute_prefix,
+                runtime_kind,
+            )
+            records.append(record.evidence)
+            physical_executions.append(record.physical_execution)
+        selected = max(records, key=lambda record: record.physical_attempt)
+        if selected.status != "failed_infrastructure":
+            raise CampaignFinalizationError(
+                "failed trial selected execution is not a recorded failure"
+            )
+        verifier = {
+            "task_name": trial.task_name,
+            "outcome": "failed",
+            "rewards": {"reward": 0.0},
+        }
+        return _TrialRecords(
+            trial=TrialEvidence(
+                trial_id=trial.trial_id,
+                task_name=trial.task_name,
+                task_digest=trial.task_digest,
+                logical_attempt=trial.logical_attempt,
+                selected_execution_id=selected.execution_id,
+                outcome="failed",
+            ),
+            executions=records,
+            physical_executions=physical_executions,
+            metrics=[
+                MetricEvidence(
+                    owner_type="trial",
+                    owner_id=trial.trial_id,
+                    name="reward",
+                    value=0.0,
+                    unit="score",
+                )
+            ],
+            verification_trials=[verifier],
+            completed_at=selected.completed_at,
         )
 
     def _execution_record(
