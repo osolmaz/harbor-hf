@@ -21,6 +21,11 @@ from pydantic import (
 
 Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 EntityId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+Commit = Annotated[str, Field(pattern=r"^[0-9a-f]{40,64}$")]
+DatasetId = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"),
+]
 OwnerType = Literal["run", "trial", "execution"]
 RuntimeKind = Literal["endpoint", "provider"]
 ArtifactKind = Literal[
@@ -229,50 +234,56 @@ class TraceValues(TypedDict):
 
 class TraceRow(FrozenModel):
     schema_version: str
-    publication_id: str
-    run_id: str
-    source_bucket: str
-    source_prefix: str
-    source_checksum: str
-    run_lock_path: str
-    run_lock_sha256: str
-    control_commit: str
+    publication_id: EntityId
+    run_id: EntityId
+    source_bucket: str = Field(min_length=1)
+    source_prefix: str = Field(min_length=1)
+    source_checksum: Digest
+    run_lock_path: str = Field(min_length=1)
+    run_lock_sha256: Digest
+    control_commit: Commit
 
 
 class RunRow(TraceRow):
     schema_version: Literal["harbor-hf/results/runs/v1"] = "harbor-hf/results/runs/v1"
-    campaign_id: str
-    experiment: str
-    benchmark: str
-    benchmark_revision: str
+    campaign_id: EntityId
+    experiment: str = Field(min_length=1)
+    benchmark: str = Field(min_length=1)
+    benchmark_revision: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
     created_at: AwareDatetime
     completed_at: AwareDatetime
-    model_id: str
-    model_repo: str
-    model_revision: str
-    deployment_id: str
-    provider: str
-    region: str
-    hardware: str
-    accelerator_count: int
-    agent_id: str
-    agent_name: str
-    agent_revision: str
-    trial_count: int
-    execution_count: int
+    model_id: EntityId
+    model_repo: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    deployment_id: EntityId
+    provider: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    hardware: str = Field(min_length=1)
+    accelerator_count: int = Field(ge=0)
+    agent_id: EntityId
+    agent_name: str = Field(min_length=1)
+    agent_revision: str = Field(min_length=1)
+    trial_count: int = Field(ge=0)
+    execution_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def completion_follows_creation(self) -> RunRow:
+        if self.completed_at < self.created_at:
+            raise ValueError("run completion precedes creation")
+        return self
 
 
 class TrialRow(TraceRow):
     schema_version: Literal["harbor-hf/results/trials/v1"] = (
         "harbor-hf/results/trials/v1"
     )
-    trial_id: str
-    task_name: str
-    task_digest: str
-    logical_attempt: int
-    selected_execution_id: str
+    trial_id: EntityId
+    task_name: str = Field(min_length=1)
+    task_digest: Digest
+    logical_attempt: int = Field(ge=1)
+    selected_execution_id: EntityId
     outcome: Literal["complete"]
 
 
@@ -280,9 +291,9 @@ class ExecutionRow(TraceRow):
     schema_version: Literal["harbor-hf/results/executions/v1"] = (
         "harbor-hf/results/executions/v1"
     )
-    execution_id: str
-    trial_id: str
-    physical_attempt: int
+    execution_id: EntityId
+    trial_id: EntityId
+    physical_attempt: int = Field(ge=1)
     runtime_kind: RuntimeKind
     status: Literal["succeeded", "failed_infrastructure", "cancelled"]
     started_at: AwareDatetime
@@ -290,17 +301,25 @@ class ExecutionRow(TraceRow):
     retry_reason: str | None
     remote_job_id: str | None
 
+    @model_validator(mode="after")
+    def values_are_consistent(self) -> ExecutionRow:
+        if self.completed_at < self.started_at:
+            raise ValueError("execution completion precedes start")
+        if self.physical_attempt == 1 and self.retry_reason is not None:
+            raise ValueError("first execution cannot have a retry reason")
+        return self
+
 
 class MetricRow(TraceRow):
     schema_version: Literal["harbor-hf/results/metrics/v1"] = (
         "harbor-hf/results/metrics/v1"
     )
-    metric_id: str
+    metric_id: EntityId
     owner_type: OwnerType
-    owner_id: str
-    name: str
-    value: float
-    unit: str
+    owner_id: EntityId
+    name: str = Field(min_length=1)
+    value: float = Field(allow_inf_nan=False)
+    unit: str = Field(min_length=1)
     aggregation: str | None
 
 
@@ -308,14 +327,14 @@ class ArtifactRow(TraceRow):
     schema_version: Literal["harbor-hf/results/artifacts/v1"] = (
         "harbor-hf/results/artifacts/v1"
     )
-    artifact_id: str
+    artifact_id: EntityId
     owner_type: OwnerType
-    owner_id: str
+    owner_id: EntityId
     kind: ArtifactKind
-    path: str
-    sha256: str
-    media_type: str
-    size_bytes: int
+    path: str = Field(min_length=1)
+    sha256: Digest
+    media_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
 
 
 class ResultTables(FrozenModel):
@@ -344,21 +363,64 @@ class ResultTables(FrozenModel):
 
 class GlobalIndexRow(FrozenModel):
     schema_version: Literal["harbor-hf/results/index/v1"] = "harbor-hf/results/index/v1"
-    publication_id: str
-    run_id: str
-    campaign_id: str
-    benchmark: str
+    publication_id: EntityId
+    run_id: EntityId
+    campaign_id: EntityId
+    benchmark: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
     completed_at: AwareDatetime
-    model_repo: str
-    model_revision: str
-    agent_name: str
-    agent_revision: str
-    result_dataset: str
-    result_revision: str
-    source_checksum: str
-    control_commit: str
+    model_repo: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    agent_name: str = Field(min_length=1)
+    agent_revision: str = Field(min_length=1)
+    result_dataset: DatasetId
+    result_revision: Commit
+    source_checksum: Digest
+    control_commit: Commit
+
+
+class CatalogRow(FrozenModel):
+    schema_version: Literal["harbor-hf/results/catalog/v1"] = (
+        "harbor-hf/results/catalog/v1"
+    )
+    publication_id: EntityId
+    run_id: EntityId
+    campaign_id: EntityId
+    benchmark: str = Field(min_length=1)
+    benchmark_revision: str = Field(min_length=1)
+    result_kind: Literal["ordinary"]
+    outcome: Literal["complete"]
+    created_at: AwareDatetime
+    completed_at: AwareDatetime
+    model_repo: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    agent_name: str = Field(min_length=1)
+    agent_revision: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    hardware: str = Field(min_length=1)
+    accelerator_count: int = Field(ge=0)
+    score: float = Field(allow_inf_nan=False)
+    passed_trials: int = Field(ge=0)
+    trial_count: int = Field(ge=0)
+    execution_count: int = Field(ge=0)
+    infrastructure_failures: int = Field(ge=0)
+    duration_seconds: float = Field(ge=0)
+    result_dataset: DatasetId
+    result_revision: Commit
+    source_checksum: Digest
+    control_commit: Commit
+
+    @model_validator(mode="after")
+    def values_are_consistent(self) -> CatalogRow:
+        if not math.isfinite(self.score):
+            raise ValueError("catalog score must be finite")
+        if self.passed_trials > self.trial_count:
+            raise ValueError("catalog passed trials exceed trial count")
+        if self.completed_at < self.created_at:
+            raise ValueError("catalog completion precedes creation")
+        return self
 
 
 class DatasetFile(FrozenModel):
@@ -565,6 +627,125 @@ def build_index_window_file(rows: Sequence[GlobalIndexRow], size: int) -> Datase
     )
 
 
+def build_catalog_row(
+    tables: ResultTables, *, result_dataset: str, result_revision: str
+) -> CatalogRow:
+    run = tables.runs[0]
+    rewards = _trial_reward_scores(tables)
+    score = sum(rewards) / len(rewards) if rewards else 0.0
+    return CatalogRow(
+        publication_id=tables.publication_id,
+        run_id=run.run_id,
+        campaign_id=run.campaign_id,
+        benchmark=run.benchmark,
+        benchmark_revision=run.benchmark_revision,
+        result_kind=run.result_kind,
+        outcome=run.outcome,
+        created_at=run.created_at,
+        completed_at=run.completed_at,
+        model_repo=run.model_repo,
+        model_revision=run.model_revision,
+        agent_name=run.agent_name,
+        agent_revision=run.agent_revision,
+        provider=run.provider,
+        region=run.region,
+        hardware=run.hardware,
+        accelerator_count=run.accelerator_count,
+        score=score,
+        passed_trials=sum(value >= 1.0 for value in rewards),
+        trial_count=run.trial_count,
+        execution_count=run.execution_count,
+        infrastructure_failures=sum(
+            execution.status == "failed_infrastructure"
+            for execution in tables.executions
+        ),
+        duration_seconds=(run.completed_at - run.created_at).total_seconds(),
+        result_dataset=result_dataset,
+        result_revision=result_revision,
+        source_checksum=run.source_checksum,
+        control_commit=run.control_commit,
+    )
+
+
+def build_catalog_window_file(rows: Sequence[CatalogRow], size: int) -> DatasetFile:
+    if size < 1:
+        raise ValueError("catalog window size must be positive")
+    return DatasetFile(
+        path=f"data/catalog/schema=v1/windows/{size:04d}.parquet",
+        content=_parquet_bytes(rows[:size], catalog_parquet_schema()),
+    )
+
+
+def catalog_lookup_path(run_id: str) -> str:
+    identity = hashlib.sha256(run_id.encode()).hexdigest()
+    return f"data/catalog/schema=v1/runs/{identity}.parquet"
+
+
+def build_catalog_lookup_file(row: CatalogRow) -> DatasetFile:
+    return DatasetFile(
+        path=catalog_lookup_path(row.run_id),
+        content=_parquet_bytes([row], catalog_parquet_schema()),
+    )
+
+
+def read_catalog_file(content: bytes) -> list[CatalogRow]:
+    try:
+        values = pq.read_table(
+            pa.BufferReader(content), schema=catalog_parquet_schema()
+        )
+    except (pa.ArrowException, OSError) as error:
+        raise ValueError("result catalog Parquet is invalid") from error
+    return [CatalogRow.model_validate(value) for value in values.to_pylist()]
+
+
+def _trial_reward_scores(tables: ResultTables) -> list[float]:
+    by_trial: dict[str, list[MetricRow]] = {}
+    for metric in tables.metrics:
+        if metric.owner_type == "trial" and metric.unit == "score":
+            by_trial.setdefault(metric.owner_id, []).append(metric)
+    return [
+        score
+        for trial in tables.trials
+        if (score := _select_reward_score(by_trial.get(trial.trial_id, []))) is not None
+    ]
+
+
+def trial_reward_score(metrics: Sequence[MetricRow], trial_id: str) -> float | None:
+    candidates = [
+        metric
+        for metric in metrics
+        if metric.owner_type == "trial"
+        and metric.owner_id == trial_id
+        and metric.unit == "score"
+    ]
+    return _select_reward_score(candidates)
+
+
+def _select_reward_score(candidates: Sequence[MetricRow]) -> float | None:
+    if not candidates:
+        return None
+    preferred = next(
+        (
+            metric
+            for name in ("reward", "score", "verifier_reward")
+            for metric in candidates
+            if metric.name.casefold() == name
+        ),
+        None,
+    )
+    if preferred is not None:
+        return preferred.value
+    named_scores = [
+        metric
+        for metric in candidates
+        if any(
+            term in metric.name.casefold() for term in ("reward", "score", "verifier")
+        )
+    ]
+    selected = named_scores or candidates
+    return sum(metric.value for metric in selected) / len(selected)
+
+
 def read_index_file(content: bytes) -> list[GlobalIndexRow]:
     try:
         values = pq.read_table(pa.BufferReader(content), schema=index_parquet_schema())
@@ -626,6 +807,7 @@ def result_schema_manifest() -> dict[str, object]:
         name: _schema_description(parquet_schema(name)) for name in _table_names()
     }
     schemas["index"] = _schema_description(index_parquet_schema())
+    schemas["catalog"] = _schema_description(catalog_parquet_schema())
     return {"schema_version": "harbor-hf/result-schemas/v1", "tables": schemas}
 
 
@@ -635,6 +817,10 @@ def parquet_schema(table: TableName) -> pa.Schema:
 
 def index_parquet_schema() -> pa.Schema:
     return _INDEX_SCHEMA
+
+
+def catalog_parquet_schema() -> pa.Schema:
+    return _CATALOG_SCHEMA
 
 
 def _verify_evidence(
@@ -1014,6 +1200,40 @@ _INDEX_SCHEMA = _make_schema(
         _field("model_revision", pa.string()),
         _field("agent_name", pa.string()),
         _field("agent_revision", pa.string()),
+        _field("result_dataset", pa.string()),
+        _field("result_revision", pa.string()),
+        _field("source_checksum", pa.string()),
+        _field("control_commit", pa.string()),
+    ],
+)
+
+_CATALOG_SCHEMA = _make_schema(
+    "harbor-hf/results/catalog/v1",
+    [
+        _field("schema_version", pa.string()),
+        _field("publication_id", pa.string()),
+        _field("run_id", pa.string()),
+        _field("campaign_id", pa.string()),
+        _field("benchmark", pa.string()),
+        _field("benchmark_revision", pa.string()),
+        _field("result_kind", pa.string()),
+        _field("outcome", pa.string()),
+        _field("created_at", _TIMESTAMP),
+        _field("completed_at", _TIMESTAMP),
+        _field("model_repo", pa.string()),
+        _field("model_revision", pa.string()),
+        _field("agent_name", pa.string()),
+        _field("agent_revision", pa.string()),
+        _field("provider", pa.string()),
+        _field("region", pa.string()),
+        _field("hardware", pa.string()),
+        _field("accelerator_count", pa.int64()),
+        _field("score", pa.float64()),
+        _field("passed_trials", pa.int64()),
+        _field("trial_count", pa.int64()),
+        _field("execution_count", pa.int64()),
+        _field("infrastructure_failures", pa.int64()),
+        _field("duration_seconds", pa.float64()),
         _field("result_dataset", pa.string()),
         _field("result_revision", pa.string()),
         _field("source_checksum", pa.string()),

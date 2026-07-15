@@ -20,7 +20,9 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ty check
       - run: uv run pytest --cov=src/harbor_hf --cov-fail-under=85
-      - run: uv run pytest tests/test_presentation.py --cov=space --cov-fail-under=85
+      - run: npm ci && npm run build
+        working-directory: apps/results-web
+      - run: docker build -f deploy/space/Dockerfile .
       - run: uv run slophammer-py dry .
       - run: uv run pip-audit
       - run: uv run slophammer-py check . --baseline
