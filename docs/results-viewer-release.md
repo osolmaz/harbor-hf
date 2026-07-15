@@ -4,10 +4,10 @@
 
 - Space: <https://huggingface.co/spaces/osolmaz/harbor-results>
 - Runtime: public Docker Space on `cpu-basic`
-- Space revision: `a93a672e4ee160c691e86f0f5fd5b26cef69d62f`
+- Space revision: `c13f87a8629a89dc13a690938e706261b64edd9e`
 - Credentials: none
 - Index Dataset: `osolmaz/benchmark-run-index`
-- Catalog revision: `d30eb71a421642d37eb635840e5c132340084181`
+- Catalog revision: `5ec3b7276330a81020c67d2218e4e9db15f08de4`
 - ShellBench result revision: `3ca396225803d5ce65dcf58ad41d7e0f719b3d0d`
 - Smoke result revision: `05720340ef06c19f035bd7a71e46cdf67d93a975`
 
@@ -58,12 +58,12 @@ leaderboard and comparison patterns only.
 - Privacy: Space variables are public configuration only and the secret list is
   empty.
 
-The first rollout remained in `APP_STARTING` after its image built successfully,
-without producing container logs. The identical image started and passed its
-browser suite in local Docker. One factory rebuild cleared the stale Space
-container state; the replacement started Uvicorn normally and passed the hosted
-suite. The only request-time warning states that Hub reads are anonymous, which
-is the intended public deployment boundary.
+Some rollouts remained in `APP_STARTING` after their images built successfully,
+without producing container logs. The identical images started and passed their
+browser suites in local Docker. Factory rebuilds cleared the stale Space
+container state; the replacements started Uvicorn normally and passed the
+hosted suite. The only request-time warning states that Hub reads are anonymous,
+which is the intended public deployment boundary.
 
 The public capability response deliberately reports trajectory and artifact
 content access as unavailable. A future protected deployment can add sanitized
