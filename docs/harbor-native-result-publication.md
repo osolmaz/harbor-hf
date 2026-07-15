@@ -4,8 +4,10 @@
 
 The canonical `v1` publication boundary is implemented. The dual writer,
 v2-first reader, migration command, legacy classifications, and superseded
-schemas have been removed. The active hosted catalog must be rebuilt only from
-verified native evidence and deployed with the matching Results Space release.
+schemas have been removed. The active hosted catalog and Results Space were cut
+over together on 2026-07-15. The six unverifiable pre-cutover rows remain only
+in immutable archival revisions; the active catalog accepts only publications
+backed by verified native evidence.
 
 ## Purpose
 
