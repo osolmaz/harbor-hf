@@ -132,7 +132,9 @@ Each physical execution records `bundle_status`. New successful executions use
 compatibility adapter existed use `legacy_unavailable`; failed or cancelled
 executions without a valid bundle use `not_available`. The legacy status keeps
 in-flight campaigns finalizable during rollout without claiming native
-provenance that does not exist.
+provenance that does not exist. Runs containing a legacy successful execution
+remain `legacy-v1` in public catalogs until they are rerun with verified native
+bundles.
 
 `checksums.json` covers every non-marker object. `_SUCCESS` is written last and
 only after Harbor output, HF infrastructure evidence, checksums, redaction,

@@ -1084,6 +1084,12 @@ def _load_publication_provenance(
     except Exception as error:
         raise ResultPublicationError("publication envelope is invalid") from error
     _validate_envelope_identity(envelope, source, summary, checksums)
+    _validate_envelope_executions(envelope, summary)
+    if any(
+        execution.bundle_status == "legacy_unavailable"
+        for execution in envelope.executions
+    ):
+        return None
     manifests = []
     archives = []
     for execution in envelope.executions:
@@ -1134,6 +1140,40 @@ def _validate_envelope_identity(
         or runtime.accelerator_count != run.accelerator_count
     ):
         raise ResultPublicationError("publication envelope runtime conflicts")
+
+
+def _validate_envelope_executions(
+    envelope: PublicationEnvelopeV2,
+    summary: ResultEvidence,
+) -> None:
+    expected = {
+        execution.execution_id: (
+            execution.trial_id,
+            execution.physical_attempt,
+            execution.status,
+            execution.started_at,
+            execution.completed_at,
+            execution.retry_reason,
+            execution.remote_job_id,
+        )
+        for execution in summary.executions
+    }
+    observed = {
+        execution.execution_id: (
+            execution.trial_id,
+            execution.physical_attempt,
+            execution.status,
+            execution.started_at,
+            execution.completed_at,
+            execution.retry_reason,
+            execution.remote_job_id,
+        )
+        for execution in envelope.executions
+    }
+    if observed != expected:
+        raise ResultPublicationError(
+            "publication envelope executions conflict with normalized evidence"
+        )
 
 
 def _verified_listing(reader: EvidenceReader, source: EvidenceSource) -> list[str]:

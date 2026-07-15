@@ -386,6 +386,39 @@ def test_rejects_v2_envelope_with_unverified_bundle(
         build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
 
 
+def test_legacy_success_envelope_publishes_without_v2_provenance(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_v2_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    succeeded = next(
+        record for record in envelope["executions"] if record["status"] == "succeeded"
+    )
+    succeeded["bundle_status"] = "legacy_unavailable"
+    succeeded["harbor_bundle"] = None
+    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+    tables = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+    publication = build_result_publication(tables)
+
+    assert tables.provenance is None
+    assert not any(item.path.startswith("projections/") for item in publication.files)
+
+
+def test_rejects_envelope_execution_that_conflicts_with_summary(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_v2_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    envelope["executions"][0]["trial_id"] = "trial-imposter"
+    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+    with pytest.raises(ResultPublicationError, match="executions conflict"):
+        build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+
+
 def test_publication_identity_is_stable_across_later_control_events(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
