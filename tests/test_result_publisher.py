@@ -20,6 +20,7 @@ from harbor_hf.result_publisher import (
     publisher_lease_path,
 )
 from harbor_hf.results import (
+    PublicationProvenance,
     ResultPublication,
     ResultTables,
     RunRow,
@@ -28,6 +29,7 @@ from harbor_hf.results import (
     build_index_file,
     build_result_publication,
     read_catalog_file,
+    read_catalog_v2_file,
     read_index_file,
 )
 
@@ -170,6 +172,22 @@ def publication() -> ResultPublication:
     return build_result_publication(tables)
 
 
+@pytest.fixture
+def native_publication(publication: ResultPublication) -> ResultPublication:
+    tables = publication.tables.model_copy(
+        update={
+            "provenance": PublicationProvenance(
+                envelope_sha256="sha256:" + "7" * 64,
+                projection_version="harbor-hf/results-projection/v2",
+                sanitizer_version="harbor-hf/public-results/v1",
+                harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
+                harbor_archive_sha256s=["sha256:" + "9" * 64],
+            )
+        }
+    )
+    return build_result_publication(tables)
+
+
 def test_serializes_result_and_index_with_parent_checked_leases(
     publication: ResultPublication, tmp_path: Path
 ) -> None:
@@ -225,6 +243,44 @@ def test_serializes_result_and_index_with_parent_checked_leases(
     assert catalog[0].score == 0.0
     lookup = build_catalog_lookup_file(catalog[0])
     assert read_catalog_file(api.files["org/index"][lookup.path]) == catalog
+    catalog_v2 = read_catalog_v2_file(
+        api.files["org/index"]["data/catalog/schema=v2/windows/2048.parquet"]
+    )
+    assert catalog_v2[0].source_format == "legacy-v1"
+
+
+def test_publishes_native_v2_projection_and_catalog(
+    native_publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+
+    publisher.publish(
+        native_publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+
+    projection_path = (
+        f"projections/schema=v2/{native_publication.tables.publication_id}.json"
+    )
+    projection = json.loads(api.files["org/results"][projection_path])
+    assert projection["schema_version"] == "harbor-hf/result-projection/v2"
+    assert set(projection["tables"]) == {
+        "runs",
+        "trials",
+        "executions",
+        "metrics",
+        "artifacts",
+    }
+    catalog = read_catalog_v2_file(
+        api.files["org/index"]["data/catalog/schema=v2/windows/2048.parquet"]
+    )[0]
+    assert catalog.source_format == "native-v2"
+    assert catalog.projection_path == projection_path
+    assert catalog.harbor_bundle_count == 1
 
 
 def test_duplicate_publication_is_a_no_op(

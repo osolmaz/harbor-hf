@@ -14,17 +14,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from harbor_hf.control import CampaignStoreApi
 from harbor_hf.results import (
     CatalogRow,
+    CatalogRowV2,
     DatasetFile,
     GlobalIndexRow,
     ResultPublication,
-    ResultTables,
     build_catalog_lookup_file,
     build_catalog_row,
+    build_catalog_row_v2,
+    build_catalog_v2_lookup_file,
+    build_catalog_v2_window_file,
     build_catalog_window_file,
     build_global_index_row,
     build_index_file,
     build_index_window_file,
+    catalog_v2_from_legacy,
     read_catalog_file,
+    read_catalog_v2_file,
     read_index_file,
 )
 
@@ -122,7 +127,7 @@ class HubDatasetPublisher:
         result_revision, index_revision = self._with_lease(
             index_dataset,
             lambda: self._publish_index(
-                publication.tables,
+                publication,
                 result_dataset=result_dataset,
                 result_revision=result_revision,
                 index_dataset=index_dataset,
@@ -213,12 +218,21 @@ class HubDatasetPublisher:
 
     def _publish_index(
         self,
-        tables: ResultTables,
+        publication: ResultPublication,
         *,
         result_dataset: str,
         result_revision: str,
         index_dataset: str,
     ) -> tuple[str, str]:
+        tables = publication.tables
+        projection = next(
+            (
+                item
+                for item in publication.files
+                if item.path == f"projections/schema=v2/{tables.publication_id}.json"
+            ),
+            None,
+        )
         receipt_path = f"publications/{tables.publication_id}.json"
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
             head = self._head(index_dataset)
@@ -256,8 +270,25 @@ class HubDatasetPublisher:
             )
             catalog_windows = self._catalog_windows(index_dataset, head, catalog)
             catalog_lookup = build_catalog_lookup_file(catalog)
+            catalog_v2 = build_catalog_row_v2(
+                tables,
+                result_dataset=result_dataset,
+                result_revision=indexed_result_revision,
+                projection=projection,
+            )
+            catalog_v2_windows = self._catalog_v2_windows(
+                index_dataset, head, catalog_v2
+            )
+            catalog_v2_lookup = build_catalog_v2_lookup_file(catalog_v2)
+            index_updates = [
+                *windows,
+                *catalog_windows,
+                catalog_lookup,
+                *catalog_v2_windows,
+                catalog_v2_lookup,
+            ]
             if receipt is not None and self._windows_match(
-                index_dataset, head, [*windows, *catalog_windows, catalog_lookup]
+                index_dataset, head, index_updates
             ):
                 return receipt.result_revision, head
             receipt = receipt or self._index_receipt(row, index_file)
@@ -266,7 +297,7 @@ class HubDatasetPublisher:
                     path_in_repo=window.path,
                     path_or_fileobj=window.content,
                 )
-                for window in [*windows, *catalog_windows, catalog_lookup]
+                for window in index_updates
             ]
             if not self._exists(index_dataset, receipt_path, head):
                 operations.extend(
@@ -358,6 +389,35 @@ class HubDatasetPublisher:
         )[:_LARGEST_INDEX_WINDOW]
         return [
             build_catalog_window_file(ordered, size) for size in _INDEX_WINDOW_SIZES
+        ]
+
+    def _catalog_v2_windows(
+        self, dataset: str, revision: str, row: CatalogRowV2
+    ) -> list[DatasetFile]:
+        largest_path = build_catalog_v2_window_file([], _LARGEST_INDEX_WINDOW).path
+        if self._exists(dataset, largest_path, revision):
+            existing = read_catalog_v2_file(self._read(dataset, largest_path, revision))
+        else:
+            legacy_path = build_catalog_window_file([], _LARGEST_INDEX_WINDOW).path
+            existing = (
+                [
+                    catalog_v2_from_legacy(item)
+                    for item in read_catalog_file(
+                        self._read(dataset, legacy_path, revision)
+                    )
+                ]
+                if self._exists(dataset, legacy_path, revision)
+                else []
+            )
+        by_publication = {item.publication_id: item for item in existing}
+        by_publication[row.publication_id] = row
+        ordered = sorted(
+            by_publication.values(),
+            key=lambda item: (item.completed_at, item.publication_id),
+            reverse=True,
+        )[:_LARGEST_INDEX_WINDOW]
+        return [
+            build_catalog_v2_window_file(ordered, size) for size in _INDEX_WINDOW_SIZES
         ]
 
     def _windows_match(
