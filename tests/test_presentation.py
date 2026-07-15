@@ -22,14 +22,19 @@ from harbor_hf.presentation.repository import (
 from harbor_hf.presentation.service import ResultService
 from harbor_hf.results import (
     ArtifactRow,
+    CatalogRowV2,
     ExecutionRow,
     GlobalIndexRow,
     MetricRow,
+    PublicationProvenance,
     ResultTables,
     RunRow,
     TrialRow,
     build_catalog_lookup_file,
     build_catalog_row,
+    build_catalog_row_v2,
+    build_catalog_v2_lookup_file,
+    build_result_publication,
 )
 
 NOW = datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC)
@@ -78,6 +83,17 @@ class FakeReader:
         self.snapshot = snapshot
         self.read_calls: list[str] = []
         self.rows: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+        self.bytes: dict[tuple[str, str, str], bytes] = {}
+        self.files = [
+            "data/catalog/schema=v1/windows/0004.parquet",
+            "data/catalog/schema=v1/windows/0008.parquet",
+            "data/index/schema=v1/windows/0004.parquet",
+            "data/index/schema=v1/windows/0008.parquet",
+            *[
+                f"data/index/schema=v1/{row.publication_id}.parquet"
+                for row in snapshot.index_rows
+            ],
+        ]
         for size in (4, 8):
             catalog_path = f"data/catalog/schema=v1/windows/{size:04d}.parquet"
             self.rows[("org/index", INDEX_REVISION, catalog_path)] = [
@@ -117,22 +133,17 @@ class FakeReader:
 
     def list_files(self, dataset: str, revision: str) -> list[str]:
         assert (dataset, revision) == ("org/index", INDEX_REVISION)
-        return [
-            "data/catalog/schema=v1/windows/0004.parquet",
-            "data/catalog/schema=v1/windows/0008.parquet",
-            "data/index/schema=v1/windows/0004.parquet",
-            "data/index/schema=v1/windows/0008.parquet",
-            *[
-                f"data/index/schema=v1/{row.publication_id}.parquet"
-                for row in self.snapshot.index_rows
-            ],
-        ]
+        return self.files
 
     def read_rows(
         self, dataset: str, revision: str, path: str
     ) -> Sequence[Mapping[str, object]]:
         self.read_calls.append(path)
         return self.rows[(dataset, revision, path)]
+
+    def read_bytes(self, dataset: str, revision: str, path: str) -> bytes:
+        self.read_calls.append(path)
+        return self.bytes[(dataset, revision, path)]
 
 
 @pytest.fixture
@@ -248,6 +259,80 @@ def test_repository_loads_exact_revisions_and_validates_trace(
         )
 
 
+def test_repository_prefers_and_verifies_native_v2_catalog(
+    snapshot: ResultSnapshot,
+) -> None:
+    index = snapshot.index_rows[0]
+    tables = ResultTables(
+        publication_id=index.publication_id,
+        runs=[
+            row for row in snapshot.runs if row.publication_id == index.publication_id
+        ],
+        trials=[
+            row for row in snapshot.trials if row.publication_id == index.publication_id
+        ],
+        executions=[
+            row
+            for row in snapshot.executions
+            if row.publication_id == index.publication_id
+        ],
+        metrics=[
+            row
+            for row in snapshot.metrics
+            if row.publication_id == index.publication_id
+        ],
+        artifacts=[
+            row
+            for row in snapshot.artifacts
+            if row.publication_id == index.publication_id
+        ],
+        provenance=PublicationProvenance(
+            envelope_sha256="sha256:" + "1" * 64,
+            projection_version="harbor-hf/results-projection/v2",
+            sanitizer_version="harbor-hf/public-results/v1",
+            harbor_bundle_manifest_sha256s=["sha256:" + "2" * 64],
+            harbor_archive_sha256s=["sha256:" + "3" * 64],
+        ),
+    )
+    publication = build_result_publication(tables)
+    projection = next(
+        item for item in publication.files if item.path.startswith("projections/")
+    )
+    catalog = build_catalog_row_v2(
+        tables,
+        result_dataset="org/results",
+        result_revision=RESULT_REVISION,
+        projection=projection,
+    )
+    reader = FakeReader(snapshot)
+    for size in (4, 8):
+        path = f"data/catalog/schema=v2/windows/{size:04d}.parquet"
+        reader.files.append(path)
+        reader.rows[("org/index", INDEX_REVISION, path)] = [
+            catalog.model_dump(mode="python")
+        ]
+    lookup = build_catalog_v2_lookup_file(catalog)
+    reader.rows[("org/index", INDEX_REVISION, lookup.path)] = [
+        catalog.model_dump(mode="python")
+    ]
+    for item in publication.files:
+        reader.bytes[("org/results", RESULT_REVISION, item.path)] = item.content
+
+    repository = ResultRepository(
+        PresentationConfig("org/index", max_publications=2), reader
+    )
+    loaded = repository.load()
+
+    assert isinstance(loaded.catalog_rows[0], CatalogRowV2)
+    assert loaded.catalog_rows[0].source_format == "native-v2"
+    assert repository.load_publication(loaded.catalog_rows[0]).runs[0].run_id == (
+        index.run_id
+    )
+    reader.bytes[("org/results", RESULT_REVISION, projection.path)] += b"tampered"
+    with pytest.raises(PresentationError, match="manifest checksum differs"):
+        repository.load_publication(loaded.catalog_rows[0])
+
+
 def test_repository_rejects_malformed_rows_and_broken_relations(
     snapshot: ResultSnapshot,
 ) -> None:
@@ -346,7 +431,7 @@ def test_historical_links_resolve_outside_list_window(
     assert client.get("/api/v1/runs/run-1/trials/trial-1").status_code == 200
     assert client.get("/api/v1/runs/run-1/executions/execution-1").status_code == 200
     assert client.get("/api/v1/runs/run-1/trials/missing").status_code == 404
-    assert len([path for path in reader.read_calls if "/windows/" not in path]) == 6
+    assert len([path for path in reader.read_calls if "/windows/" not in path]) == 7
 
 
 def test_catalog_uses_valid_nonstandard_reward_names() -> None:

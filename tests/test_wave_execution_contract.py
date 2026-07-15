@@ -298,6 +298,8 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-compatibility.json",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-native-bundle.json",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-export.log",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-job.json",
@@ -343,6 +345,7 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         "task_digest": task_digest,
         "logical_attempt": 1,
         "physical_attempt": 1,
+        "remote_job_id": "test-wave-job",
     }
     assert _events(execution_root / "events.jsonl") == [
         {"event": "execution_started", "execution_id": execution_id},

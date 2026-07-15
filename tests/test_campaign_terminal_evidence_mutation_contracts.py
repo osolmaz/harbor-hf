@@ -117,6 +117,7 @@ def _execution_lock(
             task_digest=trial.task_digest,
             logical_attempt=trial.logical_attempt,
             physical_attempt=physical_attempt,
+            remote_job_id=f"job-{execution_id}",
         )
         .model_dump_json()
         .encode()
@@ -151,10 +152,53 @@ def _finalizer_files(
         "execution_succeeded",
         "2026-07-14T03:06:00+01:00",
     )
+    archive = b"deterministic Harbor archive"
+    compatibility = b"{}\n"
+    native_lock = b'{"kind":"trial-lock"}\n'
+    native_result = b'{"kind":"trial-result"}\n'
+    bundle = _pretty(
+        {
+            "schema_version": "harbor-hf/harbor-native-bundle/v1alpha1",
+            "contract_status": "compatibility",
+            "harbor_revision": "a" * 40,
+            "harbor_version": "test",
+            "request_digest": "sha256:" + "b" * 64,
+            "compatibility_schema": "harbor-hf/harbor-compatibility/v1alpha3",
+            "archive": {
+                "path": "artifacts.tar.gz",
+                "digest": _sha(archive),
+                "size_bytes": len(archive),
+                "media_type": "application/gzip",
+            },
+            "compatibility": {
+                "path": "harbor-compatibility.json",
+                "digest": _sha(compatibility),
+                "size_bytes": len(compatibility),
+                "media_type": "application/json",
+            },
+            "documents": [
+                {
+                    "kind": "trial_lock",
+                    "path": "harbor-jobs/job/trial/lock.json",
+                    "digest": _sha(native_lock),
+                },
+                {
+                    "kind": "trial_result",
+                    "path": "harbor-jobs/job/trial/result.json",
+                    "digest": _sha(native_result),
+                },
+            ],
+        }
+    )
     manifest = _pretty(
         {
+            "artifacts.tar.gz": _sha(archive),
             "execution.lock.json": _sha(lock_two),
             "events.jsonl": _sha(events_two),
+            "harbor-compatibility.json": _sha(compatibility),
+            "harbor-jobs/job/trial/lock.json": _sha(native_lock),
+            "harbor-jobs/job/trial/result.json": _sha(native_result),
+            "harbor-native-bundle.json": _sha(bundle),
             "verification.json": _sha(verification),
             "_SUCCESS": _sha(b"\n"),
         }
@@ -173,6 +217,11 @@ def _finalizer_files(
         f"{one}/_FAILED": b"\n",
         f"{two}/execution.lock.json": lock_two,
         f"{two}/events.jsonl": events_two,
+        f"{two}/artifacts.tar.gz": archive,
+        f"{two}/harbor-compatibility.json": compatibility,
+        f"{two}/harbor-jobs/job/trial/lock.json": native_lock,
+        f"{two}/harbor-jobs/job/trial/result.json": native_result,
+        f"{two}/harbor-native-bundle.json": bundle,
         f"{two}/verification.json": verification,
         f"{two}/_SUCCESS": b"\n",
         f"{two}/checksums.json": manifest,
@@ -246,6 +295,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     assert [write[1] for write in writer.writes] == [
         f"{base}/verification.json",
         f"{base}/run-summary.json",
+        f"{base}/publication-envelope.v2.json",
         f"{base}/checksums.json",
         f"{base}/_SUCCESS",
         f"{lock.artifact_prefix}/campaign-summary.json",
@@ -284,6 +334,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             execution["completed_at"],
             execution["runtime_kind"],
             execution["physical_attempt"],
+            execution["remote_job_id"],
         )
         for execution in summary["executions"]
     ] == [
@@ -295,6 +346,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "2026-07-14T01:04:00Z",
             "endpoint",
             1,
+            "job-execution-one",
         ),
         (
             "execution-two",
@@ -304,8 +356,28 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "2026-07-14T02:06:00Z",
             "endpoint",
             2,
+            "job-execution-two",
         ),
     ]
+    envelope_bytes = contents[f"{base}/publication-envelope.v2.json"]
+    envelope = json.loads(envelope_bytes)
+    assert envelope["schema_version"] == "harbor-hf/publication-envelope/v2"
+    assert envelope["run_id"] == run.run_id
+    assert envelope["campaign_id"] == lock.campaign_id
+    assert envelope["runtime"]["kind"] == "endpoint"
+    assert envelope["cleanup_outcome"] == "verified"
+    assert [record["execution_id"] for record in envelope["executions"]] == [
+        "execution-one",
+        "execution-two",
+    ]
+    assert envelope["executions"][0]["harbor_bundle"] is None
+    assert envelope["executions"][1]["harbor_bundle"]["document_count"] == 2
+    assert [record["remote_job_id"] for record in envelope["executions"]] == [
+        "job-execution-one",
+        "job-execution-two",
+    ]
+    assert "task_name" not in envelope_bytes.decode()
+    assert "rewards" not in envelope_bytes.decode()
     assert [
         (metric["owner_id"], metric["name"], metric["value"], metric["unit"])
         for metric in summary["metrics"]
@@ -339,6 +411,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     }
     expected_checksums["verification.json"] = _sha(verification)
     expected_checksums["run-summary.json"] = _sha(contents[f"{base}/run-summary.json"])
+    expected_checksums["publication-envelope.v2.json"] = _sha(envelope_bytes)
     checksum_bytes = contents[f"{base}/checksums.json"]
     assert checksum_bytes == _pretty(dict(sorted(expected_checksums.items())))
     assert contents[f"{base}/_SUCCESS"] == b"\n"
@@ -400,6 +473,40 @@ def test_finalize_preserves_cancelled_execution_status_and_timestamp(
     )
     assert cancelled["status"] == "cancelled"
     assert cancelled["completed_at"] == "2026-07-14T01:04:00Z"
+
+
+def test_finalize_preserves_legacy_success_without_native_bundle(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    run = lock.runs[0]
+    trial = run.shards[0].trials[0]
+    execution = f"runs/{run.run_id}/trials/{trial.trial_id}/executions/execution-two"
+    files = _finalizer_files(remote_spec, lock)
+    del files[f"{execution}/harbor-native-bundle.json"]
+    checksums = json.loads(files[f"{execution}/checksums.json"])
+    del checksums["harbor-native-bundle.json"]
+    files[f"{execution}/checksums.json"] = _pretty(checksums)
+    writer = _Writer()
+
+    BucketCampaignFinalizer(_Reader(files), writer).finalize(
+        lock,
+        remote_spec,
+        _projection(lock, "complete"),
+        _decision(lock, "completed"),
+    )
+
+    envelope_path = (
+        f"{lock.artifact_prefix}/runs/{run.run_id}/publication-envelope.v2.json"
+    )
+    envelope = json.loads(
+        next(content for _, path, content in writer.writes if path == envelope_path)
+    )
+    succeeded = next(
+        item for item in envelope["executions"] if item["status"] == "succeeded"
+    )
+    assert succeeded["bundle_status"] == "legacy_unavailable"
+    assert succeeded["harbor_bundle"] is None
 
 
 def test_finalize_skips_incomplete_runs_and_guards_completed_campaigns(

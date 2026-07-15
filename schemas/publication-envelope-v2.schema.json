@@ -1,0 +1,338 @@
+{
+  "$defs": {
+    "HarborBundleReference": {
+      "additionalProperties": false,
+      "properties": {
+        "archive": {
+          "$ref": "#/$defs/ObjectReference"
+        },
+        "compatibility_schema": {
+          "minLength": 1,
+          "title": "Compatibility Schema",
+          "type": "string"
+        },
+        "document_count": {
+          "minimum": 1,
+          "title": "Document Count",
+          "type": "integer"
+        },
+        "harbor_revision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Harbor Revision",
+          "type": "string"
+        },
+        "harbor_version": {
+          "minLength": 1,
+          "title": "Harbor Version",
+          "type": "string"
+        },
+        "manifest": {
+          "$ref": "#/$defs/ObjectReference"
+        },
+        "request_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Request Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest",
+        "archive",
+        "harbor_revision",
+        "harbor_version",
+        "compatibility_schema",
+        "request_digest",
+        "document_count"
+      ],
+      "title": "HarborBundleReference",
+      "type": "object"
+    },
+    "ObjectReference": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "size_bytes": {
+          "minimum": 0,
+          "title": "Size Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "digest",
+        "size_bytes"
+      ],
+      "title": "ObjectReference",
+      "type": "object"
+    },
+    "PhysicalExecutionReference": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle_status": {
+          "enum": [
+            "verified",
+            "legacy_unavailable",
+            "not_available"
+          ],
+          "title": "Bundle Status",
+          "type": "string"
+        },
+        "completed_at": {
+          "format": "date-time",
+          "title": "Completed At",
+          "type": "string"
+        },
+        "execution_id": {
+          "minLength": 1,
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "harbor_bundle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HarborBundleReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "physical_attempt": {
+          "minimum": 1,
+          "title": "Physical Attempt",
+          "type": "integer"
+        },
+        "remote_job_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Job Id"
+        },
+        "retry_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retry Reason"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed_infrastructure",
+            "cancelled"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "trial_id": {
+          "minLength": 1,
+          "title": "Trial Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_id",
+        "trial_id",
+        "physical_attempt",
+        "status",
+        "started_at",
+        "completed_at",
+        "bundle_status"
+      ],
+      "title": "PhysicalExecutionReference",
+      "type": "object"
+    },
+    "ProfileDigests": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Agent",
+          "type": "string"
+        },
+        "deployment": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Deployment",
+          "type": "string"
+        },
+        "experiment": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Experiment",
+          "type": "string"
+        },
+        "model": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "experiment",
+        "model",
+        "deployment",
+        "agent"
+      ],
+      "title": "ProfileDigests",
+      "type": "object"
+    },
+    "RuntimeIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "accelerator_count": {
+          "minimum": 0,
+          "title": "Accelerator Count",
+          "type": "integer"
+        },
+        "hardware": {
+          "minLength": 1,
+          "title": "Hardware",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "endpoint",
+            "provider"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "region": {
+          "minLength": 1,
+          "title": "Region",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "provider",
+        "region",
+        "hardware",
+        "accelerator_count"
+      ],
+      "title": "RuntimeIdentity",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "HF execution metadata around referenced Harbor-native bundles.",
+  "properties": {
+    "campaign_id": {
+      "minLength": 1,
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "cleanup_outcome": {
+      "enum": [
+        "verified",
+        "not_applicable"
+      ],
+      "title": "Cleanup Outcome",
+      "type": "string"
+    },
+    "completed_at": {
+      "format": "date-time",
+      "title": "Completed At",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "evidence_bucket": {
+      "minLength": 1,
+      "title": "Evidence Bucket",
+      "type": "string"
+    },
+    "evidence_prefix": {
+      "minLength": 1,
+      "title": "Evidence Prefix",
+      "type": "string"
+    },
+    "executions": {
+      "items": {
+        "$ref": "#/$defs/PhysicalExecutionReference"
+      },
+      "title": "Executions",
+      "type": "array"
+    },
+    "profiles": {
+      "$ref": "#/$defs/ProfileDigests"
+    },
+    "projection_version": {
+      "const": "harbor-hf/results-projection/v2",
+      "default": "harbor-hf/results-projection/v2",
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "run_id": {
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    },
+    "run_lock": {
+      "$ref": "#/$defs/ObjectReference"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeIdentity"
+    },
+    "sanitizer_version": {
+      "const": "harbor-hf/public-results/v1",
+      "default": "harbor-hf/public-results/v1",
+      "title": "Sanitizer Version",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/publication-envelope/v2",
+      "default": "harbor-hf/publication-envelope/v2",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "campaign_id",
+    "created_at",
+    "completed_at",
+    "evidence_bucket",
+    "evidence_prefix",
+    "run_lock",
+    "profiles",
+    "runtime",
+    "cleanup_outcome",
+    "executions"
+  ],
+  "title": "PublicationEnvelopeV2",
+  "type": "object"
+}

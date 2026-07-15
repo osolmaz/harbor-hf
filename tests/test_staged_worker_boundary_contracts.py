@@ -102,7 +102,9 @@ def test_staged_worker_success_has_exact_ordered_side_effects(
     monkeypatch.setattr(
         worker,
         "_finalize_evidence",
-        lambda candidate, token: calls.append(("finalize", candidate, token)),
+        lambda candidate, token, **options: calls.append(
+            ("finalize", candidate, token, options)
+        ),
     )
 
     def prepare(
@@ -152,7 +154,7 @@ def test_staged_worker_success_has_exact_ordered_side_effects(
     )
     assert calls[8:] == [
         ("pause_and_verify",),
-        ("finalize", root, "contract-token"),
+        ("finalize", root, "contract-token", {"strict_compatibility": True}),
     ]
     assert (root / "harbor-jobs").is_dir()
     assert (root / "manifest.yaml").read_text(encoding="utf-8") == (
@@ -215,7 +217,7 @@ def test_staged_worker_failure_before_lease_skips_cleanup_and_redacts_publicatio
     monkeypatch.setattr(
         worker,
         "_finalize_evidence",
-        lambda candidate, token: finalized.append((candidate, token)),
+        lambda candidate, token, **_options: finalized.append((candidate, token)),
     )
 
     with pytest.raises(WorkerError) as captured:

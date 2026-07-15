@@ -72,9 +72,12 @@ def test_success_publication_failure_records_complete_redacted_side_effects(
     root.mkdir()
     events = root / "events.jsonl"
 
-    def fail_finalization(path: Path, token: str) -> None:
+    def fail_finalization(
+        path: Path, token: str, *, strict_compatibility: bool
+    ) -> None:
         assert path == root
         assert token == "contract-token"
+        assert strict_compatibility is True
         raise RuntimeError("finalization failed with contract-token")
 
     monkeypatch.setattr("harbor_hf.worker._finalize_evidence", fail_finalization)

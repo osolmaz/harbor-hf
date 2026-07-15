@@ -1,0 +1,229 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "accelerator_count": {
+      "minimum": 0,
+      "title": "Accelerator Count",
+      "type": "integer"
+    },
+    "agent_name": {
+      "minLength": 1,
+      "title": "Agent Name",
+      "type": "string"
+    },
+    "agent_revision": {
+      "minLength": 1,
+      "title": "Agent Revision",
+      "type": "string"
+    },
+    "benchmark": {
+      "minLength": 1,
+      "title": "Benchmark",
+      "type": "string"
+    },
+    "benchmark_revision": {
+      "minLength": 1,
+      "title": "Benchmark Revision",
+      "type": "string"
+    },
+    "campaign_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "completed_at": {
+      "format": "date-time",
+      "title": "Completed At",
+      "type": "string"
+    },
+    "control_commit": {
+      "pattern": "^[0-9a-f]{40,64}$",
+      "title": "Control Commit",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "duration_seconds": {
+      "minimum": 0,
+      "title": "Duration Seconds",
+      "type": "number"
+    },
+    "envelope_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Envelope Sha256"
+    },
+    "execution_count": {
+      "minimum": 0,
+      "title": "Execution Count",
+      "type": "integer"
+    },
+    "harbor_bundle_count": {
+      "minimum": 0,
+      "title": "Harbor Bundle Count",
+      "type": "integer"
+    },
+    "hardware": {
+      "minLength": 1,
+      "title": "Hardware",
+      "type": "string"
+    },
+    "infrastructure_failures": {
+      "minimum": 0,
+      "title": "Infrastructure Failures",
+      "type": "integer"
+    },
+    "model_repo": {
+      "minLength": 1,
+      "title": "Model Repo",
+      "type": "string"
+    },
+    "model_revision": {
+      "minLength": 1,
+      "title": "Model Revision",
+      "type": "string"
+    },
+    "outcome": {
+      "const": "complete",
+      "title": "Outcome",
+      "type": "string"
+    },
+    "passed_trials": {
+      "minimum": 0,
+      "title": "Passed Trials",
+      "type": "integer"
+    },
+    "projection_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Projection Path"
+    },
+    "projection_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Projection Sha256"
+    },
+    "provider": {
+      "minLength": 1,
+      "title": "Provider",
+      "type": "string"
+    },
+    "publication_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "title": "Publication Id",
+      "type": "string"
+    },
+    "region": {
+      "minLength": 1,
+      "title": "Region",
+      "type": "string"
+    },
+    "result_dataset": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "title": "Result Dataset",
+      "type": "string"
+    },
+    "result_kind": {
+      "const": "ordinary",
+      "title": "Result Kind",
+      "type": "string"
+    },
+    "result_revision": {
+      "pattern": "^[0-9a-f]{40,64}$",
+      "title": "Result Revision",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/results/catalog/v2",
+      "default": "harbor-hf/results/catalog/v2",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "score": {
+      "title": "Score",
+      "type": "number"
+    },
+    "source_checksum": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Source Checksum",
+      "type": "string"
+    },
+    "source_format": {
+      "enum": [
+        "native-v2",
+        "legacy-v1"
+      ],
+      "title": "Source Format",
+      "type": "string"
+    },
+    "trial_count": {
+      "minimum": 0,
+      "title": "Trial Count",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "publication_id",
+    "run_id",
+    "campaign_id",
+    "benchmark",
+    "benchmark_revision",
+    "result_kind",
+    "outcome",
+    "created_at",
+    "completed_at",
+    "model_repo",
+    "model_revision",
+    "agent_name",
+    "agent_revision",
+    "provider",
+    "region",
+    "hardware",
+    "accelerator_count",
+    "score",
+    "passed_trials",
+    "trial_count",
+    "execution_count",
+    "infrastructure_failures",
+    "duration_seconds",
+    "result_dataset",
+    "result_revision",
+    "source_checksum",
+    "control_commit",
+    "source_format",
+    "harbor_bundle_count"
+  ],
+  "title": "CatalogRowV2",
+  "type": "object"
+}

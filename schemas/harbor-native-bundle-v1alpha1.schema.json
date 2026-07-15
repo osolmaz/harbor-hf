@@ -1,0 +1,129 @@
+{
+  "$defs": {
+    "BundleObject": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "media_type": {
+          "minLength": 1,
+          "title": "Media Type",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "size_bytes": {
+          "minimum": 0,
+          "title": "Size Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "digest",
+        "size_bytes",
+        "media_type"
+      ],
+      "title": "BundleObject",
+      "type": "object"
+    },
+    "NativeDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "job_lock",
+            "job_result",
+            "trial_lock",
+            "trial_result"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "digest"
+      ],
+      "title": "NativeDocument",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Packaging metadata around Harbor-owned serialized result documents.",
+  "properties": {
+    "archive": {
+      "$ref": "#/$defs/BundleObject"
+    },
+    "compatibility": {
+      "$ref": "#/$defs/BundleObject"
+    },
+    "compatibility_schema": {
+      "minLength": 1,
+      "title": "Compatibility Schema",
+      "type": "string"
+    },
+    "contract_status": {
+      "const": "compatibility",
+      "default": "compatibility",
+      "title": "Contract Status",
+      "type": "string"
+    },
+    "documents": {
+      "items": {
+        "$ref": "#/$defs/NativeDocument"
+      },
+      "title": "Documents",
+      "type": "array"
+    },
+    "harbor_revision": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Harbor Revision",
+      "type": "string"
+    },
+    "harbor_version": {
+      "minLength": 1,
+      "title": "Harbor Version",
+      "type": "string"
+    },
+    "request_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Request Digest",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/harbor-native-bundle/v1alpha1",
+      "default": "harbor-hf/harbor-native-bundle/v1alpha1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "harbor_revision",
+    "harbor_version",
+    "request_digest",
+    "compatibility_schema",
+    "archive",
+    "compatibility",
+    "documents"
+  ],
+  "title": "HarborNativeBundle",
+  "type": "object"
+}

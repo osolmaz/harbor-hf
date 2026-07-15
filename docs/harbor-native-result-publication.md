@@ -2,9 +2,11 @@
 
 ## Status
 
-Planned. The current `harbor-hf/results/*/v1` Parquet publications remain
-supported and immutable. This plan defines a non-breaking v2 path; it does not
-authorize rewriting or deleting existing publications.
+Implemented through the non-breaking dual-publication and v2-reader phases.
+The current `harbor-hf/results/*/v1` Parquet publications remain supported and
+immutable. New evidence can carry native v2 provenance while historical rows
+remain explicitly marked `legacy-v1`. Stopping new v1 query-table writes and a
+future Harbor-owned export command remain deferred compatibility work.
 
 ## Purpose
 
@@ -84,37 +86,38 @@ rows and stable publication identities.
 
 ## Canonical Publication
 
-Each terminal run receives one immutable publication prefix:
+Each terminal run receives one immutable publication prefix. A run may contain
+multiple physical Harbor execution bundles because infrastructure retries are
+retained rather than overwritten:
 
 ```text
-runs/<experiment>/<run-id>/
-  harbor/
-    job.tar.gz
-    bundle-manifest.json
-  hf/
-    execution.json
+runs/<run-id>/
+  trials/<trial-id>/executions/<execution-id>/
+    artifacts.tar.gz
+    harbor-native-bundle.json
+  publication-envelope.v2.json
   checksums.json
   _SUCCESS | _FAILED
 ```
 
-`harbor/job.tar.gz` contains the allowlisted Harbor job tree, including native
-job and trial results and retained private artifacts. The archive format must
+Each `artifacts.tar.gz` contains the allowlisted Harbor job tree, including
+native job and trial results and retained private artifacts. The archive format must
 preserve names, modes where relevant, and deterministic ordering. It must not
 follow links or include unlisted scratch files.
 
-`harbor/bundle-manifest.json` is Harbor-owned when an upstream export contract
-exists. It identifies the Harbor schema and version, job and trial IDs, native
-result paths, artifact inventory, and checksums. Until Harbor publishes that
-contract, the pinned compatibility exporter may produce an equivalent
-temporary manifest from Harbor's public Pydantic models inside the pinned
-Harbor environment.
+Today, `harbor-native-bundle.json` is a `harbor-hf` packaging manifest with
+`contract_status: compatibility`. It records the Harbor schema and version,
+native result paths, and checksums without copying result semantics. The pinned
+compatibility exporter derives it from Harbor's public Pydantic models inside
+the pinned Harbor environment. A future Harbor-owned export manifest can
+replace this temporary packaging contract without changing the HF envelope.
 
-`hf/execution.json` uses `harbor-hf/publication-envelope/v2`. Its smallest
+`publication-envelope.v2.json` uses `harbor-hf/publication-envelope/v2`. Its smallest
 stable shape contains:
 
 - the run, campaign, and physical-execution IDs;
-- the Harbor source revision, package version, bundle schema, bundle path, and
-  bundle checksum;
+- the Harbor source revision, package version, bundle schema, paths, and
+  checksums for every physical execution bundle;
 - the resolved model and serving profile digests;
 - provider, region, hardware, accelerator count, and remote execution IDs;
 - canonical Bucket prefix and evidence checksum;
@@ -123,6 +126,15 @@ stable shape contains:
 
 The envelope references the Harbor bundle. It does not copy task names,
 rewards, trial timing, exceptions, trajectories, or artifact entries.
+
+Each physical execution records `bundle_status`. New successful executions use
+`verified` and must reference a bundle. Immutable successes produced before the
+compatibility adapter existed use `legacy_unavailable`; failed or cancelled
+executions without a valid bundle use `not_available`. The legacy status keeps
+in-flight campaigns finalizable during rollout without claiming native
+provenance that does not exist. Runs containing a legacy successful execution
+remain `legacy-v1` in public catalogs until they are rerun with verified native
+bundles.
 
 `checksums.json` covers every non-marker object. `_SUCCESS` is written last and
 only after Harbor output, HF infrastructure evidence, checksums, redaction,
@@ -207,6 +219,8 @@ promote its compatibility bundle into a competing permanent standard.
 
 Exit criterion: every current field has one documented owner and derivation.
 
+Status: complete. See `docs/result-field-ownership.md`.
+
 ### Phase 1: Specify V2
 
 - Define the minimal HF execution envelope and JSON Schema.
@@ -215,7 +229,9 @@ Exit criterion: every current field has one documented owner and derivation.
 - Run a focused schema review before implementation.
 
 Exit criterion: the envelope contains no Harbor-owned result fields and can
-address one immutable native Harbor bundle without consulting mutable state.
+address immutable native Harbor bundles without consulting mutable state.
+
+Status: complete. JSON Schemas are checked in under `schemas/`.
 
 ### Phase 2: Build The Native Adapter
 
@@ -228,6 +244,9 @@ address one immutable native Harbor bundle without consulting mutable state.
 Exit criterion: new canonical evidence can be validated using the pinned
 Harbor models plus the HF envelope, without `harbor-hf` trial-result models.
 
+Status: complete for the compatibility adapter. Replacement by a Harbor-owned
+export command remains upstream work and is not required for current runs.
+
 ### Phase 3: Dual Publish
 
 - Publish the canonical v2 bundle and envelope alongside existing v1 output.
@@ -239,6 +258,8 @@ Harbor models plus the HF envelope, without `harbor-hf` trial-result models.
 Exit criterion: dual publication is idempotent and produces equivalent visible
 results for all supported run shapes.
 
+Status: complete locally; bounded hosted verification is required for release.
+
 ### Phase 4: Move Readers
 
 - Teach the Results API to read the v2 catalog and revision-pinned details.
@@ -249,6 +270,9 @@ results for all supported run shapes.
 
 Exit criterion: the Space uses v2 by default and mixed v1/v2 history remains
 searchable and comparable.
+
+Status: reader and publisher complete; hosted Dataset migration and Space
+verification are required for release.
 
 ### Phase 5: Stop New V1 Writes
 

@@ -52,6 +52,7 @@ from harbor_hf.harbor_adapter import (
     HarborVerificationFailure,
 )
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
+from harbor_hf.harbor_native_bundle import write_harbor_native_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.private_artifacts import (
@@ -191,6 +192,9 @@ class ExecutionLock(FrozenModel):
     task_digest: str
     logical_attempt: int
     physical_attempt: int
+    remote_job_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class _EndpointWaveLifecycle:
@@ -841,6 +845,7 @@ def _execute_trial(
         task_digest=trial.task_digest,
         logical_attempt=trial.logical_attempt,
         physical_attempt=physical_attempt,
+        remote_job_id=os.environ.get("JOB_ID"),
     )
     write_json(
         execution_root / "execution.lock.json", execution.model_dump(mode="json")
@@ -1287,6 +1292,7 @@ def _finalize_execution(
     )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, secrets)
+    write_harbor_native_bundle(root, required=strict_compatibility)
     write_checksums(root)
 
 

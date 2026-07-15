@@ -678,6 +678,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "harbor-export.log",
             "harbor-job.json",
             "harbor-jobs",
+            "harbor-native-bundle.json",
             "harbor-request.json",
             "harbor.log",
             "manifest.yaml",
@@ -701,6 +702,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "task_digest": trial.task_digest,
             "logical_attempt": trial.logical_attempt,
             "physical_attempt": 1,
+            "remote_job_id": "test-wave-job",
         }
         assert _event_payloads(execution_root / "events.jsonl") == [
             {"event": "execution_started", "execution_id": execution_root.name},

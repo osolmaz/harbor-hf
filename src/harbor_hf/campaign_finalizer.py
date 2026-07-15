@@ -11,8 +11,26 @@ from typing import Literal, Protocol, cast
 from pydantic import TypeAdapter
 
 from harbor_hf.campaigns import CampaignLock, CampaignRunLock, CampaignTrialLock
+from harbor_hf.harbor_native_bundle import (
+    HARBOR_NATIVE_BUNDLE_PATH,
+    BundleObject,
+    HarborNativeBundle,
+    load_harbor_native_bundle,
+)
 from harbor_hf.models import DeploymentProfile, ExperimentSpec
 from harbor_hf.provider_models import ProviderTarget
+from harbor_hf.publication_envelope import (
+    PUBLICATION_ENVELOPE_PATH,
+    HarborBundleReference,
+    ObjectReference,
+    PhysicalExecutionReference,
+    ProfileDigests,
+    PublicationEnvelopeV2,
+    RuntimeIdentity,
+    canonical_json_bytes,
+    object_reference,
+    profile_digest,
+)
 from harbor_hf.recovery import RecoveryProjection, TerminalDecision
 from harbor_hf.results import (
     ArtifactEvidence,
@@ -118,6 +136,7 @@ class BucketCampaignFinalizer:
         trials: list[TrialEvidence] = []
         executions: list[ExecutionEvidence] = []
         metrics: list[MetricEvidence] = []
+        physical_executions: list[PhysicalExecutionReference] = []
         verification_trials: list[object] = []
         completion_times: list[datetime] = []
         runtime_kind = (
@@ -137,6 +156,7 @@ class BucketCampaignFinalizer:
                 )
                 trials.append(records.trial)
                 executions.extend(records.executions)
+                physical_executions.extend(records.physical_executions)
                 metrics.extend(records.metrics)
                 verification_trials.extend(records.verification_trials)
                 completion_times.append(records.completed_at)
@@ -167,9 +187,10 @@ class BucketCampaignFinalizer:
                 verification,
             ),
         ]
+        run_evidence = _run_evidence(campaign, configuration, completed_at)
         evidence = ResultEvidence(
             sanitized=True,
-            run=_run_evidence(campaign, configuration, completed_at),
+            run=run_evidence,
             trials=trials,
             executions=executions,
             metrics=metrics,
@@ -182,9 +203,42 @@ class BucketCampaignFinalizer:
             path=f"{campaign.artifact_prefix}/{summary_path}",
             content=summary,
         )
+        envelope = PublicationEnvelopeV2(
+            run_id=run.run_id,
+            campaign_id=campaign.campaign_id,
+            created_at=configuration.created_at,
+            completed_at=completed_at,
+            evidence_bucket=spec.artifacts.bucket,
+            evidence_prefix=f"{campaign.artifact_prefix}/{prefix}",
+            run_lock=object_reference("run.lock.json", run_lock_bytes),
+            profiles=ProfileDigests(
+                experiment=configuration.spec_digest,
+                model=profile_digest(configuration.model),
+                deployment=profile_digest(configuration.deployment),
+                agent=profile_digest(configuration.agent),
+            ),
+            runtime=RuntimeIdentity(
+                kind=runtime_kind,
+                provider=run_evidence.provider,
+                region=run_evidence.region,
+                hardware=run_evidence.hardware,
+                accelerator_count=run_evidence.accelerator_count,
+            ),
+            cleanup_outcome=(
+                "not_applicable" if runtime_kind == "provider" else "verified"
+            ),
+            executions=physical_executions,
+        )
+        envelope_bytes = canonical_json_bytes(envelope.model_dump(mode="json"))
+        self.writer.write_immutable(
+            bucket=spec.artifacts.bucket,
+            path=(f"{campaign.artifact_prefix}/{prefix}/{PUBLICATION_ENVELOPE_PATH}"),
+            content=envelope_bytes,
+        )
         additions = {
             "verification.json": verification,
             "run-summary.json": summary,
+            PUBLICATION_ENVELOPE_PATH: envelope_bytes,
         }
         checksums = self._aggregate_checksums(
             spec,
@@ -234,6 +288,7 @@ class BucketCampaignFinalizer:
             and path.endswith("/execution.lock.json")
         )
         records: list[ExecutionEvidence] = []
+        physical_executions: list[PhysicalExecutionReference] = []
         selected: tuple[dict[str, object], datetime] | None = None
         for relative in execution_paths:
             execution_prefix = str(PurePosixPath(relative).parent)
@@ -247,6 +302,7 @@ class BucketCampaignFinalizer:
                 runtime_kind,
             )
             records.append(record.evidence)
+            physical_executions.append(record.physical_execution)
             if record.evidence.execution_id != selected_id:
                 continue
             if record.evidence.status != "succeeded":
@@ -271,6 +327,7 @@ class BucketCampaignFinalizer:
                 selected_execution_id=selected_id,
             ),
             executions=records,
+            physical_executions=physical_executions,
             metrics=_reward_metrics(trial.trial_id, verifier),
             verification_trials=[dict(verifier)],
             completed_at=selected[1],
@@ -307,20 +364,148 @@ class BucketCampaignFinalizer:
                 "_CANCELLED": "cancelled",
             }[marker],
         )
-        return _ExecutionRecord(
-            evidence=ExecutionEvidence(
-                execution_id=execution.execution_id,
-                trial_id=execution.trial_id,
-                physical_attempt=execution.physical_attempt,
-                runtime_kind=runtime_kind,
-                status=status,
-                started_at=started,
-                completed_at=finished,
-                retry_reason=(
-                    "infrastructure_retry" if execution.physical_attempt > 1 else None
-                ),
-            )
+        evidence = ExecutionEvidence(
+            execution_id=execution.execution_id,
+            trial_id=execution.trial_id,
+            physical_attempt=execution.physical_attempt,
+            runtime_kind=runtime_kind,
+            status=status,
+            started_at=started,
+            completed_at=finished,
+            retry_reason=(
+                "infrastructure_retry" if execution.physical_attempt > 1 else None
+            ),
+            remote_job_id=execution.remote_job_id,
         )
+        bundle = self._execution_bundle_reference(
+            spec,
+            campaign,
+            run_paths,
+            execution_prefix,
+            absolute_prefix,
+        )
+        return _ExecutionRecord(
+            evidence=evidence,
+            physical_execution=PhysicalExecutionReference(
+                execution_id=evidence.execution_id,
+                trial_id=evidence.trial_id,
+                physical_attempt=evidence.physical_attempt,
+                status=evidence.status,
+                started_at=evidence.started_at,
+                completed_at=evidence.completed_at,
+                retry_reason=evidence.retry_reason,
+                remote_job_id=evidence.remote_job_id,
+                bundle_status=(
+                    "verified"
+                    if bundle is not None
+                    else (
+                        "legacy_unavailable"
+                        if evidence.status == "succeeded"
+                        else "not_available"
+                    )
+                ),
+                harbor_bundle=bundle,
+            ),
+        )
+
+    def _execution_bundle_reference(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        run_paths: list[str],
+        execution_prefix: str,
+        absolute_prefix: str,
+    ) -> HarborBundleReference | None:
+        relative_manifest = f"{execution_prefix}/{HARBOR_NATIVE_BUNDLE_PATH}"
+        if relative_manifest not in run_paths:
+            return None
+        manifest_bytes = self._read(
+            spec,
+            campaign,
+            f"{absolute_prefix}/{HARBOR_NATIVE_BUNDLE_PATH}",
+        )
+        try:
+            manifest = load_harbor_native_bundle(manifest_bytes)
+        except Exception as error:
+            raise CampaignFinalizationError(
+                "execution Harbor native bundle is invalid"
+            ) from error
+        _validate_native_bundle_paths(manifest)
+        self._verify_bundle_documents(
+            spec, campaign, run_paths, execution_prefix, absolute_prefix, manifest
+        )
+        archive = self._verified_bundle_object(
+            spec,
+            campaign,
+            run_paths,
+            execution_prefix,
+            absolute_prefix,
+            manifest.archive,
+            "archive",
+        )
+        self._verified_bundle_object(
+            spec,
+            campaign,
+            run_paths,
+            execution_prefix,
+            absolute_prefix,
+            manifest.compatibility,
+            "compatibility export",
+        )
+        return HarborBundleReference(
+            manifest=object_reference(relative_manifest, manifest_bytes),
+            archive=archive,
+            harbor_revision=manifest.harbor_revision,
+            harbor_version=manifest.harbor_version,
+            compatibility_schema=manifest.compatibility_schema,
+            request_digest=manifest.request_digest,
+            document_count=len(manifest.documents),
+        )
+
+    def _verified_bundle_object(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        run_paths: list[str],
+        execution_prefix: str,
+        absolute_prefix: str,
+        reference: BundleObject,
+        label: str,
+    ) -> ObjectReference:
+        relative = f"{execution_prefix}/{reference.path}"
+        if relative not in run_paths:
+            raise CampaignFinalizationError(f"execution Harbor {label} is missing")
+        content = self._read(spec, campaign, f"{absolute_prefix}/{reference.path}")
+        observed = object_reference(relative, content)
+        if (
+            observed.digest != reference.digest
+            or observed.size_bytes != reference.size_bytes
+        ):
+            raise CampaignFinalizationError(
+                f"execution Harbor {label} conflicts with its bundle manifest"
+            )
+        return observed
+
+    def _verify_bundle_documents(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        run_paths: list[str],
+        execution_prefix: str,
+        absolute_prefix: str,
+        manifest: HarborNativeBundle,
+    ) -> None:
+        for document in manifest.documents:
+            relative = f"{execution_prefix}/{document.path}"
+            if relative not in run_paths:
+                raise CampaignFinalizationError(
+                    "execution Harbor native document is missing"
+                )
+            content = self._read(spec, campaign, f"{absolute_prefix}/{document.path}")
+            if _sha256(content) != document.digest:
+                raise CampaignFinalizationError(
+                    "execution Harbor native document conflicts with its bundle"
+                )
 
     def _aggregate_checksums(
         self,
@@ -388,15 +573,27 @@ class BucketCampaignFinalizer:
 @dataclass(frozen=True)
 class _ExecutionRecord:
     evidence: ExecutionEvidence
+    physical_execution: PhysicalExecutionReference
 
 
 @dataclass(frozen=True)
 class _TrialRecords:
     trial: TrialEvidence
     executions: list[ExecutionEvidence]
+    physical_executions: list[PhysicalExecutionReference]
     metrics: list[MetricEvidence]
     verification_trials: list[object]
     completed_at: datetime
+
+
+def _validate_native_bundle_paths(manifest: HarborNativeBundle) -> None:
+    if (
+        manifest.archive.path != "artifacts.tar.gz"
+        or manifest.compatibility.path != "harbor-compatibility.json"
+    ):
+        raise CampaignFinalizationError(
+            "execution Harbor native bundle uses noncanonical paths"
+        )
 
 
 def _run_evidence(

@@ -218,6 +218,86 @@ def _refresh_checksums(evidence: MemoryEvidence) -> None:
     evidence.files["checksums.json"] = _json_bytes(checksums)
 
 
+def _add_v2_envelope(evidence: MemoryEvidence) -> None:
+    summary = json.loads(evidence.files["run-summary.json"])
+    run_lock = evidence.files["run.lock.json"]
+    executions = []
+    for record in summary["executions"]:
+        bundle = None
+        if record["status"] == "succeeded":
+            prefix = f"trials/{record['trial_id']}/executions/{record['execution_id']}"
+            manifest_path = f"{prefix}/harbor-native-bundle.json"
+            archive_path = f"{prefix}/artifacts.tar.gz"
+            manifest = f"manifest for {record['execution_id']}".encode()
+            archive = f"archive for {record['execution_id']}".encode()
+            evidence.files[manifest_path] = manifest
+            evidence.files[archive_path] = archive
+            bundle = {
+                "manifest": {
+                    "path": manifest_path,
+                    "digest": _sha256(manifest),
+                    "size_bytes": len(manifest),
+                },
+                "archive": {
+                    "path": archive_path,
+                    "digest": _sha256(archive),
+                    "size_bytes": len(archive),
+                },
+                "harbor_revision": "a" * 40,
+                "harbor_version": "0.1.0",
+                "compatibility_schema": "harbor-hf/harbor-compatibility/v1alpha3",
+                "request_digest": "sha256:" + "a" * 64,
+                "document_count": 2,
+            }
+        executions.append(
+            {
+                "execution_id": record["execution_id"],
+                "trial_id": record["trial_id"],
+                "physical_attempt": record["physical_attempt"],
+                "status": record["status"],
+                "started_at": record["started_at"],
+                "completed_at": record["completed_at"],
+                "retry_reason": record["retry_reason"],
+                "remote_job_id": record["remote_job_id"],
+                "bundle_status": "verified" if bundle else "not_available",
+                "harbor_bundle": bundle,
+            }
+        )
+    envelope = {
+        "schema_version": "harbor-hf/publication-envelope/v2",
+        "run_id": summary["run"]["run_id"],
+        "campaign_id": summary["run"]["campaign_id"],
+        "created_at": summary["run"]["created_at"],
+        "completed_at": summary["run"]["completed_at"],
+        "evidence_bucket": "hf://buckets/private-evidence",
+        "evidence_prefix": "campaigns/campaign-one/runs/run-one",
+        "run_lock": {
+            "path": "run.lock.json",
+            "digest": _sha256(run_lock),
+            "size_bytes": len(run_lock),
+        },
+        "profiles": {
+            "experiment": "sha256:" + "1" * 64,
+            "model": "sha256:" + "2" * 64,
+            "deployment": "sha256:" + "3" * 64,
+            "agent": "sha256:" + "4" * 64,
+        },
+        "runtime": {
+            "kind": "endpoint",
+            "provider": summary["run"]["provider"],
+            "region": summary["run"]["region"],
+            "hardware": summary["run"]["hardware"],
+            "accelerator_count": summary["run"]["accelerator_count"],
+        },
+        "sanitizer_version": "harbor-hf/public-results/v1",
+        "projection_version": "harbor-hf/results-projection/v2",
+        "cleanup_outcome": "verified",
+        "executions": executions,
+    }
+    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+
 def test_builds_deterministic_traceable_rows_and_parquet(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
@@ -260,6 +340,83 @@ def test_builds_deterministic_traceable_rows_and_parquet(
         assert b"harbor_hf.schema_version" in table.schema.metadata
         assert SECRET_SESSION not in item.content
         assert SHELLBENCH_TASK not in item.content
+
+
+def test_builds_v2_projection_bound_to_native_envelope(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_v2_envelope(evidence)
+
+    tables = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+    publication = build_result_publication(tables)
+
+    assert tables.provenance is not None
+    assert len(tables.provenance.harbor_archive_sha256s) == 2
+    projection_file = next(
+        item for item in publication.files if item.path.startswith("projections/")
+    )
+    projection = json.loads(projection_file.content)
+    assert projection["envelope_sha256"] == tables.provenance.envelope_sha256
+    assert projection["source_checksum"] == tables.runs[0].source_checksum
+    assert set(projection["tables"]) == {
+        "runs",
+        "trials",
+        "executions",
+        "metrics",
+        "artifacts",
+    }
+    published = b"".join(item.content for item in publication.files)
+    assert SECRET_SESSION not in published
+    assert SHELLBENCH_TASK not in published
+
+
+def test_rejects_v2_envelope_with_unverified_bundle(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_v2_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    succeeded = next(
+        record for record in envelope["executions"] if record["harbor_bundle"]
+    )
+    succeeded["harbor_bundle"]["archive"]["digest"] = "sha256:" + "0" * 64
+    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+    with pytest.raises(ResultPublicationError, match="unverified Harbor archive"):
+        build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+
+
+def test_legacy_success_envelope_publishes_without_v2_provenance(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_v2_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    succeeded = next(
+        record for record in envelope["executions"] if record["status"] == "succeeded"
+    )
+    succeeded["bundle_status"] = "legacy_unavailable"
+    succeeded["harbor_bundle"] = None
+    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+    tables = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+    publication = build_result_publication(tables)
+
+    assert tables.provenance is None
+    assert not any(item.path.startswith("projections/") for item in publication.files)
+
+
+def test_rejects_envelope_execution_that_conflicts_with_summary(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_v2_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    envelope["executions"][0]["trial_id"] = "trial-imposter"
+    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+    with pytest.raises(ResultPublicationError, match="executions conflict"):
+        build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
 
 
 def test_publication_identity_is_stable_across_later_control_events(

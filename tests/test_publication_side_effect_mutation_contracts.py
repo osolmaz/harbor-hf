@@ -196,7 +196,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "ae3cd0519fe14d485f54343014eac8878bcd26dfb05c4a9c19c7eb9174a12739"
+        "11e750a73a67f47e314c7ce77746be455ad5fd6f521f239ba26a7fa572d23f1c"
     )
 
 
