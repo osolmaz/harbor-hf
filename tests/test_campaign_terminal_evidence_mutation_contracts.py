@@ -117,6 +117,7 @@ def _execution_lock(
             task_digest=trial.task_digest,
             logical_attempt=trial.logical_attempt,
             physical_attempt=physical_attempt,
+            remote_job_id=f"job-{execution_id}",
         )
         .model_dump_json()
         .encode()
@@ -333,6 +334,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             execution["completed_at"],
             execution["runtime_kind"],
             execution["physical_attempt"],
+            execution["remote_job_id"],
         )
         for execution in summary["executions"]
     ] == [
@@ -344,6 +346,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "2026-07-14T01:04:00Z",
             "endpoint",
             1,
+            "job-execution-one",
         ),
         (
             "execution-two",
@@ -353,6 +356,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "2026-07-14T02:06:00Z",
             "endpoint",
             2,
+            "job-execution-two",
         ),
     ]
     envelope_bytes = contents[f"{base}/publication-envelope.v2.json"]
@@ -368,6 +372,10 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     ]
     assert envelope["executions"][0]["harbor_bundle"] is None
     assert envelope["executions"][1]["harbor_bundle"]["document_count"] == 2
+    assert [record["remote_job_id"] for record in envelope["executions"]] == [
+        "job-execution-one",
+        "job-execution-two",
+    ]
     assert "task_name" not in envelope_bytes.decode()
     assert "rewards" not in envelope_bytes.decode()
     assert [

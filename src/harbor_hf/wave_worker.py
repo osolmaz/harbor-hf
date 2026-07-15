@@ -192,6 +192,9 @@ class ExecutionLock(FrozenModel):
     task_digest: str
     logical_attempt: int
     physical_attempt: int
+    remote_job_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class _EndpointWaveLifecycle:
@@ -842,6 +845,7 @@ def _execute_trial(
         task_digest=trial.task_digest,
         logical_attempt=trial.logical_attempt,
         physical_attempt=physical_attempt,
+        remote_job_id=os.environ.get("JOB_ID"),
     )
     write_json(
         execution_root / "execution.lock.json", execution.model_dump(mode="json")

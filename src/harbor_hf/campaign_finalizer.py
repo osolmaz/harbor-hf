@@ -375,6 +375,7 @@ class BucketCampaignFinalizer:
             retry_reason=(
                 "infrastructure_retry" if execution.physical_attempt > 1 else None
             ),
+            remote_job_id=execution.remote_job_id,
         )
         bundle = self._execution_bundle_reference(
             spec,
