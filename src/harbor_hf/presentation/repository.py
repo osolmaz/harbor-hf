@@ -85,30 +85,41 @@ class AnonymousHubReader:
         self._parse_parquet = _read_parquet if parse_parquet is None else parse_parquet
 
     def resolve_revision(self, dataset: str, revision: str) -> str:
-        info = self._api.repo_info(
-            dataset, revision=revision, repo_type="dataset", token=False
-        )
+        try:
+            info = self._api.repo_info(
+                dataset, revision=revision, repo_type="dataset", token=False
+            )
+        except Exception as error:
+            raise PresentationError(f"failed to resolve Dataset {dataset}") from error
         sha = getattr(info, "sha", None)
         if not isinstance(sha, str) or not _is_commit(sha):
             raise PresentationError(f"Dataset {dataset} returned no immutable revision")
         return sha
 
     def list_files(self, dataset: str, revision: str) -> list[str]:
-        return self._api.list_repo_files(
-            dataset, revision=revision, repo_type="dataset", token=False
-        )
+        try:
+            return self._api.list_repo_files(
+                dataset, revision=revision, repo_type="dataset", token=False
+            )
+        except Exception as error:
+            raise PresentationError(f"failed to list Dataset {dataset}") from error
 
     def read_rows(
         self, dataset: str, revision: str, path: str
     ) -> list[Mapping[str, object]]:
-        downloaded = self._download(
-            repo_id=dataset,
-            filename=path,
-            repo_type="dataset",
-            revision=revision,
-            token=False,
-        )
-        return self._parse_parquet(Path(downloaded))
+        try:
+            downloaded = self._download(
+                repo_id=dataset,
+                filename=path,
+                repo_type="dataset",
+                revision=revision,
+                token=False,
+            )
+            return self._parse_parquet(Path(downloaded))
+        except Exception as error:
+            raise PresentationError(
+                f"failed to read {path} from Dataset {dataset}"
+            ) from error
 
 
 @dataclass(frozen=True)
@@ -201,10 +212,6 @@ class ResultRepository:
             if row.run_id == run_id:
                 return row
         raise KeyError(run_id)
-
-    def all_catalog_rows(self) -> tuple[CatalogRow, ...]:
-        """Return the largest bounded catalog for stable entity lookup."""
-        return tuple(self._load_catalog(self._current_revision(), largest=True))
 
     def rebuild_catalog(self) -> list[CatalogRow]:
         """Rebuild catalog rows from legacy index and publication tables."""

@@ -85,8 +85,8 @@ function App() {
           <Route path="/campaigns/:campaignId" element={<CampaignPage />} />
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/runs/:runId/compare/:otherId" element={<ComparePage />} />
-          <Route path="/trials/:trialId" element={<EntityPage kind="trial" />} />
-          <Route path="/executions/:executionId" element={<EntityPage kind="execution" />} />
+          <Route path="/runs/:runId/trials/:trialId" element={<EntityPage kind="trial" />} />
+          <Route path="/runs/:runId/executions/:executionId" element={<EntityPage kind="execution" />} />
           <Route path="*" element={<EmptyState message="Page not found" />} />
         </Routes>
       </main>
@@ -257,7 +257,7 @@ function RunPage() {
         <section className="panel span-two">
           <SectionTitle title="Task results" meta={`${data.trials.length} trials`} />
           <div className="table-wrap flush"><table><thead><tr><th>Task</th><th>Score</th><th>Attempt</th><th>Executions</th><th /></tr></thead><tbody>
-            {data.trials.map((trial) => <tr key={trial.trial_id}><td>{trial.task_name}</td><td><Score value={trial.score ?? 0} /></td><td>{String(trial.logical_attempt)}</td><td>{trial.execution_count}</td><td><Link className="icon-button compact" title="Open trial" to={`/trials/${trial.trial_id}`}><ChevronRight size={15} /></Link></td></tr>)}
+            {data.trials.map((trial) => <tr key={trial.trial_id}><td>{trial.task_name}</td><td><Score value={trial.score ?? 0} /></td><td>{String(trial.logical_attempt)}</td><td>{trial.execution_count}</td><td><Link className="icon-button compact" title="Open trial" to={`/runs/${data.summary.run_id}/trials/${trial.trial_id}`}><ChevronRight size={15} /></Link></td></tr>)}
           </tbody></table></div>
         </section>
         <KeyValuePanel title="Configuration" values={data.configuration} />
@@ -308,9 +308,10 @@ function CampaignPage() {
 
 function EntityPage({ kind }: { kind: "trial" | "execution" }) {
   const params = useParams();
+  const runId = params.runId ?? "";
   const id = kind === "trial" ? params.trialId : params.executionId;
   const plural = kind === "trial" ? "trials" : "executions";
-  const { data, error } = useData<Record<string, unknown>>(`/api/v1/${plural}/${encodeURIComponent(id ?? "")}`);
+  const { data, error } = useData<Record<string, unknown>>(`/api/v1/runs/${encodeURIComponent(runId)}/${plural}/${encodeURIComponent(id ?? "")}`);
   if (error) return <EmptyState message={error} />;
   if (!data) return <Loading />;
   const primary = data[kind] as Record<string, unknown>;

@@ -166,7 +166,7 @@ def test_config_is_public_and_bounded() -> None:
     )
     with pytest.raises(ValueError, match="namespace/name"):
         PresentationConfig.from_env({})
-    with pytest.raises(ValueError, match="between 1 and 4096"):
+    with pytest.raises(ValueError, match="between 1 and 2048"):
         PresentationConfig.from_env(
             {"HARBOR_HF_INDEX_DATASET": "org/index", "HARBOR_HF_MAX_PUBLICATIONS": "0"}
         )
@@ -288,11 +288,39 @@ def test_service_refreshes_mutable_revision_after_ttl(
     assert holder.get().snapshot.index_revision == "9" * 40
 
 
+def test_service_keeps_cached_snapshot_when_refresh_fails(
+    snapshot: ResultSnapshot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loads: list[ResultSnapshot | PresentationError] = [
+        snapshot,
+        PresentationError("temporary Hub failure"),
+    ]
+
+    class FailingRefreshRepository:
+        def __init__(self, _config: PresentationConfig) -> None:
+            pass
+
+        def load(self) -> ResultSnapshot:
+            value = loads.pop(0)
+            if isinstance(value, PresentationError):
+                raise value
+            return value
+
+    times = iter((10.0, 10.0, 16.0, 16.0))
+    monkeypatch.setattr(presentation_api, "ResultRepository", FailingRefreshRepository)
+    monkeypatch.setattr(presentation_api, "monotonic", lambda: next(times))
+    holder = ServiceHolder(config=PresentationConfig("org/index", refresh_seconds=5))
+
+    first = holder.get()
+    assert holder.get() is first
+
+
 def test_historical_links_resolve_outside_list_window(
     snapshot: ResultSnapshot,
 ) -> None:
+    reader = FakeReader(snapshot)
     repository = ResultRepository(
-        PresentationConfig("org/index", max_publications=1), FakeReader(snapshot)
+        PresentationConfig("org/index", max_publications=1), reader
     )
     service = ResultService(repository.load(), repository=repository)
     client = TestClient(create_app(service))
@@ -301,8 +329,10 @@ def test_historical_links_resolve_outside_list_window(
         "run-2"
     ]
     assert client.get("/api/v1/runs/run-1").status_code == 200
-    assert client.get("/api/v1/trials/trial-1").status_code == 200
-    assert client.get("/api/v1/executions/execution-1").status_code == 200
+    assert client.get("/api/v1/runs/run-1/trials/trial-1").status_code == 200
+    assert client.get("/api/v1/runs/run-1/executions/execution-1").status_code == 200
+    assert client.get("/api/v1/runs/run-1/trials/missing").status_code == 404
+    assert len([path for path in reader.read_calls if "/windows/" not in path]) == 5
 
 
 def test_api_exposes_comparison_details_and_denies_private_content(
@@ -358,12 +388,19 @@ def test_api_exposes_comparison_details_and_denies_private_content(
     assert client.get("/api/v1/runs/run-1/trials").json()["total"] == 1
     assert client.get("/api/v1/runs/run-1/metrics").json()["total"] == 1
 
-    assert client.get("/api/v1/trials/trial-1").json()["score"] == 1.0
-    assert client.get("/api/v1/trials/trial-1/executions").json()["total"] == 1
-    assert client.get("/api/v1/executions/execution-1").status_code == 200
-    assert client.get("/api/v1/artifacts/artifact-1").status_code == 200
-    assert client.get("/api/v1/artifacts/artifact-1/content").status_code == 403
-    assert client.get("/api/v1/executions/execution-1/trajectory").status_code == 403
+    assert client.get("/api/v1/runs/run-1/trials/trial-1").json()["score"] == 1.0
+    assert (
+        client.get("/api/v1/runs/run-1/trials/trial-1/executions").json()["total"] == 1
+    )
+    assert client.get("/api/v1/runs/run-1/executions/execution-1").status_code == 200
+    assert client.get("/api/v1/runs/run-1/artifacts/artifact-1").status_code == 200
+    assert (
+        client.get("/api/v1/runs/run-1/artifacts/artifact-1/content").status_code == 403
+    )
+    assert (
+        client.get("/api/v1/runs/run-1/executions/execution-1/trajectory").status_code
+        == 403
+    )
     missing = client.get("/api/v1/runs/missing")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "not_found"
@@ -371,6 +408,19 @@ def test_api_exposes_comparison_details_and_denies_private_content(
     assert unknown_api.status_code == 404
     assert unknown_api.json()["error"]["code"] == "request_rejected"
     assert "Harbor Results" in client.get("/runs/run-1").text
+
+
+def test_etag_changes_with_response_representation(snapshot: ResultSnapshot) -> None:
+    first = TestClient(create_app(ResultService(snapshot, title="First"))).get(
+        "/api/v1/health"
+    )
+    second = TestClient(create_app(ResultService(snapshot, title="Second"))).get(
+        "/api/v1/health"
+    )
+
+    assert first.json()["title"] == "First"
+    assert second.json()["title"] == "Second"
+    assert first.headers["etag"] != second.headers["etag"]
 
 
 def test_comparison_keeps_logical_attempts_and_checks_benchmark_revision(

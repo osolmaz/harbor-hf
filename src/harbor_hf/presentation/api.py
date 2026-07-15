@@ -6,12 +6,13 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
+from starlette.responses import StreamingResponse
 
 from harbor_hf.presentation.config import PresentationConfig
 from harbor_hf.presentation.repository import PresentationError, ResultRepository
@@ -48,7 +49,13 @@ class ServiceHolder:
             ):
                 return self._service
             repository = ResultRepository(config)
-            snapshot = repository.load()
+            try:
+                snapshot = repository.load()
+            except PresentationError:
+                if self._service is None:
+                    raise
+                self._loaded_at = now
+                return self._service
             if (
                 self._service is None
                 or self._service.snapshot.index_revision != snapshot.index_revision
@@ -119,21 +126,26 @@ def _register_cache_middleware(app: FastAPI, holder: ServiceHolder) -> None:
         response = await call_next(request)
         if request.method != "GET" or not request.url.path.startswith("/api/v1/"):
             return response
-        try:
-            revision = holder.get().snapshot.index_revision
-        except (PresentationError, ValueError):
-            return response
-        digest = hashlib.sha256(
-            f"{revision}:{request.url.path}?{request.url.query}".encode()
-        ).hexdigest()
+        stream = cast(StreamingResponse, response)
+        chunks = [
+            chunk.encode() if isinstance(chunk, str) else bytes(chunk)
+            async for chunk in stream.body_iterator
+        ]
+        body = b"".join(chunks)
+        digest = hashlib.sha256(body).hexdigest()
         etag = f'"{digest}"'
         if request.headers.get("if-none-match") == etag and response.status_code == 200:
             return Response(status_code=304, headers={"ETag": etag})
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = (
-            "public, max-age=60, stale-while-revalidate=3600"
+        headers = dict(response.headers)
+        headers["ETag"] = etag
+        headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=3600"
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+            background=response.background,
         )
-        return response
 
 
 def _register_api_routes(app: FastAPI, holder: ServiceHolder) -> None:
@@ -211,37 +223,37 @@ def _register_campaign_routes(app: FastAPI, holder: ServiceHolder) -> None:
 
 
 def _register_entity_routes(app: FastAPI, holder: ServiceHolder) -> None:
-    @app.get("/api/v1/trials/{trial_id}")
-    def trial(trial_id: str) -> dict[str, Any]:
-        return holder.get().trial(trial_id)
+    @app.get("/api/v1/runs/{run_id}/trials/{trial_id}")
+    def trial(run_id: str, trial_id: str) -> dict[str, Any]:
+        return holder.get().trial(run_id, trial_id)
 
-    @app.get("/api/v1/trials/{trial_id}/executions")
-    def trial_executions(trial_id: str) -> dict[str, Any]:
-        detail = holder.get().trial(trial_id)
+    @app.get("/api/v1/runs/{run_id}/trials/{trial_id}/executions")
+    def trial_executions(run_id: str, trial_id: str) -> dict[str, Any]:
+        detail = holder.get().trial(run_id, trial_id)
         return {
             "items": detail["executions"],
             "total": len(detail["executions"]),
         }
 
-    @app.get("/api/v1/executions/{execution_id}")
-    def execution(execution_id: str) -> dict[str, Any]:
-        return holder.get().execution(execution_id)
+    @app.get("/api/v1/runs/{run_id}/executions/{execution_id}")
+    def execution(run_id: str, execution_id: str) -> dict[str, Any]:
+        return holder.get().execution(run_id, execution_id)
 
-    @app.get("/api/v1/executions/{execution_id}/trajectory")
-    def trajectory(execution_id: str) -> None:
-        holder.get().execution(execution_id)
+    @app.get("/api/v1/runs/{run_id}/executions/{execution_id}/trajectory")
+    def trajectory(run_id: str, execution_id: str) -> None:
+        holder.get().execution(run_id, execution_id)
         raise HTTPException(
             status_code=403,
             detail="Raw trajectories remain in private canonical evidence",
         )
 
-    @app.get("/api/v1/artifacts/{artifact_id}")
-    def artifact(artifact_id: str) -> dict[str, Any]:
-        return holder.get().artifact(artifact_id)
+    @app.get("/api/v1/runs/{run_id}/artifacts/{artifact_id}")
+    def artifact(run_id: str, artifact_id: str) -> dict[str, Any]:
+        return holder.get().artifact(run_id, artifact_id)
 
-    @app.get("/api/v1/artifacts/{artifact_id}/content")
-    def artifact_content(artifact_id: str) -> None:
-        holder.get().artifact(artifact_id)
+    @app.get("/api/v1/runs/{run_id}/artifacts/{artifact_id}/content")
+    def artifact_content(run_id: str, artifact_id: str) -> None:
+        holder.get().artifact(run_id, artifact_id)
         raise HTTPException(
             status_code=403,
             detail="Artifact content is unavailable in public mode",

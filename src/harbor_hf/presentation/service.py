@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 from harbor_hf.presentation.repository import ResultRepository, ResultSnapshot
 from harbor_hf.results import (
@@ -16,7 +16,6 @@ from harbor_hf.results import (
 )
 
 RunCatalog = RunRow | CatalogRow
-EntityField = Literal["trial_id", "execution_id", "artifact_id"]
 TrialKey = tuple[str, int]
 
 
@@ -195,9 +194,11 @@ class ResultService:
             "tasks": tasks,
         }
 
-    def trial(self, trial_id: str) -> dict[str, Any]:
-        detail = self._entity_service("trial_id", trial_id)
+    def trial(self, run_id: str, trial_id: str) -> dict[str, Any]:
+        detail = self._publication_service(run_id)
         trial = self._find(detail.snapshot.trials, "trial_id", trial_id)
+        if trial.run_id != run_id:
+            raise ResultNotFound(trial_id)
         return {
             "trial": _public_row(trial),
             "score": detail._trial_score(trial),
@@ -218,9 +219,11 @@ class ResultService:
             ],
         }
 
-    def execution(self, execution_id: str) -> dict[str, Any]:
-        detail = self._entity_service("execution_id", execution_id)
+    def execution(self, run_id: str, execution_id: str) -> dict[str, Any]:
+        detail = self._publication_service(run_id)
         execution = self._find(detail.snapshot.executions, "execution_id", execution_id)
+        if execution.run_id != run_id:
+            raise ResultNotFound(execution_id)
         return {
             "execution": _public_row(execution),
             "metrics": [
@@ -235,9 +238,11 @@ class ResultService:
             ],
         }
 
-    def artifact(self, artifact_id: str) -> dict[str, Any]:
-        detail = self._entity_service("artifact_id", artifact_id)
+    def artifact(self, run_id: str, artifact_id: str) -> dict[str, Any]:
+        detail = self._publication_service(run_id)
         artifact = self._find(detail.snapshot.artifacts, "artifact_id", artifact_id)
+        if artifact.run_id != run_id:
+            raise ResultNotFound(artifact_id)
         return _public_row(artifact)
 
     def _summary(self, run: RunCatalog) -> dict[str, Any]:
@@ -346,30 +351,6 @@ class ResultService:
             publication = self.repository.load_publication(catalog)
             self._publications[run_id] = publication
         return ResultService(publication, self.title)
-
-    def _entity_service(self, field_name: EntityField, value: str) -> ResultService:
-        table = {
-            "trial_id": "trials",
-            "execution_id": "executions",
-            "artifact_id": "artifacts",
-        }[field_name]
-        if any(
-            getattr(row, field_name) == value for row in getattr(self.snapshot, table)
-        ):
-            return self
-        catalogs = (
-            self.repository.all_catalog_rows()
-            if self.repository is not None
-            else self._catalog_rows()
-        )
-        for catalog in catalogs:
-            detail = self._publication_service(catalog.run_id)
-            if any(
-                getattr(row, field_name) == value
-                for row in getattr(detail.snapshot, table)
-            ):
-                return detail
-        raise ResultNotFound(value)
 
     def _trials_by_task(self, run_id: str) -> dict[TrialKey, TrialRow]:
         return {

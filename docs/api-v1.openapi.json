@@ -62,84 +62,6 @@
   },
   "openapi": "3.1.0",
   "paths": {
-    "/api/v1/artifacts/{artifact_id}": {
-      "get": {
-        "operationId": "artifact_api_v1_artifacts__artifact_id__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "artifact_id",
-            "required": true,
-            "schema": {
-              "title": "Artifact Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Artifact Api V1 Artifacts  Artifact Id  Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Artifact"
-      }
-    },
-    "/api/v1/artifacts/{artifact_id}/content": {
-      "get": {
-        "operationId": "artifact_content_api_v1_artifacts__artifact_id__content_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "artifact_id",
-            "required": true,
-            "schema": {
-              "title": "Artifact Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Artifact Content"
-      }
-    },
     "/api/v1/campaigns": {
       "get": {
         "operationId": "campaigns_api_v1_campaigns_get",
@@ -300,84 +222,6 @@
           }
         },
         "summary": "Compare Query"
-      }
-    },
-    "/api/v1/executions/{execution_id}": {
-      "get": {
-        "operationId": "execution_api_v1_executions__execution_id__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "execution_id",
-            "required": true,
-            "schema": {
-              "title": "Execution Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Execution Api V1 Executions  Execution Id  Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Execution"
-      }
-    },
-    "/api/v1/executions/{execution_id}/trajectory": {
-      "get": {
-        "operationId": "trajectory_api_v1_executions__execution_id__trajectory_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "execution_id",
-            "required": true,
-            "schema": {
-              "title": "Execution Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Trajectory"
       }
     },
     "/api/v1/health": {
@@ -560,6 +404,102 @@
         "summary": "Run"
       }
     },
+    "/api/v1/runs/{run_id}/artifacts/{artifact_id}": {
+      "get": {
+        "operationId": "artifact_api_v1_runs__run_id__artifacts__artifact_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Artifact Api V1 Runs  Run Id  Artifacts  Artifact Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Artifact"
+      }
+    },
+    "/api/v1/runs/{run_id}/artifacts/{artifact_id}/content": {
+      "get": {
+        "operationId": "artifact_content_api_v1_runs__run_id__artifacts__artifact_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Artifact Content"
+      }
+    },
     "/api/v1/runs/{run_id}/compare/{other_run_id}": {
       "get": {
         "operationId": "compare_api_v1_runs__run_id__compare__other_run_id__get",
@@ -608,6 +548,102 @@
           }
         },
         "summary": "Compare"
+      }
+    },
+    "/api/v1/runs/{run_id}/executions/{execution_id}": {
+      "get": {
+        "operationId": "execution_api_v1_runs__run_id__executions__execution_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "title": "Execution Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Execution Api V1 Runs  Run Id  Executions  Execution Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Execution"
+      }
+    },
+    "/api/v1/runs/{run_id}/executions/{execution_id}/trajectory": {
+      "get": {
+        "operationId": "trajectory_api_v1_runs__run_id__executions__execution_id__trajectory_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "title": "Execution Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trajectory"
       }
     },
     "/api/v1/runs/{run_id}/metrics": {
@@ -692,10 +728,19 @@
         "summary": "Run Trials"
       }
     },
-    "/api/v1/trials/{trial_id}": {
+    "/api/v1/runs/{run_id}/trials/{trial_id}": {
       "get": {
-        "operationId": "trial_api_v1_trials__trial_id__get",
+        "operationId": "trial_api_v1_runs__run_id__trials__trial_id__get",
         "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
           {
             "in": "path",
             "name": "trial_id",
@@ -712,7 +757,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": true,
-                  "title": "Response Trial Api V1 Trials  Trial Id  Get",
+                  "title": "Response Trial Api V1 Runs  Run Id  Trials  Trial Id  Get",
                   "type": "object"
                 }
               }
@@ -733,10 +778,19 @@
         "summary": "Trial"
       }
     },
-    "/api/v1/trials/{trial_id}/executions": {
+    "/api/v1/runs/{run_id}/trials/{trial_id}/executions": {
       "get": {
-        "operationId": "trial_executions_api_v1_trials__trial_id__executions_get",
+        "operationId": "trial_executions_api_v1_runs__run_id__trials__trial_id__executions_get",
         "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
           {
             "in": "path",
             "name": "trial_id",
@@ -753,7 +807,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": true,
-                  "title": "Response Trial Executions Api V1 Trials  Trial Id  Executions Get",
+                  "title": "Response Trial Executions Api V1 Runs  Run Id  Trials  Trial Id  Executions Get",
                   "type": "object"
                 }
               }
@@ -776,4 +830,3 @@
     }
   }
 }
-

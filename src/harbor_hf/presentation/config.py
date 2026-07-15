@@ -38,8 +38,8 @@ class PresentationConfig:
             max_publications = int(maximum)
         except ValueError as error:
             raise ValueError("HARBOR_HF_MAX_PUBLICATIONS must be an integer") from error
-        if not 1 <= max_publications <= 4096:
-            raise ValueError("HARBOR_HF_MAX_PUBLICATIONS must be between 1 and 4096")
+        if not 1 <= max_publications <= 2048:
+            raise ValueError("HARBOR_HF_MAX_PUBLICATIONS must be between 1 and 2048")
         try:
             refresh_seconds = int(refresh)
         except ValueError as error:

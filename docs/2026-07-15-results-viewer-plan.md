@@ -133,12 +133,12 @@ GET /api/v1/runs/{run_id}
 GET /api/v1/runs/{run_id}/trials
 GET /api/v1/runs/{run_id}/metrics
 GET /api/v1/compare?run_id=...&run_id=...
-GET /api/v1/trials/{trial_id}
-GET /api/v1/trials/{trial_id}/executions
-GET /api/v1/executions/{execution_id}
-GET /api/v1/executions/{execution_id}/trajectory
-GET /api/v1/artifacts/{artifact_id}
-GET /api/v1/artifacts/{artifact_id}/content
+GET /api/v1/runs/{run_id}/trials/{trial_id}
+GET /api/v1/runs/{run_id}/trials/{trial_id}/executions
+GET /api/v1/runs/{run_id}/executions/{execution_id}
+GET /api/v1/runs/{run_id}/executions/{execution_id}/trajectory
+GET /api/v1/runs/{run_id}/artifacts/{artifact_id}
+GET /api/v1/runs/{run_id}/artifacts/{artifact_id}/content
 ```
 
 Collection endpoints use opaque cursor pagination, deterministic ordering,
@@ -446,4 +446,3 @@ The viewer is production-ready only when all of the following hold:
 - Adding a database before measured scale requires one.
 - Blocking result publication on Space availability.
 - Requiring Harbor to merge upstream changes before this viewer can ship.
-
