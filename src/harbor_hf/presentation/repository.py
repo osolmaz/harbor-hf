@@ -31,6 +31,7 @@ from harbor_hf.results import (
     TrialRow,
     build_catalog_row,
     catalog_lookup_path,
+    task_outcome_matches_execution,
 )
 
 _TABLE_MODELS: dict[TableName, type[BaseModel]] = {
@@ -440,6 +441,7 @@ def _validate_index_identity(index: GlobalIndexRow, run: RunRow) -> None:
         index.run_id,
         index.campaign_id,
         index.benchmark,
+        index.quality,
         index.completed_at,
         index.model_repo,
         index.model_revision,
@@ -453,6 +455,7 @@ def _validate_index_identity(index: GlobalIndexRow, run: RunRow) -> None:
         run.run_id,
         run.campaign_id,
         run.benchmark,
+        run.quality,
         run.completed_at,
         run.model_repo,
         run.model_revision,
@@ -495,6 +498,23 @@ def _validate_publication_relations(
         raise PresentationError("publication contains duplicate child IDs")
     if run.planned_trial_count != len(trials) or run.execution_count != len(executions):
         raise PresentationError("run child counts do not match normalized rows")
+    expected_outcomes = (
+        run.scored_trial_count,
+        run.agent_failed_count,
+        run.benchmark_failed_count,
+        run.infrastructure_exhausted_count,
+    )
+    observed_outcomes = tuple(
+        sum(row.outcome == outcome for row in trials)
+        for outcome in (
+            "scored",
+            "agent_failed",
+            "benchmark_failed",
+            "infrastructure_exhausted",
+        )
+    )
+    if observed_outcomes != expected_outcomes:
+        raise PresentationError("run outcome counts do not match trial rows")
     if any(row.trial_id not in trial_ids for row in executions):
         raise PresentationError("execution references an unknown trial")
     _validate_selected_executions(trials, executions)
@@ -522,7 +542,9 @@ def _validate_selected_executions(
         if (
             selected is None
             or selected.trial_id != trial.trial_id
-            or selected.status != "succeeded"
+            or not task_outcome_matches_execution(
+                trial.outcome, selected.status, selected.failure_category
+            )
         ):
             raise PresentationError("trial selected execution is invalid")
 

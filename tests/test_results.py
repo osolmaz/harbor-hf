@@ -390,6 +390,19 @@ def test_exhausted_trial_failure_is_a_zero_score_result(
     assert reward.value == 0.0
 
 
+def test_rejects_task_outcome_that_conflicts_with_failure_category() -> None:
+    summary = sample_summary()
+    cast(dict[str, object], summary["run"])["quality"] = "degraded"
+    trial = cast(list[dict[str, object]], summary["trials"])[0]
+    trial["outcome"] = "agent_failed"
+    execution = cast(list[dict[str, object]], summary["executions"])[0]
+    execution["status"] = "failed"
+    execution["failure_category"] = "benchmark"
+
+    with pytest.raises(ValidationError, match="conflicts with its outcome"):
+        ResultEvidence.model_validate(summary)
+
+
 def test_builds_projection_bound_to_native_envelope(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
@@ -469,6 +482,22 @@ def test_rejects_envelope_execution_that_conflicts_with_summary(
     _add_envelope(evidence)
     envelope = json.loads(evidence.files["publication-envelope.v1.json"])
     envelope["executions"][0]["trial_id"] = "trial-imposter"
+    evidence.files["publication-envelope.v1.json"] = _json_bytes(envelope)
+    _refresh_checksums(evidence)
+
+    with pytest.raises(ResultPublicationError, match="executions conflict"):
+        build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+
+
+def test_rejects_envelope_failure_category_that_conflicts_with_summary(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    _add_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v1.json"])
+    failed = next(
+        record for record in envelope["executions"] if record["status"] == "failed"
+    )
+    failed["failure_category"] = "benchmark"
     evidence.files["publication-envelope.v1.json"] = _json_bytes(envelope)
     _refresh_checksums(evidence)
 

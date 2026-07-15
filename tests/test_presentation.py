@@ -18,6 +18,7 @@ from harbor_hf.presentation.repository import (
     PresentationError,
     ResultRepository,
     ResultSnapshot,
+    _validate_publication,
 )
 from harbor_hf.presentation.service import ResultService
 from harbor_hf.results import (
@@ -725,3 +726,53 @@ def _publication(
         size_bytes=100,
     )
     return index, run, trial, execution, metric, artifact
+
+
+def test_degraded_publication_accepts_failed_selected_execution() -> None:
+    index, run, trial, execution, metric, artifact = _publication(1, 0.0)
+    index = index.model_copy(update={"quality": "degraded"})
+    run = run.model_copy(
+        update={
+            "quality": "degraded",
+            "scored_trial_count": 0,
+            "benchmark_failed_count": 1,
+        }
+    )
+    trial = trial.model_copy(update={"outcome": "benchmark_failed"})
+    execution = execution.model_copy(
+        update={"status": "failed", "failure_category": "benchmark"}
+    )
+
+    _validate_publication(
+        index,
+        {
+            "runs": [run],
+            "trials": [trial],
+            "executions": [execution],
+            "metrics": [metric],
+            "artifacts": [artifact],
+        },
+    )
+
+
+def test_publication_rejects_outcome_counts_that_conflict_with_trials() -> None:
+    index, run, trial, execution, metric, artifact = _publication(1, 0.0)
+    inconsistent = run.model_copy(
+        update={
+            "quality": "degraded",
+            "scored_trial_count": 0,
+            "agent_failed_count": 1,
+        }
+    )
+
+    with pytest.raises(PresentationError, match="outcome counts"):
+        _validate_publication(
+            index.model_copy(update={"quality": "degraded"}),
+            {
+                "runs": [inconsistent],
+                "trials": [trial],
+                "executions": [execution],
+                "metrics": [metric],
+                "artifacts": [artifact],
+            },
+        )

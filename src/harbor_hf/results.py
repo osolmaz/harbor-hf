@@ -158,6 +158,22 @@ class ExecutionEvidence(FrozenModel):
         return self
 
 
+def task_outcome_matches_execution(
+    outcome: TaskOutcome,
+    status: str,
+    failure_category: RetryCategory | None,
+) -> bool:
+    if outcome == "scored":
+        return status == "succeeded" and failure_category is None
+    if status != "failed" or failure_category is None:
+        return False
+    if outcome == "agent_failed":
+        return failure_category == "agent"
+    if outcome == "benchmark_failed":
+        return failure_category == "benchmark"
+    return failure_category not in {"agent", "benchmark"}
+
+
 class MetricEvidence(FrozenModel):
     owner_type: OwnerType
     owner_id: EntityId
@@ -214,8 +230,9 @@ class ResultEvidence(FrozenModel):
             if (
                 not isinstance(selected, ExecutionEvidence)
                 or selected.trial_id != trial.trial_id
-                or (trial.outcome == "scored" and selected.status != "succeeded")
-                or (trial.outcome != "scored" and selected.status != "failed")
+                or not task_outcome_matches_execution(
+                    trial.outcome, selected.status, selected.failure_category
+                )
             ):
                 raise ValueError("trial selected execution conflicts with its outcome")
         if any(execution.trial_id not in trials for execution in self.executions):
@@ -1122,6 +1139,7 @@ def _validate_envelope_executions(
             execution.trial_id,
             execution.physical_attempt,
             execution.status,
+            execution.failure_category,
             execution.started_at,
             execution.completed_at,
             execution.retry_reason,
@@ -1134,6 +1152,7 @@ def _validate_envelope_executions(
             execution.trial_id,
             execution.physical_attempt,
             execution.status,
+            execution.failure_category,
             execution.started_at,
             execution.completed_at,
             execution.retry_reason,
