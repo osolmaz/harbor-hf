@@ -58,6 +58,7 @@ from harbor_hf.harbor_adapter.legacy import (
     validate_task_counts,
     validate_trial_count,
 )
+from harbor_hf.harbor_native_bundle import write_harbor_native_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import (
     DeploymentProfile,
@@ -560,7 +561,7 @@ def _run_staged_worker(
     append_event(events, "run_failed", **failure_event)
     write_json(root / "_FAILED", failure_record)
     try:
-        _finalize_evidence(root, secrets)
+        _finalize_evidence(root, secrets, strict_compatibility=False)
     except Exception as caught:
         finalization_message = _redact_secret_values(str(caught), secrets)
         message = (
@@ -619,7 +620,7 @@ def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
 def _publish_success(root: Path, events: Path, secrets: SecretValues) -> None:
     append_event(events, "run_succeeded")
     try:
-        _finalize_evidence(root, secrets)
+        _finalize_evidence(root, secrets, strict_compatibility=True)
     except Exception as caught:
         append_event(
             events,
@@ -1198,7 +1199,12 @@ def require_executable(name: str) -> None:
         raise WorkerError(f"required controller executable is missing: {name}")
 
 
-def _finalize_evidence(root: Path, secrets: SecretValues) -> None:
+def _finalize_evidence(
+    root: Path,
+    secrets: SecretValues,
+    *,
+    strict_compatibility: bool = False,
+) -> None:
     failed = (root / "_FAILED").is_file()
     fallback_attempted = openclaw_execution_was_attempted(root)
     rejection_count = 0
@@ -1265,6 +1271,7 @@ def _finalize_evidence(root: Path, secrets: SecretValues) -> None:
     )
     assert_secret_absent(root, secrets)
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
+    write_harbor_native_bundle(root, required=strict_compatibility)
     write_checksums(root)
 
 

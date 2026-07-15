@@ -678,6 +678,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             "harbor-export.log",
             "harbor-job.json",
             "harbor-jobs",
+            "harbor-native-bundle.json",
             "harbor-request.json",
             "harbor.log",
             "manifest.yaml",

@@ -151,10 +151,53 @@ def _finalizer_files(
         "execution_succeeded",
         "2026-07-14T03:06:00+01:00",
     )
+    archive = b"deterministic Harbor archive"
+    compatibility = b"{}\n"
+    native_lock = b'{"kind":"trial-lock"}\n'
+    native_result = b'{"kind":"trial-result"}\n'
+    bundle = _pretty(
+        {
+            "schema_version": "harbor-hf/harbor-native-bundle/v1alpha1",
+            "contract_status": "compatibility",
+            "harbor_revision": "a" * 40,
+            "harbor_version": "test",
+            "request_digest": "sha256:" + "b" * 64,
+            "compatibility_schema": "harbor-hf/harbor-compatibility/v1alpha3",
+            "archive": {
+                "path": "artifacts.tar.gz",
+                "digest": _sha(archive),
+                "size_bytes": len(archive),
+                "media_type": "application/gzip",
+            },
+            "compatibility": {
+                "path": "harbor-compatibility.json",
+                "digest": _sha(compatibility),
+                "size_bytes": len(compatibility),
+                "media_type": "application/json",
+            },
+            "documents": [
+                {
+                    "kind": "trial_lock",
+                    "path": "harbor-jobs/job/trial/lock.json",
+                    "digest": _sha(native_lock),
+                },
+                {
+                    "kind": "trial_result",
+                    "path": "harbor-jobs/job/trial/result.json",
+                    "digest": _sha(native_result),
+                },
+            ],
+        }
+    )
     manifest = _pretty(
         {
+            "artifacts.tar.gz": _sha(archive),
             "execution.lock.json": _sha(lock_two),
             "events.jsonl": _sha(events_two),
+            "harbor-compatibility.json": _sha(compatibility),
+            "harbor-jobs/job/trial/lock.json": _sha(native_lock),
+            "harbor-jobs/job/trial/result.json": _sha(native_result),
+            "harbor-native-bundle.json": _sha(bundle),
             "verification.json": _sha(verification),
             "_SUCCESS": _sha(b"\n"),
         }
@@ -173,6 +216,11 @@ def _finalizer_files(
         f"{one}/_FAILED": b"\n",
         f"{two}/execution.lock.json": lock_two,
         f"{two}/events.jsonl": events_two,
+        f"{two}/artifacts.tar.gz": archive,
+        f"{two}/harbor-compatibility.json": compatibility,
+        f"{two}/harbor-jobs/job/trial/lock.json": native_lock,
+        f"{two}/harbor-jobs/job/trial/result.json": native_result,
+        f"{two}/harbor-native-bundle.json": bundle,
         f"{two}/verification.json": verification,
         f"{two}/_SUCCESS": b"\n",
         f"{two}/checksums.json": manifest,
@@ -246,6 +294,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     assert [write[1] for write in writer.writes] == [
         f"{base}/verification.json",
         f"{base}/run-summary.json",
+        f"{base}/publication-envelope.v2.json",
         f"{base}/checksums.json",
         f"{base}/_SUCCESS",
         f"{lock.artifact_prefix}/campaign-summary.json",
@@ -306,6 +355,21 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             2,
         ),
     ]
+    envelope_bytes = contents[f"{base}/publication-envelope.v2.json"]
+    envelope = json.loads(envelope_bytes)
+    assert envelope["schema_version"] == "harbor-hf/publication-envelope/v2"
+    assert envelope["run_id"] == run.run_id
+    assert envelope["campaign_id"] == lock.campaign_id
+    assert envelope["runtime"]["kind"] == "endpoint"
+    assert envelope["cleanup_outcome"] == "verified"
+    assert [record["execution_id"] for record in envelope["executions"]] == [
+        "execution-one",
+        "execution-two",
+    ]
+    assert envelope["executions"][0]["harbor_bundle"] is None
+    assert envelope["executions"][1]["harbor_bundle"]["document_count"] == 2
+    assert "task_name" not in envelope_bytes.decode()
+    assert "rewards" not in envelope_bytes.decode()
     assert [
         (metric["owner_id"], metric["name"], metric["value"], metric["unit"])
         for metric in summary["metrics"]
@@ -339,6 +403,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     }
     expected_checksums["verification.json"] = _sha(verification)
     expected_checksums["run-summary.json"] = _sha(contents[f"{base}/run-summary.json"])
+    expected_checksums["publication-envelope.v2.json"] = _sha(envelope_bytes)
     checksum_bytes = contents[f"{base}/checksums.json"]
     assert checksum_bytes == _pretty(dict(sorted(expected_checksums.items())))
     assert contents[f"{base}/_SUCCESS"] == b"\n"

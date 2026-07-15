@@ -52,6 +52,7 @@ from harbor_hf.harbor_adapter import (
     HarborVerificationFailure,
 )
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
+from harbor_hf.harbor_native_bundle import write_harbor_native_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.private_artifacts import (
@@ -1287,6 +1288,7 @@ def _finalize_execution(
     )
     archive_directory(root / "harbor-jobs", root / "artifacts.tar.gz")
     assert_secret_absent(root, secrets)
+    write_harbor_native_bundle(root, required=strict_compatibility)
     write_checksums(root)
 
 

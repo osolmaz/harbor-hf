@@ -3302,6 +3302,7 @@ def test_worker_publishes_success_after_cleanup(
         "harbor-export.log",
         "harbor-job.json",
         "harbor-jobs",
+        "harbor-native-bundle.json",
         "harbor-request.json",
         "harbor.log",
         "manifest.yaml",
@@ -3352,6 +3353,7 @@ def test_worker_publishes_success_after_cleanup(
         "harbor-jobs/job/trial/result.json",
         "harbor-jobs/job/trial/lock.json",
         "harbor-jobs/job/trial/private-artifacts.json",
+        "harbor-native-bundle.json",
         "harbor.log",
         "harbor-request.json",
         "manifest.yaml",
@@ -3647,10 +3649,13 @@ def test_worker_marks_failed_when_success_evidence_cannot_finalize(
     )
     staged_roots: list[Path] = []
 
-    def fail_finalization(root: Path, token: str) -> None:
+    def fail_finalization(
+        root: Path, token: str, *, strict_compatibility: bool
+    ) -> None:
         staged_roots.append(root)
         assert tmp_path / "output" not in root.parents
         assert token == "test-token"
+        assert strict_compatibility is True
         raise RuntimeError("archive test-token failed")
 
     monkeypatch.setattr("harbor_hf.worker._finalize_evidence", fail_finalization)

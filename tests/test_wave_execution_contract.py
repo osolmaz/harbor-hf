@@ -298,6 +298,8 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-compatibility.json",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-native-bundle.json",
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-export.log",
         f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
         f"{execution_id}/harbor-job.json",
