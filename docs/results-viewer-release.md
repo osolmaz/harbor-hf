@@ -4,7 +4,7 @@
 
 - Space: <https://huggingface.co/spaces/osolmaz/harbor-results>
 - Runtime: public Docker Space on `cpu-basic`
-- Space revision: `c52245d5cdb980fe325686117580faffbd920211`
+- Space revision: `a93a672e4ee160c691e86f0f5fd5b26cef69d62f`
 - Credentials: none
 - Index Dataset: `osolmaz/benchmark-run-index`
 - Catalog revision: `d30eb71a421642d37eb635840e5c132340084181`
@@ -48,7 +48,7 @@ leaderboard and comparison patterns only.
 
 ## Verification
 
-- Python: 1,412 tests with branch coverage above the required 85% gate.
+- Python: 1,414 tests with branch coverage above the required 85% gate.
 - Frontend: TypeScript and Vite production build.
 - Hosted API: health, catalog, run detail, comparison, restricted content, and
   permanent-route smoke requests.
