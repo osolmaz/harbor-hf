@@ -61,6 +61,12 @@ class PublicationResult(FrozenModel):
     index_revision: str
 
 
+class CatalogMigrationResult(FrozenModel):
+    index_dataset: str
+    index_revision: str
+    publication_count: int = Field(ge=0)
+
+
 class ResultReceipt(FrozenModel):
     schema_version: Literal["harbor-hf/result-publication/v1"] = (
         "harbor-hf/result-publication/v1"
@@ -141,6 +147,12 @@ class HubDatasetPublisher:
             index_revision=index_revision,
         )
 
+    def migrate_catalog_v2(self, index_dataset: str) -> CatalogMigrationResult:
+        return self._with_lease(
+            index_dataset,
+            lambda: self._migrate_catalog_v2(index_dataset),
+        )
+
     def _with_lease[Value](self, dataset: str, operation: Callable[[], Value]) -> Value:
         path = publisher_lease_path(dataset)
         owner = {
@@ -153,6 +165,74 @@ class HubDatasetPublisher:
             return operation()
         finally:
             self.leases.release(path, owner)
+
+    def _migrate_catalog_v2(self, dataset: str) -> CatalogMigrationResult:
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head(dataset)
+            rows = self._catalog_v2_migration_rows(dataset, head)
+            files = [
+                *(
+                    build_catalog_v2_window_file(rows, size)
+                    for size in _INDEX_WINDOW_SIZES
+                ),
+                *(build_catalog_v2_lookup_file(row) for row in rows),
+            ]
+            if self._windows_match(dataset, head, files):
+                return CatalogMigrationResult(
+                    index_dataset=dataset,
+                    index_revision=head,
+                    publication_count=len(rows),
+                )
+            try:
+                response = self.api.create_commit(
+                    dataset,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=item.path,
+                            path_or_fileobj=item.content,
+                        )
+                        for item in files
+                    ],
+                    commit_message="feat: migrate result catalog to v2",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return CatalogMigrationResult(
+                    index_dataset=dataset,
+                    index_revision=self._commit_oid(response, dataset),
+                    publication_count=len(rows),
+                )
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise DatasetPublicationError("v2 catalog migration remained contended")
+
+    def _catalog_v2_migration_rows(
+        self, dataset: str, revision: str
+    ) -> list[CatalogRowV2]:
+        legacy_path = build_catalog_window_file([], _LARGEST_INDEX_WINDOW).path
+        if not self._exists(dataset, legacy_path, revision):
+            raise DatasetPublicationError("index Dataset has no v1 result catalog")
+        legacy = read_catalog_file(self._read(dataset, legacy_path, revision))
+        by_publication = {
+            row.publication_id: catalog_v2_from_legacy(row) for row in legacy
+        }
+        v2_path = build_catalog_v2_window_file([], _LARGEST_INDEX_WINDOW).path
+        if self._exists(dataset, v2_path, revision):
+            by_publication.update(
+                {
+                    row.publication_id: row
+                    for row in read_catalog_v2_file(
+                        self._read(dataset, v2_path, revision)
+                    )
+                }
+            )
+        return sorted(
+            by_publication.values(),
+            key=lambda item: (item.completed_at, item.publication_id),
+            reverse=True,
+        )[:_LARGEST_INDEX_WINDOW]
 
     def _publish_result(self, publication: ResultPublication, dataset: str) -> str:
         operations: list[object] = [

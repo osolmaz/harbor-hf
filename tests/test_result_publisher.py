@@ -283,6 +283,38 @@ def test_publishes_native_v2_projection_and_catalog(
     assert catalog.harbor_bundle_count == 1
 
 
+def test_migrates_existing_v1_catalog_idempotently(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    publisher.publish(
+        publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+    api.files["org/index"] = {
+        path: content
+        for path, content in api.files["org/index"].items()
+        if "schema=v2" not in path
+    }
+    commits_before = len(api.commits)
+
+    first = publisher.migrate_catalog_v2("org/index")
+    second = publisher.migrate_catalog_v2("org/index")
+
+    assert first.publication_count == 1
+    assert second.publication_count == 1
+    assert len(api.commits) == commits_before + 1
+    rows = read_catalog_v2_file(
+        api.files["org/index"]["data/catalog/schema=v2/windows/2048.parquet"]
+    )
+    assert rows[0].publication_id == publication.tables.publication_id
+    assert rows[0].source_format == "legacy-v1"
+
+
 def test_duplicate_publication_is_a_no_op(
     publication: ResultPublication, tmp_path: Path
 ) -> None:

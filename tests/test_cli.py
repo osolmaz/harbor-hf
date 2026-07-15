@@ -22,6 +22,7 @@ from harbor_hf.operations import (
     VerifiedRun,
 )
 from harbor_hf.process import ProcessError
+from harbor_hf.result_publisher import CatalogMigrationResult
 from harbor_hf.runs import build_run_lock
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
@@ -422,6 +423,53 @@ def test_results_publish_uses_repository_creating_recovery_path(
     assert interactions == [
         ("repositories", api),
         ("publish", "campaign-one"),
+    ]
+
+
+def test_results_catalog_v2_migration_uses_authenticated_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class Publisher:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        def migrate_catalog_v2(self, dataset: str) -> CatalogMigrationResult:
+            calls.append(dataset)
+            return CatalogMigrationResult(
+                index_dataset=dataset,
+                index_revision="a" * 40,
+                publication_count=6,
+            )
+
+    api = object()
+    lease = object()
+    monkeypatch.setattr("harbor_hf.cli.get_token", lambda: "test-token")
+    monkeypatch.setattr("harbor_hf.cli.HfApi", lambda: api)
+    monkeypatch.setattr("harbor_hf.cli.HubClaimStore", lambda *_args: lease)
+    monkeypatch.setattr("harbor_hf.cli.HubDatasetPublisher", Publisher)
+
+    result = runner.invoke(
+        app,
+        [
+            "results",
+            "migrate-catalog-v2",
+            "org/index",
+            "--namespace",
+            "org",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["publication_count"] == 6
+    assert calls == [
+        {
+            "publisher_id": "cli-catalog-v2-migration",
+            "leases": lease,
+            "api": api,
+        },
+        "org/index",
     ]
 
 
