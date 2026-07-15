@@ -15,7 +15,8 @@ uv run ruff check .
 uv run ruff format --check .
 uv run ty check
 uv run pytest --cov=src/harbor_hf --cov-fail-under=85
-uv run pytest tests/test_presentation.py --cov=space --cov-fail-under=85
+(cd apps/results-web && npm ci && npm run build)
+docker build -f deploy/space/Dockerfile .
 uv run slophammer-py dry .
 uv run pip-audit
 uv run slophammer-py check . --baseline

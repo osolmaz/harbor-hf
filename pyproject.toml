@@ -7,11 +7,13 @@ license = "Apache-2.0"
 authors = [{ name = "Onur Solmaz" }]
 requires-python = ">=3.12"
 dependencies = [
+  "fastapi>=0.116.0",
   "huggingface-hub>=1.22.0",
   "httpx>=0.23.0",
   "pydantic>=2.11.7",
   "pyyaml>=6.0.2",
   "typer>=0.16.0",
+  "uvicorn>=0.35.0",
   "pyarrow>=18.0.0",
 ]
 
@@ -38,13 +40,11 @@ dev = [
   "ty>=0.0.59",
 ]
 presentation = [
-  "gradio>=6.20,<7",
   "pyarrow>=18,<26",
 ]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
-pythonpath = ["space"]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -68,4 +68,4 @@ skip_covered = true
 [tool.mutmut]
 source_paths = ["src/harbor_hf"]
 pytest_add_cli_args_test_selection = ["tests"]
-also_copy = ["examples", "space"]
+also_copy = ["examples", "deploy"]

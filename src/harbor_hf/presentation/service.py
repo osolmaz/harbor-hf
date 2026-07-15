@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from harbor_hf.presentation.repository import ResultRepository, ResultSnapshot
+from harbor_hf.results import (
+    ArtifactRow,
+    CatalogRow,
+    ExecutionRow,
+    MetricRow,
+    RunRow,
+    TrialRow,
+)
+
+RunCatalog = RunRow | CatalogRow
+EntityField = Literal["trial_id", "execution_id", "artifact_id"]
+
+
+class ResultNotFound(LookupError):
+    """Raised when a public result entity does not exist."""
+
+
+@dataclass(frozen=True)
+class ResultService:
+    snapshot: ResultSnapshot
+    title: str = "Harbor Results"
+    repository: ResultRepository | None = None
+    _publications: dict[str, ResultSnapshot] = field(
+        default_factory=dict, init=False, compare=False, repr=False
+    )
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "title": self.title,
+            "index_dataset": self.snapshot.index_dataset,
+            "index_revision": self.snapshot.index_revision,
+            "run_count": len(self._catalog_rows()),
+        }
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "mode": "public",
+            "comparison": True,
+            "artifact_metadata": True,
+            "artifact_content": False,
+            "trajectories": False,
+            "canonical_evidence": "private",
+        }
+
+    def list_runs(
+        self,
+        *,
+        search: str = "",
+        benchmark: str = "",
+        model: str = "",
+        hardware: str = "",
+    ) -> dict[str, Any]:
+        items = [self._summary(run) for run in self._catalog_rows()]
+        facets = {
+            "benchmarks": sorted({item["benchmark"] for item in items}),
+            "models": sorted({item["model_repo"] for item in items}),
+            "hardware": sorted({item["hardware"] for item in items}),
+            "agents": sorted({item["agent_name"] for item in items}),
+        }
+        needle = search.casefold().strip()
+        if needle:
+            fields = (
+                "run_id",
+                "campaign_id",
+                "benchmark",
+                "model_repo",
+                "agent_name",
+                "hardware",
+            )
+            items = [
+                item
+                for item in items
+                if needle in " ".join(str(item[key]) for key in fields).casefold()
+            ]
+        filters = {
+            "benchmark": benchmark,
+            "model_repo": model,
+            "hardware": hardware,
+        }
+        for field_name, expected in filters.items():
+            if expected:
+                items = [item for item in items if item[field_name] == expected]
+        items.sort(key=lambda item: item["completed_at"], reverse=True)
+        return {"items": items, "total": len(items), "facets": facets}
+
+    def list_campaigns(self) -> dict[str, Any]:
+        grouped: dict[str, list[RunCatalog]] = defaultdict(list)
+        for run in self._catalog_rows():
+            grouped[run.campaign_id].append(run)
+        items = []
+        for campaign_id, runs in grouped.items():
+            summaries = [self._summary(run) for run in runs]
+            items.append(
+                {
+                    "campaign_id": campaign_id,
+                    "run_count": len(runs),
+                    "benchmark_count": len({run.benchmark for run in runs}),
+                    "model_count": len({run.model_repo for run in runs}),
+                    "completed_at": max(run.completed_at for run in runs),
+                    "average_score": _average(
+                        float(item["score"]) for item in summaries
+                    ),
+                }
+            )
+        items.sort(key=lambda item: item["completed_at"], reverse=True)
+        return {"items": items, "total": len(items)}
+
+    def campaign(self, campaign_id: str) -> dict[str, Any]:
+        runs = [run for run in self._catalog_rows() if run.campaign_id == campaign_id]
+        if not runs:
+            raise ResultNotFound(campaign_id)
+        return {
+            "campaign_id": campaign_id,
+            "runs": [self._summary(run) for run in runs],
+        }
+
+    def run(self, run_id: str) -> dict[str, Any]:
+        detail = self._publication_service(run_id)
+        run = detail._run(run_id)
+        return {
+            "summary": self._summary(self._catalog(run_id)),
+            "configuration": _public_row(run),
+            "trials": [
+                detail._trial_summary(row)
+                for row in detail.snapshot.trials
+                if row.run_id == run_id
+            ],
+            "executions": [
+                _public_row(row)
+                for row in detail.snapshot.executions
+                if row.run_id == run_id
+            ],
+            "metrics": [
+                _public_row(row)
+                for row in detail.snapshot.metrics
+                if row.run_id == run_id
+            ],
+            "artifacts": [
+                _public_row(row)
+                for row in detail.snapshot.artifacts
+                if row.run_id == run_id
+            ],
+            "provenance": detail._provenance(run),
+        }
+
+    def compare(self, run_id: str, other_run_id: str) -> dict[str, Any]:
+        left_catalog = self._catalog(run_id)
+        right_catalog = self._catalog(other_run_id)
+        left = self._publication_service(run_id)
+        right = self._publication_service(other_run_id)
+        left_trials = left._trials_by_task(run_id)
+        right_trials = right._trials_by_task(other_run_id)
+        tasks = []
+        for task in sorted(set(left_trials) | set(right_trials)):
+            left_score = left._trial_score(left_trials.get(task))
+            right_score = right._trial_score(right_trials.get(task))
+            tasks.append(
+                {
+                    "task_name": task,
+                    "left_score": left_score,
+                    "right_score": right_score,
+                    "delta": None
+                    if left_score is None or right_score is None
+                    else right_score - left_score,
+                }
+            )
+        return {
+            "compatible": left_catalog.benchmark == right_catalog.benchmark,
+            "left": self._summary(left_catalog),
+            "right": self._summary(right_catalog),
+            "score_delta": self._catalog_score(right_catalog)
+            - self._catalog_score(left_catalog),
+            "tasks": tasks,
+        }
+
+    def trial(self, trial_id: str) -> dict[str, Any]:
+        detail = self._entity_service("trial_id", trial_id)
+        trial = self._find(detail.snapshot.trials, "trial_id", trial_id)
+        return {
+            "trial": _public_row(trial),
+            "score": detail._trial_score(trial),
+            "executions": [
+                _public_row(row)
+                for row in detail.snapshot.executions
+                if row.trial_id == trial_id
+            ],
+            "metrics": [
+                _public_row(row)
+                for row in detail.snapshot.metrics
+                if row.owner_type == "trial" and row.owner_id == trial_id
+            ],
+            "artifacts": [
+                _public_row(row)
+                for row in detail.snapshot.artifacts
+                if row.owner_type == "trial" and row.owner_id == trial_id
+            ],
+        }
+
+    def execution(self, execution_id: str) -> dict[str, Any]:
+        detail = self._entity_service("execution_id", execution_id)
+        execution = self._find(detail.snapshot.executions, "execution_id", execution_id)
+        return {
+            "execution": _public_row(execution),
+            "metrics": [
+                _public_row(row)
+                for row in detail.snapshot.metrics
+                if row.owner_type == "execution" and row.owner_id == execution_id
+            ],
+            "artifacts": [
+                _public_row(row)
+                for row in detail.snapshot.artifacts
+                if row.owner_type == "execution" and row.owner_id == execution_id
+            ],
+        }
+
+    def artifact(self, artifact_id: str) -> dict[str, Any]:
+        detail = self._entity_service("artifact_id", artifact_id)
+        artifact = self._find(detail.snapshot.artifacts, "artifact_id", artifact_id)
+        return _public_row(artifact)
+
+    def _summary(self, run: RunCatalog) -> dict[str, Any]:
+        if isinstance(run, CatalogRow):
+            return run.model_dump(mode="json")
+        return {
+            "run_id": run.run_id,
+            "publication_id": run.publication_id,
+            "campaign_id": run.campaign_id,
+            "benchmark": run.benchmark,
+            "benchmark_revision": run.benchmark_revision,
+            "model_repo": run.model_repo,
+            "model_revision": run.model_revision,
+            "agent_name": run.agent_name,
+            "agent_revision": run.agent_revision,
+            "provider": run.provider,
+            "region": run.region,
+            "hardware": run.hardware,
+            "accelerator_count": run.accelerator_count,
+            "result_kind": run.result_kind,
+            "outcome": run.outcome,
+            "score": self._score(run),
+            "passed_trials": sum(
+                self._trial_score(trial) == 1
+                for trial in self.snapshot.trials
+                if trial.run_id == run.run_id
+            ),
+            "trial_count": run.trial_count,
+            "execution_count": run.execution_count,
+            "infrastructure_failures": sum(
+                execution.status == "failed_infrastructure"
+                for execution in self.snapshot.executions
+                if execution.run_id == run.run_id
+            ),
+            "duration_seconds": (run.completed_at - run.created_at).total_seconds(),
+            "completed_at": run.completed_at,
+        }
+
+    def _trial_summary(self, trial: TrialRow) -> dict[str, Any]:
+        value = _public_row(trial)
+        value["score"] = self._trial_score(trial)
+        value["execution_count"] = sum(
+            row.trial_id == trial.trial_id for row in self.snapshot.executions
+        )
+        return value
+
+    def _score(self, run: RunRow) -> float:
+        return _average(
+            metric.value
+            for metric in self.snapshot.metrics
+            if metric.run_id == run.run_id
+            and metric.owner_type == "trial"
+            and metric.name == "reward"
+        )
+
+    def _trial_score(self, trial: TrialRow | None) -> float | None:
+        if trial is None:
+            return None
+        values = [
+            metric.value
+            for metric in self.snapshot.metrics
+            if metric.run_id == trial.run_id
+            and metric.owner_type == "trial"
+            and metric.owner_id == trial.trial_id
+            and metric.name == "reward"
+        ]
+        return _average(values) if values else None
+
+    def _run(self, run_id: str) -> RunRow:
+        return self._find(self.snapshot.runs, "run_id", run_id)
+
+    def _catalog(self, run_id: str) -> RunCatalog:
+        return self._find(self._catalog_rows(), "run_id", run_id)
+
+    def _catalog_rows(self) -> tuple[RunCatalog, ...]:
+        if self.snapshot.catalog_rows:
+            return self.snapshot.catalog_rows
+        return self.snapshot.runs
+
+    def _catalog_score(self, run: RunCatalog) -> float:
+        return run.score if isinstance(run, CatalogRow) else self._score(run)
+
+    def _publication_service(self, run_id: str) -> ResultService:
+        if any(run.run_id == run_id for run in self.snapshot.runs):
+            return self
+        if self.repository is None:
+            raise ResultNotFound(run_id)
+        publication = self._publications.get(run_id)
+        if publication is None:
+            catalog = self._catalog(run_id)
+            if not isinstance(catalog, CatalogRow):
+                raise ResultNotFound(run_id)
+            publication = self.repository.load_publication(catalog)
+            self._publications[run_id] = publication
+        return ResultService(publication, self.title)
+
+    def _entity_service(self, field_name: EntityField, value: str) -> ResultService:
+        table = {
+            "trial_id": "trials",
+            "execution_id": "executions",
+            "artifact_id": "artifacts",
+        }[field_name]
+        if any(
+            getattr(row, field_name) == value for row in getattr(self.snapshot, table)
+        ):
+            return self
+        for catalog in self._catalog_rows():
+            detail = self._publication_service(catalog.run_id)
+            if any(
+                getattr(row, field_name) == value
+                for row in getattr(detail.snapshot, table)
+            ):
+                return detail
+        raise ResultNotFound(value)
+
+    def _trials_by_task(self, run_id: str) -> dict[str, TrialRow]:
+        return {
+            trial.task_name: trial
+            for trial in self.snapshot.trials
+            if trial.run_id == run_id
+        }
+
+    def _provenance(self, run: RunRow) -> dict[str, Any]:
+        index = next(
+            row
+            for row in self.snapshot.index_rows
+            if row.publication_id == run.publication_id
+        )
+        return {
+            "index_dataset": self.snapshot.index_dataset,
+            "index_revision": self.snapshot.index_revision,
+            "result_dataset": index.result_dataset,
+            "result_revision": index.result_revision,
+            "source_checksum": run.source_checksum,
+            "run_lock_sha256": run.run_lock_sha256,
+            "control_commit": run.control_commit,
+        }
+
+    @staticmethod
+    def _find[Row](rows: Iterable[Row], field_name: str, value: str) -> Row:
+        for row in rows:
+            if getattr(row, field_name) == value:
+                return row
+        raise ResultNotFound(value)
+
+
+def _public_row(
+    row: RunRow | TrialRow | ExecutionRow | MetricRow | ArtifactRow,
+) -> dict[str, Any]:
+    return row.model_dump(
+        mode="json",
+        exclude={"source_bucket", "source_prefix", "run_lock_path"},
+    )
+
+
+def _average(values: Iterable[float]) -> float:
+    collected = list(values)
+    return sum(collected) / len(collected) if collected else 0.0

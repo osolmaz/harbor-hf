@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from os import PathLike
+from pathlib import Path
+from typing import Protocol
+
+import pyarrow.parquet as parquet
+from huggingface_hub import HfApi, hf_hub_download
+from pydantic import BaseModel, ValidationError
+
+from harbor_hf.presentation.config import PresentationConfig
+from harbor_hf.results import (
+    ArtifactRow,
+    CatalogRow,
+    ExecutionRow,
+    GlobalIndexRow,
+    MetricRow,
+    RunRow,
+    TraceRow,
+    TrialRow,
+)
+
+_TABLE_MODELS = {
+    "runs": RunRow,
+    "trials": TrialRow,
+    "executions": ExecutionRow,
+    "metrics": MetricRow,
+    "artifacts": ArtifactRow,
+}
+
+
+class PresentationError(RuntimeError):
+    """Raised when public result data is missing, malformed, or inconsistent."""
+
+
+class DatasetReader(Protocol):
+    def resolve_revision(self, dataset: str, revision: str) -> str: ...
+
+    def list_files(self, dataset: str, revision: str) -> list[str]: ...
+
+    def read_rows(
+        self, dataset: str, revision: str, path: str
+    ) -> Sequence[Mapping[str, object]]: ...
+
+
+class HubApi(Protocol):
+    def repo_info(
+        self,
+        repo_id: str,
+        *,
+        revision: str,
+        repo_type: str,
+        token: bool,
+    ) -> object: ...
+
+    def list_repo_files(
+        self,
+        repo_id: str,
+        *,
+        revision: str,
+        repo_type: str,
+        token: bool,
+    ) -> list[str]: ...
+
+
+Download = Callable[..., str | PathLike[str]]
+ParquetParser = Callable[[Path], list[Mapping[str, object]]]
+
+
+class AnonymousHubReader:
+    """Read public datasets without consulting ambient HF credentials."""
+
+    def __init__(
+        self,
+        *,
+        api: HubApi | None = None,
+        download: Download = hf_hub_download,
+        parse_parquet: ParquetParser | None = None,
+    ) -> None:
+        self._api = HfApi(token=False) if api is None else api
+        self._download = download
+        self._parse_parquet = _read_parquet if parse_parquet is None else parse_parquet
+
+    def resolve_revision(self, dataset: str, revision: str) -> str:
+        info = self._api.repo_info(
+            dataset, revision=revision, repo_type="dataset", token=False
+        )
+        sha = getattr(info, "sha", None)
+        if not isinstance(sha, str) or not _is_commit(sha):
+            raise PresentationError(f"Dataset {dataset} returned no immutable revision")
+        return sha
+
+    def list_files(self, dataset: str, revision: str) -> list[str]:
+        return self._api.list_repo_files(
+            dataset, revision=revision, repo_type="dataset", token=False
+        )
+
+    def read_rows(
+        self, dataset: str, revision: str, path: str
+    ) -> list[Mapping[str, object]]:
+        downloaded = self._download(
+            repo_id=dataset,
+            filename=path,
+            repo_type="dataset",
+            revision=revision,
+            token=False,
+        )
+        return self._parse_parquet(Path(downloaded))
+
+
+@dataclass(frozen=True)
+class ResultSnapshot:
+    index_dataset: str
+    index_revision: str
+    catalog_rows: tuple[CatalogRow, ...]
+    index_rows: tuple[GlobalIndexRow, ...]
+    runs: tuple[RunRow, ...]
+    trials: tuple[TrialRow, ...]
+    executions: tuple[ExecutionRow, ...]
+    metrics: tuple[MetricRow, ...]
+    artifacts: tuple[ArtifactRow, ...]
+
+
+class ResultRepository:
+    """Load and validate one immutable view over normalized result datasets."""
+
+    def __init__(
+        self, config: PresentationConfig, reader: DatasetReader | None = None
+    ) -> None:
+        self.config = config
+        self._reader = AnonymousHubReader() if reader is None else reader
+        self._resolved_revision: str | None = None
+
+    def load(self) -> ResultSnapshot:
+        revision = self._reader.resolve_revision(
+            self.config.index_dataset, self.config.index_revision
+        )
+        self._resolved_revision = revision
+        catalog_rows = self._load_catalog(revision)
+        return ResultSnapshot(
+            index_dataset=self.config.index_dataset,
+            index_revision=revision,
+            catalog_rows=tuple(catalog_rows),
+            index_rows=(),
+            runs=(),
+            trials=(),
+            executions=(),
+            metrics=(),
+            artifacts=(),
+        )
+
+    def load_publication(self, catalog: CatalogRow) -> ResultSnapshot:
+        from harbor_hf.results import ResultTables, build_catalog_row
+
+        index = _catalog_index(catalog)
+        publication = self._load_publication(index)
+        rows: dict[str, list[BaseModel]] = {name: [] for name in _TABLE_MODELS}
+        for table, values in publication.items():
+            rows[table].extend(values)
+        runs = tuple(_only(rows["runs"], RunRow))
+        tables = ResultTables(
+            publication_id=catalog.publication_id,
+            runs=list(runs),
+            trials=_only(rows["trials"], TrialRow),
+            executions=_only(rows["executions"], ExecutionRow),
+            metrics=_only(rows["metrics"], MetricRow),
+            artifacts=_only(rows["artifacts"], ArtifactRow),
+        )
+        expected = build_catalog_row(
+            tables,
+            result_dataset=catalog.result_dataset,
+            result_revision=catalog.result_revision,
+        )
+        if expected != catalog:
+            raise PresentationError(
+                f"publication {catalog.publication_id} conflicts with its catalog row"
+            )
+        return ResultSnapshot(
+            index_dataset=self.config.index_dataset,
+            index_revision=self._resolved_revision
+            or self._reader.resolve_revision(
+                self.config.index_dataset, self.config.index_revision
+            ),
+            catalog_rows=(catalog,),
+            index_rows=(index,),
+            runs=runs,
+            trials=tuple(_only(rows["trials"], TrialRow)),
+            executions=tuple(_only(rows["executions"], ExecutionRow)),
+            metrics=tuple(_only(rows["metrics"], MetricRow)),
+            artifacts=tuple(_only(rows["artifacts"], ArtifactRow)),
+        )
+
+    def rebuild_catalog(self) -> list[CatalogRow]:
+        """Rebuild catalog rows from legacy index and publication tables."""
+        from harbor_hf.results import ResultTables, build_catalog_row
+
+        revision = self._reader.resolve_revision(
+            self.config.index_dataset, self.config.index_revision
+        )
+        self._resolved_revision = revision
+        rows = []
+        for index in self._load_index(revision):
+            publication = self._load_publication(index)
+            tables = ResultTables(
+                publication_id=index.publication_id,
+                runs=_only(publication["runs"], RunRow),
+                trials=_only(publication["trials"], TrialRow),
+                executions=_only(publication["executions"], ExecutionRow),
+                metrics=_only(publication["metrics"], MetricRow),
+                artifacts=_only(publication["artifacts"], ArtifactRow),
+            )
+            rows.append(
+                build_catalog_row(
+                    tables,
+                    result_dataset=index.result_dataset,
+                    result_revision=index.result_revision,
+                )
+            )
+        return rows
+
+    def _load_catalog(self, revision: str) -> list[CatalogRow]:
+        paths = sorted(
+            path
+            for path in self._reader.list_files(self.config.index_dataset, revision)
+            if path.startswith("data/catalog/schema=v1/windows/")
+            and path.endswith(".parquet")
+        )
+        if not paths:
+            raise PresentationError(
+                "the configured index has no compact v1 catalog snapshot"
+            )
+        requested = self.config.max_publications
+        path = min(
+            paths,
+            key=lambda value: (
+                _window_size(value) < requested,
+                abs(_window_size(value) - requested),
+            ),
+        )
+        rows = [
+            _validate(CatalogRow, value, path)
+            for value in self._reader.read_rows(
+                self.config.index_dataset, revision, path
+            )
+        ]
+        unique: dict[str, CatalogRow] = {}
+        for row in rows:
+            previous = unique.get(row.publication_id)
+            if previous is not None and previous != row:
+                raise PresentationError(
+                    f"catalog has conflicting rows for publication {row.publication_id}"
+                )
+            unique[row.publication_id] = row
+        return sorted(
+            unique.values(), key=lambda item: item.completed_at, reverse=True
+        )[: self.config.max_publications]
+
+    def _load_index(self, revision: str) -> list[GlobalIndexRow]:
+        paths = sorted(
+            path
+            for path in self._reader.list_files(self.config.index_dataset, revision)
+            if path.startswith("data/index/schema=v1/") and path.endswith(".parquet")
+        )
+        if not paths:
+            raise PresentationError("the configured index has no v1 Parquet rows")
+        windows = [path for path in paths if "/windows/" in path]
+        if windows:
+            requested = self.config.max_publications
+            paths = [
+                min(
+                    windows,
+                    key=lambda path: (
+                        _window_size(path) < requested,
+                        abs(_window_size(path) - requested),
+                    ),
+                )
+            ]
+        parsed = [
+            _validate(GlobalIndexRow, value, path)
+            for path in paths
+            for value in self._reader.read_rows(
+                self.config.index_dataset, revision, path
+            )
+        ]
+        unique: dict[str, GlobalIndexRow] = {}
+        for row in parsed:
+            previous = unique.get(row.publication_id)
+            if previous is not None and previous != row:
+                raise PresentationError(
+                    f"index has conflicting rows for publication {row.publication_id}"
+                )
+            unique[row.publication_id] = row
+        return sorted(
+            unique.values(), key=lambda item: item.completed_at, reverse=True
+        )[: self.config.max_publications]
+
+    def _load_publication(self, index: GlobalIndexRow) -> dict[str, list[BaseModel]]:
+        with ThreadPoolExecutor(max_workers=len(_TABLE_MODELS)) as executor:
+            futures = {
+                table: executor.submit(self._load_table, index, table, model)
+                for table, model in _TABLE_MODELS.items()
+            }
+            publication = {table: future.result() for table, future in futures.items()}
+        _validate_publication(index, publication)
+        return publication
+
+    def _load_table(
+        self,
+        index: GlobalIndexRow,
+        table: str,
+        model: type[BaseModel],
+    ) -> list[BaseModel]:
+        path = (
+            f"data/{table}/schema=v1/campaign={index.campaign_id}/"
+            f"{index.publication_id}.parquet"
+        )
+        return [
+            _validate(model, value, path)
+            for value in self._reader.read_rows(
+                index.result_dataset, index.result_revision, path
+            )
+        ]
+
+
+def _validate_publication(
+    index: GlobalIndexRow, publication: Mapping[str, Sequence[BaseModel]]
+) -> None:
+    runs = _only(publication["runs"], RunRow)
+    trials = _only(publication["trials"], TrialRow)
+    executions = _only(publication["executions"], ExecutionRow)
+    metrics = _only(publication["metrics"], MetricRow)
+    artifacts = _only(publication["artifacts"], ArtifactRow)
+    if len(runs) != 1:
+        raise PresentationError("a publication must contain exactly one run row")
+    run = runs[0]
+    _validate_index_identity(index, run)
+    _validate_publication_trace(index, run, trials, executions, metrics, artifacts)
+    _validate_publication_relations(run, trials, executions, metrics, artifacts)
+
+
+def _validate_index_identity(index: GlobalIndexRow, run: RunRow) -> None:
+    expected = (
+        index.publication_id,
+        index.run_id,
+        index.campaign_id,
+        index.benchmark,
+        index.completed_at,
+        index.model_repo,
+        index.model_revision,
+        index.agent_name,
+        index.agent_revision,
+        index.source_checksum,
+        index.control_commit,
+    )
+    actual = (
+        run.publication_id,
+        run.run_id,
+        run.campaign_id,
+        run.benchmark,
+        run.completed_at,
+        run.model_repo,
+        run.model_revision,
+        run.agent_name,
+        run.agent_revision,
+        run.source_checksum,
+        run.control_commit,
+    )
+    if actual != expected:
+        raise PresentationError(
+            f"publication {index.publication_id} conflicts with its index row"
+        )
+
+
+def _validate_publication_trace(
+    index: GlobalIndexRow,
+    run: RunRow,
+    trials: Sequence[TrialRow],
+    executions: Sequence[ExecutionRow],
+    metrics: Sequence[MetricRow],
+    artifacts: Sequence[ArtifactRow],
+) -> None:
+    all_rows: list[TraceRow] = [run, *trials, *executions, *metrics, *artifacts]
+    if any(_trace(row) != _trace(run) for row in all_rows):
+        raise PresentationError(
+            f"publication {index.publication_id} has a mismatched trace"
+        )
+
+
+def _validate_publication_relations(
+    run: RunRow,
+    trials: Sequence[TrialRow],
+    executions: Sequence[ExecutionRow],
+    metrics: Sequence[MetricRow],
+    artifacts: Sequence[ArtifactRow],
+) -> None:
+    trial_ids = {row.trial_id for row in trials}
+    execution_ids = {row.execution_id for row in executions}
+    if len(trial_ids) != len(trials) or len(execution_ids) != len(executions):
+        raise PresentationError("publication contains duplicate child IDs")
+    if run.trial_count != len(trials) or run.execution_count != len(executions):
+        raise PresentationError("run child counts do not match normalized rows")
+    execution_by_id = {row.execution_id: row for row in executions}
+    for trial in trials:
+        selected = execution_by_id.get(trial.selected_execution_id)
+        if selected is None or selected.trial_id != trial.trial_id:
+            raise PresentationError("trial selected execution is invalid")
+    owners = {
+        "run": {run.run_id},
+        "trial": trial_ids,
+        "execution": execution_ids,
+    }
+    if any(
+        row.owner_id not in owners[row.owner_type] for row in [*metrics, *artifacts]
+    ):
+        raise PresentationError("publication row references an unknown owner")
+
+
+def _catalog_index(row: CatalogRow) -> GlobalIndexRow:
+    return GlobalIndexRow(
+        publication_id=row.publication_id,
+        run_id=row.run_id,
+        campaign_id=row.campaign_id,
+        benchmark=row.benchmark,
+        result_kind=row.result_kind,
+        outcome=row.outcome,
+        completed_at=row.completed_at,
+        model_repo=row.model_repo,
+        model_revision=row.model_revision,
+        agent_name=row.agent_name,
+        agent_revision=row.agent_revision,
+        result_dataset=row.result_dataset,
+        result_revision=row.result_revision,
+        source_checksum=row.source_checksum,
+        control_commit=row.control_commit,
+    )
+
+
+def _read_parquet(path: Path) -> list[Mapping[str, object]]:
+    values = parquet.read_table(path).to_pylist()
+    if not all(isinstance(value, Mapping) for value in values):
+        raise PresentationError(f"Parquet file {path.name} contains a non-object row")
+    return [value for value in values if isinstance(value, Mapping)]
+
+
+def _validate[Model: BaseModel](model: type[Model], value: object, path: str) -> Model:
+    try:
+        return model.model_validate(value)
+    except ValidationError as error:
+        raise PresentationError(f"invalid normalized row in {path}: {error}") from error
+
+
+def _window_size(path: str) -> int:
+    try:
+        return int(Path(path).stem)
+    except ValueError as error:
+        raise PresentationError(f"invalid index window path: {path}") from error
+
+
+def _is_commit(value: str) -> bool:
+    return len(value) in {40, 64} and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _trace(row: TraceRow) -> tuple[str, ...]:
+    return (
+        row.publication_id,
+        row.run_id,
+        row.source_bucket,
+        row.source_prefix,
+        row.source_checksum,
+        row.run_lock_path,
+        row.run_lock_sha256,
+        row.control_commit,
+    )
+
+
+def _only[T](values: Sequence[object], expected: type[T]) -> list[T]:
+    if not all(isinstance(value, expected) for value in values):
+        raise PresentationError(f"expected only {expected.__name__} rows")
+    return [value for value in values if isinstance(value, expected)]

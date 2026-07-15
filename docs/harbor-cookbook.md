@@ -295,9 +295,11 @@ rows and stable publication paths.
 
 ## 7. Deploy the optional read-only Space
 
-The repository's [`space/`](../space/) directory is ready to copy into a
-separate HF Space repository. Creating that remote Space is an operator action;
-the campaign controller and result publisher must never create or mutate it.
+The repository's Docker Space is staged from [`deploy/space/`](../deploy/space/)
+with `scripts/build_space_release.py`. Build `apps/results-web`, stage the
+release outside the checkout, and upload that directory to a separate HF Space
+repository. Creating that remote Space is an operator action; the campaign
+controller and result publisher must never create or mutate it.
 
 Set only public environment variables:
 
@@ -313,9 +315,9 @@ configured index revision to an immutable commit on each refresh, and reads
 each result publication at the exact commit in its index row. It fails closed
 on a schema or provenance mismatch and stores no authoritative state.
 
-The campaign, run, task, attempt, error, throughput, hardware, cost, and
-provenance tabs all show `OUTCOME · KIND`, for example
-`COMPLETE · ORDINARY`, `PARTIAL · COMPOSITE`, or `COMPLETE · MANUAL`.
+The Space exposes a versioned read-only API plus run, campaign, task,
+comparison, configuration, artifact-metadata, and provenance views. Stable
+routes can be shared without granting access to private canonical evidence.
 
 ## Final operational checklist
 
