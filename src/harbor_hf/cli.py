@@ -390,29 +390,6 @@ def results_publish(
     _echo_json(result.model_dump(mode="json"))
 
 
-@results_app.command("migrate-catalog-v2")
-def results_migrate_catalog_v2(
-    index_dataset: Annotated[str, typer.Argument()],
-    namespace: Annotated[str, typer.Option("--namespace")],
-    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
-) -> None:
-    """Build a v2 catalog over existing immutable result publications."""
-    del output_format
-    try:
-        token = get_token()
-        if token is None:
-            raise ValueError("catalog migration requires HF authentication")
-        api = HfApi()
-        result = HubDatasetPublisher(
-            publisher_id="cli-catalog-v2-migration",
-            leases=HubClaimStore(namespace, token),
-            api=cast(DatasetApi, api),
-        ).migrate_catalog_v2(index_dataset)
-    except _OPERATION_ERRORS as error:
-        _exit_operation(error)
-    _echo_json(result.model_dump(mode="json"))
-
-
 @automation_app.command("install")
 def automation_install(
     manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],

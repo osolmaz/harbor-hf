@@ -25,7 +25,7 @@ from harbor_hf.publication_envelope import (
     ObjectReference,
     PhysicalExecutionReference,
     ProfileDigests,
-    PublicationEnvelopeV2,
+    PublicationEnvelope,
     RuntimeIdentity,
     canonical_json_bytes,
     object_reference,
@@ -203,7 +203,7 @@ class BucketCampaignFinalizer:
             path=f"{campaign.artifact_prefix}/{summary_path}",
             content=summary,
         )
-        envelope = PublicationEnvelopeV2(
+        envelope = PublicationEnvelope(
             run_id=run.run_id,
             campaign_id=campaign.campaign_id,
             created_at=configuration.created_at,
@@ -384,6 +384,10 @@ class BucketCampaignFinalizer:
             execution_prefix,
             absolute_prefix,
         )
+        if evidence.status == "succeeded" and bundle is None:
+            raise CampaignFinalizationError(
+                "successful execution has no verified Harbor native bundle"
+            )
         return _ExecutionRecord(
             evidence=evidence,
             physical_execution=PhysicalExecutionReference(
@@ -395,15 +399,7 @@ class BucketCampaignFinalizer:
                 completed_at=evidence.completed_at,
                 retry_reason=evidence.retry_reason,
                 remote_job_id=evidence.remote_job_id,
-                bundle_status=(
-                    "verified"
-                    if bundle is not None
-                    else (
-                        "legacy_unavailable"
-                        if evidence.status == "succeeded"
-                        else "not_available"
-                    )
-                ),
+                bundle_status="verified" if bundle is not None else "not_available",
                 harbor_bundle=bundle,
             ),
         )

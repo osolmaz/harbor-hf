@@ -262,13 +262,85 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
         "run.lock.json": json.dumps({"run_id": run.run_id}).encode(),
         "run-summary.json": json.dumps(summary).encode(),
     }
+    execution_prefix = f"trials/{trial.trial_id}/executions/execution-one"
+    manifest_path = f"{execution_prefix}/harbor-native-bundle.json"
+    archive_path = f"{execution_prefix}/artifacts.tar.gz"
+    files[manifest_path] = b"native bundle manifest"
+    files[archive_path] = b"native bundle archive"
+    prefix = f"{snapshot.lock.artifact_prefix}/runs/{run.run_id}"
+    run_lock = files["run.lock.json"]
+    files["publication-envelope.v1.json"] = json.dumps(
+        {
+            "schema_version": "harbor-hf/publication-envelope/v1",
+            "run_id": run.run_id,
+            "campaign_id": snapshot.lock.campaign_id,
+            "created_at": created.isoformat(),
+            "completed_at": (created + timedelta(minutes=1)).isoformat(),
+            "evidence_bucket": "example/benchmark-runs",
+            "evidence_prefix": prefix,
+            "run_lock": {
+                "path": "run.lock.json",
+                "digest": f"sha256:{hashlib.sha256(run_lock).hexdigest()}",
+                "size_bytes": len(run_lock),
+            },
+            "profiles": {
+                "experiment": "sha256:" + "1" * 64,
+                "model": "sha256:" + "2" * 64,
+                "deployment": "sha256:" + "3" * 64,
+                "agent": "sha256:" + "4" * 64,
+            },
+            "runtime": {
+                "kind": "endpoint",
+                "provider": "huggingface",
+                "region": "aws-us-east-1",
+                "hardware": "cpu-basic",
+                "accelerator_count": 0,
+            },
+            "sanitizer_version": "harbor-hf/public-results/v1",
+            "projection_version": "harbor-hf/results-projection/v1",
+            "cleanup_outcome": "verified",
+            "executions": [
+                {
+                    "execution_id": "execution-one",
+                    "trial_id": trial.trial_id,
+                    "physical_attempt": 1,
+                    "status": "succeeded",
+                    "started_at": created.isoformat(),
+                    "completed_at": (created + timedelta(minutes=1)).isoformat(),
+                    "retry_reason": None,
+                    "remote_job_id": "job-one",
+                    "bundle_status": "verified",
+                    "harbor_bundle": {
+                        "manifest": {
+                            "path": manifest_path,
+                            "digest": "sha256:"
+                            + hashlib.sha256(files[manifest_path]).hexdigest(),
+                            "size_bytes": len(files[manifest_path]),
+                        },
+                        "archive": {
+                            "path": archive_path,
+                            "digest": "sha256:"
+                            + hashlib.sha256(files[archive_path]).hexdigest(),
+                            "size_bytes": len(files[archive_path]),
+                        },
+                        "harbor_revision": "a" * 40,
+                        "harbor_version": "0.1.0",
+                        "compatibility_schema": (
+                            "harbor-hf/harbor-compatibility/v1alpha3"
+                        ),
+                        "request_digest": "sha256:" + "5" * 64,
+                        "document_count": 2,
+                    },
+                }
+            ],
+        }
+    ).encode()
     checksums = {
         path: f"sha256:{hashlib.sha256(content).hexdigest()}"
         for path, content in files.items()
     }
     files["checksums.json"] = json.dumps(checksums).encode()
     files["_SUCCESS"] = b""
-    prefix = f"{snapshot.lock.artifact_prefix}/runs/{run.run_id}"
     return MemoryEvidence(prefix, files)
 
 

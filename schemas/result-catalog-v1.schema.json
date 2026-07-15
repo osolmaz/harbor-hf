@@ -52,17 +52,9 @@
       "type": "number"
     },
     "envelope_sha256": {
-      "anyOf": [
-        {
-          "pattern": "^sha256:[0-9a-f]{64}$",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Envelope Sha256"
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Envelope Sha256",
+      "type": "string"
     },
     "execution_count": {
       "minimum": 0,
@@ -70,7 +62,7 @@
       "type": "integer"
     },
     "harbor_bundle_count": {
-      "minimum": 0,
+      "minimum": 1,
       "title": "Harbor Bundle Count",
       "type": "integer"
     },
@@ -105,29 +97,14 @@
       "type": "integer"
     },
     "projection_path": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Projection Path"
+      "minLength": 1,
+      "title": "Projection Path",
+      "type": "string"
     },
     "projection_sha256": {
-      "anyOf": [
-        {
-          "pattern": "^sha256:[0-9a-f]{64}$",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Projection Sha256"
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Projection Sha256",
+      "type": "string"
     },
     "provider": {
       "minLength": 1,
@@ -165,8 +142,8 @@
       "type": "string"
     },
     "schema_version": {
-      "const": "harbor-hf/results/catalog/v2",
-      "default": "harbor-hf/results/catalog/v2",
+      "const": "harbor-hf/results/catalog/v1",
+      "default": "harbor-hf/results/catalog/v1",
       "title": "Schema Version",
       "type": "string"
     },
@@ -177,14 +154,6 @@
     "source_checksum": {
       "pattern": "^sha256:[0-9a-f]{64}$",
       "title": "Source Checksum",
-      "type": "string"
-    },
-    "source_format": {
-      "enum": [
-        "native-v2",
-        "legacy-v1"
-      ],
-      "title": "Source Format",
       "type": "string"
     },
     "trial_count": {
@@ -221,9 +190,11 @@
     "result_revision",
     "source_checksum",
     "control_commit",
-    "source_format",
+    "projection_path",
+    "projection_sha256",
+    "envelope_sha256",
     "harbor_bundle_count"
   ],
-  "title": "CatalogRowV2",
+  "title": "CatalogRow",
   "type": "object"
 }

@@ -23,6 +23,7 @@ from harbor_hf.result_publisher import (
     PublicationConflict,
 )
 from harbor_hf.results import (
+    PublicationProvenance,
     ResultPublication,
     ResultTables,
     RunRow,
@@ -88,6 +89,13 @@ def _publication() -> ResultPublication:
             executions=[],
             metrics=[],
             artifacts=[],
+            provenance=PublicationProvenance(
+                envelope_sha256="sha256:" + "7" * 64,
+                projection_version="harbor-hf/results-projection/v1",
+                sanitizer_version="harbor-hf/public-results/v1",
+                harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
+                harbor_archive_sha256s=["sha256:" + "9" * 64],
+            ),
         )
     )
 
@@ -196,7 +204,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "11e750a73a67f47e314c7ce77746be455ad5fd6f521f239ba26a7fa572d23f1c"
+        "73c4a9649a9aa332b82986b675f449b1d7de46c67c3f664b0bb3b38e9f3b4d97"
     )
 
 

@@ -168,8 +168,8 @@ defines the hard cutover from duplicated result models to canonical Harbor
 bundles, a minimal Hugging Face execution envelope, and rebuildable query
 projections. The [field ownership inventory](docs/result-field-ownership.md)
 records each projected value's authority, and checked-in JSON Schemas under
-[`schemas/`](schemas/) define the publication contracts that the cutover will
-replace in place under the `v1` identifier. The
+[`schemas/`](schemas/) define the single canonical publication contract under
+the `v1` identifier. The
 [implementation plan](docs/implementation-plan.md) tracks the complete path to
 remote execution.
 

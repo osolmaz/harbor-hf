@@ -22,7 +22,7 @@ from harbor_hf.presentation.repository import (
 from harbor_hf.presentation.service import ResultService
 from harbor_hf.results import (
     ArtifactRow,
-    CatalogRowV2,
+    CatalogRow,
     ExecutionRow,
     GlobalIndexRow,
     MetricRow,
@@ -32,8 +32,6 @@ from harbor_hf.results import (
     TrialRow,
     build_catalog_lookup_file,
     build_catalog_row,
-    build_catalog_row_v2,
-    build_catalog_v2_lookup_file,
     build_result_publication,
 )
 
@@ -113,19 +111,9 @@ class FakeReader:
             self.rows[("org/index", INDEX_REVISION, index_path)] = [
                 index.model_dump(mode="python")
             ]
-            for table in ("runs", "trials", "executions", "metrics", "artifacts"):
-                values = [
-                    row
-                    for row in getattr(snapshot, table)
-                    if row.publication_id == index.publication_id
-                ]
-                path = (
-                    f"data/{table}/schema=v1/campaign={index.campaign_id}/"
-                    f"{index.publication_id}.parquet"
-                )
-                self.rows[("org/results", RESULT_REVISION, path)] = [
-                    row.model_dump(mode="python") for row in values
-                ]
+            publication = build_result_publication(_tables_for(snapshot, index))
+            for item in publication.files:
+                self.bytes[("org/results", RESULT_REVISION, item.path)] = item.content
 
     def resolve_revision(self, dataset: str, revision: str) -> str:
         assert (dataset, revision) == ("org/index", "main")
@@ -146,24 +134,75 @@ class FakeReader:
         return self.bytes[(dataset, revision, path)]
 
 
+def _provenance(publication_id: str) -> PublicationProvenance:
+    identity = str(sum(publication_id.encode()) % 10)
+    return PublicationProvenance(
+        envelope_sha256="sha256:" + identity * 64,
+        projection_version="harbor-hf/results-projection/v1",
+        sanitizer_version="harbor-hf/public-results/v1",
+        harbor_bundle_manifest_sha256s=["sha256:" + "2" * 64],
+        harbor_archive_sha256s=["sha256:" + "3" * 64],
+    )
+
+
+def _tables_from_row(
+    row: tuple[
+        GlobalIndexRow,
+        RunRow,
+        TrialRow,
+        ExecutionRow,
+        MetricRow,
+        ArtifactRow,
+    ],
+) -> ResultTables:
+    return ResultTables(
+        publication_id=row[0].publication_id,
+        runs=[row[1]],
+        trials=[row[2]],
+        executions=[row[3]],
+        metrics=[row[4]],
+        artifacts=[row[5]],
+        provenance=_provenance(row[0].publication_id),
+    )
+
+
+def _tables_for(snapshot: ResultSnapshot, index: GlobalIndexRow) -> ResultTables:
+    publication_id = index.publication_id
+    return ResultTables(
+        publication_id=publication_id,
+        runs=[row for row in snapshot.runs if row.publication_id == publication_id],
+        trials=[row for row in snapshot.trials if row.publication_id == publication_id],
+        executions=[
+            row for row in snapshot.executions if row.publication_id == publication_id
+        ],
+        metrics=[
+            row for row in snapshot.metrics if row.publication_id == publication_id
+        ],
+        artifacts=[
+            row for row in snapshot.artifacts if row.publication_id == publication_id
+        ],
+        provenance=_provenance(publication_id),
+    )
+
+
+def _catalog_for_tables(tables: ResultTables) -> CatalogRow:
+    publication = build_result_publication(tables)
+    projection = next(
+        item for item in publication.files if item.path.startswith("projections/")
+    )
+    return build_catalog_row(
+        tables,
+        result_dataset="org/results",
+        result_revision=RESULT_REVISION,
+        projection=projection,
+    )
+
+
 @pytest.fixture
 def snapshot() -> ResultSnapshot:
     rows = [_publication(1, 1.0), _publication(2, 0.0)]
-    catalogs = [
-        build_catalog_row(
-            ResultTables(
-                publication_id=row[0].publication_id,
-                runs=[row[1]],
-                trials=[row[2]],
-                executions=[row[3]],
-                metrics=[row[4]],
-                artifacts=[row[5]],
-            ),
-            result_dataset="org/results",
-            result_revision=RESULT_REVISION,
-        )
-        for row in rows
-    ]
+    tables = [_tables_from_row(row) for row in rows]
+    catalogs = [_catalog_for_tables(value) for value in tables]
     return ResultSnapshot(
         index_dataset="org/index",
         index_revision=INDEX_REVISION,
@@ -239,101 +278,40 @@ def test_repository_loads_exact_revisions_and_validates_trace(
     assert reader.read_calls[0].endswith("windows/0004.parquet")
     detail = repository.load_publication(loaded.catalog_rows[0])
     assert len(detail.runs) == 1
-    rebuilt = repository.rebuild_catalog()
-    assert {row.run_id: row.score for row in rebuilt} == {
-        "run-1": 1.0,
-        "run-2": 0.0,
-    }
     assert all(
         revision in {INDEX_REVISION, RESULT_REVISION}
         for _dataset, revision, _path in reader.rows
     )
 
     run_path = "data/runs/schema=v1/campaign=campaign-1/publication-1.parquet"
-    reader.rows[("org/results", RESULT_REVISION, run_path)][0]["source_checksum"] = (
-        "sha256:" + "0" * 64
-    )
-    with pytest.raises(PresentationError, match="conflicts with its index row"):
+    reader.bytes[("org/results", RESULT_REVISION, run_path)] += b"tampered"
+    with pytest.raises(PresentationError, match="table checksum differs"):
         repository.load_publication(
             next(row for row in loaded.catalog_rows if row.run_id == "run-1")
         )
 
 
-def test_repository_prefers_and_verifies_native_v2_catalog(
+def test_repository_verifies_canonical_catalog(
     snapshot: ResultSnapshot,
 ) -> None:
-    index = snapshot.index_rows[0]
-    tables = ResultTables(
-        publication_id=index.publication_id,
-        runs=[
-            row for row in snapshot.runs if row.publication_id == index.publication_id
-        ],
-        trials=[
-            row for row in snapshot.trials if row.publication_id == index.publication_id
-        ],
-        executions=[
-            row
-            for row in snapshot.executions
-            if row.publication_id == index.publication_id
-        ],
-        metrics=[
-            row
-            for row in snapshot.metrics
-            if row.publication_id == index.publication_id
-        ],
-        artifacts=[
-            row
-            for row in snapshot.artifacts
-            if row.publication_id == index.publication_id
-        ],
-        provenance=PublicationProvenance(
-            envelope_sha256="sha256:" + "1" * 64,
-            projection_version="harbor-hf/results-projection/v2",
-            sanitizer_version="harbor-hf/public-results/v1",
-            harbor_bundle_manifest_sha256s=["sha256:" + "2" * 64],
-            harbor_archive_sha256s=["sha256:" + "3" * 64],
-        ),
-    )
-    publication = build_result_publication(tables)
-    projection = next(
-        item for item in publication.files if item.path.startswith("projections/")
-    )
-    catalog = build_catalog_row_v2(
-        tables,
-        result_dataset="org/results",
-        result_revision=RESULT_REVISION,
-        projection=projection,
-    )
     reader = FakeReader(snapshot)
-    for size in (4, 8):
-        path = f"data/catalog/schema=v2/windows/{size:04d}.parquet"
-        reader.files.append(path)
-        reader.rows[("org/index", INDEX_REVISION, path)] = [
-            catalog.model_dump(mode="python")
-        ]
-    lookup = build_catalog_v2_lookup_file(catalog)
-    reader.rows[("org/index", INDEX_REVISION, lookup.path)] = [
-        catalog.model_dump(mode="python")
-    ]
-    for item in publication.files:
-        reader.bytes[("org/results", RESULT_REVISION, item.path)] = item.content
-
     repository = ResultRepository(
         PresentationConfig("org/index", max_publications=2), reader
     )
     loaded = repository.load()
+    catalog = loaded.catalog_rows[0]
 
-    assert isinstance(loaded.catalog_rows[0], CatalogRowV2)
-    assert loaded.catalog_rows[0].source_format == "native-v2"
-    assert repository.load_publication(loaded.catalog_rows[0]).runs[0].run_id == (
-        index.run_id
+    assert isinstance(catalog, CatalogRow)
+    assert catalog.projection_path.startswith("projections/schema=v1/")
+    assert repository.load_publication(catalog).runs[0].run_id == catalog.run_id
+    reader.bytes[("org/results", RESULT_REVISION, catalog.projection_path)] += (
+        b"tampered"
     )
-    reader.bytes[("org/results", RESULT_REVISION, projection.path)] += b"tampered"
     with pytest.raises(PresentationError, match="manifest checksum differs"):
-        repository.load_publication(loaded.catalog_rows[0])
+        repository.load_publication(catalog)
 
 
-def test_repository_rejects_malformed_rows_and_broken_relations(
+def test_repository_rejects_tampered_projected_table(
     snapshot: ResultSnapshot,
 ) -> None:
     reader = FakeReader(snapshot)
@@ -344,23 +322,8 @@ def test_repository_rejects_malformed_rows_and_broken_relations(
         row for row in repository.load().catalog_rows if row.run_id == "run-1"
     )
     metric_path = "data/metrics/schema=v1/campaign=campaign-1/publication-1.parquet"
-    metric = reader.rows[("org/results", RESULT_REVISION, metric_path)][0]
-    metric["value"] = float("nan")
-    with pytest.raises(PresentationError, match="invalid normalized row"):
-        repository.load_publication(catalog)
-
-    metric["value"] = 1.0
-    execution_path = (
-        "data/executions/schema=v1/campaign=campaign-1/publication-1.parquet"
-    )
-    execution = reader.rows[("org/results", RESULT_REVISION, execution_path)][0]
-    execution["trial_id"] = "unknown-trial"
-    with pytest.raises(PresentationError, match="unknown trial"):
-        repository.load_publication(catalog)
-
-    execution["trial_id"] = "trial-1"
-    execution["status"] = "failed_infrastructure"
-    with pytest.raises(PresentationError, match="selected execution"):
+    reader.bytes[("org/results", RESULT_REVISION, metric_path)] += b"tampered"
+    with pytest.raises(PresentationError, match="table checksum differs"):
         repository.load_publication(catalog)
 
 
@@ -445,13 +408,10 @@ def test_catalog_uses_valid_nonstandard_reward_names() -> None:
         executions=[execution],
         metrics=[renamed],
         artifacts=[artifact],
+        provenance=_provenance(run.publication_id),
     )
 
-    catalog = build_catalog_row(
-        tables,
-        result_dataset="org/results",
-        result_revision=RESULT_REVISION,
-    )
+    catalog = _catalog_for_tables(tables)
 
     assert catalog.score == 0.75
     assert catalog.passed_trials == 0
@@ -470,13 +430,10 @@ def test_catalog_prefers_primary_reward_over_secondary_metrics() -> None:
         executions=[execution],
         metrics=[speed, metric],
         artifacts=[artifact],
+        provenance=_provenance(run.publication_id),
     )
 
-    catalog = build_catalog_row(
-        tables,
-        result_dataset="org/results",
-        result_revision=RESULT_REVISION,
-    )
+    catalog = _catalog_for_tables(tables)
 
     assert catalog.score == 1.0
     assert catalog.passed_trials == 1

@@ -80,7 +80,6 @@
         "bundle_status": {
           "enum": [
             "verified",
-            "legacy_unavailable",
             "not_available"
           ],
           "title": "Bundle Status",
@@ -291,8 +290,8 @@
       "$ref": "#/$defs/ProfileDigests"
     },
     "projection_version": {
-      "const": "harbor-hf/results-projection/v2",
-      "default": "harbor-hf/results-projection/v2",
+      "const": "harbor-hf/results-projection/v1",
+      "default": "harbor-hf/results-projection/v1",
       "title": "Projection Version",
       "type": "string"
     },
@@ -314,8 +313,8 @@
       "type": "string"
     },
     "schema_version": {
-      "const": "harbor-hf/publication-envelope/v2",
-      "default": "harbor-hf/publication-envelope/v2",
+      "const": "harbor-hf/publication-envelope/v1",
+      "default": "harbor-hf/publication-envelope/v1",
       "title": "Schema Version",
       "type": "string"
     }
@@ -333,6 +332,6 @@
     "cleanup_outcome",
     "executions"
   ],
-  "title": "PublicationEnvelopeV2",
+  "title": "PublicationEnvelope",
   "type": "object"
 }

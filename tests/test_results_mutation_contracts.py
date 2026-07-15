@@ -180,6 +180,87 @@ def _reader() -> RecordingEvidence:
         "verification.json": artifact,
         "logs/controller.jsonl": b'{"event":"complete"}\n',
     }
+    bundles: dict[str, dict[str, object]] = {}
+    for execution_id, trial_id in (
+        ("execution-z", "trial-z"),
+        ("execution-b", "trial-a"),
+    ):
+        prefix = f"trials/{trial_id}/executions/{execution_id}"
+        manifest_path = f"{prefix}/harbor-native-bundle.json"
+        archive_path = f"{prefix}/artifacts.tar.gz"
+        manifest = f"manifest for {execution_id}".encode()
+        archive = f"archive for {execution_id}".encode()
+        files[manifest_path] = manifest
+        files[archive_path] = archive
+        bundles[execution_id] = {
+            "manifest": {
+                "path": manifest_path,
+                "digest": _sha256(manifest),
+                "size_bytes": len(manifest),
+            },
+            "archive": {
+                "path": archive_path,
+                "digest": _sha256(archive),
+                "size_bytes": len(archive),
+            },
+            "harbor_revision": "a" * 40,
+            "harbor_version": "0.1.0",
+            "compatibility_schema": "harbor-hf/harbor-compatibility/v1alpha3",
+            "request_digest": "sha256:" + "a" * 64,
+            "document_count": 2,
+        }
+    run_lock = files["run.lock.json"]
+    files["publication-envelope.v1.json"] = _json_bytes(
+        {
+            "schema_version": "harbor-hf/publication-envelope/v1",
+            "run_id": "run-mutation",
+            "campaign_id": "campaign-mutation",
+            "created_at": NOW.isoformat(),
+            "completed_at": (NOW + timedelta(minutes=5)).isoformat(),
+            "evidence_bucket": SOURCE.bucket,
+            "evidence_prefix": SOURCE.prefix,
+            "run_lock": {
+                "path": "run.lock.json",
+                "digest": _sha256(run_lock),
+                "size_bytes": len(run_lock),
+            },
+            "profiles": {
+                "experiment": "sha256:" + "1" * 64,
+                "model": "sha256:" + "2" * 64,
+                "deployment": "sha256:" + "3" * 64,
+                "agent": "sha256:" + "4" * 64,
+            },
+            "runtime": {
+                "kind": "endpoint",
+                "provider": "huggingface",
+                "region": "aws-us-east-1",
+                "hardware": "a100",
+                "accelerator_count": 2,
+            },
+            "sanitizer_version": "harbor-hf/public-results/v1",
+            "projection_version": "harbor-hf/results-projection/v1",
+            "cleanup_outcome": "verified",
+            "executions": [
+                {
+                    "execution_id": record["execution_id"],
+                    "trial_id": record["trial_id"],
+                    "physical_attempt": record["physical_attempt"],
+                    "status": record["status"],
+                    "started_at": record["started_at"],
+                    "completed_at": record["completed_at"],
+                    "retry_reason": record["retry_reason"],
+                    "remote_job_id": record["remote_job_id"],
+                    "bundle_status": (
+                        "verified"
+                        if record["execution_id"] in bundles
+                        else "not_available"
+                    ),
+                    "harbor_bundle": bundles.get(record["execution_id"]),
+                }
+                for record in summary["executions"]
+            ],
+        }
+    )
     files["checksums.json"] = _json_bytes(
         {path: _sha256(content) for path, content in files.items()}
     )
@@ -199,7 +280,7 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
     index_file = build_index_file(index_row)
 
     assert _canonical_hash(tables.model_dump(mode="json")) == (
-        "645b795511e0e1d29c18d0f4bd0bda7d870d461ef7db923a131d9d388c5cfbc9"
+        "12dc4803bccfc4bf4e660be626de8444ee7b2bab20d9decd280aad589067dce2"
     )
     assert (
         _canonical_hash(
@@ -221,14 +302,15 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
                 "index_size": len(index_file.content),
             }
         )
-        == "daf7009da69b3692ff515608388cc98b9c2c13bb1d4e72a69098826d21b6a9d1"
+        == "9361173e9823753d9e0e2ff3e9bc0d89ea0d2f5edaf7f59513fe5859ac42f099"
     )
     assert [_sha256(item.content) for item in publication.files] == [
-        "sha256:c1db979ec612be71707303f73a6c8ebd2d92cfc630636e80be984c6d2a6ebd7a",
-        "sha256:fb6c0dea894eda9a7e73adbe60a0dfcc2253573c7cd051d7abc023ac33420b18",
-        "sha256:d7a557fa895d1bd46745c8f7c7fedd6ebc19c8e2377871c418073b7c063119ab",
-        "sha256:71bf2bc5966cf40c1ea4f475313dc5eef9ac7a4601be05fca2bc13c823424df1",
-        "sha256:89de30051694da42e63fc7033ddb71f0260dc244b95dd1ab371606dea6cbad99",
+        "sha256:6d9cfa821ae2dea4121b2401c413fc3446896512003c5a70f3d8ceef31e6a633",
+        "sha256:e82a159092b41008572a41303fe2a869536aac5e7e3ee5c735facef7f2ff2eab",
+        "sha256:f6a5af37074f9c372349b959ab1d08bc0c1c68a931daba00330e83a7ea239b0c",
+        "sha256:86c6b8c11017ff40ba471c128f3835c84eaf99b872fff0f095f6e1182b45f49a",
+        "sha256:b137c3ee948a2f89ee3948fe52553ddc21373895d4450a34560a51bcaea66b3d",
+        "sha256:7fd3d542c9eb85c482cccbce84b86fd11f493cafcae07b237faaee9f9008a72d",
     ]
 
     common = ("hf://buckets/private-evidence", SOURCE.prefix)
@@ -236,12 +318,26 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
         ("list", *common, None),
         ("read", *common, "checksums.json"),
         ("read", *common, "logs/controller.jsonl"),
+        ("read", *common, "publication-envelope.v1.json"),
         ("read", *common, "run-summary.json"),
         ("read", *common, "run.lock.json"),
+        ("read", *common, "trials/trial-a/executions/execution-b/artifacts.tar.gz"),
+        (
+            "read",
+            *common,
+            "trials/trial-a/executions/execution-b/harbor-native-bundle.json",
+        ),
+        ("read", *common, "trials/trial-z/executions/execution-z/artifacts.tar.gz"),
+        (
+            "read",
+            *common,
+            "trials/trial-z/executions/execution-z/harbor-native-bundle.json",
+        ),
         ("read", *common, "verification.json"),
         ("read", *common, "run-summary.json"),
         ("read", *common, "run.lock.json"),
         ("read", *common, "verification.json"),
+        ("read", *common, "publication-envelope.v1.json"),
     ]
 
 

@@ -271,17 +271,11 @@ The publisher also updates consolidated power-of-two index windows from 1 to
 publication limit, keeping refresh requests and bytes bounded as the immutable
 per-publication index archive grows.
 
-To introduce the v2 catalog before another benchmark publication, migrate the
-existing immutable v1 catalog in place:
-
-```bash
-uv run harbor-hf results migrate-catalog-v2 organization/harbor-results-index \
-  --namespace organization --format json
-```
-
-This operation is leased and idempotent. Existing publications become explicit
-`legacy-v1` rows; later native v2 publications replace only their matching
-catalog entries with checksummed envelope and archive provenance.
+The publisher accepts only canonical v1 evidence with a verified native Harbor
+bundle. It writes one checksummed projection and one catalog contract under the
+v1 paths. Datasets from the superseded dual-publication format must be archived
+and rebuilt from verified private evidence before they are configured as the
+active Results Dataset; there is no mixed-version reader or migration shim.
 
 Ordinary complete runs are the default comparable result class. Partial,
 composite, and manually selected results require an explicit publication path

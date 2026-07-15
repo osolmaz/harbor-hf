@@ -17,23 +17,20 @@ from pydantic import BaseModel, ValidationError
 from harbor_hf.presentation.config import PresentationConfig
 from harbor_hf.results import (
     ArtifactRow,
-    CatalogEntry,
     CatalogRow,
-    CatalogRowV2,
     DatasetFile,
     ExecutionRow,
     GlobalIndexRow,
     MetricRow,
     ProjectionFileReference,
     PublicationProvenance,
-    ResultProjectionV2,
+    ResultProjection,
     RunRow,
     TableName,
     TraceRow,
     TrialRow,
-    build_catalog_row_v2,
+    build_catalog_row,
     catalog_lookup_path,
-    catalog_v2_lookup_path,
 )
 
 _TABLE_MODELS: dict[TableName, type[BaseModel]] = {
@@ -168,7 +165,7 @@ class AnonymousHubReader:
 class ResultSnapshot:
     index_dataset: str
     index_revision: str
-    catalog_rows: tuple[CatalogEntry, ...]
+    catalog_rows: tuple[CatalogRow, ...]
     index_rows: tuple[GlobalIndexRow, ...]
     runs: tuple[RunRow, ...]
     trials: tuple[TrialRow, ...]
@@ -205,8 +202,8 @@ class ResultRepository:
             artifacts=(),
         )
 
-    def load_publication(self, catalog: CatalogEntry) -> ResultSnapshot:
-        from harbor_hf.results import ResultTables, build_catalog_row
+    def load_publication(self, catalog: CatalogRow) -> ResultSnapshot:
+        from harbor_hf.results import ResultTables
 
         index = _catalog_index(catalog)
         projection, projection_file = self._load_projection(catalog)
@@ -224,19 +221,11 @@ class ResultRepository:
             artifacts=_only(rows["artifacts"], ArtifactRow),
             provenance=_projection_provenance(projection),
         )
-        expected = (
-            build_catalog_row_v2(
-                tables,
-                result_dataset=catalog.result_dataset,
-                result_revision=catalog.result_revision,
-                projection=projection_file,
-            )
-            if isinstance(catalog, CatalogRowV2)
-            else build_catalog_row(
-                tables,
-                result_dataset=catalog.result_dataset,
-                result_revision=catalog.result_revision,
-            )
+        expected = build_catalog_row(
+            tables,
+            result_dataset=catalog.result_dataset,
+            result_revision=catalog.result_revision,
+            projection=projection_file,
         )
         if expected != catalog:
             raise PresentationError(
@@ -257,82 +246,42 @@ class ResultRepository:
             artifacts=tuple(_only(rows["artifacts"], ArtifactRow)),
         )
 
-    def find_catalog(self, run_id: str) -> CatalogEntry:
+    def find_catalog(self, run_id: str) -> CatalogRow:
         """Resolve a stable run link outside the configured list-page window."""
         revision = self._current_revision()
-        for path, model in (
-            (catalog_v2_lookup_path(run_id), CatalogRowV2),
-            (catalog_lookup_path(run_id), CatalogRow),
-        ):
-            try:
-                rows = [
-                    _validate(model, value, path)
-                    for value in self._reader.read_rows(
-                        self.config.index_dataset, revision, path
-                    )
-                ]
-                if len(rows) != 1 or rows[0].run_id != run_id:
-                    raise PresentationError(
-                        f"catalog lookup for {run_id} is inconsistent"
-                    )
-                return rows[0]
-            except (DatasetPathNotFound, KeyError):
-                continue
+        path = catalog_lookup_path(run_id)
+        try:
+            rows = [
+                _validate(CatalogRow, value, path)
+                for value in self._reader.read_rows(
+                    self.config.index_dataset, revision, path
+                )
+            ]
+            if len(rows) != 1 or rows[0].run_id != run_id:
+                raise PresentationError(f"catalog lookup for {run_id} is inconsistent")
+            return rows[0]
+        except (DatasetPathNotFound, KeyError):
+            pass
         rows = self._load_catalog(revision, largest=True)
         for row in rows:
             if row.run_id == run_id:
                 return row
         raise KeyError(run_id)
 
-    def rebuild_catalog(self) -> list[CatalogRow]:
-        """Rebuild catalog rows from legacy index and publication tables."""
-        from harbor_hf.results import ResultTables, build_catalog_row
-
-        revision = self._reader.resolve_revision(
-            self.config.index_dataset, self.config.index_revision
-        )
-        self._resolved_revision = revision
-        rows = []
-        for index in self._load_index(revision):
-            publication = self._load_publication(index)
-            tables = ResultTables(
-                publication_id=index.publication_id,
-                runs=_only(publication["runs"], RunRow),
-                trials=_only(publication["trials"], TrialRow),
-                executions=_only(publication["executions"], ExecutionRow),
-                metrics=_only(publication["metrics"], MetricRow),
-                artifacts=_only(publication["artifacts"], ArtifactRow),
-            )
-            rows.append(
-                build_catalog_row(
-                    tables,
-                    result_dataset=index.result_dataset,
-                    result_revision=index.result_revision,
-                )
-            )
-        return rows
-
     def _load_projection(
-        self, catalog: CatalogEntry
-    ) -> tuple[ResultProjectionV2 | None, DatasetFile | None]:
-        if (
-            not isinstance(catalog, CatalogRowV2)
-            or catalog.source_format == "legacy-v1"
-        ):
-            return None, None
+        self, catalog: CatalogRow
+    ) -> tuple[ResultProjection, DatasetFile]:
         path = catalog.projection_path
         expected_digest = catalog.projection_sha256
-        if path is None or expected_digest is None:
-            raise PresentationError("native v2 catalog has no projection reference")
         content = self._reader.read_bytes(
             catalog.result_dataset, catalog.result_revision, path
         )
         if _sha256(content) != expected_digest:
-            raise PresentationError("v2 projection manifest checksum differs")
+            raise PresentationError("projection manifest checksum differs")
         try:
-            projection = ResultProjectionV2.model_validate_json(content)
+            projection = ResultProjection.model_validate_json(content)
         except ValidationError as error:
-            raise PresentationError("v2 projection manifest is invalid") from error
+            raise PresentationError("projection manifest is invalid") from error
         if (
             projection.publication_id != catalog.publication_id
             or projection.run_id != catalog.run_id
@@ -341,20 +290,14 @@ class ResultRepository:
             or projection.envelope_sha256 != catalog.envelope_sha256
             or len(projection.harbor_archive_sha256s) != catalog.harbor_bundle_count
         ):
-            raise PresentationError("v2 projection manifest conflicts with catalog")
+            raise PresentationError("projection manifest conflicts with catalog")
         return projection, DatasetFile(path=path, content=content)
 
     def _load_catalog(
         self, revision: str, *, largest: bool = False
-    ) -> list[CatalogEntry]:
+    ) -> list[CatalogRow]:
         all_paths = self._reader.list_files(self.config.index_dataset, revision)
-        v2_paths = sorted(
-            path
-            for path in all_paths
-            if path.startswith("data/catalog/schema=v2/windows/")
-            and path.endswith(".parquet")
-        )
-        paths = v2_paths or sorted(
+        paths = sorted(
             path
             for path in all_paths
             if path.startswith("data/catalog/schema=v1/windows/")
@@ -376,14 +319,13 @@ class ResultRepository:
                 ),
             )
         )
-        model = CatalogRowV2 if v2_paths else CatalogRow
         rows = [
-            _validate(model, value, path)
+            _validate(CatalogRow, value, path)
             for value in self._reader.read_rows(
                 self.config.index_dataset, revision, path
             )
         ]
-        unique: dict[str, CatalogEntry] = {}
+        unique: dict[str, CatalogRow] = {}
         for row in rows:
             previous = unique.get(row.publication_id)
             if previous is not None and previous != row:
@@ -433,7 +375,7 @@ class ResultRepository:
     def _load_publication(
         self,
         index: GlobalIndexRow,
-        projection: ResultProjectionV2 | None = None,
+        projection: ResultProjection,
     ) -> dict[TableName, list[BaseModel]]:
         with ThreadPoolExecutor(max_workers=len(_TABLE_MODELS)) as executor:
             futures = {
@@ -455,7 +397,7 @@ class ResultRepository:
         index: GlobalIndexRow,
         table: str,
         model: type[BaseModel],
-        reference: ProjectionFileReference | None,
+        reference: ProjectionFileReference,
     ) -> list[BaseModel]:
         expected_path = (
             f"data/{table}/schema=v1/campaign={index.campaign_id}/"
@@ -463,20 +405,15 @@ class ResultRepository:
         )
         path = reference.path if reference is not None else expected_path
         if path != expected_path:
-            raise PresentationError("v2 projection references a noncanonical table")
-        if reference is None:
-            values = self._reader.read_rows(
-                index.result_dataset, index.result_revision, path
-            )
-        else:
-            content = self._reader.read_bytes(
-                index.result_dataset, index.result_revision, path
-            )
-            if _sha256(content) != reference.sha256:
-                raise PresentationError("v2 projected table checksum differs")
-            values = _read_parquet_bytes(content, path)
-            if len(values) != reference.row_count:
-                raise PresentationError("v2 projected table row count differs")
+            raise PresentationError("projection references a noncanonical table")
+        content = self._reader.read_bytes(
+            index.result_dataset, index.result_revision, path
+        )
+        if _sha256(content) != reference.sha256:
+            raise PresentationError("projected table checksum differs")
+        values = _read_parquet_bytes(content, path)
+        if len(values) != reference.row_count:
+            raise PresentationError("projected table row count differs")
         return [_validate(model, value, path) for value in values]
 
 
@@ -590,7 +527,7 @@ def _validate_selected_executions(
             raise PresentationError("trial selected execution is invalid")
 
 
-def _catalog_index(row: CatalogEntry) -> GlobalIndexRow:
+def _catalog_index(row: CatalogRow) -> GlobalIndexRow:
     return GlobalIndexRow(
         publication_id=row.publication_id,
         run_id=row.run_id,
@@ -628,10 +565,8 @@ def _read_parquet_bytes(content: bytes, path: str) -> list[Mapping[str, object]]
 
 
 def _projection_provenance(
-    projection: ResultProjectionV2 | None,
-) -> PublicationProvenance | None:
-    if projection is None:
-        return None
+    projection: ResultProjection,
+) -> PublicationProvenance:
     return PublicationProvenance(
         envelope_path=projection.envelope_path,
         envelope_sha256=projection.envelope_sha256,
