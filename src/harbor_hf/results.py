@@ -367,7 +367,9 @@ class ResultTables(FrozenModel):
     executions: list[ExecutionRow]
     metrics: list[MetricRow]
     artifacts: list[ArtifactRow]
-    provenance: PublicationProvenance | None = None
+    provenance: PublicationProvenance | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def has_one_consistent_run(self) -> ResultTables:

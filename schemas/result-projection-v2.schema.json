@@ -1,0 +1,139 @@
+{
+  "$defs": {
+    "ProjectionFileReference": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "row_count": {
+          "minimum": 0,
+          "title": "Row Count",
+          "type": "integer"
+        },
+        "sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "row_count"
+      ],
+      "title": "ProjectionFileReference",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "control_commit": {
+      "pattern": "^[0-9a-f]{40,64}$",
+      "title": "Control Commit",
+      "type": "string"
+    },
+    "envelope_path": {
+      "const": "publication-envelope.v2.json",
+      "title": "Envelope Path",
+      "type": "string"
+    },
+    "envelope_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Envelope Sha256",
+      "type": "string"
+    },
+    "harbor_archive_sha256s": {
+      "items": {
+        "pattern": "^sha256:[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "title": "Harbor Archive Sha256S",
+      "type": "array"
+    },
+    "harbor_bundle_manifest_sha256s": {
+      "items": {
+        "pattern": "^sha256:[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "title": "Harbor Bundle Manifest Sha256S",
+      "type": "array"
+    },
+    "projection_version": {
+      "minLength": 1,
+      "title": "Projection Version",
+      "type": "string"
+    },
+    "publication_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "title": "Publication Id",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "sanitizer_version": {
+      "minLength": 1,
+      "title": "Sanitizer Version",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/result-projection/v2",
+      "default": "harbor-hf/result-projection/v2",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_bucket": {
+      "minLength": 1,
+      "title": "Source Bucket",
+      "type": "string"
+    },
+    "source_checksum": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Source Checksum",
+      "type": "string"
+    },
+    "source_prefix": {
+      "minLength": 1,
+      "title": "Source Prefix",
+      "type": "string"
+    },
+    "tables": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProjectionFileReference"
+      },
+      "propertyNames": {
+        "enum": [
+          "runs",
+          "trials",
+          "executions",
+          "metrics",
+          "artifacts"
+        ]
+      },
+      "title": "Tables",
+      "type": "object"
+    }
+  },
+  "required": [
+    "publication_id",
+    "run_id",
+    "source_bucket",
+    "source_prefix",
+    "source_checksum",
+    "control_commit",
+    "envelope_path",
+    "envelope_sha256",
+    "projection_version",
+    "sanitizer_version",
+    "harbor_bundle_manifest_sha256s",
+    "harbor_archive_sha256s",
+    "tables"
+  ],
+  "title": "ResultProjectionV2",
+  "type": "object"
+}

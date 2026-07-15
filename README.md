@@ -166,7 +166,9 @@ the migration to a stable Harbor-owned protocol. The
 [Harbor-native result publication plan](docs/harbor-native-result-publication.md)
 defines the non-breaking migration from duplicated result models to canonical
 Harbor bundles, a minimal Hugging Face execution envelope, and rebuildable
-query projections. The
+query projections. The [field ownership inventory](docs/result-field-ownership.md)
+records each projected value's authority, and checked-in JSON Schemas under
+[`schemas/`](schemas/) freeze the v2 publication contracts. The
 [implementation plan](docs/implementation-plan.md) tracks the complete path to
 remote execution.
 
