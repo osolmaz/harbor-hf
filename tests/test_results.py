@@ -259,6 +259,7 @@ def _add_v2_envelope(evidence: MemoryEvidence) -> None:
                 "completed_at": record["completed_at"],
                 "retry_reason": record["retry_reason"],
                 "remote_job_id": record["remote_job_id"],
+                "bundle_status": "verified" if bundle else "not_available",
                 "harbor_bundle": bundle,
             }
         )

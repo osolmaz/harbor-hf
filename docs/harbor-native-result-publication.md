@@ -127,6 +127,13 @@ stable shape contains:
 The envelope references the Harbor bundle. It does not copy task names,
 rewards, trial timing, exceptions, trajectories, or artifact entries.
 
+Each physical execution records `bundle_status`. New successful executions use
+`verified` and must reference a bundle. Immutable successes produced before the
+compatibility adapter existed use `legacy_unavailable`; failed or cancelled
+executions without a valid bundle use `not_available`. The legacy status keeps
+in-flight campaigns finalizable during rollout without claiming native
+provenance that does not exist.
+
 `checksums.json` covers every non-marker object. `_SUCCESS` is written last and
 only after Harbor output, HF infrastructure evidence, checksums, redaction,
 and endpoint cleanup all validate. Publication consumes only an exclusively

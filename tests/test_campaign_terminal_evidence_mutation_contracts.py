@@ -467,6 +467,40 @@ def test_finalize_preserves_cancelled_execution_status_and_timestamp(
     assert cancelled["completed_at"] == "2026-07-14T01:04:00Z"
 
 
+def test_finalize_preserves_legacy_success_without_native_bundle(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    run = lock.runs[0]
+    trial = run.shards[0].trials[0]
+    execution = f"runs/{run.run_id}/trials/{trial.trial_id}/executions/execution-two"
+    files = _finalizer_files(remote_spec, lock)
+    del files[f"{execution}/harbor-native-bundle.json"]
+    checksums = json.loads(files[f"{execution}/checksums.json"])
+    del checksums["harbor-native-bundle.json"]
+    files[f"{execution}/checksums.json"] = _pretty(checksums)
+    writer = _Writer()
+
+    BucketCampaignFinalizer(_Reader(files), writer).finalize(
+        lock,
+        remote_spec,
+        _projection(lock, "complete"),
+        _decision(lock, "completed"),
+    )
+
+    envelope_path = (
+        f"{lock.artifact_prefix}/runs/{run.run_id}/publication-envelope.v2.json"
+    )
+    envelope = json.loads(
+        next(content for _, path, content in writer.writes if path == envelope_path)
+    )
+    succeeded = next(
+        item for item in envelope["executions"] if item["status"] == "succeeded"
+    )
+    assert succeeded["bundle_status"] == "legacy_unavailable"
+    assert succeeded["harbor_bundle"] is None
+
+
 def test_finalize_skips_incomplete_runs_and_guards_completed_campaigns(
     remote_spec: ExperimentSpec,
 ) -> None:

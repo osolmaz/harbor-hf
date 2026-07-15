@@ -382,7 +382,6 @@ class BucketCampaignFinalizer:
             run_paths,
             execution_prefix,
             absolute_prefix,
-            required=status == "succeeded",
         )
         return _ExecutionRecord(
             evidence=evidence,
@@ -395,6 +394,15 @@ class BucketCampaignFinalizer:
                 completed_at=evidence.completed_at,
                 retry_reason=evidence.retry_reason,
                 remote_job_id=evidence.remote_job_id,
+                bundle_status=(
+                    "verified"
+                    if bundle is not None
+                    else (
+                        "legacy_unavailable"
+                        if evidence.status == "succeeded"
+                        else "not_available"
+                    )
+                ),
                 harbor_bundle=bundle,
             ),
         )
@@ -406,15 +414,9 @@ class BucketCampaignFinalizer:
         run_paths: list[str],
         execution_prefix: str,
         absolute_prefix: str,
-        *,
-        required: bool,
     ) -> HarborBundleReference | None:
         relative_manifest = f"{execution_prefix}/{HARBOR_NATIVE_BUNDLE_PATH}"
         if relative_manifest not in run_paths:
-            if required:
-                raise CampaignFinalizationError(
-                    "successful execution has no Harbor native bundle"
-                )
             return None
         manifest_bytes = self._read(
             spec,

@@ -77,6 +77,15 @@
     "PhysicalExecutionReference": {
       "additionalProperties": false,
       "properties": {
+        "bundle_status": {
+          "enum": [
+            "verified",
+            "legacy_unavailable",
+            "not_available"
+          ],
+          "title": "Bundle Status",
+          "type": "string"
+        },
         "completed_at": {
           "format": "date-time",
           "title": "Completed At",
@@ -153,7 +162,8 @@
         "physical_attempt",
         "status",
         "started_at",
-        "completed_at"
+        "completed_at",
+        "bundle_status"
       ],
       "title": "PhysicalExecutionReference",
       "type": "object"

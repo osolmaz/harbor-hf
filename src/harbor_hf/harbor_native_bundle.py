@@ -135,9 +135,11 @@ def write_harbor_native_bundle(
 ) -> HarborNativeBundle | None:
     try:
         bundle = build_harbor_native_bundle(root)
-    except NativeBundleError:
+    except (NativeBundleError, ValueError) as error:
         if required:
-            raise
+            if isinstance(error, NativeBundleError):
+                raise
+            raise NativeBundleError("Harbor native bundle is invalid") from error
         return None
     (root / HARBOR_NATIVE_BUNDLE_PATH).write_bytes(
         canonical_json_bytes(bundle.model_dump(mode="json")) + b"\n"

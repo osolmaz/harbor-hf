@@ -146,6 +146,21 @@ def test_failed_execution_can_omit_invalid_bundle(tmp_path: Path) -> None:
         write_harbor_native_bundle(root, required=True)
 
 
+def test_optional_bundle_omits_noncanonical_compatibility_paths(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    compatibility_path = root / "harbor-compatibility.json"
+    compatibility = json.loads(compatibility_path.read_text(encoding="utf-8"))
+    compatibility["jobs"][0]["path"] = "../escape"
+    compatibility_path.write_text(json.dumps(compatibility), encoding="utf-8")
+
+    assert write_harbor_native_bundle(root, required=False) is None
+    assert not (root / HARBOR_NATIVE_BUNDLE_PATH).exists()
+    with pytest.raises(NativeBundleError, match="native bundle is invalid"):
+        write_harbor_native_bundle(root, required=True)
+
+
 def test_manifest_rejects_duplicate_documents(tmp_path: Path) -> None:
     value = build_harbor_native_bundle(_root(tmp_path)).model_dump(mode="json")
     value["documents"].append(value["documents"][0])

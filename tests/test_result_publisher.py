@@ -25,9 +25,11 @@ from harbor_hf.results import (
     ResultTables,
     RunRow,
     build_catalog_lookup_file,
+    build_catalog_v2_lookup_file,
     build_global_index_row,
     build_index_file,
     build_result_publication,
+    catalog_v2_from_legacy,
     read_catalog_file,
     read_catalog_v2_file,
     read_index_file,
@@ -313,6 +315,46 @@ def test_migrates_existing_v1_catalog_idempotently(
     )
     assert rows[0].publication_id == publication.tables.publication_id
     assert rows[0].source_format == "legacy-v1"
+
+
+def test_migration_includes_history_outside_bounded_catalog_window(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    publisher.publish(
+        publication,
+        result_dataset="org/results",
+        index_dataset="org/index",
+    )
+    current = read_catalog_file(
+        api.files["org/index"]["data/catalog/schema=v1/windows/2048.parquet"]
+    )[0]
+    historical = current.model_copy(
+        update={
+            "publication_id": "pub-" + "9" * 32,
+            "run_id": "historical-run-outside-window",
+            "created_at": current.created_at - timedelta(days=1),
+            "completed_at": current.completed_at - timedelta(days=1),
+        }
+    )
+    lookup = build_catalog_lookup_file(historical)
+    api.files["org/index"][lookup.path] = lookup.content
+    api.files["org/index"] = {
+        path: content
+        for path, content in api.files["org/index"].items()
+        if "schema=v2" not in path
+    }
+
+    result = publisher.migrate_catalog_v2("org/index")
+
+    expected = build_catalog_v2_lookup_file(catalog_v2_from_legacy(historical))
+    assert result.publication_count == 2
+    assert read_catalog_v2_file(api.files["org/index"][expected.path]) == [
+        catalog_v2_from_legacy(historical)
+    ]
 
 
 def test_duplicate_publication_is_a_no_op(

@@ -64,14 +64,24 @@ class PhysicalExecutionReference(FrozenModel):
     completed_at: AwareDatetime
     retry_reason: str | None = None
     remote_job_id: str | None = None
+    bundle_status: Literal["verified", "legacy_unavailable", "not_available"]
     harbor_bundle: HarborBundleReference | None = None
 
     @model_validator(mode="after")
     def values_are_consistent(self) -> PhysicalExecutionReference:
         if self.completed_at < self.started_at:
             raise ValueError("physical execution completion precedes start")
-        if self.status == "succeeded" and self.harbor_bundle is None:
-            raise ValueError("successful execution has no Harbor bundle")
+        if self.bundle_status == "verified" and self.harbor_bundle is None:
+            raise ValueError("verified Harbor bundle is missing")
+        if self.bundle_status != "verified" and self.harbor_bundle is not None:
+            raise ValueError("unavailable Harbor bundle is present")
+        if self.status == "succeeded" and self.bundle_status not in {
+            "verified",
+            "legacy_unavailable",
+        }:
+            raise ValueError("successful execution has invalid bundle status")
+        if self.status != "succeeded" and self.bundle_status == "legacy_unavailable":
+            raise ValueError("only legacy successes may omit a Harbor bundle")
         return self
 
 

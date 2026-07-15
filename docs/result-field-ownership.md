@@ -27,6 +27,7 @@ paths and digests in `harbor-native-bundle.json`.
 | --- | --- |
 | campaign and run IDs | campaign and run locks |
 | physical execution ID and attempt | execution lock |
+| physical execution bundle status | verified bundle presence or explicit legacy/unavailable classification |
 | infrastructure status and retry reason | campaign recovery events |
 | provider, region, hardware, and accelerator count | resolved deployment lock |
 | model repository, revision, engine, quantization, context, and concurrency | resolved model and deployment profiles |

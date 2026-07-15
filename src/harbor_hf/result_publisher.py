@@ -214,7 +214,20 @@ class HubDatasetPublisher:
         legacy_path = build_catalog_window_file([], _LARGEST_INDEX_WINDOW).path
         if not self._exists(dataset, legacy_path, revision):
             raise DatasetPublicationError("index Dataset has no v1 result catalog")
+        paths = self.api.list_repo_files(
+            dataset, repo_type="dataset", revision=revision
+        )
         legacy = read_catalog_file(self._read(dataset, legacy_path, revision))
+        legacy.extend(
+            self._catalog_lookup_rows(
+                dataset,
+                revision,
+                paths,
+                prefix="data/catalog/schema=v1/runs/",
+                reader=read_catalog_file,
+                label="v1",
+            )
+        )
         by_publication = {
             row.publication_id: catalog_v2_from_legacy(row) for row in legacy
         }
@@ -228,11 +241,42 @@ class HubDatasetPublisher:
                     )
                 }
             )
+        for row in self._catalog_lookup_rows(
+            dataset,
+            revision,
+            paths,
+            prefix="data/catalog/schema=v2/runs/",
+            reader=read_catalog_v2_file,
+            label="v2",
+        ):
+            by_publication[row.publication_id] = row
         return sorted(
             by_publication.values(),
             key=lambda item: (item.completed_at, item.publication_id),
             reverse=True,
-        )[:_LARGEST_INDEX_WINDOW]
+        )
+
+    def _catalog_lookup_rows[Row](
+        self,
+        dataset: str,
+        revision: str,
+        paths: list[str],
+        *,
+        prefix: str,
+        reader: Callable[[bytes], list[Row]],
+        label: str,
+    ) -> list[Row]:
+        results: list[Row] = []
+        for path in paths:
+            if not (path.startswith(prefix) and path.endswith(".parquet")):
+                continue
+            rows = reader(self._read(dataset, path, revision))
+            if len(rows) != 1:
+                raise DatasetPublicationError(
+                    f"{label} catalog lookup must contain exactly one row"
+                )
+            results.append(rows[0])
+        return results
 
     def _publish_result(self, publication: ResultPublication, dataset: str) -> str:
         operations: list[object] = [
