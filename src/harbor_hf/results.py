@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from harbor_hf.control import RetryCategory
 from harbor_hf.publication_envelope import (
     PUBLICATION_ENVELOPE_PATH,
     PublicationEnvelope,
@@ -33,6 +34,13 @@ DatasetId = Annotated[
 ]
 OwnerType = Literal["run", "trial", "execution"]
 RuntimeKind = Literal["endpoint", "provider"]
+RunQuality = Literal["clean", "degraded"]
+TaskOutcome = Literal[
+    "scored",
+    "agent_failed",
+    "benchmark_failed",
+    "infrastructure_exhausted",
+]
 ArtifactKind = Literal[
     "run_lock",
     "verification",
@@ -96,6 +104,7 @@ class RunEvidence(FrozenModel):
     benchmark_revision: str = Field(min_length=1)
     result_kind: Literal["ordinary"] = "ordinary"
     outcome: Literal["complete"] = "complete"
+    quality: RunQuality
     created_at: AwareDatetime
     completed_at: AwareDatetime
     model_id: EntityId
@@ -123,7 +132,7 @@ class TrialEvidence(FrozenModel):
     task_digest: Digest
     logical_attempt: int = Field(ge=1)
     selected_execution_id: EntityId
-    outcome: Literal["complete", "failed"] = "complete"
+    outcome: TaskOutcome
 
 
 class ExecutionEvidence(FrozenModel):
@@ -131,7 +140,8 @@ class ExecutionEvidence(FrozenModel):
     trial_id: EntityId
     physical_attempt: int = Field(ge=1)
     runtime_kind: RuntimeKind
-    status: Literal["succeeded", "failed_infrastructure", "cancelled"]
+    status: Literal["succeeded", "failed", "cancelled"]
+    failure_category: RetryCategory | None
     started_at: AwareDatetime
     completed_at: AwareDatetime
     retry_reason: str | None = None
@@ -143,7 +153,25 @@ class ExecutionEvidence(FrozenModel):
             raise ValueError("execution completion precedes start")
         if self.physical_attempt == 1 and self.retry_reason is not None:
             raise ValueError("first execution cannot have a retry reason")
+        if (self.status == "failed") != (self.failure_category is not None):
+            raise ValueError("execution failure category conflicts with its status")
         return self
+
+
+def task_outcome_matches_execution(
+    outcome: TaskOutcome,
+    status: str,
+    failure_category: RetryCategory | None,
+) -> bool:
+    if outcome == "scored":
+        return status == "succeeded" and failure_category is None
+    if status != "failed" or failure_category is None:
+        return False
+    if outcome == "agent_failed":
+        return failure_category == "agent"
+    if outcome == "benchmark_failed":
+        return failure_category == "benchmark"
+    return failure_category not in {"agent", "benchmark"}
 
 
 class MetricEvidence(FrozenModel):
@@ -202,10 +230,8 @@ class ResultEvidence(FrozenModel):
             if (
                 not isinstance(selected, ExecutionEvidence)
                 or selected.trial_id != trial.trial_id
-                or (trial.outcome == "complete" and selected.status != "succeeded")
-                or (
-                    trial.outcome == "failed"
-                    and selected.status != "failed_infrastructure"
+                or not task_outcome_matches_execution(
+                    trial.outcome, selected.status, selected.failure_category
                 )
             ):
                 raise ValueError("trial selected execution conflicts with its outcome")
@@ -221,6 +247,9 @@ class ResultEvidence(FrozenModel):
                 raise ValueError("result evidence references an unknown owner")
         _require_unique_measurements(self.metrics)
         _require_unique_artifacts(self.artifacts)
+        degraded = any(trial.outcome != "scored" for trial in self.trials)
+        if (self.run.quality == "degraded") != degraded:
+            raise ValueError("run quality conflicts with its trial outcomes")
         return self
 
 
@@ -261,6 +290,7 @@ class RunRow(TraceRow):
     benchmark_revision: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
+    quality: RunQuality
     created_at: AwareDatetime
     completed_at: AwareDatetime
     model_id: EntityId
@@ -274,13 +304,29 @@ class RunRow(TraceRow):
     agent_id: EntityId
     agent_name: str = Field(min_length=1)
     agent_revision: str = Field(min_length=1)
-    trial_count: int = Field(ge=0)
+    planned_trial_count: int = Field(ge=0)
+    scored_trial_count: int = Field(ge=0)
+    agent_failed_count: int = Field(ge=0)
+    benchmark_failed_count: int = Field(ge=0)
+    infrastructure_exhausted_count: int = Field(ge=0)
     execution_count: int = Field(ge=0)
 
     @model_validator(mode="after")
     def completion_follows_creation(self) -> RunRow:
         if self.completed_at < self.created_at:
             raise ValueError("run completion precedes creation")
+        outcome_count = (
+            self.scored_trial_count
+            + self.agent_failed_count
+            + self.benchmark_failed_count
+            + self.infrastructure_exhausted_count
+        )
+        if outcome_count != self.planned_trial_count:
+            raise ValueError("run task outcome counts do not match trial count")
+        if (self.quality == "degraded") != (
+            self.scored_trial_count < self.planned_trial_count
+        ):
+            raise ValueError("run quality conflicts with task outcome counts")
         return self
 
 
@@ -293,7 +339,7 @@ class TrialRow(TraceRow):
     task_digest: Digest
     logical_attempt: int = Field(ge=1)
     selected_execution_id: EntityId
-    outcome: Literal["complete", "failed"]
+    outcome: TaskOutcome
 
 
 class ExecutionRow(TraceRow):
@@ -304,7 +350,8 @@ class ExecutionRow(TraceRow):
     trial_id: EntityId
     physical_attempt: int = Field(ge=1)
     runtime_kind: RuntimeKind
-    status: Literal["succeeded", "failed_infrastructure", "cancelled"]
+    status: Literal["succeeded", "failed", "cancelled"]
+    failure_category: RetryCategory | None
     started_at: AwareDatetime
     completed_at: AwareDatetime
     retry_reason: str | None
@@ -316,6 +363,8 @@ class ExecutionRow(TraceRow):
             raise ValueError("execution completion precedes start")
         if self.physical_attempt == 1 and self.retry_reason is not None:
             raise ValueError("first execution cannot have a retry reason")
+        if (self.status == "failed") != (self.failure_category is not None):
+            raise ValueError("execution failure category conflicts with its status")
         return self
 
 
@@ -397,6 +446,7 @@ class GlobalIndexRow(FrozenModel):
     benchmark: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
+    quality: RunQuality
     completed_at: AwareDatetime
     model_repo: str = Field(min_length=1)
     model_revision: str = Field(min_length=1)
@@ -419,6 +469,7 @@ class CatalogRow(FrozenModel):
     benchmark_revision: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
+    quality: RunQuality
     created_at: AwareDatetime
     completed_at: AwareDatetime
     model_repo: str = Field(min_length=1)
@@ -431,9 +482,13 @@ class CatalogRow(FrozenModel):
     accelerator_count: int = Field(ge=0)
     score: float = Field(allow_inf_nan=False)
     passed_trials: int = Field(ge=0)
-    trial_count: int = Field(ge=0)
+    planned_trial_count: int = Field(ge=0)
+    scored_trial_count: int = Field(ge=0)
+    agent_failed_count: int = Field(ge=0)
+    benchmark_failed_count: int = Field(ge=0)
+    infrastructure_exhausted_count: int = Field(ge=0)
     execution_count: int = Field(ge=0)
-    infrastructure_failures: int = Field(ge=0)
+    failed_executions: int = Field(ge=0)
     duration_seconds: float = Field(ge=0)
     result_dataset: DatasetId
     result_revision: Commit
@@ -448,8 +503,20 @@ class CatalogRow(FrozenModel):
     def values_are_consistent(self) -> CatalogRow:
         if not math.isfinite(self.score):
             raise ValueError("catalog score must be finite")
-        if self.passed_trials > self.trial_count:
+        if self.passed_trials > self.planned_trial_count:
             raise ValueError("catalog passed trials exceed trial count")
+        outcome_count = (
+            self.scored_trial_count
+            + self.agent_failed_count
+            + self.benchmark_failed_count
+            + self.infrastructure_exhausted_count
+        )
+        if outcome_count != self.planned_trial_count:
+            raise ValueError("catalog task outcome counts do not match trial count")
+        if (self.quality == "degraded") != (
+            self.scored_trial_count < self.planned_trial_count
+        ):
+            raise ValueError("catalog quality conflicts with task outcome counts")
         if self.completed_at < self.created_at:
             raise ValueError("catalog completion precedes creation")
         _validate_relative_path(self.projection_path)
@@ -544,6 +611,15 @@ def build_result_tables(
     }
     publication_id = trace["publication_id"]
     run_evidence = summary.run
+    outcome_counts = {
+        outcome: sum(trial.outcome == outcome for trial in summary.trials)
+        for outcome in (
+            "scored",
+            "agent_failed",
+            "benchmark_failed",
+            "infrastructure_exhausted",
+        )
+    }
     run = RunRow(
         **trace,
         campaign_id=run_evidence.campaign_id,
@@ -552,6 +628,7 @@ def build_result_tables(
         benchmark_revision=run_evidence.benchmark_revision,
         result_kind=run_evidence.result_kind,
         outcome=run_evidence.outcome,
+        quality=run_evidence.quality,
         created_at=run_evidence.created_at,
         completed_at=run_evidence.completed_at,
         model_id=run_evidence.model_id,
@@ -565,7 +642,11 @@ def build_result_tables(
         agent_id=run_evidence.agent_id,
         agent_name=run_evidence.agent_name,
         agent_revision=run_evidence.agent_revision,
-        trial_count=len(summary.trials),
+        planned_trial_count=len(summary.trials),
+        scored_trial_count=outcome_counts["scored"],
+        agent_failed_count=outcome_counts["agent_failed"],
+        benchmark_failed_count=outcome_counts["benchmark_failed"],
+        infrastructure_exhausted_count=outcome_counts["infrastructure_exhausted"],
         execution_count=len(summary.executions),
     )
     trials = [
@@ -588,6 +669,7 @@ def build_result_tables(
             physical_attempt=record.physical_attempt,
             runtime_kind=record.runtime_kind,
             status=record.status,
+            failure_category=record.failure_category,
             started_at=record.started_at,
             completed_at=record.completed_at,
             retry_reason=record.retry_reason,
@@ -717,6 +799,7 @@ def build_global_index_row(
         benchmark=run.benchmark,
         result_kind=run.result_kind,
         outcome=run.outcome,
+        quality=run.quality,
         completed_at=run.completed_at,
         model_repo=run.model_repo,
         model_revision=run.model_revision,
@@ -763,6 +846,7 @@ def build_catalog_row(
         benchmark_revision=run.benchmark_revision,
         result_kind=run.result_kind,
         outcome=run.outcome,
+        quality=run.quality,
         created_at=run.created_at,
         completed_at=run.completed_at,
         model_repo=run.model_repo,
@@ -775,11 +859,14 @@ def build_catalog_row(
         accelerator_count=run.accelerator_count,
         score=score,
         passed_trials=sum(value >= 1.0 for value in rewards),
-        trial_count=run.trial_count,
+        planned_trial_count=run.planned_trial_count,
+        scored_trial_count=run.scored_trial_count,
+        agent_failed_count=run.agent_failed_count,
+        benchmark_failed_count=run.benchmark_failed_count,
+        infrastructure_exhausted_count=run.infrastructure_exhausted_count,
         execution_count=run.execution_count,
-        infrastructure_failures=sum(
-            execution.status == "failed_infrastructure"
-            for execution in tables.executions
+        failed_executions=sum(
+            execution.status == "failed" for execution in tables.executions
         ),
         duration_seconds=(run.completed_at - run.created_at).total_seconds(),
         result_dataset=result_dataset,
@@ -829,11 +916,13 @@ def _trial_reward_scores(tables: ResultTables) -> list[float]:
     for metric in tables.metrics:
         if metric.owner_type == "trial" and metric.unit == "score":
             by_trial.setdefault(metric.owner_id, []).append(metric)
-    return [
-        score
+    scores = [
+        _select_reward_score(by_trial.get(trial.trial_id, []))
         for trial in tables.trials
-        if (score := _select_reward_score(by_trial.get(trial.trial_id, []))) is not None
     ]
+    if any(score is None for score in scores):
+        raise ResultPublicationError("trial has no score metric")
+    return [float(score) for score in scores if score is not None]
 
 
 def trial_reward_score(metrics: Sequence[MetricRow], trial_id: str) -> float | None:
@@ -963,9 +1052,38 @@ def _verify_evidence(
     summary, lock = _load_summary_and_lock(reader, source)
     if lock.get("run_id") != summary.run.run_id:
         raise ResultPublicationError("evidence summary does not match its run lock")
+    _validate_summary_tasks_against_lock(summary, lock)
     _verify_artifact_evidence(reader, source, checksums, summary.artifacts)
     source_checksum = _digest(checksums)
     return summary, source_checksum, checksums[source.run_lock_path], checksums
+
+
+def _validate_summary_tasks_against_lock(
+    summary: ResultEvidence, lock: Mapping[str, JsonValue]
+) -> None:
+    locked = lock.get("benchmark_task_digests")
+    attempts = lock.get("attempts")
+    if (
+        not isinstance(locked, dict)
+        or not all(
+            isinstance(name, str) and isinstance(digest, str)
+            for name, digest in locked.items()
+        )
+        or not isinstance(attempts, int)
+        or attempts < 1
+    ):
+        raise ResultPublicationError("run lock omits its planned task identities")
+    expected = {
+        (name, logical_attempt): digest
+        for name, digest in locked.items()
+        for logical_attempt in range(1, attempts + 1)
+    }
+    observed = {
+        (trial.task_name, trial.logical_attempt): trial.task_digest
+        for trial in summary.trials
+    }
+    if len(observed) != len(summary.trials) or observed != expected:
+        raise ResultPublicationError("evidence tasks do not match its run lock")
 
 
 def _load_publication_provenance(
@@ -1050,6 +1168,7 @@ def _validate_envelope_executions(
             execution.trial_id,
             execution.physical_attempt,
             execution.status,
+            execution.failure_category,
             execution.started_at,
             execution.completed_at,
             execution.retry_reason,
@@ -1062,6 +1181,7 @@ def _validate_envelope_executions(
             execution.trial_id,
             execution.physical_attempt,
             execution.status,
+            execution.failure_category,
             execution.started_at,
             execution.completed_at,
             execution.retry_reason,
@@ -1345,6 +1465,7 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             _field("benchmark_revision", pa.string()),
             _field("result_kind", pa.string()),
             _field("outcome", pa.string()),
+            _field("quality", pa.string()),
             _field("created_at", _TIMESTAMP),
             _field("completed_at", _TIMESTAMP),
             _field("model_id", pa.string()),
@@ -1358,7 +1479,11 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             _field("agent_id", pa.string()),
             _field("agent_name", pa.string()),
             _field("agent_revision", pa.string()),
-            _field("trial_count", pa.int64()),
+            _field("planned_trial_count", pa.int64()),
+            _field("scored_trial_count", pa.int64()),
+            _field("agent_failed_count", pa.int64()),
+            _field("benchmark_failed_count", pa.int64()),
+            _field("infrastructure_exhausted_count", pa.int64()),
             _field("execution_count", pa.int64()),
         ],
     ),
@@ -1383,6 +1508,7 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             _field("physical_attempt", pa.int64()),
             _field("runtime_kind", pa.string()),
             _field("status", pa.string()),
+            _field("failure_category", pa.string(), nullable=True),
             _field("started_at", _TIMESTAMP),
             _field("completed_at", _TIMESTAMP),
             _field("retry_reason", pa.string(), nullable=True),
@@ -1428,6 +1554,7 @@ _INDEX_SCHEMA = _make_schema(
         _field("benchmark", pa.string()),
         _field("result_kind", pa.string()),
         _field("outcome", pa.string()),
+        _field("quality", pa.string()),
         _field("completed_at", _TIMESTAMP),
         _field("model_repo", pa.string()),
         _field("model_revision", pa.string()),
@@ -1451,6 +1578,7 @@ _CATALOG_SCHEMA = _make_schema(
         _field("benchmark_revision", pa.string()),
         _field("result_kind", pa.string()),
         _field("outcome", pa.string()),
+        _field("quality", pa.string()),
         _field("created_at", _TIMESTAMP),
         _field("completed_at", _TIMESTAMP),
         _field("model_repo", pa.string()),
@@ -1463,9 +1591,13 @@ _CATALOG_SCHEMA = _make_schema(
         _field("accelerator_count", pa.int64()),
         _field("score", pa.float64()),
         _field("passed_trials", pa.int64()),
-        _field("trial_count", pa.int64()),
+        _field("planned_trial_count", pa.int64()),
+        _field("scored_trial_count", pa.int64()),
+        _field("agent_failed_count", pa.int64()),
+        _field("benchmark_failed_count", pa.int64()),
+        _field("infrastructure_exhausted_count", pa.int64()),
         _field("execution_count", pa.int64()),
-        _field("infrastructure_failures", pa.int64()),
+        _field("failed_executions", pa.int64()),
         _field("duration_seconds", pa.float64()),
         _field("result_dataset", pa.string()),
         _field("result_revision", pa.string()),

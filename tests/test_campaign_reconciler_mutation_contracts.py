@@ -104,7 +104,7 @@ def test_campaign_plan_lock_reconcile_and_wave_have_one_canonical_output(
     }
 
     assert _hash(corpus) == (
-        "8c4c1c2ca91762a82167593006dabc3bdc5d39bf47c2dd06529a217c4e2e9d4c"
+        "042d70b40d6a5ba185a7329589c0f6db0103e8d6ebe4ccc983d4c01e1111d334"
     )
 
 

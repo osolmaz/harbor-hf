@@ -75,6 +75,7 @@ def _reader() -> RecordingEvidence:
             "benchmark_revision": "sha256:" + "b" * 64,
             "result_kind": "ordinary",
             "outcome": "complete",
+            "quality": "clean",
             "created_at": NOW.isoformat(),
             "completed_at": (NOW + timedelta(minutes=5)).isoformat(),
             "model_id": "model-mutation",
@@ -94,9 +95,9 @@ def _reader() -> RecordingEvidence:
                 "trial_id": "trial-z",
                 "task_name": "task-z",
                 "task_digest": "sha256:" + "2" * 64,
-                "logical_attempt": 2,
+                "logical_attempt": 1,
                 "selected_execution_id": "execution-z",
-                "outcome": "complete",
+                "outcome": "scored",
             },
             {
                 "trial_id": "trial-a",
@@ -104,7 +105,7 @@ def _reader() -> RecordingEvidence:
                 "task_digest": "sha256:" + "1" * 64,
                 "logical_attempt": 1,
                 "selected_execution_id": "execution-b",
-                "outcome": "complete",
+                "outcome": "scored",
             },
         ],
         "executions": [
@@ -114,6 +115,7 @@ def _reader() -> RecordingEvidence:
                 "physical_attempt": 1,
                 "runtime_kind": "provider",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": (NOW + timedelta(minutes=3)).isoformat(),
                 "completed_at": (NOW + timedelta(minutes=4)).isoformat(),
                 "retry_reason": None,
@@ -124,7 +126,8 @@ def _reader() -> RecordingEvidence:
                 "trial_id": "trial-a",
                 "physical_attempt": 1,
                 "runtime_kind": "endpoint",
-                "status": "failed_infrastructure",
+                "status": "failed",
+                "failure_category": "transient",
                 "started_at": NOW.isoformat(),
                 "completed_at": (NOW + timedelta(minutes=1)).isoformat(),
                 "retry_reason": None,
@@ -136,6 +139,7 @@ def _reader() -> RecordingEvidence:
                 "physical_attempt": 2,
                 "runtime_kind": "endpoint",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": (NOW + timedelta(minutes=1)).isoformat(),
                 "completed_at": (NOW + timedelta(minutes=2)).isoformat(),
                 "retry_reason": "provider_timeout",
@@ -143,6 +147,14 @@ def _reader() -> RecordingEvidence:
             },
         ],
         "metrics": [
+            {
+                "owner_type": "trial",
+                "owner_id": "trial-a",
+                "name": "reward",
+                "value": 1.0,
+                "unit": "score",
+                "aggregation": None,
+            },
             {
                 "owner_type": "trial",
                 "owner_id": "trial-z",
@@ -174,7 +186,15 @@ def _reader() -> RecordingEvidence:
     }
     files = {
         "run.lock.json": _json_bytes(
-            {"run_id": "run-mutation", "cell_digest": "sha256:" + "d" * 64}
+            {
+                "run_id": "run-mutation",
+                "cell_digest": "sha256:" + "d" * 64,
+                "attempts": 1,
+                "benchmark_task_digests": {
+                    "task-a": "sha256:" + "1" * 64,
+                    "task-z": "sha256:" + "2" * 64,
+                },
+            }
         ),
         "run-summary.json": _json_bytes(summary),
         "verification.json": artifact,
@@ -246,6 +266,7 @@ def _reader() -> RecordingEvidence:
                     "trial_id": record["trial_id"],
                     "physical_attempt": record["physical_attempt"],
                     "status": record["status"],
+                    "failure_category": record["failure_category"],
                     "started_at": record["started_at"],
                     "completed_at": record["completed_at"],
                     "retry_reason": record["retry_reason"],
@@ -280,7 +301,7 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
     index_file = build_index_file(index_row)
 
     assert _canonical_hash(tables.model_dump(mode="json")) == (
-        "12dc4803bccfc4bf4e660be626de8444ee7b2bab20d9decd280aad589067dce2"
+        "250c61cb9384283a8b5944f6eba324a854515faeeea5872192580f19323337f5"
     )
     assert (
         _canonical_hash(
@@ -302,15 +323,15 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
                 "index_size": len(index_file.content),
             }
         )
-        == "9361173e9823753d9e0e2ff3e9bc0d89ea0d2f5edaf7f59513fe5859ac42f099"
+        == "859202fab28b0f437547313a73f9b1b723a0db18a03ed12fba19d670f212181d"
     )
     assert [_sha256(item.content) for item in publication.files] == [
-        "sha256:6d9cfa821ae2dea4121b2401c413fc3446896512003c5a70f3d8ceef31e6a633",
-        "sha256:e82a159092b41008572a41303fe2a869536aac5e7e3ee5c735facef7f2ff2eab",
-        "sha256:f6a5af37074f9c372349b959ab1d08bc0c1c68a931daba00330e83a7ea239b0c",
-        "sha256:86c6b8c11017ff40ba471c128f3835c84eaf99b872fff0f095f6e1182b45f49a",
-        "sha256:b137c3ee948a2f89ee3948fe52553ddc21373895d4450a34560a51bcaea66b3d",
-        "sha256:7fd3d542c9eb85c482cccbce84b86fd11f493cafcae07b237faaee9f9008a72d",
+        "sha256:b95a37a4eac16e3509834c51ebb075bcf2c4bf7a712ef3c71d11387adf85d15f",
+        "sha256:51594f21462afa1219ae7be085d766ab32b0a79c2ba5dfc1b2889a8a91553a12",
+        "sha256:977993819e1fd35cd2f6bba2ea1a8790b73c15b3eea5646b4d1de7e2568540c6",
+        "sha256:c159bc7f67104d8ecf0241de63c775597cabe4fbeb30c4a415daca9d66931a9f",
+        "sha256:132f1f6714bf97631bdd33ce066bfcf56953c202f42b47be3f9f255391390164",
+        "sha256:d7eb8dee533259bec447c94c654878991a25d38b14e8deb47149c5f07ba9be09",
     ]
 
     common = ("hf://buckets/private-evidence", SOURCE.prefix)

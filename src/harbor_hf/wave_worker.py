@@ -997,7 +997,9 @@ def _harbor_trial_failure_category(
     if category is not None:
         return category
     if exception_type == "nonzeroagentexitcodeerror":
-        return _openclaw_transport_failure_category(evidence_root) or "benchmark"
+        return _openclaw_transport_failure_category(evidence_root) or "agent"
+    if "agent" in exception_type:
+        return "agent"
     return "benchmark"
 
 

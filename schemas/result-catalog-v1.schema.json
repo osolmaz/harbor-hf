@@ -6,6 +6,11 @@
       "title": "Accelerator Count",
       "type": "integer"
     },
+    "agent_failed_count": {
+      "minimum": 0,
+      "title": "Agent Failed Count",
+      "type": "integer"
+    },
     "agent_name": {
       "minLength": 1,
       "title": "Agent Name",
@@ -20,6 +25,11 @@
       "minLength": 1,
       "title": "Benchmark",
       "type": "string"
+    },
+    "benchmark_failed_count": {
+      "minimum": 0,
+      "title": "Benchmark Failed Count",
+      "type": "integer"
     },
     "benchmark_revision": {
       "minLength": 1,
@@ -61,6 +71,11 @@
       "title": "Execution Count",
       "type": "integer"
     },
+    "failed_executions": {
+      "minimum": 0,
+      "title": "Failed Executions",
+      "type": "integer"
+    },
     "harbor_bundle_count": {
       "minimum": 1,
       "title": "Harbor Bundle Count",
@@ -71,9 +86,9 @@
       "title": "Hardware",
       "type": "string"
     },
-    "infrastructure_failures": {
+    "infrastructure_exhausted_count": {
       "minimum": 0,
-      "title": "Infrastructure Failures",
+      "title": "Infrastructure Exhausted Count",
       "type": "integer"
     },
     "model_repo": {
@@ -96,6 +111,11 @@
       "title": "Passed Trials",
       "type": "integer"
     },
+    "planned_trial_count": {
+      "minimum": 0,
+      "title": "Planned Trial Count",
+      "type": "integer"
+    },
     "projection_path": {
       "minLength": 1,
       "title": "Projection Path",
@@ -114,6 +134,14 @@
     "publication_id": {
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
       "title": "Publication Id",
+      "type": "string"
+    },
+    "quality": {
+      "enum": [
+        "clean",
+        "degraded"
+      ],
+      "title": "Quality",
       "type": "string"
     },
     "region": {
@@ -151,15 +179,15 @@
       "title": "Score",
       "type": "number"
     },
+    "scored_trial_count": {
+      "minimum": 0,
+      "title": "Scored Trial Count",
+      "type": "integer"
+    },
     "source_checksum": {
       "pattern": "^sha256:[0-9a-f]{64}$",
       "title": "Source Checksum",
       "type": "string"
-    },
-    "trial_count": {
-      "minimum": 0,
-      "title": "Trial Count",
-      "type": "integer"
     }
   },
   "required": [
@@ -170,6 +198,7 @@
     "benchmark_revision",
     "result_kind",
     "outcome",
+    "quality",
     "created_at",
     "completed_at",
     "model_repo",
@@ -182,9 +211,13 @@
     "accelerator_count",
     "score",
     "passed_trials",
-    "trial_count",
+    "planned_trial_count",
+    "scored_trial_count",
+    "agent_failed_count",
+    "benchmark_failed_count",
+    "infrastructure_exhausted_count",
     "execution_count",
-    "infrastructure_failures",
+    "failed_executions",
     "duration_seconds",
     "result_dataset",
     "result_revision",

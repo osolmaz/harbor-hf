@@ -11,7 +11,7 @@ not transfer ownership.
 | `trial_id` | Harbor `TrialResult.id` | Copy from the pinned compatibility export. |
 | `task_name`, `task_digest` | Harbor trial lock and result | Public allowlist only; never publish task bodies. |
 | verifier metric names and values | Harbor `VerifierResult.rewards` | Preserve names and numeric values without reinterpretation. |
-| trial outcome and selected result | Harbor trial result | Derive only through the pinned Harbor models. |
+| verifier result and selected successful execution | Harbor trial result | Derive only through the pinned Harbor models. |
 | Harbor timing and usage | Harbor job and trial results | Add query columns only when the public contract explicitly allows them. |
 | Harbor exceptions | Harbor job and trial results | Keep complete values private; public projections use approved classifications only. |
 | native artifacts and sessions | Harbor job directory | Keep bytes in the private Bucket; public rows contain allowlisted metadata only. |
@@ -28,7 +28,10 @@ paths and digests in `harbor-native-bundle.json`.
 | campaign and run IDs | campaign and run locks |
 | physical execution ID and attempt | execution lock |
 | physical execution bundle status | verified bundle presence or `not_available` for failed or cancelled execution |
-| infrastructure status and retry reason | campaign recovery events |
+| physical execution status, failure category, and retry reason | campaign recovery events |
+| task outcome | selected execution, Harbor result, and exhausted retry decision |
+| run quality | deterministic projection of all task outcomes |
+| planned trial denominator | immutable campaign and run locks |
 | provider, region, hardware, and accelerator count | resolved deployment lock |
 | model repository, revision, engine, quantization, context, and concurrency | resolved model and deployment profiles |
 | remote HF Job, Endpoint, Dataset, Bucket, and Space identity | HF control-plane evidence |
@@ -45,10 +48,12 @@ production reader.
 
 The following catalog values are derived:
 
-- `score`: mean selected trial reward under the documented reward-selection rule;
+- `score`: sum of selected trial rewards divided by the locked planned-trial count;
 - `passed_trials`: selected trial rewards greater than or equal to `1.0`;
 - `duration_seconds`: run completion time minus run creation time;
-- `infrastructure_failures`: count of physical executions classified as infrastructure failures;
+- `scored_trial_count`, `agent_failed_count`, `benchmark_failed_count`, and
+  `infrastructure_exhausted_count`: counts of explicit task outcomes;
+- `failed_executions`: count of failed physical executions, regardless of category;
 - row counts: counts of validated projection rows.
 
 Every catalog row points to a checksummed projection manifest. That manifest

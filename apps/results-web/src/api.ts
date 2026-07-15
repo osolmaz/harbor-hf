@@ -14,11 +14,16 @@ export interface RunSummary {
   accelerator_count: number;
   result_kind: string;
   outcome: string;
+  quality: "clean" | "degraded";
   score: number;
   passed_trials: number;
-  trial_count: number;
+  planned_trial_count: number;
+  scored_trial_count: number;
+  agent_failed_count: number;
+  benchmark_failed_count: number;
+  infrastructure_exhausted_count: number;
   execution_count: number;
-  infrastructure_failures: number;
+  failed_executions: number;
   duration_seconds: number;
   completed_at: string;
 }
@@ -41,6 +46,7 @@ export interface RunDetail {
   trials: Array<Record<string, unknown> & {
     trial_id: string;
     task_name: string;
+    outcome: "scored" | "agent_failed" | "benchmark_failed" | "infrastructure_exhausted";
     score: number | null;
     execution_count: number;
   }>;

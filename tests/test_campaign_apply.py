@@ -1449,7 +1449,7 @@ def test_provider_wave_uses_provider_identity_without_endpoint_side_effects(
     assert endpoints.inspect_calls == []
     assert endpoints.create_calls == []
     assert endpoints.pause_calls == []
-    run_evidence = _run_evidence(lock, wave.runs[0].configuration, NOW)
+    run_evidence = _run_evidence(lock, wave.runs[0].configuration, NOW, quality="clean")
     assert run_evidence.model_revision == "not_observed"
 
 

@@ -209,6 +209,7 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
             "benchmark_revision": "sha256:" + "1" * 64,
             "result_kind": "ordinary",
             "outcome": "complete",
+            "quality": "clean",
             "created_at": created.isoformat(),
             "completed_at": (created + timedelta(minutes=1)).isoformat(),
             "model_id": "model-one",
@@ -230,7 +231,7 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
                 "task_digest": trial.task_digest,
                 "logical_attempt": trial.logical_attempt,
                 "selected_execution_id": "execution-one",
-                "outcome": "complete",
+                "outcome": "scored",
             }
         ],
         "executions": [
@@ -240,6 +241,7 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
                 "physical_attempt": 1,
                 "runtime_kind": "endpoint",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": created.isoformat(),
                 "completed_at": (created + timedelta(minutes=1)).isoformat(),
                 "retry_reason": None,
@@ -259,7 +261,15 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
         "artifacts": [],
     }
     files = {
-        "run.lock.json": json.dumps({"run_id": run.run_id}).encode(),
+        "run.lock.json": json.dumps(
+            {
+                "run_id": run.run_id,
+                "attempts": 1,
+                "benchmark_task_digests": {
+                    trial.task_name: trial.task_digest,
+                },
+            }
+        ).encode(),
         "run-summary.json": json.dumps(summary).encode(),
     }
     execution_prefix = f"trials/{trial.trial_id}/executions/execution-one"
@@ -305,6 +315,7 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
                     "trial_id": trial.trial_id,
                     "physical_attempt": 1,
                     "status": "succeeded",
+                    "failure_category": None,
                     "started_at": created.isoformat(),
                     "completed_at": (created + timedelta(minutes=1)).isoformat(),
                     "retry_reason": None,

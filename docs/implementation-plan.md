@@ -193,6 +193,15 @@ both terminal failure states contribute zero to its fixed denominator instead
 of making the whole run partial. A run with no valid completed trial still
 fails closed.
 
+These are internal recovery states. Public task outcomes are `scored`,
+`agent_failed`, `benchmark_failed`, and `infrastructure_exhausted`. Physical
+executions separately publish `succeeded`, `failed`, or `cancelled` plus a
+typed failure category. The planned task count is locked before execution and
+is always the score denominator. A complete run is `clean` when every task is
+scored and `degraded` when one or more exhausted tasks contribute zero.
+`partial` is reserved for interrupted work that did not reach a terminal task
+outcome.
+
 ### Event Rules
 
 - Events are immutable and include `schema_version`, `event_id`, `subject_type`,

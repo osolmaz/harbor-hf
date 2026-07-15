@@ -37,6 +37,7 @@ RetryCategory = Literal[
     "quota",
     "rate-limit",
     "ambiguous",
+    "agent",
     "benchmark",
     "configuration",
     "authentication",

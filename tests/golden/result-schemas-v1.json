@@ -134,6 +134,11 @@
           "type": "string"
         },
         {
+          "name": "quality",
+          "nullable": false,
+          "type": "string"
+        },
+        {
           "name": "created_at",
           "nullable": false,
           "type": "timestamp[us, tz=UTC]"
@@ -194,7 +199,27 @@
           "type": "int64"
         },
         {
-          "name": "trial_count",
+          "name": "planned_trial_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "scored_trial_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "agent_failed_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "benchmark_failed_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "infrastructure_exhausted_count",
           "nullable": false,
           "type": "int64"
         },
@@ -204,7 +229,7 @@
           "type": "int64"
         },
         {
-          "name": "infrastructure_failures",
+          "name": "failed_executions",
           "nullable": false,
           "type": "int64"
         },
@@ -329,6 +354,11 @@
           "type": "string"
         },
         {
+          "name": "failure_category",
+          "nullable": true,
+          "type": "string"
+        },
+        {
           "name": "started_at",
           "nullable": false,
           "type": "timestamp[us, tz=UTC]"
@@ -385,6 +415,11 @@
         },
         {
           "name": "outcome",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "quality",
           "nullable": false,
           "type": "string"
         },
@@ -599,6 +634,11 @@
           "type": "string"
         },
         {
+          "name": "quality",
+          "nullable": false,
+          "type": "string"
+        },
+        {
           "name": "created_at",
           "nullable": false,
           "type": "timestamp[us, tz=UTC]"
@@ -664,7 +704,27 @@
           "type": "string"
         },
         {
-          "name": "trial_count",
+          "name": "planned_trial_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "scored_trial_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "agent_failed_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "benchmark_failed_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
+          "name": "infrastructure_exhausted_count",
           "nullable": false,
           "type": "int64"
         },

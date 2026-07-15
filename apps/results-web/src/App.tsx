@@ -226,7 +226,7 @@ function RunsTable({ runs, selected, onToggle, comparable = true }: {
               <td><span className="model-name">{run.model_repo}</span><SmallText>{shortRevision(run.model_revision)}</SmallText></td>
               <td>{run.agent_name}<SmallText>{run.agent_revision}</SmallText></td>
               <td>{run.hardware}<SmallText>{run.accelerator_count} accelerator{run.accelerator_count === 1 ? "" : "s"}</SmallText></td>
-              <td>{run.passed_trials}/{run.trial_count}<SmallText>{run.infrastructure_failures ? `${run.infrastructure_failures} failed executions` : "complete"}</SmallText></td>
+              <td>{run.passed_trials}/{run.planned_trial_count}<SmallText>{run.failed_executions ? `${run.quality}; ${run.failed_executions} failed execution${run.failed_executions === 1 ? "" : "s"}` : run.quality}</SmallText></td>
               <td>{formatDuration(run.duration_seconds)}</td>
               <td>{formatDate(run.completed_at)}</td>
               <td><Link className="icon-button compact" title="Open run" to={`/runs/${run.run_id}`}><ChevronRight size={15} /></Link></td>
@@ -249,15 +249,16 @@ function RunPage() {
       <PageHeader eyebrow={data.summary.benchmark} title={data.summary.model_repo} meta={data.summary.run_id} />
       <section className="summary-strip">
         <SummaryStat label="Score" value={formatPercent(data.summary.score)} />
-        <SummaryStat label="Passed" value={`${data.summary.passed_trials}/${data.summary.trial_count}`} />
+        <SummaryStat label="Passed" value={`${data.summary.passed_trials}/${data.summary.planned_trial_count}`} />
+        <SummaryStat label="Quality" value={data.summary.quality} />
         <SummaryStat label="Executions" value={String(data.summary.execution_count)} />
         <SummaryStat label="Duration" value={formatDuration(data.summary.duration_seconds)} />
       </section>
       <div className="detail-grid">
         <section className="panel span-two">
           <SectionTitle title="Task results" meta={`${data.trials.length} trials`} />
-          <div className="table-wrap flush"><table><thead><tr><th>Task</th><th>Score</th><th>Attempt</th><th>Executions</th><th /></tr></thead><tbody>
-            {data.trials.map((trial) => <tr key={trial.trial_id}><td>{trial.task_name}</td><td><Score value={trial.score ?? 0} /></td><td>{String(trial.logical_attempt)}</td><td>{trial.execution_count}</td><td><Link className="icon-button compact" title="Open trial" to={`/runs/${data.summary.run_id}/trials/${trial.trial_id}`}><ChevronRight size={15} /></Link></td></tr>)}
+          <div className="table-wrap flush"><table><thead><tr><th>Task</th><th>Score</th><th>Outcome</th><th>Attempt</th><th>Executions</th><th /></tr></thead><tbody>
+            {data.trials.map((trial) => <tr key={trial.trial_id}><td>{trial.task_name}</td><td><Score value={trial.score ?? 0} /></td><td>{formatOutcome(trial.outcome)}</td><td>{String(trial.logical_attempt)}</td><td>{trial.execution_count}</td><td><Link className="icon-button compact" title="Open trial" to={`/runs/${data.summary.run_id}/trials/${trial.trial_id}`}><ChevronRight size={15} /></Link></td></tr>)}
           </tbody></table></div>
         </section>
         <KeyValuePanel title="Configuration" values={data.configuration} />
@@ -328,7 +329,7 @@ function ArtifactTable({ artifacts }: { artifacts: Array<Record<string, unknown>
 }
 
 function CompareRun({ run, label }: { run: RunSummary; label: string }) {
-  return <section className="compare-run"><span className="eyebrow">{label}</span><Link to={`/runs/${run.run_id}`}>{run.model_repo}</Link><Score value={run.score} /><dl><div><dt>Trials</dt><dd>{run.passed_trials}/{run.trial_count}</dd></div><div><dt>Hardware</dt><dd>{run.hardware}</dd></div><div><dt>Agent</dt><dd>{run.agent_name}</dd></div></dl></section>;
+  return <section className="compare-run"><span className="eyebrow">{label}</span><Link to={`/runs/${run.run_id}`}>{run.model_repo}</Link><Score value={run.score} /><dl><div><dt>Trials</dt><dd>{run.passed_trials}/{run.planned_trial_count}</dd></div><div><dt>Hardware</dt><dd>{run.hardware}</dd></div><div><dt>Agent</dt><dd>{run.agent_name}</dd></div></dl></section>;
 }
 
 function PageHeader({ eyebrow, title, meta }: { eyebrow: string; title: string; meta: string }) {
@@ -362,6 +363,7 @@ function EmptyState({ message }: { message: string }) { return <div className="e
 function formatPercent(value: number) { return `${(value * 100).toFixed(value === 0 || value === 1 ? 0 : 1)}%`; }
 function signedPercent(value: number) { return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(1)} pp`; }
 function scoreOrDash(value: number | null) { return value === null ? "-" : formatPercent(value); }
+function formatOutcome(value: string) { return humanize(value); }
 function formatDuration(seconds: number) { if (seconds < 60) return `${Math.round(seconds)}s`; if (seconds < 3600) return `${Math.round(seconds / 60)}m`; return `${(seconds / 3600).toFixed(1)}h`; }
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
 function formatBytes(value: number) { if (value < 1024) return `${value} B`; if (value < 1048576) return `${(value / 1024).toFixed(1)} KB`; return `${(value / 1048576).toFixed(1)} MB`; }

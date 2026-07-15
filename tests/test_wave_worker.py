@@ -64,22 +64,22 @@ def test_verification_failure_is_terminal_benchmark_evidence() -> None:
     assert _execution_failure_category(error, "execution") == "benchmark"
 
 
-def test_wrapped_endpoint_server_error_without_log_remains_benchmark_failure() -> None:
+def test_wrapped_endpoint_server_error_without_log_remains_agent_failure() -> None:
     error = HarborTrialFailure(
         "agent failed",
         "NonZeroAgentExitCodeError",
         'provider response status=500: "500 Internal Server Error"',
     )
 
-    assert _execution_failure_category(error, "execution") == "benchmark"
+    assert _execution_failure_category(error, "execution") == "agent"
 
 
-def test_plain_nonzero_agent_exit_remains_benchmark_failure() -> None:
+def test_plain_nonzero_agent_exit_is_agent_failure() -> None:
     error = HarborTrialFailure(
         "agent failed", "NonZeroAgentExitCodeError", "command exited with status 1"
     )
 
-    assert _execution_failure_category(error, "execution") == "benchmark"
+    assert _execution_failure_category(error, "execution") == "agent"
 
 
 def test_benchmark_exception_message_does_not_trigger_transport_retry() -> None:
@@ -97,7 +97,7 @@ def test_agent_output_keywords_do_not_trigger_transport_retry() -> None:
         "command asked to diagnose a timeout and quota issue; exit status 1",
     )
 
-    assert _execution_failure_category(error, "execution") == "benchmark"
+    assert _execution_failure_category(error, "execution") == "agent"
 
 
 def test_openclaw_terminal_transport_log_makes_wrapped_exit_retryable(
@@ -144,7 +144,7 @@ def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
 
     assert (
         _execution_failure_category(error, "execution", evidence_root=tmp_path)
-        == "benchmark"
+        == "agent"
     )
 
 

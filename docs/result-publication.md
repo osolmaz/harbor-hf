@@ -45,12 +45,15 @@ Common trace fields:
 | `control_commit` | string | Immutable control Dataset commit used to publish |
 
 `runs` adds campaign, experiment, benchmark, result classification, completion
-times, model, deployment, agent, and aggregate child-count fields. `trials` adds
-the logical trial identity, task name and digest, attempt, selected execution,
-and `complete` or `failed` outcome. A failed trial has a zero reward metric and
+times, model, deployment, agent, fixed planned-trial denominator, task-outcome
+counts, quality, and aggregate child-count fields. `trials` adds the logical
+trial identity, task name and digest, attempt, selected execution, and one of
+four outcomes: `scored`, `agent_failed`, `benchmark_failed`, or
+`infrastructure_exhausted`. Every non-scored trial has a zero reward metric and
 selects its final failed execution. `executions` adds the physical execution
-identity, trial identity, attempt, runtime kind, status, timestamps, retry
-reason, and optional remote Job identity. `metrics` adds a deterministic metric
+identity, trial identity, attempt, runtime kind, `succeeded`, `failed`, or
+`cancelled` status, typed failure category, timestamps, retry reason, and
+optional remote Job identity. `metrics` adds a deterministic metric
 identity, typed owner, name, value, unit, and optional aggregation. `artifacts`
 adds a deterministic artifact identity, typed owner, safe artifact kind, private
 canonical path, checksum, media type, and size. Artifact rows are metadata and
@@ -69,10 +72,13 @@ source checksum, and control commit. It contains no trial, execution, metric,
 artifact, session, or task-content data.
 
 Task failures remain visible through trial outcomes, execution statuses, retry
-counts, and the catalog's infrastructure-failure count. They stay in the score
-denominator instead of suppressing valid results from the rest of the run. A
-run with no valid completed trial, missing terminal evidence, or inconsistent
-checksums is not publishable as an ordinary complete result.
+counts, the catalog's outcome counts, and its failed-execution count. The
+planned trial count is locked before execution and remains the score
+denominator. Exhausted failures therefore contribute zero instead of shrinking
+the denominator or suppressing valid results from the rest of the run. A run is
+`clean` only when every task is scored; otherwise it is `degraded`. A run with
+no valid completed trial, missing terminal evidence, or inconsistent checksums
+is not publishable as an ordinary complete result.
 
 Each publication keeps its immutable index row. The publisher also rewrites
 consolidated power-of-two windows containing the newest 1, 2, 4, and so on up
@@ -129,7 +135,7 @@ covered with in-memory mocks.
 An existing publication with no consolidated windows is repaired idempotently
 on adoption; later publications update all windows in the normal index commit.
 
-Schema changes require a new table version and a new path. Historical Parquet
-files are never rewritten. Application callers must explicitly select a
-supported version during rebuild; version migration and CLI exposure can be
-added without changing the frozen v1 row contracts.
+The active pre-release contract is cut over in place under `v1`; superseded
+shapes are not supported by production readers. Historical immutable
+publications are never rewritten. They must be rebuilt from canonical evidence
+or rerun before they can enter the active catalog.

@@ -95,6 +95,29 @@
           "title": "Execution Id",
           "type": "string"
         },
+        "failure_category": {
+          "anyOf": [
+            {
+              "enum": [
+                "lost",
+                "transient",
+                "quota",
+                "rate-limit",
+                "ambiguous",
+                "agent",
+                "benchmark",
+                "configuration",
+                "authentication",
+                "cleanup"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Failure Category"
+        },
         "harbor_bundle": {
           "anyOf": [
             {
@@ -143,7 +166,7 @@
         "status": {
           "enum": [
             "succeeded",
-            "failed_infrastructure",
+            "failed",
             "cancelled"
           ],
           "title": "Status",
@@ -160,6 +183,7 @@
         "trial_id",
         "physical_attempt",
         "status",
+        "failure_category",
         "started_at",
         "completed_at",
         "bundle_status"
