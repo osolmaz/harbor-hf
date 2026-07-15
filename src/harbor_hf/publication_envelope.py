@@ -9,9 +9,9 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 
 from harbor_hf.harbor_adapter.models import Sha256Digest
 
-PUBLICATION_ENVELOPE_V2 = "harbor-hf/publication-envelope/v2"
-PUBLICATION_ENVELOPE_PATH = "publication-envelope.v2.json"
-PROJECTION_VERSION = "harbor-hf/results-projection/v2"
+PUBLICATION_ENVELOPE_V1 = "harbor-hf/publication-envelope/v1"
+PUBLICATION_ENVELOPE_PATH = "publication-envelope.v1.json"
+PROJECTION_VERSION = "harbor-hf/results-projection/v1"
 SANITIZER_VERSION = "harbor-hf/public-results/v1"
 
 
@@ -64,7 +64,7 @@ class PhysicalExecutionReference(FrozenModel):
     completed_at: AwareDatetime
     retry_reason: str | None = None
     remote_job_id: str | None = None
-    bundle_status: Literal["verified", "legacy_unavailable", "not_available"]
+    bundle_status: Literal["verified", "not_available"]
     harbor_bundle: HarborBundleReference | None = None
 
     @model_validator(mode="after")
@@ -75,21 +75,16 @@ class PhysicalExecutionReference(FrozenModel):
             raise ValueError("verified Harbor bundle is missing")
         if self.bundle_status != "verified" and self.harbor_bundle is not None:
             raise ValueError("unavailable Harbor bundle is present")
-        if self.status == "succeeded" and self.bundle_status not in {
-            "verified",
-            "legacy_unavailable",
-        }:
-            raise ValueError("successful execution has invalid bundle status")
-        if self.status != "succeeded" and self.bundle_status == "legacy_unavailable":
-            raise ValueError("only legacy successes may omit a Harbor bundle")
+        if self.status == "succeeded" and self.bundle_status != "verified":
+            raise ValueError("successful execution requires a verified Harbor bundle")
         return self
 
 
-class PublicationEnvelopeV2(FrozenModel):
+class PublicationEnvelope(FrozenModel):
     """HF execution metadata around referenced Harbor-native bundles."""
 
-    schema_version: Literal["harbor-hf/publication-envelope/v2"] = (
-        PUBLICATION_ENVELOPE_V2
+    schema_version: Literal["harbor-hf/publication-envelope/v1"] = (
+        PUBLICATION_ENVELOPE_V1
     )
     run_id: str = Field(min_length=1)
     campaign_id: str = Field(min_length=1)
@@ -101,12 +96,12 @@ class PublicationEnvelopeV2(FrozenModel):
     profiles: ProfileDigests
     runtime: RuntimeIdentity
     sanitizer_version: Literal["harbor-hf/public-results/v1"] = SANITIZER_VERSION
-    projection_version: Literal["harbor-hf/results-projection/v2"] = PROJECTION_VERSION
+    projection_version: Literal["harbor-hf/results-projection/v1"] = PROJECTION_VERSION
     cleanup_outcome: Literal["verified", "not_applicable"]
     executions: list[PhysicalExecutionReference]
 
     @model_validator(mode="after")
-    def values_are_consistent(self) -> PublicationEnvelopeV2:
+    def values_are_consistent(self) -> PublicationEnvelope:
         if self.completed_at < self.created_at:
             raise ValueError("publication completion precedes creation")
         ids = [execution.execution_id for execution in self.executions]
@@ -144,7 +139,7 @@ def profile_digest(value: object) -> str:
 
 
 def publication_envelope_schema() -> dict[str, object]:
-    return PublicationEnvelopeV2.model_json_schema()
+    return PublicationEnvelope.model_json_schema()
 
 
 def _relative_path(value: str) -> PurePosixPath:

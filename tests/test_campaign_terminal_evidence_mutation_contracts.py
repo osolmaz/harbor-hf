@@ -295,7 +295,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     assert [write[1] for write in writer.writes] == [
         f"{base}/verification.json",
         f"{base}/run-summary.json",
-        f"{base}/publication-envelope.v2.json",
+        f"{base}/publication-envelope.v1.json",
         f"{base}/checksums.json",
         f"{base}/_SUCCESS",
         f"{lock.artifact_prefix}/campaign-summary.json",
@@ -359,9 +359,9 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "job-execution-two",
         ),
     ]
-    envelope_bytes = contents[f"{base}/publication-envelope.v2.json"]
+    envelope_bytes = contents[f"{base}/publication-envelope.v1.json"]
     envelope = json.loads(envelope_bytes)
-    assert envelope["schema_version"] == "harbor-hf/publication-envelope/v2"
+    assert envelope["schema_version"] == "harbor-hf/publication-envelope/v1"
     assert envelope["run_id"] == run.run_id
     assert envelope["campaign_id"] == lock.campaign_id
     assert envelope["runtime"]["kind"] == "endpoint"
@@ -411,7 +411,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     }
     expected_checksums["verification.json"] = _sha(verification)
     expected_checksums["run-summary.json"] = _sha(contents[f"{base}/run-summary.json"])
-    expected_checksums["publication-envelope.v2.json"] = _sha(envelope_bytes)
+    expected_checksums["publication-envelope.v1.json"] = _sha(envelope_bytes)
     checksum_bytes = contents[f"{base}/checksums.json"]
     assert checksum_bytes == _pretty(dict(sorted(expected_checksums.items())))
     assert contents[f"{base}/_SUCCESS"] == b"\n"
@@ -475,7 +475,7 @@ def test_finalize_preserves_cancelled_execution_status_and_timestamp(
     assert cancelled["completed_at"] == "2026-07-14T01:04:00Z"
 
 
-def test_finalize_preserves_legacy_success_without_native_bundle(
+def test_finalize_rejects_success_without_native_bundle(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock = _campaign(remote_spec)
@@ -489,24 +489,17 @@ def test_finalize_preserves_legacy_success_without_native_bundle(
     files[f"{execution}/checksums.json"] = _pretty(checksums)
     writer = _Writer()
 
-    BucketCampaignFinalizer(_Reader(files), writer).finalize(
-        lock,
-        remote_spec,
-        _projection(lock, "complete"),
-        _decision(lock, "completed"),
-    )
+    with pytest.raises(
+        CampaignFinalizationError, match="no verified Harbor native bundle"
+    ):
+        BucketCampaignFinalizer(_Reader(files), writer).finalize(
+            lock,
+            remote_spec,
+            _projection(lock, "complete"),
+            _decision(lock, "completed"),
+        )
 
-    envelope_path = (
-        f"{lock.artifact_prefix}/runs/{run.run_id}/publication-envelope.v2.json"
-    )
-    envelope = json.loads(
-        next(content for _, path, content in writer.writes if path == envelope_path)
-    )
-    succeeded = next(
-        item for item in envelope["executions"] if item["status"] == "succeeded"
-    )
-    assert succeeded["bundle_status"] == "legacy_unavailable"
-    assert succeeded["harbor_bundle"] is None
+    assert not any(path.endswith("/_SUCCESS") for _, path, _ in writer.writes)
 
 
 def test_finalize_skips_incomplete_runs_and_guards_completed_campaigns(

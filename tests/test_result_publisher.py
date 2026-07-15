@@ -25,13 +25,10 @@ from harbor_hf.results import (
     ResultTables,
     RunRow,
     build_catalog_lookup_file,
-    build_catalog_v2_lookup_file,
     build_global_index_row,
     build_index_file,
     build_result_publication,
-    catalog_v2_from_legacy,
     read_catalog_file,
-    read_catalog_v2_file,
     read_index_file,
 )
 
@@ -170,22 +167,13 @@ def publication() -> ResultPublication:
         executions=[],
         metrics=[],
         artifacts=[],
-    )
-    return build_result_publication(tables)
-
-
-@pytest.fixture
-def native_publication(publication: ResultPublication) -> ResultPublication:
-    tables = publication.tables.model_copy(
-        update={
-            "provenance": PublicationProvenance(
-                envelope_sha256="sha256:" + "7" * 64,
-                projection_version="harbor-hf/results-projection/v2",
-                sanitizer_version="harbor-hf/public-results/v1",
-                harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
-                harbor_archive_sha256s=["sha256:" + "9" * 64],
-            )
-        }
+        provenance=PublicationProvenance(
+            envelope_sha256="sha256:" + "7" * 64,
+            projection_version="harbor-hf/results-projection/v1",
+            sanitizer_version="harbor-hf/public-results/v1",
+            harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
+            harbor_archive_sha256s=["sha256:" + "9" * 64],
+        ),
     )
     return build_result_publication(tables)
 
@@ -245,14 +233,12 @@ def test_serializes_result_and_index_with_parent_checked_leases(
     assert catalog[0].score == 0.0
     lookup = build_catalog_lookup_file(catalog[0])
     assert read_catalog_file(api.files["org/index"][lookup.path]) == catalog
-    catalog_v2 = read_catalog_v2_file(
-        api.files["org/index"]["data/catalog/schema=v2/windows/2048.parquet"]
-    )
-    assert catalog_v2[0].source_format == "legacy-v1"
+    assert catalog[0].projection_path.startswith("projections/schema=v1/")
+    assert catalog[0].harbor_bundle_count == 1
 
 
-def test_publishes_native_v2_projection_and_catalog(
-    native_publication: ResultPublication, tmp_path: Path
+def test_publishes_canonical_projection_and_catalog(
+    publication: ResultPublication, tmp_path: Path
 ) -> None:
     api = FakeDatasetApi(tmp_path)
     publisher = HubDatasetPublisher(
@@ -260,16 +246,14 @@ def test_publishes_native_v2_projection_and_catalog(
     )
 
     publisher.publish(
-        native_publication,
+        publication,
         result_dataset="org/results",
         index_dataset="org/index",
     )
 
-    projection_path = (
-        f"projections/schema=v2/{native_publication.tables.publication_id}.json"
-    )
+    projection_path = f"projections/schema=v1/{publication.tables.publication_id}.json"
     projection = json.loads(api.files["org/results"][projection_path])
-    assert projection["schema_version"] == "harbor-hf/result-projection/v2"
+    assert projection["schema_version"] == "harbor-hf/result-projection/v1"
     assert set(projection["tables"]) == {
         "runs",
         "trials",
@@ -277,84 +261,11 @@ def test_publishes_native_v2_projection_and_catalog(
         "metrics",
         "artifacts",
     }
-    catalog = read_catalog_v2_file(
-        api.files["org/index"]["data/catalog/schema=v2/windows/2048.parquet"]
-    )[0]
-    assert catalog.source_format == "native-v2"
-    assert catalog.projection_path == projection_path
-    assert catalog.harbor_bundle_count == 1
-
-
-def test_migrates_existing_v1_catalog_idempotently(
-    publication: ResultPublication, tmp_path: Path
-) -> None:
-    api = FakeDatasetApi(tmp_path)
-    publisher = HubDatasetPublisher(
-        publisher_id="publisher-one", leases=FakeLeases(), api=api
-    )
-    publisher.publish(
-        publication,
-        result_dataset="org/results",
-        index_dataset="org/index",
-    )
-    api.files["org/index"] = {
-        path: content
-        for path, content in api.files["org/index"].items()
-        if "schema=v2" not in path
-    }
-    commits_before = len(api.commits)
-
-    first = publisher.migrate_catalog_v2("org/index")
-    second = publisher.migrate_catalog_v2("org/index")
-
-    assert first.publication_count == 1
-    assert second.publication_count == 1
-    assert len(api.commits) == commits_before + 1
-    rows = read_catalog_v2_file(
-        api.files["org/index"]["data/catalog/schema=v2/windows/2048.parquet"]
-    )
-    assert rows[0].publication_id == publication.tables.publication_id
-    assert rows[0].source_format == "legacy-v1"
-
-
-def test_migration_includes_history_outside_bounded_catalog_window(
-    publication: ResultPublication, tmp_path: Path
-) -> None:
-    api = FakeDatasetApi(tmp_path)
-    publisher = HubDatasetPublisher(
-        publisher_id="publisher-one", leases=FakeLeases(), api=api
-    )
-    publisher.publish(
-        publication,
-        result_dataset="org/results",
-        index_dataset="org/index",
-    )
-    current = read_catalog_file(
+    catalog = read_catalog_file(
         api.files["org/index"]["data/catalog/schema=v1/windows/2048.parquet"]
     )[0]
-    historical = current.model_copy(
-        update={
-            "publication_id": "pub-" + "9" * 32,
-            "run_id": "historical-run-outside-window",
-            "created_at": current.created_at - timedelta(days=1),
-            "completed_at": current.completed_at - timedelta(days=1),
-        }
-    )
-    lookup = build_catalog_lookup_file(historical)
-    api.files["org/index"][lookup.path] = lookup.content
-    api.files["org/index"] = {
-        path: content
-        for path, content in api.files["org/index"].items()
-        if "schema=v2" not in path
-    }
-
-    result = publisher.migrate_catalog_v2("org/index")
-
-    expected = build_catalog_v2_lookup_file(catalog_v2_from_legacy(historical))
-    assert result.publication_count == 2
-    assert read_catalog_v2_file(api.files["org/index"][expected.path]) == [
-        catalog_v2_from_legacy(historical)
-    ]
+    assert catalog.projection_path == projection_path
+    assert catalog.harbor_bundle_count == 1
 
 
 def test_duplicate_publication_is_a_no_op(
@@ -380,7 +291,7 @@ def test_duplicate_publication_is_a_no_op(
     assert len(api.commits) == 2
 
 
-def test_adoption_requires_migration_when_catalog_history_is_missing(
+def test_adoption_requires_canonical_catalog_when_history_is_missing(
     publication: ResultPublication, tmp_path: Path
 ) -> None:
     api = FakeDatasetApi(tmp_path)
@@ -396,7 +307,7 @@ def test_adoption_requires_migration_when_catalog_history_is_missing(
         if "/windows/" in path:
             del api.files["org/index"][path]
 
-    with pytest.raises(DatasetPublicationError, match="catalog migration"):
+    with pytest.raises(DatasetPublicationError, match="canonical catalog"):
         publisher.publish(
             publication,
             result_dataset="org/results",

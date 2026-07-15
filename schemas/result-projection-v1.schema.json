@@ -36,7 +36,7 @@
       "type": "string"
     },
     "envelope_path": {
-      "const": "publication-envelope.v2.json",
+      "const": "publication-envelope.v1.json",
       "title": "Envelope Path",
       "type": "string"
     },
@@ -82,8 +82,8 @@
       "type": "string"
     },
     "schema_version": {
-      "const": "harbor-hf/result-projection/v2",
-      "default": "harbor-hf/result-projection/v2",
+      "const": "harbor-hf/result-projection/v1",
+      "default": "harbor-hf/result-projection/v1",
       "title": "Schema Version",
       "type": "string"
     },
@@ -134,6 +134,6 @@
     "harbor_archive_sha256s",
     "tables"
   ],
-  "title": "ResultProjectionV2",
+  "title": "ResultProjection",
   "type": "object"
 }

@@ -198,7 +198,9 @@ def _evidence(summary: dict[str, object], marker: str = "_SUCCESS") -> MemoryEvi
     checksums = {path: _sha256(value) for path, value in files.items()}
     files["checksums.json"] = _json_bytes(checksums)
     files[marker] = b"\n"
-    return MemoryEvidence(files)
+    evidence = MemoryEvidence(files)
+    _add_envelope(evidence)
+    return evidence
 
 
 def _json_bytes(value: object) -> bytes:
@@ -218,7 +220,7 @@ def _refresh_checksums(evidence: MemoryEvidence) -> None:
     evidence.files["checksums.json"] = _json_bytes(checksums)
 
 
-def _add_v2_envelope(evidence: MemoryEvidence) -> None:
+def _add_envelope(evidence: MemoryEvidence) -> None:
     summary = json.loads(evidence.files["run-summary.json"])
     run_lock = evidence.files["run.lock.json"]
     executions = []
@@ -264,7 +266,7 @@ def _add_v2_envelope(evidence: MemoryEvidence) -> None:
             }
         )
     envelope = {
-        "schema_version": "harbor-hf/publication-envelope/v2",
+        "schema_version": "harbor-hf/publication-envelope/v1",
         "run_id": summary["run"]["run_id"],
         "campaign_id": summary["run"]["campaign_id"],
         "created_at": summary["run"]["created_at"],
@@ -290,11 +292,11 @@ def _add_v2_envelope(evidence: MemoryEvidence) -> None:
             "accelerator_count": summary["run"]["accelerator_count"],
         },
         "sanitizer_version": "harbor-hf/public-results/v1",
-        "projection_version": "harbor-hf/results-projection/v2",
+        "projection_version": "harbor-hf/results-projection/v1",
         "cleanup_outcome": "verified",
         "executions": executions,
     }
-    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    evidence.files["publication-envelope.v1.json"] = _json_bytes(envelope)
     _refresh_checksums(evidence)
 
 
@@ -333,8 +335,10 @@ def test_builds_deterministic_traceable_rows_and_parquet(
         for row in rows
     }
     assert len(trace) == 1
-    assert len(first_publication.files) == 5
+    assert len(first_publication.files) == 6
     for item in first_publication.files:
+        if not item.path.startswith("data/"):
+            continue
         table = pq.read_table(pa.BufferReader(item.content))
         assert table.schema.metadata is not None
         assert b"harbor_hf.schema_version" in table.schema.metadata
@@ -342,10 +346,10 @@ def test_builds_deterministic_traceable_rows_and_parquet(
         assert SHELLBENCH_TASK not in item.content
 
 
-def test_builds_v2_projection_bound_to_native_envelope(
+def test_builds_projection_bound_to_native_envelope(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
-    _add_v2_envelope(evidence)
+    _add_envelope(evidence)
 
     tables = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
     publication = build_result_publication(tables)
@@ -370,49 +374,58 @@ def test_builds_v2_projection_bound_to_native_envelope(
     assert SHELLBENCH_TASK not in published
 
 
-def test_rejects_v2_envelope_with_unverified_bundle(
+def test_rejects_envelope_with_unverified_bundle(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
-    _add_v2_envelope(evidence)
-    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    _add_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v1.json"])
     succeeded = next(
         record for record in envelope["executions"] if record["harbor_bundle"]
     )
     succeeded["harbor_bundle"]["archive"]["digest"] = "sha256:" + "0" * 64
-    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    evidence.files["publication-envelope.v1.json"] = _json_bytes(envelope)
     _refresh_checksums(evidence)
 
     with pytest.raises(ResultPublicationError, match="unverified Harbor archive"):
         build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
 
 
-def test_legacy_success_envelope_publishes_without_v2_provenance(
+def test_rejects_legacy_success_without_native_provenance(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
-    _add_v2_envelope(evidence)
-    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    _add_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v1.json"])
     succeeded = next(
         record for record in envelope["executions"] if record["status"] == "succeeded"
     )
     succeeded["bundle_status"] = "legacy_unavailable"
     succeeded["harbor_bundle"] = None
-    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    evidence.files["publication-envelope.v1.json"] = _json_bytes(envelope)
     _refresh_checksums(evidence)
 
-    tables = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
-    publication = build_result_publication(tables)
+    with pytest.raises(ResultPublicationError, match="envelope is invalid"):
+        build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
 
-    assert tables.provenance is None
-    assert not any(item.path.startswith("projections/") for item in publication.files)
+
+def test_rejects_evidence_without_canonical_envelope(
+    evidence: MemoryEvidence, source: EvidenceSource
+) -> None:
+    del evidence.files["publication-envelope.v1.json"]
+    _refresh_checksums(evidence)
+
+    with pytest.raises(
+        ResultPublicationError, match="no canonical publication envelope"
+    ):
+        build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
 
 
 def test_rejects_envelope_execution_that_conflicts_with_summary(
     evidence: MemoryEvidence, source: EvidenceSource
 ) -> None:
-    _add_v2_envelope(evidence)
-    envelope = json.loads(evidence.files["publication-envelope.v2.json"])
+    _add_envelope(evidence)
+    envelope = json.loads(evidence.files["publication-envelope.v1.json"])
     envelope["executions"][0]["trial_id"] = "trial-imposter"
-    evidence.files["publication-envelope.v2.json"] = _json_bytes(envelope)
+    evidence.files["publication-envelope.v1.json"] = _json_bytes(envelope)
     _refresh_checksums(evidence)
 
     with pytest.raises(ResultPublicationError, match="executions conflict"):

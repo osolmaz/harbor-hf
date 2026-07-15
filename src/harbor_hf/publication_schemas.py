@@ -3,14 +3,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from harbor_hf.harbor_native_bundle import HarborNativeBundle
-from harbor_hf.publication_envelope import PublicationEnvelopeV2
-from harbor_hf.results import CatalogRowV2, ResultProjectionV2
+from harbor_hf.publication_envelope import PublicationEnvelope
+from harbor_hf.results import CatalogRow, ResultProjection
 
 PUBLICATION_SCHEMA_MODELS = {
     "harbor-native-bundle-v1alpha1.schema.json": HarborNativeBundle,
-    "publication-envelope-v2.schema.json": PublicationEnvelopeV2,
-    "result-projection-v2.schema.json": ResultProjectionV2,
-    "result-catalog-v2.schema.json": CatalogRowV2,
+    "publication-envelope-v1.schema.json": PublicationEnvelope,
+    "result-projection-v1.schema.json": ResultProjection,
+    "result-catalog-v1.schema.json": CatalogRow,
 }
 
 

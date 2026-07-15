@@ -2,11 +2,10 @@
 
 ## Status
 
-The native publication boundary is implemented, but the current dual-publication
-and v2-first reader are deprecated. The remaining work is a coordinated hard
-cutover that replaces the existing `v1` contract in place, removes the temporary
-v2 and legacy paths, rebuilds the active catalog from verified native evidence,
-and deploys the writer, reader, and Results Space together.
+The canonical `v1` publication boundary is implemented. The dual writer,
+v2-first reader, migration command, legacy classifications, and superseded
+schemas have been removed. The active hosted catalog must be rebuilt only from
+verified native evidence and deployed with the matching Results Space release.
 
 ## Purpose
 
@@ -241,8 +240,8 @@ promote its compatibility bundle into a competing permanent standard.
 Exit criterion: every field has one documented owner and the complete removal
 surface is enumerated.
 
-Status: field ownership and native fixtures are complete. The implementation
-removal inventory remains to be finalized before cutover.
+Status: complete. Field ownership, native fixtures, and the removal inventory
+are recorded and covered by the canonical contract tests.
 
 ### Phase 1: Define The Canonical V1 Contract
 

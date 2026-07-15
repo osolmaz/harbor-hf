@@ -1101,7 +1101,7 @@ def test_result_index_windows_are_deduplicated_sorted_and_power_sized(
     monkeypatch.setattr(publisher, "_exists", lambda *args: False)
     monkeypatch.setattr(
         publisher,
-        "_legacy_index_rows",
+        "_individual_index_rows",
         lambda *args: [same_time_later_id, replaced, old],
     )
 
@@ -1155,8 +1155,8 @@ def test_result_index_window_prefers_consolidated_history(
     )
     monkeypatch.setattr(
         publisher,
-        "_legacy_index_rows",
-        lambda *args: pytest.fail("legacy files must not be read"),
+        "_individual_index_rows",
+        lambda *args: pytest.fail("individual files must not be read"),
     )
 
     windows = publisher._index_windows(

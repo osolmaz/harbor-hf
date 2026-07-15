@@ -232,6 +232,26 @@
           "name": "control_commit",
           "nullable": false,
           "type": "string"
+        },
+        {
+          "name": "projection_path",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "projection_sha256",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "envelope_sha256",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "harbor_bundle_count",
+          "nullable": false,
+          "type": "int64"
         }
       ],
       "schema_version": "harbor-hf/results/catalog/v1"

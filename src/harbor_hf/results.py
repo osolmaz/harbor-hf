@@ -21,7 +21,7 @@ from pydantic import (
 
 from harbor_hf.publication_envelope import (
     PUBLICATION_ENVELOPE_PATH,
-    PublicationEnvelopeV2,
+    PublicationEnvelope,
 )
 
 Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
@@ -343,10 +343,10 @@ class ArtifactRow(TraceRow):
 
 
 class PublicationProvenance(FrozenModel):
-    schema_version: Literal["harbor-hf/result-provenance/v2"] = (
-        "harbor-hf/result-provenance/v2"
+    schema_version: Literal["harbor-hf/result-provenance/v1"] = (
+        "harbor-hf/result-provenance/v1"
     )
-    envelope_path: Literal["publication-envelope.v2.json"] = PUBLICATION_ENVELOPE_PATH
+    envelope_path: Literal["publication-envelope.v1.json"] = PUBLICATION_ENVELOPE_PATH
     envelope_sha256: Digest
     projection_version: str = Field(min_length=1)
     sanitizer_version: str = Field(min_length=1)
@@ -367,9 +367,7 @@ class ResultTables(FrozenModel):
     executions: list[ExecutionRow]
     metrics: list[MetricRow]
     artifacts: list[ArtifactRow]
-    provenance: PublicationProvenance | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
+    provenance: PublicationProvenance
 
     @model_validator(mode="after")
     def has_one_consistent_run(self) -> ResultTables:
@@ -437,6 +435,10 @@ class CatalogRow(FrozenModel):
     result_revision: Commit
     source_checksum: Digest
     control_commit: Commit
+    projection_path: str = Field(min_length=1)
+    projection_sha256: Digest
+    envelope_sha256: Digest
+    harbor_bundle_count: int = Field(ge=1)
 
     @model_validator(mode="after")
     def values_are_consistent(self) -> CatalogRow:
@@ -446,36 +448,8 @@ class CatalogRow(FrozenModel):
             raise ValueError("catalog passed trials exceed trial count")
         if self.completed_at < self.created_at:
             raise ValueError("catalog completion precedes creation")
+        _validate_relative_path(self.projection_path)
         return self
-
-
-class CatalogRowV2(CatalogRow):
-    schema_version: Literal["harbor-hf/results/catalog/v2"] = (
-        "harbor-hf/results/catalog/v2"
-    )
-    source_format: Literal["native-v2", "legacy-v1"]
-    projection_path: str | None = None
-    projection_sha256: Digest | None = None
-    envelope_sha256: Digest | None = None
-    harbor_bundle_count: int = Field(ge=0)
-
-    @model_validator(mode="after")
-    def provenance_is_consistent(self) -> CatalogRowV2:
-        values = (
-            self.projection_path,
-            self.projection_sha256,
-            self.envelope_sha256,
-        )
-        if self.source_format == "native-v2":
-            if any(value is None for value in values) or self.harbor_bundle_count < 1:
-                raise ValueError("native v2 catalog row has incomplete provenance")
-            _validate_relative_path(self.projection_path or "")
-        elif any(value is not None for value in values) or self.harbor_bundle_count:
-            raise ValueError("legacy v1 catalog row cannot claim v2 provenance")
-        return self
-
-
-CatalogEntry = CatalogRow | CatalogRowV2
 
 
 class DatasetFile(FrozenModel):
@@ -501,9 +475,9 @@ class ProjectionFileReference(FrozenModel):
         return self
 
 
-class ResultProjectionV2(FrozenModel):
-    schema_version: Literal["harbor-hf/result-projection/v2"] = (
-        "harbor-hf/result-projection/v2"
+class ResultProjection(FrozenModel):
+    schema_version: Literal["harbor-hf/result-projection/v1"] = (
+        "harbor-hf/result-projection/v1"
     )
     publication_id: EntityId
     run_id: EntityId
@@ -511,7 +485,7 @@ class ResultProjectionV2(FrozenModel):
     source_prefix: str = Field(min_length=1)
     source_checksum: Digest
     control_commit: Commit
-    envelope_path: Literal["publication-envelope.v2.json"]
+    envelope_path: Literal["publication-envelope.v1.json"]
     envelope_sha256: Digest
     projection_version: str = Field(min_length=1)
     sanitizer_version: str = Field(min_length=1)
@@ -520,9 +494,9 @@ class ResultProjectionV2(FrozenModel):
     tables: dict[TableName, ProjectionFileReference]
 
     @model_validator(mode="after")
-    def tables_are_complete(self) -> ResultProjectionV2:
+    def tables_are_complete(self) -> ResultProjection:
         if set(self.tables) != set(_table_names()):
-            raise ValueError("v2 projection does not reference every query table")
+            raise ValueError("projection does not reference every query table")
         return self
 
 
@@ -667,8 +641,7 @@ def build_result_publication(tables: ResultTables) -> ResultPublication:
         )
         for table in _table_names()
     ]
-    if tables.provenance is not None:
-        files.append(_build_projection_file(tables, files))
+    files.append(_build_projection_file(tables, files))
     receipt_path = f"publications/{tables.publication_id}.json"
     receipt_value = {
         "schema_version": "harbor-hf/result-publication/v1",
@@ -689,8 +662,6 @@ def _build_projection_file(
     tables: ResultTables, table_files: list[DatasetFile]
 ) -> DatasetFile:
     provenance = tables.provenance
-    if provenance is None:
-        raise ValueError("v2 projection requires publication provenance")
     run = tables.runs[0]
     references = {
         table: ProjectionFileReference(
@@ -710,7 +681,7 @@ def _build_projection_file(
         )
         for table in _table_names()
     }
-    projection = ResultProjectionV2(
+    projection = ResultProjection(
         publication_id=tables.publication_id,
         run_id=run.run_id,
         source_bucket=run.source_bucket,
@@ -726,7 +697,7 @@ def _build_projection_file(
         tables=references,
     )
     return DatasetFile(
-        path=f"projections/schema=v2/{tables.publication_id}.json",
+        path=f"projections/schema=v1/{tables.publication_id}.json",
         content=_canonical_json(projection.model_dump(mode="json")),
     )
 
@@ -771,7 +742,11 @@ def build_index_window_file(rows: Sequence[GlobalIndexRow], size: int) -> Datase
 
 
 def build_catalog_row(
-    tables: ResultTables, *, result_dataset: str, result_revision: str
+    tables: ResultTables,
+    *,
+    result_dataset: str,
+    result_revision: str,
+    projection: DatasetFile,
 ) -> CatalogRow:
     run = tables.runs[0]
     rewards = _trial_reward_scores(tables)
@@ -807,6 +782,10 @@ def build_catalog_row(
         result_revision=result_revision,
         source_checksum=run.source_checksum,
         control_commit=run.control_commit,
+        projection_path=projection.path,
+        projection_sha256=_sha256_bytes(projection.content),
+        envelope_sha256=tables.provenance.envelope_sha256,
+        harbor_bundle_count=len(tables.provenance.harbor_archive_sha256s),
     )
 
 
@@ -819,80 +798,15 @@ def build_catalog_window_file(rows: Sequence[CatalogRow], size: int) -> DatasetF
     )
 
 
-def build_catalog_row_v2(
-    tables: ResultTables,
-    *,
-    result_dataset: str,
-    result_revision: str,
-    projection: DatasetFile | None,
-) -> CatalogRowV2:
-    base = build_catalog_row(
-        tables,
-        result_dataset=result_dataset,
-        result_revision=result_revision,
-    )
-    values = base.model_dump(mode="python", exclude={"schema_version"})
-    provenance = tables.provenance
-    if provenance is None:
-        if projection is not None:
-            raise ValueError("legacy result cannot claim a v2 projection")
-        return CatalogRowV2(
-            **values,
-            source_format="legacy-v1",
-            harbor_bundle_count=0,
-        )
-    if projection is None:
-        raise ValueError("native v2 result has no projection manifest")
-    return CatalogRowV2(
-        **values,
-        source_format="native-v2",
-        projection_path=projection.path,
-        projection_sha256=_sha256_bytes(projection.content),
-        envelope_sha256=provenance.envelope_sha256,
-        harbor_bundle_count=len(provenance.harbor_archive_sha256s),
-    )
-
-
-def catalog_v2_from_legacy(row: CatalogRow) -> CatalogRowV2:
-    return CatalogRowV2(
-        **row.model_dump(mode="python", exclude={"schema_version"}),
-        source_format="legacy-v1",
-        harbor_bundle_count=0,
-    )
-
-
-def build_catalog_v2_window_file(
-    rows: Sequence[CatalogRowV2], size: int
-) -> DatasetFile:
-    if size < 1:
-        raise ValueError("catalog window size must be positive")
-    return DatasetFile(
-        path=f"data/catalog/schema=v2/windows/{size:04d}.parquet",
-        content=_parquet_bytes(rows[:size], catalog_v2_parquet_schema()),
-    )
-
-
 def catalog_lookup_path(run_id: str) -> str:
     identity = hashlib.sha256(run_id.encode()).hexdigest()
     return f"data/catalog/schema=v1/runs/{identity}.parquet"
-
-
-def catalog_v2_lookup_path(run_id: str) -> str:
-    identity = hashlib.sha256(run_id.encode()).hexdigest()
-    return f"data/catalog/schema=v2/runs/{identity}.parquet"
 
 
 def build_catalog_lookup_file(row: CatalogRow) -> DatasetFile:
     return DatasetFile(
         path=catalog_lookup_path(row.run_id),
         content=_parquet_bytes([row], catalog_parquet_schema()),
-    )
-
-
-def build_catalog_v2_lookup_file(row: CatalogRowV2) -> DatasetFile:
-    return DatasetFile(
-        path=catalog_v2_lookup_path(row.run_id),
-        content=_parquet_bytes([row], catalog_v2_parquet_schema()),
     )
 
 
@@ -904,16 +818,6 @@ def read_catalog_file(content: bytes) -> list[CatalogRow]:
     except (pa.ArrowException, OSError) as error:
         raise ValueError("result catalog Parquet is invalid") from error
     return [CatalogRow.model_validate(value) for value in values.to_pylist()]
-
-
-def read_catalog_v2_file(content: bytes) -> list[CatalogRowV2]:
-    try:
-        values = pq.read_table(
-            pa.BufferReader(content), schema=catalog_v2_parquet_schema()
-        )
-    except (pa.ArrowException, OSError) as error:
-        raise ValueError("v2 result catalog Parquet is invalid") from error
-    return [CatalogRowV2.model_validate(value) for value in values.to_pylist()]
 
 
 def _trial_reward_scores(tables: ResultTables) -> list[float]:
@@ -1041,10 +945,6 @@ def catalog_parquet_schema() -> pa.Schema:
     return _CATALOG_SCHEMA
 
 
-def catalog_v2_parquet_schema() -> pa.Schema:
-    return _CATALOG_V2_SCHEMA
-
-
 def _verify_evidence(
     reader: EvidenceReader, source: EvidenceSource
 ) -> tuple[ResultEvidence, str, str, dict[str, Digest]]:
@@ -1069,12 +969,12 @@ def _load_publication_provenance(
     source: EvidenceSource,
     summary: ResultEvidence,
     checksums: Mapping[str, str],
-) -> PublicationProvenance | None:
+) -> PublicationProvenance:
     envelope_digest = checksums.get(PUBLICATION_ENVELOPE_PATH)
     if envelope_digest is None:
-        return None
+        raise ResultPublicationError("evidence has no canonical publication envelope")
     try:
-        envelope = PublicationEnvelopeV2.model_validate_json(
+        envelope = PublicationEnvelope.model_validate_json(
             reader.read_bytes(
                 bucket=source.bucket,
                 prefix=source.prefix,
@@ -1085,11 +985,6 @@ def _load_publication_provenance(
         raise ResultPublicationError("publication envelope is invalid") from error
     _validate_envelope_identity(envelope, source, summary, checksums)
     _validate_envelope_executions(envelope, summary)
-    if any(
-        execution.bundle_status == "legacy_unavailable"
-        for execution in envelope.executions
-    ):
-        return None
     manifests = []
     archives = []
     for execution in envelope.executions:
@@ -1116,7 +1011,7 @@ def _load_publication_provenance(
 
 
 def _validate_envelope_identity(
-    envelope: PublicationEnvelopeV2,
+    envelope: PublicationEnvelope,
     source: EvidenceSource,
     summary: ResultEvidence,
     checksums: Mapping[str, str],
@@ -1143,7 +1038,7 @@ def _validate_envelope_identity(
 
 
 def _validate_envelope_executions(
-    envelope: PublicationEnvelopeV2,
+    envelope: PublicationEnvelope,
     summary: ResultEvidence,
 ) -> None:
     expected = {
@@ -1572,17 +1467,9 @@ _CATALOG_SCHEMA = _make_schema(
         _field("result_revision", pa.string()),
         _field("source_checksum", pa.string()),
         _field("control_commit", pa.string()),
-    ],
-)
-
-_CATALOG_V2_SCHEMA = _make_schema(
-    "harbor-hf/results/catalog/v2",
-    [
-        *list(_CATALOG_SCHEMA),
-        _field("source_format", pa.string()),
-        _field("projection_path", pa.string(), nullable=True),
-        _field("projection_sha256", pa.string(), nullable=True),
-        _field("envelope_sha256", pa.string(), nullable=True),
+        _field("projection_path", pa.string()),
+        _field("projection_sha256", pa.string()),
+        _field("envelope_sha256", pa.string()),
         _field("harbor_bundle_count", pa.int64()),
     ],
 )
