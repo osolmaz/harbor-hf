@@ -202,7 +202,17 @@ def _evidence(summary: dict[str, object], marker: str = "_SUCCESS") -> MemoryEvi
     normalized["artifacts"][0]["sha256"] = _sha256(verification)
     normalized["artifacts"][0]["size_bytes"] = len(verification)
     files = {
-        "run.lock.json": _json_bytes({"run_id": "run-one", "cell_digest": "x"}),
+        "run.lock.json": _json_bytes(
+            {
+                "run_id": "run-one",
+                "cell_digest": "x",
+                "attempts": 1,
+                "benchmark_task_digests": {
+                    "task-one": "sha256:" + "1" * 64,
+                    "task-two": "sha256:" + "2" * 64,
+                },
+            }
+        ),
         "run-summary.json": _json_bytes(normalized),
         "verification.json": verification,
         "trials/trial-one/executions/execution-two/session.json": SECRET_SESSION,
@@ -613,6 +623,27 @@ def test_rejects_incomplete_or_tampered_raw_evidence(
 
     with pytest.raises(ResultPublicationError, match=message):
         build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+
+
+def test_rejects_summary_that_omits_a_locked_task(
+    summary_value: dict[str, object], source: EvidenceSource
+) -> None:
+    summary = json.loads(json.dumps(summary_value))
+    summary["trials"] = summary["trials"][:1]
+    selected_trial = summary["trials"][0]["trial_id"]
+    summary["executions"] = [
+        execution
+        for execution in summary["executions"]
+        if execution["trial_id"] == selected_trial
+    ]
+    summary["metrics"] = [
+        metric
+        for metric in summary["metrics"]
+        if metric["owner_type"] == "run" or metric["owner_id"] == selected_trial
+    ]
+
+    with pytest.raises(ResultPublicationError, match="tasks do not match"):
+        build_result_tables(_evidence(summary), source, control_commit=CONTROL_COMMIT)
 
 
 def test_rejects_unsanitized_or_expansive_summary(

@@ -1052,9 +1052,38 @@ def _verify_evidence(
     summary, lock = _load_summary_and_lock(reader, source)
     if lock.get("run_id") != summary.run.run_id:
         raise ResultPublicationError("evidence summary does not match its run lock")
+    _validate_summary_tasks_against_lock(summary, lock)
     _verify_artifact_evidence(reader, source, checksums, summary.artifacts)
     source_checksum = _digest(checksums)
     return summary, source_checksum, checksums[source.run_lock_path], checksums
+
+
+def _validate_summary_tasks_against_lock(
+    summary: ResultEvidence, lock: Mapping[str, JsonValue]
+) -> None:
+    locked = lock.get("benchmark_task_digests")
+    attempts = lock.get("attempts")
+    if (
+        not isinstance(locked, dict)
+        or not all(
+            isinstance(name, str) and isinstance(digest, str)
+            for name, digest in locked.items()
+        )
+        or not isinstance(attempts, int)
+        or attempts < 1
+    ):
+        raise ResultPublicationError("run lock omits its planned task identities")
+    expected = {
+        (name, logical_attempt): digest
+        for name, digest in locked.items()
+        for logical_attempt in range(1, attempts + 1)
+    }
+    observed = {
+        (trial.task_name, trial.logical_attempt): trial.task_digest
+        for trial in summary.trials
+    }
+    if len(observed) != len(summary.trials) or observed != expected:
+        raise ResultPublicationError("evidence tasks do not match its run lock")
 
 
 def _load_publication_provenance(

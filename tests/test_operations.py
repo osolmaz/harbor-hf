@@ -261,7 +261,15 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
         "artifacts": [],
     }
     files = {
-        "run.lock.json": json.dumps({"run_id": run.run_id}).encode(),
+        "run.lock.json": json.dumps(
+            {
+                "run_id": run.run_id,
+                "attempts": 1,
+                "benchmark_task_digests": {
+                    trial.task_name: trial.task_digest,
+                },
+            }
+        ).encode(),
         "run-summary.json": json.dumps(summary).encode(),
     }
     execution_prefix = f"trials/{trial.trial_id}/executions/execution-one"

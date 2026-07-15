@@ -226,7 +226,7 @@ function RunsTable({ runs, selected, onToggle, comparable = true }: {
               <td><span className="model-name">{run.model_repo}</span><SmallText>{shortRevision(run.model_revision)}</SmallText></td>
               <td>{run.agent_name}<SmallText>{run.agent_revision}</SmallText></td>
               <td>{run.hardware}<SmallText>{run.accelerator_count} accelerator{run.accelerator_count === 1 ? "" : "s"}</SmallText></td>
-              <td>{run.passed_trials}/{run.planned_trial_count}<SmallText>{run.quality === "degraded" ? `${run.failed_executions} failed executions` : "clean"}</SmallText></td>
+              <td>{run.passed_trials}/{run.planned_trial_count}<SmallText>{run.failed_executions ? `${run.quality}; ${run.failed_executions} failed execution${run.failed_executions === 1 ? "" : "s"}` : run.quality}</SmallText></td>
               <td>{formatDuration(run.duration_seconds)}</td>
               <td>{formatDate(run.completed_at)}</td>
               <td><Link className="icon-button compact" title="Open run" to={`/runs/${run.run_id}`}><ChevronRight size={15} /></Link></td>
