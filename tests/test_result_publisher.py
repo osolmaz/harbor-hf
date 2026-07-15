@@ -14,6 +14,7 @@ from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 
 from harbor_hf.result_publisher import (
+    DatasetPublicationError,
     HubDatasetPublisher,
     PublicationConflict,
     publisher_lease_path,
@@ -246,14 +247,14 @@ def test_duplicate_publication_is_a_no_op(
     assert len(api.commits) == 2
 
 
-def test_adoption_repairs_missing_bounded_index_windows(
+def test_adoption_requires_migration_when_catalog_history_is_missing(
     publication: ResultPublication, tmp_path: Path
 ) -> None:
     api = FakeDatasetApi(tmp_path)
     publisher = HubDatasetPublisher(
         publisher_id="publisher-one", leases=FakeLeases(), api=api
     )
-    first = publisher.publish(
+    publisher.publish(
         publication,
         result_dataset="org/results",
         index_dataset="org/index",
@@ -262,22 +263,15 @@ def test_adoption_repairs_missing_bounded_index_windows(
         if "/windows/" in path:
             del api.files["org/index"][path]
 
-    repaired = publisher.publish(
-        publication,
-        result_dataset="org/results",
-        index_dataset="org/index",
-    )
-    adopted = publisher.publish(
-        publication,
-        result_dataset="org/results",
-        index_dataset="org/index",
-    )
+    with pytest.raises(DatasetPublicationError, match="catalog migration"):
+        publisher.publish(
+            publication,
+            result_dataset="org/results",
+            index_dataset="org/index",
+        )
 
-    assert repaired.result_revision == first.result_revision
-    assert repaired.index_revision != first.index_revision
-    assert adopted == repaired
-    assert len(api.commits) == 3
-    assert len([path for path in api.files["org/index"] if "/windows/" in path]) == 24
+    assert len(api.commits) == 2
+    assert not [path for path in api.files["org/index"] if "/windows/" in path]
 
 
 def test_duplicate_publication_rejects_different_canonical_result_bytes(

@@ -26,6 +26,7 @@ export interface RunSummary {
 export interface RunsResponse {
   items: RunSummary[];
   total: number;
+  next_cursor: string | null;
   facets: {
     benchmarks: string[];
     models: string[];
@@ -56,6 +57,7 @@ export interface Comparison {
   score_delta: number;
   tasks: Array<{
     task_name: string;
+    logical_attempt: number;
     left_score: number | null;
     right_score: number | null;
     delta: number | null;

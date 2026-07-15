@@ -193,6 +193,19 @@ class ResultRepository:
             artifacts=tuple(_only(rows["artifacts"], ArtifactRow)),
         )
 
+    def find_catalog(self, run_id: str) -> CatalogRow:
+        """Resolve a stable run link outside the configured list-page window."""
+        revision = self._current_revision()
+        rows = self._load_catalog(revision, largest=True)
+        for row in rows:
+            if row.run_id == run_id:
+                return row
+        raise KeyError(run_id)
+
+    def all_catalog_rows(self) -> tuple[CatalogRow, ...]:
+        """Return the largest bounded catalog for stable entity lookup."""
+        return tuple(self._load_catalog(self._current_revision(), largest=True))
+
     def rebuild_catalog(self) -> list[CatalogRow]:
         """Rebuild catalog rows from legacy index and publication tables."""
         from harbor_hf.results import ResultTables, build_catalog_row
@@ -221,7 +234,9 @@ class ResultRepository:
             )
         return rows
 
-    def _load_catalog(self, revision: str) -> list[CatalogRow]:
+    def _load_catalog(
+        self, revision: str, *, largest: bool = False
+    ) -> list[CatalogRow]:
         paths = sorted(
             path
             for path in self._reader.list_files(self.config.index_dataset, revision)
@@ -233,12 +248,16 @@ class ResultRepository:
                 "the configured index has no compact v1 catalog snapshot"
             )
         requested = self.config.max_publications
-        path = min(
-            paths,
-            key=lambda value: (
-                _window_size(value) < requested,
-                abs(_window_size(value) - requested),
-            ),
+        path = (
+            max(paths, key=_window_size)
+            if largest
+            else min(
+                paths,
+                key=lambda value: (
+                    _window_size(value) < requested,
+                    abs(_window_size(value) - requested),
+                ),
+            )
         )
         rows = [
             _validate(CatalogRow, value, path)
@@ -254,9 +273,17 @@ class ResultRepository:
                     f"catalog has conflicting rows for publication {row.publication_id}"
                 )
             unique[row.publication_id] = row
-        return sorted(
+        ordered = sorted(
             unique.values(), key=lambda item: item.completed_at, reverse=True
-        )[: self.config.max_publications]
+        )
+        return ordered if largest else ordered[: self.config.max_publications]
+
+    def _current_revision(self) -> str:
+        if self._resolved_revision is None:
+            self._resolved_revision = self._reader.resolve_revision(
+                self.config.index_dataset, self.config.index_revision
+            )
+        return self._resolved_revision
 
     def _load_index(self, revision: str) -> list[GlobalIndexRow]:
         paths = sorted(
@@ -402,11 +429,9 @@ def _validate_publication_relations(
         raise PresentationError("publication contains duplicate child IDs")
     if run.trial_count != len(trials) or run.execution_count != len(executions):
         raise PresentationError("run child counts do not match normalized rows")
-    execution_by_id = {row.execution_id: row for row in executions}
-    for trial in trials:
-        selected = execution_by_id.get(trial.selected_execution_id)
-        if selected is None or selected.trial_id != trial.trial_id:
-            raise PresentationError("trial selected execution is invalid")
+    if any(row.trial_id not in trial_ids for row in executions):
+        raise PresentationError("execution references an unknown trial")
+    _validate_selected_executions(trials, executions)
     owners = {
         "run": {run.run_id},
         "trial": trial_ids,
@@ -416,6 +441,24 @@ def _validate_publication_relations(
         row.owner_id not in owners[row.owner_type] for row in [*metrics, *artifacts]
     ):
         raise PresentationError("publication row references an unknown owner")
+    if len({row.metric_id for row in metrics}) != len(metrics):
+        raise PresentationError("publication contains duplicate metric IDs")
+    if len({row.artifact_id for row in artifacts}) != len(artifacts):
+        raise PresentationError("publication contains duplicate artifact IDs")
+
+
+def _validate_selected_executions(
+    trials: Sequence[TrialRow], executions: Sequence[ExecutionRow]
+) -> None:
+    execution_by_id = {row.execution_id: row for row in executions}
+    for trial in trials:
+        selected = execution_by_id.get(trial.selected_execution_id)
+        if (
+            selected is None
+            or selected.trial_id != trial.trial_id
+            or selected.status != "succeeded"
+        ):
+            raise PresentationError("trial selected execution is invalid")
 
 
 def _catalog_index(row: CatalogRow) -> GlobalIndexRow:

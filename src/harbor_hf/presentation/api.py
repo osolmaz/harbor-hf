@@ -4,6 +4,8 @@ import hashlib
 import os
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -24,12 +26,36 @@ class ServiceHolder:
     ) -> None:
         self._service = service
         self._config = config
+        self._injected = service is not None
+        self._loaded_at = monotonic() if service is not None else 0.0
+        self._lock = Lock()
 
     def get(self) -> ResultService:
-        if self._service is None:
-            config = self._config or PresentationConfig.from_env()
+        if self._injected:
+            assert self._service is not None
+            return self._service
+        config = self._config or PresentationConfig.from_env()
+        now = monotonic()
+        immutable = _is_commit(config.index_revision)
+        if self._service is not None and (
+            immutable or now - self._loaded_at < config.refresh_seconds
+        ):
+            return self._service
+        with self._lock:
+            now = monotonic()
+            if self._service is not None and (
+                immutable or now - self._loaded_at < config.refresh_seconds
+            ):
+                return self._service
             repository = ResultRepository(config)
-            self._service = ResultService(repository.load(), config.title, repository)
+            snapshot = repository.load()
+            if (
+                self._service is None
+                or self._service.snapshot.index_revision != snapshot.index_revision
+            ):
+                self._service = ResultService(snapshot, config.title, repository)
+            self._loaded_at = now
+        assert self._service is not None
         return self._service
 
 
@@ -229,6 +255,8 @@ def _register_frontend(app: FastAPI, web_dir: Path | None) -> None:
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     def frontend(path: str) -> FileResponse:
+        if path == "api" or path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API route not found")
         candidate = (static_root / path).resolve()
         root = static_root.resolve()
         if path and candidate.is_relative_to(root) and candidate.is_file():
@@ -274,6 +302,12 @@ def _decode_cursor(cursor: str) -> int:
 
 def _encode_cursor(offset: int) -> str:
     return urlsafe_b64encode(f"v1:{offset}".encode()).decode()
+
+
+def _is_commit(value: str) -> bool:
+    return len(value) in {40, 64} and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 app = create_app()

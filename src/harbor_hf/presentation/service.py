@@ -17,6 +17,7 @@ from harbor_hf.results import (
 
 RunCatalog = RunRow | CatalogRow
 EntityField = Literal["trial_id", "execution_id", "artifact_id"]
+TrialKey = tuple[str, int]
 
 
 class ResultNotFound(LookupError):
@@ -29,6 +30,9 @@ class ResultService:
     title: str = "Harbor Results"
     repository: ResultRepository | None = None
     _publications: dict[str, ResultSnapshot] = field(
+        default_factory=dict, init=False, compare=False, repr=False
+    )
+    _historical_catalogs: dict[str, CatalogRow] = field(
         default_factory=dict, init=False, compare=False, repr=False
     )
 
@@ -160,12 +164,14 @@ class ResultService:
         left_trials = left._trials_by_task(run_id)
         right_trials = right._trials_by_task(other_run_id)
         tasks = []
-        for task in sorted(set(left_trials) | set(right_trials)):
-            left_score = left._trial_score(left_trials.get(task))
-            right_score = right._trial_score(right_trials.get(task))
+        for task_name, logical_attempt in sorted(set(left_trials) | set(right_trials)):
+            key = (task_name, logical_attempt)
+            left_score = left._trial_score(left_trials.get(key))
+            right_score = right._trial_score(right_trials.get(key))
             tasks.append(
                 {
-                    "task_name": task,
+                    "task_name": task_name,
+                    "logical_attempt": logical_attempt,
                     "left_score": left_score,
                     "right_score": right_score,
                     "delta": None
@@ -174,7 +180,14 @@ class ResultService:
                 }
             )
         return {
-            "compatible": left_catalog.benchmark == right_catalog.benchmark,
+            "compatible": (
+                left_catalog.benchmark,
+                left_catalog.benchmark_revision,
+            )
+            == (
+                right_catalog.benchmark,
+                right_catalog.benchmark_revision,
+            ),
             "left": self._summary(left_catalog),
             "right": self._summary(right_catalog),
             "score_delta": self._catalog_score(right_catalog)
@@ -297,7 +310,20 @@ class ResultService:
         return self._find(self.snapshot.runs, "run_id", run_id)
 
     def _catalog(self, run_id: str) -> RunCatalog:
-        return self._find(self._catalog_rows(), "run_id", run_id)
+        for row in self._catalog_rows():
+            if row.run_id == run_id:
+                return row
+        historical = self._historical_catalogs.get(run_id)
+        if historical is not None:
+            return historical
+        if self.repository is None:
+            raise ResultNotFound(run_id)
+        try:
+            historical = self.repository.find_catalog(run_id)
+        except KeyError as error:
+            raise ResultNotFound(run_id) from error
+        self._historical_catalogs[run_id] = historical
+        return historical
 
     def _catalog_rows(self) -> tuple[RunCatalog, ...]:
         if self.snapshot.catalog_rows:
@@ -331,7 +357,12 @@ class ResultService:
             getattr(row, field_name) == value for row in getattr(self.snapshot, table)
         ):
             return self
-        for catalog in self._catalog_rows():
+        catalogs = (
+            self.repository.all_catalog_rows()
+            if self.repository is not None
+            else self._catalog_rows()
+        )
+        for catalog in catalogs:
             detail = self._publication_service(catalog.run_id)
             if any(
                 getattr(row, field_name) == value
@@ -340,9 +371,9 @@ class ResultService:
                 return detail
         raise ResultNotFound(value)
 
-    def _trials_by_task(self, run_id: str) -> dict[str, TrialRow]:
+    def _trials_by_task(self, run_id: str) -> dict[TrialKey, TrialRow]:
         return {
-            trial.task_name: trial
+            (trial.task_name, trial.logical_attempt): trial
             for trial in self.snapshot.trials
             if trial.run_id == run_id
         }

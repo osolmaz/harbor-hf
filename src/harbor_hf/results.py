@@ -21,6 +21,11 @@ from pydantic import (
 
 Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 EntityId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+Commit = Annotated[str, Field(pattern=r"^[0-9a-f]{40,64}$")]
+DatasetId = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"),
+]
 OwnerType = Literal["run", "trial", "execution"]
 RuntimeKind = Literal["endpoint", "provider"]
 ArtifactKind = Literal[
@@ -229,50 +234,56 @@ class TraceValues(TypedDict):
 
 class TraceRow(FrozenModel):
     schema_version: str
-    publication_id: str
-    run_id: str
-    source_bucket: str
-    source_prefix: str
-    source_checksum: str
-    run_lock_path: str
-    run_lock_sha256: str
-    control_commit: str
+    publication_id: EntityId
+    run_id: EntityId
+    source_bucket: str = Field(min_length=1)
+    source_prefix: str = Field(min_length=1)
+    source_checksum: Digest
+    run_lock_path: str = Field(min_length=1)
+    run_lock_sha256: Digest
+    control_commit: Commit
 
 
 class RunRow(TraceRow):
     schema_version: Literal["harbor-hf/results/runs/v1"] = "harbor-hf/results/runs/v1"
-    campaign_id: str
-    experiment: str
-    benchmark: str
-    benchmark_revision: str
+    campaign_id: EntityId
+    experiment: str = Field(min_length=1)
+    benchmark: str = Field(min_length=1)
+    benchmark_revision: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
     created_at: AwareDatetime
     completed_at: AwareDatetime
-    model_id: str
-    model_repo: str
-    model_revision: str
-    deployment_id: str
-    provider: str
-    region: str
-    hardware: str
-    accelerator_count: int
-    agent_id: str
-    agent_name: str
-    agent_revision: str
-    trial_count: int
-    execution_count: int
+    model_id: EntityId
+    model_repo: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    deployment_id: EntityId
+    provider: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    hardware: str = Field(min_length=1)
+    accelerator_count: int = Field(ge=0)
+    agent_id: EntityId
+    agent_name: str = Field(min_length=1)
+    agent_revision: str = Field(min_length=1)
+    trial_count: int = Field(ge=0)
+    execution_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def completion_follows_creation(self) -> RunRow:
+        if self.completed_at < self.created_at:
+            raise ValueError("run completion precedes creation")
+        return self
 
 
 class TrialRow(TraceRow):
     schema_version: Literal["harbor-hf/results/trials/v1"] = (
         "harbor-hf/results/trials/v1"
     )
-    trial_id: str
-    task_name: str
-    task_digest: str
-    logical_attempt: int
-    selected_execution_id: str
+    trial_id: EntityId
+    task_name: str = Field(min_length=1)
+    task_digest: Digest
+    logical_attempt: int = Field(ge=1)
+    selected_execution_id: EntityId
     outcome: Literal["complete"]
 
 
@@ -280,9 +291,9 @@ class ExecutionRow(TraceRow):
     schema_version: Literal["harbor-hf/results/executions/v1"] = (
         "harbor-hf/results/executions/v1"
     )
-    execution_id: str
-    trial_id: str
-    physical_attempt: int
+    execution_id: EntityId
+    trial_id: EntityId
+    physical_attempt: int = Field(ge=1)
     runtime_kind: RuntimeKind
     status: Literal["succeeded", "failed_infrastructure", "cancelled"]
     started_at: AwareDatetime
@@ -290,17 +301,25 @@ class ExecutionRow(TraceRow):
     retry_reason: str | None
     remote_job_id: str | None
 
+    @model_validator(mode="after")
+    def values_are_consistent(self) -> ExecutionRow:
+        if self.completed_at < self.started_at:
+            raise ValueError("execution completion precedes start")
+        if self.physical_attempt == 1 and self.retry_reason is not None:
+            raise ValueError("first execution cannot have a retry reason")
+        return self
+
 
 class MetricRow(TraceRow):
     schema_version: Literal["harbor-hf/results/metrics/v1"] = (
         "harbor-hf/results/metrics/v1"
     )
-    metric_id: str
+    metric_id: EntityId
     owner_type: OwnerType
-    owner_id: str
-    name: str
-    value: float
-    unit: str
+    owner_id: EntityId
+    name: str = Field(min_length=1)
+    value: float = Field(allow_inf_nan=False)
+    unit: str = Field(min_length=1)
     aggregation: str | None
 
 
@@ -308,14 +327,14 @@ class ArtifactRow(TraceRow):
     schema_version: Literal["harbor-hf/results/artifacts/v1"] = (
         "harbor-hf/results/artifacts/v1"
     )
-    artifact_id: str
+    artifact_id: EntityId
     owner_type: OwnerType
-    owner_id: str
+    owner_id: EntityId
     kind: ArtifactKind
-    path: str
-    sha256: str
-    media_type: str
-    size_bytes: int
+    path: str = Field(min_length=1)
+    sha256: Digest
+    media_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
 
 
 class ResultTables(FrozenModel):
@@ -344,54 +363,54 @@ class ResultTables(FrozenModel):
 
 class GlobalIndexRow(FrozenModel):
     schema_version: Literal["harbor-hf/results/index/v1"] = "harbor-hf/results/index/v1"
-    publication_id: str
-    run_id: str
-    campaign_id: str
-    benchmark: str
+    publication_id: EntityId
+    run_id: EntityId
+    campaign_id: EntityId
+    benchmark: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
     completed_at: AwareDatetime
-    model_repo: str
-    model_revision: str
-    agent_name: str
-    agent_revision: str
-    result_dataset: str
-    result_revision: str
-    source_checksum: str
-    control_commit: str
+    model_repo: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    agent_name: str = Field(min_length=1)
+    agent_revision: str = Field(min_length=1)
+    result_dataset: DatasetId
+    result_revision: Commit
+    source_checksum: Digest
+    control_commit: Commit
 
 
 class CatalogRow(FrozenModel):
     schema_version: Literal["harbor-hf/results/catalog/v1"] = (
         "harbor-hf/results/catalog/v1"
     )
-    publication_id: str
-    run_id: str
-    campaign_id: str
-    benchmark: str
-    benchmark_revision: str
+    publication_id: EntityId
+    run_id: EntityId
+    campaign_id: EntityId
+    benchmark: str = Field(min_length=1)
+    benchmark_revision: str = Field(min_length=1)
     result_kind: Literal["ordinary"]
     outcome: Literal["complete"]
     created_at: AwareDatetime
     completed_at: AwareDatetime
-    model_repo: str
-    model_revision: str
-    agent_name: str
-    agent_revision: str
-    provider: str
-    region: str
-    hardware: str
+    model_repo: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    agent_name: str = Field(min_length=1)
+    agent_revision: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    hardware: str = Field(min_length=1)
     accelerator_count: int = Field(ge=0)
-    score: float
+    score: float = Field(allow_inf_nan=False)
     passed_trials: int = Field(ge=0)
     trial_count: int = Field(ge=0)
     execution_count: int = Field(ge=0)
     infrastructure_failures: int = Field(ge=0)
     duration_seconds: float = Field(ge=0)
-    result_dataset: str
-    result_revision: str
-    source_checksum: str
-    control_commit: str
+    result_dataset: DatasetId
+    result_revision: Commit
+    source_checksum: Digest
+    control_commit: Commit
 
     @model_validator(mode="after")
     def values_are_consistent(self) -> CatalogRow:

@@ -333,11 +333,20 @@ class HubDatasetPublisher:
         self, dataset: str, revision: str, row: CatalogRow
     ) -> list[DatasetFile]:
         largest_path = build_catalog_window_file([], _LARGEST_INDEX_WINDOW).path
-        existing = (
-            read_catalog_file(self._read(dataset, largest_path, revision))
-            if self._exists(dataset, largest_path, revision)
-            else []
-        )
+        if self._exists(dataset, largest_path, revision):
+            existing = read_catalog_file(self._read(dataset, largest_path, revision))
+        else:
+            index_path = build_index_window_file([], _LARGEST_INDEX_WINDOW).path
+            index_rows = (
+                read_index_file(self._read(dataset, index_path, revision))
+                if self._exists(dataset, index_path, revision)
+                else self._legacy_index_rows(dataset, revision)
+            )
+            if index_rows:
+                raise DatasetPublicationError(
+                    "result catalog migration is required before publication"
+                )
+            existing = []
         by_publication = {item.publication_id: item for item in existing}
         by_publication[row.publication_id] = row
         ordered = sorted(

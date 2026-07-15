@@ -1,6 +1,7 @@
 import {
   ArrowLeftRight,
   Check,
+  ChevronLeft,
   ChevronRight,
   Database,
   ExternalLink,
@@ -94,27 +95,33 @@ function App() {
 }
 
 function RunsPage() {
-  const { data, error } = useData<RunsResponse>("/api/v1/runs");
   const [search, setSearch] = useState("");
   const [benchmark, setBenchmark] = useState("");
   const [model, setModel] = useState("");
   const [hardware, setHardware] = useState("");
+  const [cursor, setCursor] = useState("");
+  const [previousCursors, setPreviousCursors] = useState<string[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const navigate = useNavigate();
-  const runs = useMemo(() => {
-    if (!data) return [];
-    const needle = search.toLowerCase();
-    return data.items.filter(
-      (run) =>
-        (!needle ||
-          `${run.run_id} ${run.benchmark} ${run.model_repo} ${run.agent_name}`
-            .toLowerCase()
-            .includes(needle)) &&
-        (!benchmark || run.benchmark === benchmark) &&
-        (!model || run.model_repo === model) &&
-        (!hardware || run.hardware === hardware),
-    );
-  }, [data, search, benchmark, model, hardware]);
+  const requestPath = useMemo(() => {
+    const parameters = new URLSearchParams({ limit: "50" });
+    if (search) parameters.set("search", search);
+    if (benchmark) parameters.set("benchmark", benchmark);
+    if (model) parameters.set("model", model);
+    if (hardware) parameters.set("hardware", hardware);
+    if (cursor) parameters.set("cursor", cursor);
+    return `/api/v1/runs?${parameters}`;
+  }, [search, benchmark, model, hardware, cursor]);
+  const { data, error } = useData<RunsResponse>(requestPath);
+  const updateFilter = (
+    setter: (value: string) => void,
+    value: string,
+  ) => {
+    setter(value);
+    setCursor("");
+    setPreviousCursors([]);
+    setSelected([]);
+  };
   const toggle = (runId: string) => {
     setSelected((current) =>
       current.includes(runId)
@@ -144,7 +151,7 @@ function RunsPage() {
           icon={<Server size={16} />}
         />
         <SummaryStat
-          label="Best score"
+          label="Best on page"
           value={formatPercent(Math.max(...data.items.map((run) => run.score), 0))}
           icon={<Check size={16} />}
         />
@@ -154,16 +161,17 @@ function RunsPage() {
           <Search size={15} />
           <input
             value={search}
-            onChange={(event) => setSearch(event.target.value)}
+            onChange={(event) => updateFilter(setSearch, event.target.value)}
             placeholder="Search runs"
           />
         </label>
-        <FilterSelect label="Benchmark" value={benchmark} values={data.facets.benchmarks} onChange={setBenchmark} />
-        <FilterSelect label="Model" value={model} values={data.facets.models} onChange={setModel} />
-        <FilterSelect label="Hardware" value={hardware} values={data.facets.hardware} onChange={setHardware} />
+        <FilterSelect label="Benchmark" value={benchmark} values={data.facets.benchmarks} onChange={(value) => updateFilter(setBenchmark, value)} />
+        <FilterSelect label="Model" value={model} values={data.facets.models} onChange={(value) => updateFilter(setModel, value)} />
+        <FilterSelect label="Hardware" value={hardware} values={data.facets.hardware} onChange={(value) => updateFilter(setHardware, value)} />
         {(search || benchmark || model || hardware) && (
           <button className="icon-button" type="button" title="Clear filters" onClick={() => {
             setSearch(""); setBenchmark(""); setModel(""); setHardware("");
+            setCursor(""); setPreviousCursors([]); setSelected([]);
           }}><X size={15} /></button>
         )}
         <button
@@ -175,24 +183,44 @@ function RunsPage() {
           <GitCompareArrows size={15} /> Compare {selected.length}/2
         </button>
       </section>
-      <RunsTable runs={runs} selected={selected} onToggle={toggle} />
+      <RunsTable runs={data.items} selected={selected} onToggle={toggle} />
+      <Pagination
+        total={data.total}
+        count={data.items.length}
+        page={previousCursors.length + 1}
+        canPrevious={previousCursors.length > 0}
+        canNext={data.next_cursor !== null}
+        onPrevious={() => {
+          const remaining = previousCursors.slice(0, -1);
+          setCursor(previousCursors.at(-1) ?? "");
+          setPreviousCursors(remaining);
+          setSelected([]);
+        }}
+        onNext={() => {
+          if (!data.next_cursor) return;
+          setPreviousCursors((current) => [...current, cursor]);
+          setCursor(data.next_cursor);
+          setSelected([]);
+        }}
+      />
     </>
   );
 }
 
-function RunsTable({ runs, selected, onToggle }: {
+function RunsTable({ runs, selected, onToggle, comparable = true }: {
   runs: RunSummary[];
   selected: string[];
   onToggle: (id: string) => void;
+  comparable?: boolean;
 }) {
   return (
     <section className="table-wrap">
       <table>
-        <thead><tr><th className="select-cell">Compare</th><th>Score</th><th>Benchmark</th><th>Model</th><th>Agent</th><th>Hardware</th><th>Trials</th><th>Duration</th><th>Completed</th><th /></tr></thead>
+        <thead><tr>{comparable && <th className="select-cell">Compare</th>}<th>Score</th><th>Benchmark</th><th>Model</th><th>Agent</th><th>Hardware</th><th>Trials</th><th>Duration</th><th>Completed</th><th /></tr></thead>
         <tbody>
           {runs.map((run) => (
             <tr key={run.run_id}>
-              <td className="select-cell"><input aria-label={`Compare ${run.run_id}`} type="checkbox" checked={selected.includes(run.run_id)} onChange={() => onToggle(run.run_id)} /></td>
+              {comparable && <td className="select-cell"><input aria-label={`Compare ${run.run_id}`} type="checkbox" checked={selected.includes(run.run_id)} onChange={() => onToggle(run.run_id)} /></td>}
               <td><Score value={run.score} /></td>
               <td><Link className="primary-link" to={`/runs/${run.run_id}`}>{run.benchmark}</Link><SmallText>{shortId(run.run_id)}</SmallText></td>
               <td><span className="model-name">{run.model_repo}</span><SmallText>{shortRevision(run.model_revision)}</SmallText></td>
@@ -254,17 +282,20 @@ function ComparePage() {
         <CompareRun run={data.right} label="Candidate" />
       </section>
       <section className="panel"><SectionTitle title="Task comparison" meta={`${data.tasks.length} tasks`} /><div className="table-wrap flush"><table><thead><tr><th>Task</th><th>Baseline</th><th>Candidate</th><th>Delta</th></tr></thead><tbody>
-        {data.tasks.map((task) => <tr key={task.task_name}><td>{task.task_name}</td><td>{scoreOrDash(task.left_score)}</td><td>{scoreOrDash(task.right_score)}</td><td className={deltaClass(task.delta)}>{task.delta === null ? "-" : signedPercent(task.delta)}</td></tr>)}
+        {data.tasks.map((task) => <tr key={`${task.task_name}:${task.logical_attempt}`}><td>{task.task_name}<SmallText>attempt {task.logical_attempt}</SmallText></td><td>{scoreOrDash(task.left_score)}</td><td>{scoreOrDash(task.right_score)}</td><td className={deltaClass(task.delta)}>{task.delta === null ? "-" : signedPercent(task.delta)}</td></tr>)}
       </tbody></table></div></section>
     </>
   );
 }
 
 function CampaignsPage() {
-  const { data, error } = useData<{items: Array<{campaign_id: string; run_count: number; benchmark_count: number; model_count: number; completed_at: string; average_score: number}>; total: number}>("/api/v1/campaigns");
+  const [cursor, setCursor] = useState("");
+  const [previousCursors, setPreviousCursors] = useState<string[]>([]);
+  const path = `/api/v1/campaigns?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+  const { data, error } = useData<{items: Array<{campaign_id: string; run_count: number; benchmark_count: number; model_count: number; completed_at: string; average_score: number}>; total: number; next_cursor: string | null}>(path);
   if (error) return <EmptyState message={error} />;
   if (!data) return <Loading />;
-  return <><PageHeader eyebrow="Evaluation groups" title="Campaigns" meta={`${data.total} campaigns`} /><section className="table-wrap"><table><thead><tr><th>Campaign</th><th>Average score</th><th>Runs</th><th>Benchmarks</th><th>Models</th><th>Completed</th><th /></tr></thead><tbody>{data.items.map((item) => <tr key={item.campaign_id}><td><Link className="primary-link" to={`/campaigns/${item.campaign_id}`}>{item.campaign_id}</Link></td><td><Score value={item.average_score} /></td><td>{item.run_count}</td><td>{item.benchmark_count}</td><td>{item.model_count}</td><td>{formatDate(item.completed_at)}</td><td><Link className="icon-button compact" title="Open campaign" to={`/campaigns/${item.campaign_id}`}><ChevronRight size={15} /></Link></td></tr>)}</tbody></table></section></>;
+  return <><PageHeader eyebrow="Evaluation groups" title="Campaigns" meta={`${data.total} campaigns`} /><section className="table-wrap"><table><thead><tr><th>Campaign</th><th>Average score</th><th>Runs</th><th>Benchmarks</th><th>Models</th><th>Completed</th><th /></tr></thead><tbody>{data.items.map((item) => <tr key={item.campaign_id}><td><Link className="primary-link" to={`/campaigns/${item.campaign_id}`}>{item.campaign_id}</Link></td><td><Score value={item.average_score} /></td><td>{item.run_count}</td><td>{item.benchmark_count}</td><td>{item.model_count}</td><td>{formatDate(item.completed_at)}</td><td><Link className="icon-button compact" title="Open campaign" to={`/campaigns/${item.campaign_id}`}><ChevronRight size={15} /></Link></td></tr>)}</tbody></table></section><Pagination total={data.total} count={data.items.length} page={previousCursors.length + 1} canPrevious={previousCursors.length > 0} canNext={data.next_cursor !== null} onPrevious={() => { setCursor(previousCursors.at(-1) ?? ""); setPreviousCursors((current) => current.slice(0, -1)); }} onNext={() => { if (!data.next_cursor) return; setPreviousCursors((current) => [...current, cursor]); setCursor(data.next_cursor); }} /></>;
 }
 
 function CampaignPage() {
@@ -272,7 +303,7 @@ function CampaignPage() {
   const { data, error } = useData<{campaign_id: string; runs: RunSummary[]}>(`/api/v1/campaigns/${encodeURIComponent(campaignId)}`);
   if (error) return <EmptyState message={error} />;
   if (!data) return <Loading />;
-  return <><PageHeader eyebrow="Campaign" title={data.campaign_id} meta={`${data.runs.length} runs`} /><RunsTable runs={data.runs} selected={[]} onToggle={() => undefined} /></>;
+  return <><PageHeader eyebrow="Campaign" title={data.campaign_id} meta={`${data.runs.length} runs`} /><RunsTable runs={data.runs} selected={[]} onToggle={() => undefined} comparable={false} /></>;
 }
 
 function EntityPage({ kind }: { kind: "trial" | "execution" }) {
@@ -313,6 +344,10 @@ function SummaryStat({ label, value, icon }: { label: string; value: string; ico
 
 function FilterSelect({ label, value, values, onChange }: { label: string; value: string; values: string[]; onChange: (value: string) => void }) {
   return <label className="select-field"><span>{label}</span><select value={value} onChange={(event) => onChange(event.target.value)}><option value="">All</option>{values.map((item) => <option key={item}>{item}</option>)}</select></label>;
+}
+
+function Pagination({ total, count, page, canPrevious, canNext, onPrevious, onNext }: { total: number; count: number; page: number; canPrevious: boolean; canNext: boolean; onPrevious: () => void; onNext: () => void }) {
+  return <nav className="pagination" aria-label="Pagination"><span>Page {page} / {count} shown / {total} total</span><button className="icon-button" type="button" title="Previous page" aria-label="Previous page" disabled={!canPrevious} onClick={onPrevious}><ChevronLeft size={15} /></button><button className="icon-button" type="button" title="Next page" aria-label="Next page" disabled={!canNext} onClick={onNext}><ChevronRight size={15} /></button></nav>;
 }
 
 function Score({ value }: { value: number }) {

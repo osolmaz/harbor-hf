@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,7 +10,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from harbor_hf.presentation.api import create_app
+import harbor_hf.presentation.api as presentation_api
+from harbor_hf.presentation.api import ServiceHolder, create_app
 from harbor_hf.presentation.config import PresentationConfig
 from harbor_hf.presentation.repository import (
     AnonymousHubReader,
@@ -169,6 +170,10 @@ def test_config_is_public_and_bounded() -> None:
         PresentationConfig.from_env(
             {"HARBOR_HF_INDEX_DATASET": "org/index", "HARBOR_HF_MAX_PUBLICATIONS": "0"}
         )
+    with pytest.raises(ValueError, match="between 5 and 3600"):
+        PresentationConfig.from_env(
+            {"HARBOR_HF_INDEX_DATASET": "org/index", "HARBOR_HF_REFRESH_SECONDS": "1"}
+        )
 
 
 def test_anonymous_reader_never_uses_ambient_token(tmp_path: Path) -> None:
@@ -227,6 +232,77 @@ def test_repository_loads_exact_revisions_and_validates_trace(
         repository.load_publication(
             next(row for row in loaded.catalog_rows if row.run_id == "run-1")
         )
+
+
+def test_repository_rejects_malformed_rows_and_broken_relations(
+    snapshot: ResultSnapshot,
+) -> None:
+    reader = FakeReader(snapshot)
+    repository = ResultRepository(
+        PresentationConfig("org/index", max_publications=2), reader
+    )
+    catalog = next(
+        row for row in repository.load().catalog_rows if row.run_id == "run-1"
+    )
+    metric_path = "data/metrics/schema=v1/campaign=campaign-1/publication-1.parquet"
+    metric = reader.rows[("org/results", RESULT_REVISION, metric_path)][0]
+    metric["value"] = float("nan")
+    with pytest.raises(PresentationError, match="invalid normalized row"):
+        repository.load_publication(catalog)
+
+    metric["value"] = 1.0
+    execution_path = (
+        "data/executions/schema=v1/campaign=campaign-1/publication-1.parquet"
+    )
+    execution = reader.rows[("org/results", RESULT_REVISION, execution_path)][0]
+    execution["trial_id"] = "unknown-trial"
+    with pytest.raises(PresentationError, match="unknown trial"):
+        repository.load_publication(catalog)
+
+    execution["trial_id"] = "trial-1"
+    execution["status"] = "failed_infrastructure"
+    with pytest.raises(PresentationError, match="selected execution"):
+        repository.load_publication(catalog)
+
+
+def test_service_refreshes_mutable_revision_after_ttl(
+    snapshot: ResultSnapshot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    newer = replace(snapshot, index_revision="9" * 40)
+    snapshots = iter((snapshot, newer))
+
+    class RefreshingRepository:
+        def __init__(self, _config: PresentationConfig) -> None:
+            pass
+
+        def load(self) -> ResultSnapshot:
+            return next(snapshots)
+
+    times = iter((10.0, 10.0, 12.0, 16.0, 16.0))
+    monkeypatch.setattr(presentation_api, "ResultRepository", RefreshingRepository)
+    monkeypatch.setattr(presentation_api, "monotonic", lambda: next(times))
+    holder = ServiceHolder(config=PresentationConfig("org/index", refresh_seconds=5))
+
+    first = holder.get()
+    assert holder.get() is first
+    assert holder.get().snapshot.index_revision == "9" * 40
+
+
+def test_historical_links_resolve_outside_list_window(
+    snapshot: ResultSnapshot,
+) -> None:
+    repository = ResultRepository(
+        PresentationConfig("org/index", max_publications=1), FakeReader(snapshot)
+    )
+    service = ResultService(repository.load(), repository=repository)
+    client = TestClient(create_app(service))
+
+    assert [item["run_id"] for item in client.get("/api/v1/runs").json()["items"]] == [
+        "run-2"
+    ]
+    assert client.get("/api/v1/runs/run-1").status_code == 200
+    assert client.get("/api/v1/trials/trial-1").status_code == 200
+    assert client.get("/api/v1/executions/execution-1").status_code == 200
 
 
 def test_api_exposes_comparison_details_and_denies_private_content(
@@ -291,7 +367,78 @@ def test_api_exposes_comparison_details_and_denies_private_content(
     missing = client.get("/api/v1/runs/missing")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "not_found"
+    unknown_api = client.get("/api/unknown")
+    assert unknown_api.status_code == 404
+    assert unknown_api.json()["error"]["code"] == "request_rejected"
     assert "Harbor Results" in client.get("/runs/run-1").text
+
+
+def test_comparison_keeps_logical_attempts_and_checks_benchmark_revision(
+    snapshot: ResultSnapshot,
+) -> None:
+    trials = list(snapshot.trials)
+    executions = list(snapshot.executions)
+    metrics = list(snapshot.metrics)
+    for number in (1, 2):
+        original_trial = next(row for row in trials if row.run_id == f"run-{number}")
+        original_execution = next(
+            row for row in executions if row.run_id == f"run-{number}"
+        )
+        original_metric = next(row for row in metrics if row.run_id == f"run-{number}")
+        trials.append(
+            original_trial.model_copy(
+                update={
+                    "trial_id": f"trial-{number}-attempt-2",
+                    "logical_attempt": 2,
+                    "selected_execution_id": f"execution-{number}-attempt-2",
+                }
+            )
+        )
+        executions.append(
+            original_execution.model_copy(
+                update={
+                    "execution_id": f"execution-{number}-attempt-2",
+                    "trial_id": f"trial-{number}-attempt-2",
+                }
+            )
+        )
+        metrics.append(
+            original_metric.model_copy(
+                update={
+                    "metric_id": f"metric-{number}-attempt-2",
+                    "owner_id": f"trial-{number}-attempt-2",
+                }
+            )
+        )
+    runs = tuple(
+        row.model_copy(
+            update={
+                "trial_count": 2,
+                "execution_count": 2,
+                **(
+                    {"benchmark_revision": "sha256:" + "0" * 64}
+                    if row.run_id == "run-2"
+                    else {}
+                ),
+            }
+        )
+        for row in snapshot.runs
+    )
+    expanded = ResultSnapshot(
+        index_dataset=snapshot.index_dataset,
+        index_revision=snapshot.index_revision,
+        catalog_rows=(),
+        index_rows=snapshot.index_rows,
+        runs=runs,
+        trials=tuple(trials),
+        executions=tuple(executions),
+        metrics=tuple(metrics),
+        artifacts=snapshot.artifacts,
+    )
+
+    comparison = ResultService(expanded).compare("run-1", "run-2")
+    assert comparison["compatible"] is False
+    assert [item["logical_attempt"] for item in comparison["tasks"]] == [1, 2]
 
 
 def test_openapi_contract_matches_snapshot() -> None:
