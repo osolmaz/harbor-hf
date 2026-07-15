@@ -1073,6 +1073,7 @@ def _index_row(
         benchmark="shellbench",
         result_kind="ordinary",
         outcome="complete",
+        quality="clean",
         completed_at=completed_at,
         model_repo="org/model",
         model_revision="a" * 40,

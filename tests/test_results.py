@@ -80,6 +80,7 @@ def sample_summary() -> dict[str, object]:
             "benchmark_revision": "sha256:" + "b" * 64,
             "result_kind": "ordinary",
             "outcome": "complete",
+            "quality": "clean",
             "created_at": NOW.isoformat(),
             "completed_at": (NOW + timedelta(minutes=5)).isoformat(),
             "model_id": "model-one",
@@ -101,7 +102,7 @@ def sample_summary() -> dict[str, object]:
                 "task_digest": "sha256:" + "2" * 64,
                 "logical_attempt": 1,
                 "selected_execution_id": "execution-three",
-                "outcome": "complete",
+                "outcome": "scored",
             },
             {
                 "trial_id": "trial-one",
@@ -109,7 +110,7 @@ def sample_summary() -> dict[str, object]:
                 "task_digest": "sha256:" + "1" * 64,
                 "logical_attempt": 1,
                 "selected_execution_id": "execution-two",
-                "outcome": "complete",
+                "outcome": "scored",
             },
         ],
         "executions": [
@@ -119,6 +120,7 @@ def sample_summary() -> dict[str, object]:
                 "physical_attempt": 1,
                 "runtime_kind": "provider",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": (NOW + timedelta(minutes=2)).isoformat(),
                 "completed_at": (NOW + timedelta(minutes=3)).isoformat(),
                 "retry_reason": None,
@@ -129,7 +131,8 @@ def sample_summary() -> dict[str, object]:
                 "trial_id": "trial-one",
                 "physical_attempt": 1,
                 "runtime_kind": "endpoint",
-                "status": "failed_infrastructure",
+                "status": "failed",
+                "failure_category": "transient",
                 "started_at": NOW.isoformat(),
                 "completed_at": (NOW + timedelta(minutes=1)).isoformat(),
                 "retry_reason": None,
@@ -141,6 +144,7 @@ def sample_summary() -> dict[str, object]:
                 "physical_attempt": 2,
                 "runtime_kind": "endpoint",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": (NOW + timedelta(minutes=1)).isoformat(),
                 "completed_at": (NOW + timedelta(minutes=2)).isoformat(),
                 "retry_reason": "provider_timeout",
@@ -148,6 +152,14 @@ def sample_summary() -> dict[str, object]:
             },
         ],
         "metrics": [
+            {
+                "owner_type": "trial",
+                "owner_id": "trial-one",
+                "name": "reward",
+                "value": 1.0,
+                "unit": "score",
+                "aggregation": None,
+            },
             {
                 "owner_type": "trial",
                 "owner_id": "trial-two",
@@ -258,6 +270,7 @@ def _add_envelope(evidence: MemoryEvidence) -> None:
                 "trial_id": record["trial_id"],
                 "physical_attempt": record["physical_attempt"],
                 "status": record["status"],
+                "failure_category": record["failure_category"],
                 "started_at": record["started_at"],
                 "completed_at": record["completed_at"],
                 "retry_reason": record["retry_reason"],
@@ -317,8 +330,7 @@ def test_builds_deterministic_traceable_rows_and_parquet(
         "execution-three",
         "execution-two",
     ]
-    assert first.metrics[0].value == 1.25
-    assert first.metrics[1].value == 0.0
+    assert [row.value for row in first.metrics] == [1.25, 1.0, 0.0]
     trace = {
         (
             row.publication_id,
@@ -354,18 +366,22 @@ def test_exhausted_trial_failure_is_a_zero_score_result(
     trials = summary["trials"]
     assert isinstance(trials, list)
     failed_trial = cast(dict[str, object], trials[0])
-    failed_trial["outcome"] = "failed"
+    failed_trial["outcome"] = "benchmark_failed"
+    run = summary["run"]
+    assert isinstance(run, dict)
+    cast(dict[str, object], run)["quality"] = "degraded"
     executions = summary["executions"]
     assert isinstance(executions, list)
     failed_execution = cast(dict[str, object], executions[0])
-    failed_execution["status"] = "failed_infrastructure"
+    failed_execution["status"] = "failed"
+    failed_execution["failure_category"] = "benchmark"
 
     tables = build_result_tables(
         _evidence(summary), source, control_commit=CONTROL_COMMIT
     )
 
     observed = next(row for row in tables.trials if row.trial_id == "trial-two")
-    assert observed.outcome == "failed"
+    assert observed.outcome == "benchmark_failed"
     reward = next(
         row
         for row in tables.metrics
@@ -510,12 +526,14 @@ def test_audit_and_rebuild_equal_canonical_rows(
         "runs": 1,
         "trials": 2,
         "executions": 3,
-        "metrics": 2,
+        "metrics": 3,
         "artifacts": 1,
     }
     assert rebuilt == [tables]
     tampered = tables.model_copy(
-        update={"runs": [tables.runs[0].model_copy(update={"trial_count": 999})]}
+        update={
+            "runs": [tables.runs[0].model_copy(update={"planned_trial_count": 999})]
+        }
     )
     with pytest.raises(ResultPublicationError, match="differ"):
         audit_result_tables(

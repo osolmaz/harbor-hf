@@ -493,7 +493,7 @@ def _validate_publication_relations(
     execution_ids = {row.execution_id for row in executions}
     if len(trial_ids) != len(trials) or len(execution_ids) != len(executions):
         raise PresentationError("publication contains duplicate child IDs")
-    if run.trial_count != len(trials) or run.execution_count != len(executions):
+    if run.planned_trial_count != len(trials) or run.execution_count != len(executions):
         raise PresentationError("run child counts do not match normalized rows")
     if any(row.trial_id not in trial_ids for row in executions):
         raise PresentationError("execution references an unknown trial")
@@ -535,6 +535,7 @@ def _catalog_index(row: CatalogRow) -> GlobalIndexRow:
         benchmark=row.benchmark,
         result_kind=row.result_kind,
         outcome=row.outcome,
+        quality=row.quality,
         completed_at=row.completed_at,
         model_repo=row.model_repo,
         model_revision=row.model_revision,

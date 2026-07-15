@@ -11,6 +11,7 @@ from typing import Literal, Protocol, cast
 from pydantic import TypeAdapter
 
 from harbor_hf.campaigns import CampaignLock, CampaignRunLock, CampaignTrialLock
+from harbor_hf.control import RetryCategory
 from harbor_hf.harbor_native_bundle import (
     HARBOR_NATIVE_BUNDLE_PATH,
     BundleObject,
@@ -31,7 +32,12 @@ from harbor_hf.publication_envelope import (
     object_reference,
     profile_digest,
 )
-from harbor_hf.recovery import RecoveryProjection, TerminalDecision, TrialStatus
+from harbor_hf.recovery import (
+    RecoveryProjection,
+    TaskOutcome,
+    TerminalDecision,
+    TrialStatus,
+)
 from harbor_hf.results import (
     ArtifactEvidence,
     ArtifactKind,
@@ -40,6 +46,7 @@ from harbor_hf.results import (
     MetricEvidence,
     ResultEvidence,
     RunEvidence,
+    RunQuality,
     RuntimeKind,
     TrialEvidence,
 )
@@ -47,6 +54,7 @@ from harbor_hf.runs import RunLock
 from harbor_hf.wave_worker import ExecutionLock
 
 _JSON_OBJECT = TypeAdapter(dict[str, object])
+_RETRY_CATEGORY = TypeAdapter(RetryCategory)
 _TERMINAL_MARKERS = frozenset({"_SUCCESS", "_FAILED", "_CANCELLED"})
 
 
@@ -155,6 +163,7 @@ class BucketCampaignFinalizer:
                     trial,
                     runtime_kind,
                     projection.trials[trial.trial_id].status,
+                    projection.trials[trial.trial_id].outcome,
                 )
                 trials.append(records.trial)
                 executions.extend(records.executions)
@@ -189,7 +198,14 @@ class BucketCampaignFinalizer:
                 verification,
             ),
         ]
-        run_evidence = _run_evidence(campaign, configuration, completed_at)
+        quality: RunQuality = (
+            "degraded"
+            if any(trial.outcome != "scored" for trial in trials)
+            else "clean"
+        )
+        run_evidence = _run_evidence(
+            campaign, configuration, completed_at, quality=quality
+        )
         evidence = ResultEvidence(
             sanitized=True,
             run=run_evidence,
@@ -271,6 +287,7 @@ class BucketCampaignFinalizer:
         trial: CampaignTrialLock,
         runtime_kind: RuntimeKind,
         status: TrialStatus,
+        outcome: TaskOutcome | None,
     ) -> _TrialRecords:
         prefix = f"{run_prefix}/trials/{trial.trial_id}"
         relative_prefix = prefix.removeprefix(f"{run_prefix}/")
@@ -283,7 +300,9 @@ class BucketCampaignFinalizer:
                 trial,
                 runtime_kind,
                 status,
+                outcome,
             )
+        _require_scored_outcome(outcome, trial.trial_id)
         if f"{relative_prefix}/_SUCCESS" not in run_paths:
             raise CampaignFinalizationError(
                 f"complete trial has no success marker: {trial.trial_id}"
@@ -338,6 +357,7 @@ class BucketCampaignFinalizer:
                 task_digest=trial.task_digest,
                 logical_attempt=trial.logical_attempt,
                 selected_execution_id=selected_id,
+                outcome="scored",
             ),
             executions=records,
             physical_executions=physical_executions,
@@ -355,10 +375,19 @@ class BucketCampaignFinalizer:
         trial: CampaignTrialLock,
         runtime_kind: RuntimeKind,
         status: TrialStatus,
+        outcome: TaskOutcome | None,
     ) -> _TrialRecords:
         if status not in {"invalid", "failed_infrastructure"}:
             raise CampaignFinalizationError(
                 f"scored run contains a nonterminal trial: {trial.trial_id}"
+            )
+        if outcome not in {
+            "agent_failed",
+            "benchmark_failed",
+            "infrastructure_exhausted",
+        }:
+            raise CampaignFinalizationError(
+                f"failed trial has no terminal task outcome: {trial.trial_id}"
             )
         relative_prefix = f"trials/{trial.trial_id}"
         execution_paths = sorted(
@@ -387,7 +416,7 @@ class BucketCampaignFinalizer:
             records.append(record.evidence)
             physical_executions.append(record.physical_execution)
         selected = max(records, key=lambda record: record.physical_attempt)
-        if selected.status != "failed_infrastructure":
+        if selected.status != "failed":
             raise CampaignFinalizationError(
                 "failed trial selected execution is not a recorded failure"
             )
@@ -403,7 +432,7 @@ class BucketCampaignFinalizer:
                 task_digest=trial.task_digest,
                 logical_attempt=trial.logical_attempt,
                 selected_execution_id=selected.execution_id,
-                outcome="failed",
+                outcome=outcome,
             ),
             executions=records,
             physical_executions=physical_executions,
@@ -444,12 +473,20 @@ class BucketCampaignFinalizer:
             "execution_cancelled",
         )
         status = cast(
-            Literal["succeeded", "failed_infrastructure", "cancelled"],
+            Literal["succeeded", "failed", "cancelled"],
             {
                 "_SUCCESS": "succeeded",
-                "_FAILED": "failed_infrastructure",
+                "_FAILED": "failed",
                 "_CANCELLED": "cancelled",
             }[marker],
+        )
+        failure_category = self._execution_failure_category(
+            spec,
+            campaign,
+            run_paths,
+            execution_prefix,
+            absolute_prefix,
+            marker,
         )
         evidence = ExecutionEvidence(
             execution_id=execution.execution_id,
@@ -457,6 +494,7 @@ class BucketCampaignFinalizer:
             physical_attempt=execution.physical_attempt,
             runtime_kind=runtime_kind,
             status=status,
+            failure_category=failure_category,
             started_at=started,
             completed_at=finished,
             retry_reason=(
@@ -482,6 +520,7 @@ class BucketCampaignFinalizer:
                 trial_id=evidence.trial_id,
                 physical_attempt=evidence.physical_attempt,
                 status=evidence.status,
+                failure_category=evidence.failure_category,
                 started_at=evidence.started_at,
                 completed_at=evidence.completed_at,
                 retry_reason=evidence.retry_reason,
@@ -490,6 +529,32 @@ class BucketCampaignFinalizer:
                 harbor_bundle=bundle,
             ),
         )
+
+    def _execution_failure_category(
+        self,
+        spec: ExperimentSpec,
+        campaign: CampaignLock,
+        run_paths: list[str],
+        execution_prefix: str,
+        absolute_prefix: str,
+        marker: str,
+    ) -> RetryCategory | None:
+        if marker != "_FAILED":
+            return None
+        relative = f"{execution_prefix}/failure.json"
+        if relative not in run_paths:
+            raise CampaignFinalizationError(
+                "failed execution has no typed failure evidence"
+            )
+        value = _JSON_OBJECT.validate_json(
+            self._read(spec, campaign, f"{absolute_prefix}/failure.json")
+        )
+        try:
+            return _RETRY_CATEGORY.validate_python(value.get("category"))
+        except ValueError as error:
+            raise CampaignFinalizationError(
+                "failed execution has an invalid failure category"
+            ) from error
 
     def _execution_bundle_reference(
         self,
@@ -669,6 +734,13 @@ class _TrialRecords:
     completed_at: datetime
 
 
+def _require_scored_outcome(outcome: TaskOutcome | None, trial_id: str) -> None:
+    if outcome != "scored":
+        raise CampaignFinalizationError(
+            f"complete trial has no scored outcome: {trial_id}"
+        )
+
+
 def _validate_native_bundle_paths(manifest: HarborNativeBundle) -> None:
     if (
         manifest.archive.path != "artifacts.tar.gz"
@@ -683,6 +755,8 @@ def _run_evidence(
     campaign: CampaignLock,
     lock: RunLock,
     completed_at: datetime,
+    *,
+    quality: RunQuality,
 ) -> RunEvidence:
     deployment = lock.deployment
     if isinstance(deployment, DeploymentProfile):
@@ -706,6 +780,7 @@ def _run_evidence(
         experiment=lock.experiment,
         benchmark=lock.benchmark_dataset,
         benchmark_revision=lock.benchmark_dataset_digest,
+        quality=quality,
         created_at=lock.created_at,
         completed_at=completed_at,
         model_id=lock.model.id,

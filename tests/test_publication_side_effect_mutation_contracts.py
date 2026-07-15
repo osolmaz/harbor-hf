@@ -64,6 +64,7 @@ def _publication() -> ResultPublication:
             "benchmark_revision": "sha256:" + "5" * 64,
             "result_kind": "ordinary",
             "outcome": "complete",
+            "quality": "clean",
             "created_at": NOW,
             "completed_at": NOW + timedelta(minutes=1),
             "model_id": "model-publication",
@@ -77,7 +78,11 @@ def _publication() -> ResultPublication:
             "agent_id": "agent-publication",
             "agent_name": "publication-agent",
             "agent_revision": "1.2.3",
-            "trial_count": 0,
+            "planned_trial_count": 0,
+            "scored_trial_count": 0,
+            "agent_failed_count": 0,
+            "benchmark_failed_count": 0,
+            "infrastructure_exhausted_count": 0,
             "execution_count": 0,
         }
     )
@@ -204,7 +209,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "73c4a9649a9aa332b82986b675f449b1d7de46c67c3f664b0bb3b38e9f3b4d97"
+        "f2400adf740a6da384c5ccf059274d42f2f8f553f51c83883a4577990869282d"
     )
 
 

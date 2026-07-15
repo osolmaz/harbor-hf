@@ -56,6 +56,12 @@ TrialStatus = Literal[
     "failed_infrastructure",
     "cancelled",
 ]
+TaskOutcome = Literal[
+    "scored",
+    "agent_failed",
+    "benchmark_failed",
+    "infrastructure_exhausted",
+]
 ExecutionStatus = Literal["active", "completed", "failed", "cancelled"]
 WaveStatus = Literal[
     "acquiring",
@@ -75,6 +81,7 @@ _RETRYABLE_CATEGORIES = {
     "quota",
     "rate-limit",
     "ambiguous",
+    "agent",
     "benchmark",
 }
 _TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure", "cancelled"}
@@ -108,6 +115,7 @@ class TrialProjection(FrozenModel):
     status: TrialStatus = "planned"
     executions: dict[str, ExecutionProjection] = Field(default_factory=dict)
     retry_not_before: datetime | None = None
+    outcome: TaskOutcome | None = None
 
 
 class ShardProjection(FrozenModel):
@@ -659,12 +667,21 @@ def _derive_trial(
         raise ValueError("a completed logical trial was physically re-executed")
     execution_map = {value.execution_id: value for value in ordered}
     if trial.status in _TERMINAL_STATUSES:
-        return trial.model_copy(update={"executions": execution_map})
+        return trial.model_copy(
+            update={
+                "executions": execution_map,
+                "outcome": _task_outcome(trial.status, ordered),
+            }
+        )
     if not ordered:
         return trial
     if any(execution.status == "completed" for execution in ordered):
         return trial.model_copy(
-            update={"status": "complete", "executions": execution_map}
+            update={
+                "status": "complete",
+                "executions": execution_map,
+                "outcome": "scored",
+            }
         )
     latest = ordered[-1]
     if latest.status == "active":
@@ -680,8 +697,26 @@ def _derive_trial(
             "status": status,
             "executions": execution_map,
             "retry_not_before": retry_at,
+            "outcome": _task_outcome(status, ordered),
         }
     )
+
+
+def _task_outcome(
+    status: TrialStatus, executions: list[ExecutionProjection]
+) -> TaskOutcome | None:
+    if status == "complete":
+        return "scored"
+    if status not in {"invalid", "failed_infrastructure"} or not executions:
+        return None
+    latest = executions[-1]
+    if latest.status != "failed":
+        return None
+    if latest.category == "agent":
+        return "agent_failed"
+    if latest.category == "benchmark":
+        return "benchmark_failed"
+    return "infrastructure_exhausted"
 
 
 def _failed_trial_state(
@@ -691,7 +726,9 @@ def _failed_trial_state(
     if category not in _RETRYABLE_CATEGORIES:
         return "failed_infrastructure", None
     if execution_count >= lock.recovery_policy.max_physical_executions_per_trial:
-        return ("invalid" if category == "benchmark" else "failed_infrastructure"), None
+        return (
+            "invalid" if category in {"agent", "benchmark"} else "failed_infrastructure"
+        ), None
     delay = retry_delay_seconds(
         lock,
         category,

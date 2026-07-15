@@ -265,16 +265,21 @@ class ResultService:
             "accelerator_count": run.accelerator_count,
             "result_kind": run.result_kind,
             "outcome": run.outcome,
+            "quality": run.quality,
             "score": self._score(run),
             "passed_trials": sum(
                 (self._trial_score(trial) or 0.0) >= 1.0
                 for trial in self.snapshot.trials
                 if trial.run_id == run.run_id
             ),
-            "trial_count": run.trial_count,
+            "planned_trial_count": run.planned_trial_count,
+            "scored_trial_count": run.scored_trial_count,
+            "agent_failed_count": run.agent_failed_count,
+            "benchmark_failed_count": run.benchmark_failed_count,
+            "infrastructure_exhausted_count": (run.infrastructure_exhausted_count),
             "execution_count": run.execution_count,
-            "infrastructure_failures": sum(
-                execution.status == "failed_infrastructure"
+            "failed_executions": sum(
+                execution.status == "failed"
                 for execution in self.snapshot.executions
                 if execution.run_id == run.run_id
             ),
@@ -291,12 +296,14 @@ class ResultService:
         return value
 
     def _score(self, run: RunRow) -> float:
-        return _average(
-            score
+        if run.planned_trial_count == 0:
+            return 0.0
+        scores = [
+            self._trial_score(trial) or 0.0
             for trial in self.snapshot.trials
             if trial.run_id == run.run_id
-            if (score := self._trial_score(trial)) is not None
-        )
+        ]
+        return sum(scores) / run.planned_trial_count
 
     def _trial_score(self, trial: TrialRow | None) -> float | None:
         if trial is None:

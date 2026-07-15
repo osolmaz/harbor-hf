@@ -75,6 +75,7 @@ def _reader() -> RecordingEvidence:
             "benchmark_revision": "sha256:" + "b" * 64,
             "result_kind": "ordinary",
             "outcome": "complete",
+            "quality": "clean",
             "created_at": NOW.isoformat(),
             "completed_at": (NOW + timedelta(minutes=5)).isoformat(),
             "model_id": "model-mutation",
@@ -96,7 +97,7 @@ def _reader() -> RecordingEvidence:
                 "task_digest": "sha256:" + "2" * 64,
                 "logical_attempt": 2,
                 "selected_execution_id": "execution-z",
-                "outcome": "complete",
+                "outcome": "scored",
             },
             {
                 "trial_id": "trial-a",
@@ -104,7 +105,7 @@ def _reader() -> RecordingEvidence:
                 "task_digest": "sha256:" + "1" * 64,
                 "logical_attempt": 1,
                 "selected_execution_id": "execution-b",
-                "outcome": "complete",
+                "outcome": "scored",
             },
         ],
         "executions": [
@@ -114,6 +115,7 @@ def _reader() -> RecordingEvidence:
                 "physical_attempt": 1,
                 "runtime_kind": "provider",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": (NOW + timedelta(minutes=3)).isoformat(),
                 "completed_at": (NOW + timedelta(minutes=4)).isoformat(),
                 "retry_reason": None,
@@ -124,7 +126,8 @@ def _reader() -> RecordingEvidence:
                 "trial_id": "trial-a",
                 "physical_attempt": 1,
                 "runtime_kind": "endpoint",
-                "status": "failed_infrastructure",
+                "status": "failed",
+                "failure_category": "transient",
                 "started_at": NOW.isoformat(),
                 "completed_at": (NOW + timedelta(minutes=1)).isoformat(),
                 "retry_reason": None,
@@ -136,6 +139,7 @@ def _reader() -> RecordingEvidence:
                 "physical_attempt": 2,
                 "runtime_kind": "endpoint",
                 "status": "succeeded",
+                "failure_category": None,
                 "started_at": (NOW + timedelta(minutes=1)).isoformat(),
                 "completed_at": (NOW + timedelta(minutes=2)).isoformat(),
                 "retry_reason": "provider_timeout",
@@ -143,6 +147,14 @@ def _reader() -> RecordingEvidence:
             },
         ],
         "metrics": [
+            {
+                "owner_type": "trial",
+                "owner_id": "trial-a",
+                "name": "reward",
+                "value": 1.0,
+                "unit": "score",
+                "aggregation": None,
+            },
             {
                 "owner_type": "trial",
                 "owner_id": "trial-z",
@@ -246,6 +258,7 @@ def _reader() -> RecordingEvidence:
                     "trial_id": record["trial_id"],
                     "physical_attempt": record["physical_attempt"],
                     "status": record["status"],
+                    "failure_category": record["failure_category"],
                     "started_at": record["started_at"],
                     "completed_at": record["completed_at"],
                     "retry_reason": record["retry_reason"],
@@ -280,7 +293,7 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
     index_file = build_index_file(index_row)
 
     assert _canonical_hash(tables.model_dump(mode="json")) == (
-        "12dc4803bccfc4bf4e660be626de8444ee7b2bab20d9decd280aad589067dce2"
+        "7596b54fa563c1f0415459f06b123a76d874d5d6cb7c675f1b1244835b00d743"
     )
     assert (
         _canonical_hash(
@@ -302,15 +315,15 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
                 "index_size": len(index_file.content),
             }
         )
-        == "9361173e9823753d9e0e2ff3e9bc0d89ea0d2f5edaf7f59513fe5859ac42f099"
+        == "73aac84f3704973bf354442f66a6050c688fd2c654689e42af0c57141739ca73"
     )
     assert [_sha256(item.content) for item in publication.files] == [
-        "sha256:6d9cfa821ae2dea4121b2401c413fc3446896512003c5a70f3d8ceef31e6a633",
-        "sha256:e82a159092b41008572a41303fe2a869536aac5e7e3ee5c735facef7f2ff2eab",
-        "sha256:f6a5af37074f9c372349b959ab1d08bc0c1c68a931daba00330e83a7ea239b0c",
-        "sha256:86c6b8c11017ff40ba471c128f3835c84eaf99b872fff0f095f6e1182b45f49a",
-        "sha256:b137c3ee948a2f89ee3948fe52553ddc21373895d4450a34560a51bcaea66b3d",
-        "sha256:7fd3d542c9eb85c482cccbce84b86fd11f493cafcae07b237faaee9f9008a72d",
+        "sha256:1fbd9966f78c3ae67bf0c2688a98b8a9c97824beeed8bedf80bd4a757bb007a5",
+        "sha256:ef5677ba945c7aa6e6b09feb6cfd1102d138f6bf57e04f2fbdeb2e09601bacbe",
+        "sha256:1595bd1a39559cae69c89b32faa04a827e1e8bdcdfc518de0dc2d3939c5d6c26",
+        "sha256:e23fa3a9f17c94bbbdb0db0cbd8aed6b7f3db77826fd8b0aa10e31fb8b2b2390",
+        "sha256:b55ac13567f6d74ae59adc1ab268fedda554b4ad84445cbce7470e819cd0448a",
+        "sha256:8a9195b320a140031349a8696d2aa186b04dac86ff92b2090e41b30f4d34dc35",
     ]
 
     common = ("hf://buckets/private-evidence", SOURCE.prefix)

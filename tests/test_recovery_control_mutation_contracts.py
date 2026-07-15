@@ -220,7 +220,7 @@ def test_recovery_terminal_decision_matrix_has_complete_canonical_structures(
         )
 
     assert _hash(corpus) == (
-        "5bb580721fd7fc8b26a42fc095a280a00877db25d1c192b274f9091fe593a315"
+        "3eba6d1bed83d93d2ae71b1676397369f7d2889c602bc25c3367f59ba1f769ba"
     )
 
 
@@ -562,7 +562,7 @@ def test_run_and_shard_event_projection_matrix_is_canonical(
         )
 
     assert _hash(corpus) == (
-        "8edbfbbf8a84b54b0e1810fafa12ca2f04c117544e48b2963311c0b87f356902"
+        "8e169c687a095d77f4de9b878fa496e43ec710ec8b1ae3bd631d73d86df4e7a6"
     )
 
 

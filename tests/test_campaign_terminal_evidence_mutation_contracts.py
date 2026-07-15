@@ -215,6 +215,9 @@ def _finalizer_files(
         ),
         f"{one}/execution.lock.json": lock_one,
         f"{one}/events.jsonl": events_one,
+        f"{one}/failure.json": _pretty(
+            {"category": "transient", "message": "provider timeout"}
+        ),
         f"{one}/_FAILED": b"\n",
         f"{two}/execution.lock.json": lock_two,
         f"{two}/events.jsonl": events_two,
@@ -258,6 +261,7 @@ def _projection(lock: CampaignLock, status: str) -> RecoveryProjection:
                 shard_id=run.shards[0].shard_id,
                 logical_attempt=trial.logical_attempt,
                 status="complete",
+                outcome="scored",
             )
         },
         executions={},
@@ -323,6 +327,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     assert summary["run"]["run_id"] == run.run_id
     assert summary["run"]["campaign_id"] == lock.campaign_id
     assert summary["run"]["provider"] == "hf-inference-endpoints"
+    assert summary["run"]["quality"] == "clean"
     assert summary["run"]["completed_at"] == "2026-07-14T02:06:00Z"
     assert summary["trials"] == [
         {
@@ -331,13 +336,14 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "task_digest": trial.task_digest,
             "logical_attempt": 1,
             "selected_execution_id": "execution-two",
-            "outcome": "complete",
+            "outcome": "scored",
         }
     ]
     assert [
         (
             execution["execution_id"],
             execution["status"],
+            execution["failure_category"],
             execution["retry_reason"],
             execution["started_at"],
             execution["completed_at"],
@@ -349,7 +355,8 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     ] == [
         (
             "execution-one",
-            "failed_infrastructure",
+            "failed",
+            "transient",
             None,
             "2026-07-14T01:03:00Z",
             "2026-07-14T01:04:00Z",
@@ -360,6 +367,7 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
         (
             "execution-two",
             "succeeded",
+            None,
             "infrastructure_retry",
             "2026-07-14T01:05:00Z",
             "2026-07-14T02:06:00Z",
@@ -470,11 +478,13 @@ def test_failed_trial_becomes_zero_score_terminal_evidence(
         trial,
         "endpoint",
         "invalid",
+        "benchmark_failed",
     )
 
-    assert records.trial.outcome == "failed"
+    assert records.trial.outcome == "benchmark_failed"
     assert records.trial.selected_execution_id == "execution-one"
-    assert records.executions[0].status == "failed_infrastructure"
+    assert records.executions[0].status == "failed"
+    assert records.executions[0].failure_category == "transient"
     assert [(metric.name, metric.value) for metric in records.metrics] == [
         ("reward", 0.0)
     ]
@@ -600,7 +610,12 @@ def _mutate(files: dict[str, bytes], lock: CampaignLock, case: str) -> dict[str,
                 {"execution_id": "execution-three"}
             )
         },
-        "selected-failed": {f"{two}/_FAILED": b"\n"},
+        "selected-failed": {
+            f"{two}/_FAILED": b"\n",
+            f"{two}/failure.json": _pretty(
+                {"category": "benchmark", "message": "verification failed"}
+            ),
+        },
         "conflicting-markers": {f"{two}/_FAILED": b"\n"},
         "invalid-events": {f"{two}/events.jsonl": b"not-json\n"},
         "missing-finish-event": {

@@ -143,6 +143,7 @@ def publication() -> ResultPublication:
             "benchmark_revision": "sha256:" + "5" * 64,
             "result_kind": "ordinary",
             "outcome": "complete",
+            "quality": "clean",
             "created_at": NOW,
             "completed_at": NOW + timedelta(minutes=1),
             "model_id": "model-one",
@@ -156,7 +157,11 @@ def publication() -> ResultPublication:
             "agent_id": "agent-one",
             "agent_name": "example-agent",
             "agent_revision": "1.2.3",
-            "trial_count": 0,
+            "planned_trial_count": 0,
+            "scored_trial_count": 0,
+            "agent_failed_count": 0,
+            "benchmark_failed_count": 0,
+            "infrastructure_exhausted_count": 0,
             "execution_count": 0,
         }
     )

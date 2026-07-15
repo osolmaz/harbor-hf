@@ -641,6 +641,7 @@ def _publication(
         benchmark="shellbench",
         result_kind="ordinary",
         outcome="complete",
+        quality="clean",
         completed_at=completed,
         model_repo=f"org/model-{number}",
         model_revision=str(number) * 40,
@@ -659,6 +660,7 @@ def _publication(
         benchmark_revision=TASK_DIGEST,
         result_kind="ordinary",
         outcome="complete",
+        quality="clean",
         created_at=NOW,
         completed_at=completed,
         model_id=f"model-{number}",
@@ -672,7 +674,11 @@ def _publication(
         agent_id="openclaw",
         agent_name="openclaw",
         agent_revision="2026.7.1",
-        trial_count=1,
+        planned_trial_count=1,
+        scored_trial_count=1,
+        agent_failed_count=0,
+        benchmark_failed_count=0,
+        infrastructure_exhausted_count=0,
         execution_count=1,
     )
     trial = TrialRow(
@@ -682,7 +688,7 @@ def _publication(
         task_digest=TASK_DIGEST,
         logical_attempt=1,
         selected_execution_id=f"execution-{number}",
-        outcome="complete",
+        outcome="scored",
     )
     execution = ExecutionRow(
         **trace,
@@ -691,6 +697,7 @@ def _publication(
         physical_attempt=1,
         runtime_kind="endpoint",
         status="succeeded",
+        failure_category=None,
         started_at=NOW,
         completed_at=completed,
         retry_reason=None,

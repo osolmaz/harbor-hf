@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from harbor_hf.control import RetryCategory
 from harbor_hf.harbor_adapter.models import Sha256Digest
 
 PUBLICATION_ENVELOPE_V1 = "harbor-hf/publication-envelope/v1"
@@ -59,7 +60,8 @@ class PhysicalExecutionReference(FrozenModel):
     execution_id: str = Field(min_length=1)
     trial_id: str = Field(min_length=1)
     physical_attempt: int = Field(ge=1)
-    status: Literal["succeeded", "failed_infrastructure", "cancelled"]
+    status: Literal["succeeded", "failed", "cancelled"]
+    failure_category: RetryCategory | None
     started_at: AwareDatetime
     completed_at: AwareDatetime
     retry_reason: str | None = None
@@ -77,6 +79,10 @@ class PhysicalExecutionReference(FrozenModel):
             raise ValueError("unavailable Harbor bundle is present")
         if self.status == "succeeded" and self.bundle_status != "verified":
             raise ValueError("successful execution requires a verified Harbor bundle")
+        if (self.status == "failed") != (self.failure_category is not None):
+            raise ValueError(
+                "physical execution failure category conflicts with status"
+            )
         return self
 
 

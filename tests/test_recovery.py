@@ -390,7 +390,9 @@ def test_benchmark_failure_retries_then_becomes_scored_invalid(
         [exhausted_submitted, *exhausted],
         now=NOW + timedelta(days=1),
     )
-    assert next(iter(exhausted_projection.trials.values())).status == "invalid"
+    exhausted_trial = next(iter(exhausted_projection.trials.values()))
+    assert exhausted_trial.status == "invalid"
+    assert exhausted_trial.outcome == "benchmark_failed"
     assert exhausted_plan.terminal_decision is not None
     assert exhausted_plan.terminal_decision.status == "failed"
 
@@ -410,7 +412,9 @@ def test_retry_budget_exhaustion_is_terminal(
         lock, [submitted, *failed], now=NOW + timedelta(days=1)
     )
 
-    assert next(iter(projection.trials.values())).status == "failed_infrastructure"
+    terminal_trial = next(iter(projection.trials.values()))
+    assert terminal_trial.status == "failed_infrastructure"
+    assert terminal_trial.outcome == "infrastructure_exhausted"
     assert all(action.kind != "retry-shard" for action in plan.actions)
     assert plan.terminal_decision is not None
     assert plan.terminal_decision.status == "failed"
@@ -1910,5 +1914,20 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
         corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "83102ef0f3b28dc652e3daf4dc5c7c004683377a86521bcf7aac013a08785a61"
+        "00afcdbd264af91a169af38819c1df4e4529fb63b5319d11191b142e08f22449"
     )
+
+
+def test_agent_failure_exhaustion_has_explicit_task_outcome(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, max_physical_executions_per_trial=1)
+    failed = _execution_events(
+        lock, 2, execution_id="execution-agent", attempt=1, category="agent"
+    )
+
+    projection = project_recovery(lock, [submitted, *failed])
+
+    trial = next(iter(projection.trials.values()))
+    assert trial.status == "invalid"
+    assert trial.outcome == "agent_failed"
