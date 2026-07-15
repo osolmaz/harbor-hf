@@ -1,6 +1,24 @@
 # Harbor Results Viewer Release
 
-## Deployment
+## Canonical V1 Cutover
+
+- Source revision: `064c3081549215a6fa319a7e7f586ed8f8d4ac1d`
+- Space revision: `cb9a3c45d8fad6ea0bc94f33f08cf3245fb5d3e8`
+- Active catalog revision: `978f4cd94982e5ddfc8cddb41dcbd19d2e8e75c1`
+- Active ShellBench result revision: `836aeb589561c83aa6bcb2366beba2fdca1c0b7e`
+
+The active Dataset and Space now use only the canonical publication `v1`
+contract. The previous six rows had no canonical publication envelopes or
+verified Harbor-native bundle references, so the cutover did not convert or
+relabel them. The active catalog is empty until a new verified run is
+published.
+
+The pre-cutover Dataset and Space revisions below remain immutable and directly
+addressable for audit. Production readers do not query them. Hosted health and
+run-list API requests passed after cutover, and Chromium checks passed against
+the empty state at desktop and iPhone 13 viewport sizes.
+
+## Pre-Cutover Release
 
 - Space: <https://huggingface.co/spaces/osolmaz/harbor-results>
 - Runtime: public Docker Space on `cpu-basic`
