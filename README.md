@@ -164,11 +164,12 @@ the current checksummed request and typed result boundary. The
 [Harbor integration refactor plan](docs/harbor-integration-refactor.md) tracks
 the migration to a stable Harbor-owned protocol. The
 [Harbor-native result publication plan](docs/harbor-native-result-publication.md)
-defines the non-breaking migration from duplicated result models to canonical
-Harbor bundles, a minimal Hugging Face execution envelope, and rebuildable
-query projections. The [field ownership inventory](docs/result-field-ownership.md)
+defines the hard cutover from duplicated result models to canonical Harbor
+bundles, a minimal Hugging Face execution envelope, and rebuildable query
+projections. The [field ownership inventory](docs/result-field-ownership.md)
 records each projected value's authority, and checked-in JSON Schemas under
-[`schemas/`](schemas/) freeze the v2 publication contracts. The
+[`schemas/`](schemas/) define the publication contracts that the cutover will
+replace in place under the `v1` identifier. The
 [implementation plan](docs/implementation-plan.md) tracks the complete path to
 remote execution.
 

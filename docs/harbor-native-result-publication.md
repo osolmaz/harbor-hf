@@ -2,11 +2,11 @@
 
 ## Status
 
-Implemented through the non-breaking dual-publication and v2-reader phases.
-The current `harbor-hf/results/*/v1` Parquet publications remain supported and
-immutable. New evidence can carry native v2 provenance while historical rows
-remain explicitly marked `legacy-v1`. Stopping new v1 query-table writes and a
-future Harbor-owned export command remain deferred compatibility work.
+The native publication boundary is implemented, but the current dual-publication
+and v2-first reader are deprecated. The remaining work is a coordinated hard
+cutover that replaces the existing `v1` contract in place, removes the temporary
+v2 and legacy paths, rebuilds the active catalog from verified native evidence,
+and deploys the writer, reader, and Results Space together.
 
 ## Purpose
 
@@ -32,8 +32,31 @@ authoritative benchmark-result contract.
    never becomes an authority or a publication dependency.
 6. Harbor Hub upload is an optional sink, not a required backend or source of
    truth.
-7. Current v1 publications remain readable indefinitely. New versions use new
-   paths and explicit schema identifiers.
+7. This repository is owned by `osolmaz`, so publication changes cut over in
+   place. The canonical contract remains `v1`; no parallel `v2`, fallback
+   reader, dual writer, or permanent legacy path survives the cutover.
+
+## Cutover Policy
+
+The current dual-publication implementation is temporary and deprecated. It is
+not a compatibility commitment. Deprecation ends with one coordinated release,
+not an open-ended window.
+
+The cutover must:
+
+- pause publication writes for a bounded maintenance window;
+- snapshot the current Dataset and Space revisions for recovery and audit;
+- rebuild active results from verified canonical evidence;
+- deploy the canonical writer, reader, API, and Space together;
+- delete the superseded schemas, code paths, commands, fixtures, and tests in
+  the same change;
+- keep the public schema identifier and paths at `v1`.
+
+Historical publications that cannot be traced to a verified native Harbor
+bundle are not silently converted. They move to an archival snapshot that the
+production API does not read, and return to the active catalog only after a
+verified rebuild or rerun. The archive is evidence retention, not a runtime
+compatibility layer.
 
 ## Ownership Boundary
 
@@ -95,7 +118,7 @@ runs/<run-id>/
   trials/<trial-id>/executions/<execution-id>/
     artifacts.tar.gz
     harbor-native-bundle.json
-  publication-envelope.v2.json
+  publication-envelope.v1.json
   checksums.json
   _SUCCESS | _FAILED
 ```
@@ -112,7 +135,7 @@ compatibility exporter derives it from Harbor's public Pydantic models inside
 the pinned Harbor environment. A future Harbor-owned export manifest can
 replace this temporary packaging contract without changing the HF envelope.
 
-`publication-envelope.v2.json` uses `harbor-hf/publication-envelope/v2`. Its smallest
+`publication-envelope.v1.json` uses `harbor-hf/publication-envelope/v1`. Its smallest
 stable shape contains:
 
 - the run, campaign, and physical-execution IDs;
@@ -127,14 +150,11 @@ stable shape contains:
 The envelope references the Harbor bundle. It does not copy task names,
 rewards, trial timing, exceptions, trajectories, or artifact entries.
 
-Each physical execution records `bundle_status`. New successful executions use
-`verified` and must reference a bundle. Immutable successes produced before the
-compatibility adapter existed use `legacy_unavailable`; failed or cancelled
-executions without a valid bundle use `not_available`. The legacy status keeps
-in-flight campaigns finalizable during rollout without claiming native
-provenance that does not exist. Runs containing a legacy successful execution
-remain `legacy-v1` in public catalogs until they are rerun with verified native
-bundles.
+Each physical execution records `bundle_status`. Successful executions use
+`verified` and must reference a bundle. Failed or cancelled executions without
+a valid bundle use `not_available`. A successful execution without a verified
+bundle is invalid for canonical publication and must be rebuilt or rerun; there
+is no `legacy_unavailable` status or legacy catalog classification.
 
 `checksums.json` covers every non-marker object. `_SUCCESS` is written last and
 only after Harbor output, HF infrastructure evidence, checksums, redaction,
@@ -207,95 +227,101 @@ The upstream contract should:
 This is the only new benchmark-result contract to pursue. `harbor-hf` must not
 promote its compatibility bundle into a competing permanent standard.
 
-## Migration
+## Cutover Plan
 
-### Phase 0: Freeze And Inventory
+### Phase 0: Inventory And Freeze
 
-- Freeze `harbor-hf/results/*/v1` and its readers.
-- Map every v1 field to Harbor, `harbor-hf`, or a derived calculation.
-- Identify fields whose meaning differs from current Harbor models.
-- Add golden native Harbor bundles for success, verifier failure,
+- Map every published field to Harbor, `harbor-hf`, or a derived calculation.
+- Retain golden native Harbor bundles for success, verifier failure,
   infrastructure failure, retry, and multi-step execution.
+- Mark the dual writer, v2 schemas, v2-first reader, and legacy classifications
+  deprecated. Do not add consumers or features to them.
+- Freeze publication changes while the cutover branch is prepared.
 
-Exit criterion: every current field has one documented owner and derivation.
+Exit criterion: every field has one documented owner and the complete removal
+surface is enumerated.
 
-Status: complete. See `docs/result-field-ownership.md`.
+Status: field ownership and native fixtures are complete. The implementation
+removal inventory remains to be finalized before cutover.
 
-### Phase 1: Specify V2
+### Phase 1: Define The Canonical V1 Contract
 
-- Define the minimal HF execution envelope and JSON Schema.
+- Rename the native envelope and projection contract to `v1` in place.
 - Define canonical archive, checksum, marker, and content-addressing rules.
 - Define public and protected allowlists.
-- Run a focused schema review before implementation.
+- Ensure the envelope contains no Harbor-owned result fields and can address
+  immutable native Harbor bundles without consulting mutable state.
+- Update schemas, generated models, API contracts, fixtures, and docs together.
 
-Exit criterion: the envelope contains no Harbor-owned result fields and can
-address immutable native Harbor bundles without consulting mutable state.
+Exit criterion: exactly one writer and one reader implement the canonical `v1`
+contract, with no runtime reference to a publication `v2`.
 
-Status: complete. JSON Schemas are checked in under `schemas/`.
+### Phase 2: Build The One-Time Rebuilder
 
-### Phase 2: Build The Native Adapter
+- Build a one-time command that validates private evidence and regenerates the
+  active Dataset projections using the canonical `v1` contract.
+- Rebuild only runs with verified native Harbor bundles and checksums.
+- Produce a report listing runs that cannot be rebuilt and therefore require a
+  rerun.
+- Keep this command outside the runtime reader and writer paths; remove it after
+  the cutover has been verified.
 
-- Change the compatibility exporter to retain Harbor-native serialized models
-  and generate the temporary bundle manifest inside the pinned Harbor runtime.
-- Stop application code from parsing Harbor's private directory layout.
-- Verify archive extraction limits, checksums, and native-model round trips.
-- Keep the legacy reader for historical evidence only.
+Exit criterion: a dry run produces a deterministic replacement catalog and an
+explicit exclusion report without mutating hosted state.
 
-Exit criterion: new canonical evidence can be validated using the pinned
-Harbor models plus the HF envelope, without `harbor-hf` trial-result models.
+### Phase 3: Snapshot And Rebuild
 
-Status: complete for the compatibility adapter. Replacement by a Harbor-owned
-export command remains upstream work and is not required for current runs.
+- Pause publication writes for a bounded maintenance window.
+- Record and verify immutable snapshots of the current result Dataset, catalog
+  Dataset, and Results Space revisions.
+- Preserve the pre-cutover publications in an archival Dataset or immutable
+  Dataset revision that production readers do not query.
+- Rebuild active results from canonical private evidence. Exclude unverifiable
+  rows instead of labeling them as legacy.
+- Validate counts, identities, rewards, aggregate scores, timing, artifacts,
+  checksums, and privacy allowlists before deployment.
 
-### Phase 3: Dual Publish
+Exit criterion: the replacement active catalog contains only verified native
+publications and every row traces to one Harbor bundle and HF envelope.
 
-- Publish the canonical v2 bundle and envelope alongside existing v1 output.
-- Generate v1 and v2-derived projections from the same successful evidence.
-- Compare trial identity, rewards, aggregate score, timing, and artifact
-  metadata for every fixture and a bounded remote campaign.
-- Treat any mismatch as a publication failure; do not choose one silently.
+### Phase 4: Coordinated Cutover
 
-Exit criterion: dual publication is idempotent and produces equivalent visible
-results for all supported run shapes.
+- Deploy the canonical `v1` writer, Results API reader, and Space in one release.
+- Atomically switch the active Dataset pointer or configured revision to the
+  rebuilt catalog.
+- Run hosted API checks, desktop and mobile browser checks, comparison views,
+  and one bounded fully remote campaign.
+- Verify all Inference Endpoints are paused with zero ready replicas.
 
-Status: complete. The hosted Dataset migration remained idempotent at revision
-`d2708c4b379f1886d53409c09dcb771538fbaf09` with six publications.
+Exit criterion: new runs publish once, the production API has one read path,
+the Space displays only canonical results, and remote publication succeeds end
+to end.
 
-### Phase 4: Move Readers
+### Phase 5: Delete Superseded Paths
 
-- Teach the Results API to read the v2 catalog and revision-pinned details.
-- Keep permanent v1 URLs and readers working.
-- Rebuild the six historical demonstration runs as v2 projections without
-  replacing their existing v1 publications.
-- Verify public and protected Space behavior end to end.
+- Remove the dual writer, fallback reader, v2 schemas, v2 models, migration
+  aliases, legacy statuses, and mixed-version tests.
+- Remove commands such as `migrate-catalog-v2` and any `catalog_v2_*` helper.
+- Remove duplicated Harbor-owned result models after the canonical projector no
+  longer imports them.
+- Remove the one-time rebuilder after its output and recovery snapshot are
+  verified.
+- Search code, tests, docs, CI, Dataset configuration, and Space configuration
+  for remaining superseded references.
 
-Exit criterion: the Space uses v2 by default and mixed v1/v2 history remains
-searchable and comparable.
+Exit criterion: repository-wide checks find no runtime compatibility path,
+parallel publication version, or legacy classification.
 
-Status: complete. The public Results Space runs the v2-first reader at revision
-`4facb5778f1239fe9578d1eff36d09255df4a36e`; hosted API and desktop/mobile
-browser checks passed against the migrated mixed-history catalog.
+### Phase 6: Adopt A Harbor-Owned Export
 
-### Phase 5: Stop New V1 Writes
-
-- Disable v1 publication for new runs after a documented compatibility window.
-- Retain v1 schemas, readers, audit commands, and golden fixtures.
-- Remove duplicated Harbor-owned write models only when no active path imports
-  them.
-- Keep rollback capable of re-enabling v1 writes without changing canonical
-  evidence.
-
-Exit criterion: new results have one canonical Harbor bundle, one HF envelope,
-and rebuildable projections; no production writer maintains a second Harbor
-result model.
-
-### Phase 6: Adopt Harbor Export
+Harbor is an important upstream repository that `harbor-hf` does not own, so its
+published compatibility and versioning requirements remain authoritative.
 
 - Replace the compatibility exporter when a released Harbor version provides
   the storage-neutral bundle contract.
 - Pin the first supported Harbor release and verify byte and semantic parity.
-- Remove only the temporary exporter path; retain migration readers for its
-  historical bundles.
+- Cut over the internal exporter in place; do not retain the temporary exporter
+  as a fallback in `harbor-hf`.
 
 Exit criterion: Harbor owns native export end to end and `harbor-hf` contains
 only HF orchestration, evidence, and projection logic.
@@ -305,18 +331,18 @@ only HF orchestration, evidence, and projection logic.
 Required local tests:
 
 - native Harbor model validation and archive round trips;
-- JSON Schema and golden-file compatibility for the HF envelope;
+- JSON Schema and golden-file validation for the canonical v1 HF envelope;
 - deterministic publication IDs, manifests, checksums, and projections;
-- v1/v2 semantic parity for all supported fixtures;
+- rejection of superseded v2, legacy, and mixed-version inputs;
 - idempotent retry after interruption between Bucket and Dataset commits;
 - corruption, traversal, archive-bomb, symlink, and secret-leak rejection;
-- mixed-version Results API and Space behavior;
+- single-version Results API and Space behavior;
 - rebuild equality from canonical evidence.
 
 Required remote test:
 
 - run one bounded campaign entirely on Hugging Face infrastructure;
-- preserve the native Harbor bundle and v2 envelope in the private Bucket;
+- preserve the native Harbor bundle and v1 envelope in the private Bucket;
 - publish and browse sanitized projections;
 - download and validate the bundle with the pinned Harbor version;
 - verify all Inference Endpoints are paused with zero ready replicas before the
@@ -334,9 +360,11 @@ The Results Space is never on the write path. Dataset or Space failure cannot
 invalidate canonical evidence. A failed projection can be rebuilt after the
 run without resuming an endpoint or rerunning a benchmark.
 
-Rollback changes the preferred reader or writer version only. It never deletes
-canonical bundles, rewrites historical Dataset commits, or mutates successful
-run prefixes.
+Rollback restores the complete pre-cutover release and points readers to the
+verified pre-cutover Dataset snapshot. It does not keep fallback code in the
+main branch, delete canonical bundles, rewrite historical Dataset commits, or
+mutate successful run prefixes. A failed cutover is fixed and attempted again
+as a coordinated release; it does not reintroduce dual reads or writes.
 
 ## Completion Criteria
 
@@ -346,7 +374,9 @@ The migration is complete when:
 - `harbor-hf` owns only HF execution, provenance, storage, and projections;
 - every displayed score traces to one immutable Harbor bundle and HF envelope;
 - public datasets can be deleted and rebuilt from canonical evidence;
-- current v1 links and historical results remain readable;
+- the active catalog contains only results with verified native provenance;
+- superseded v2, dual-publication, and legacy runtime paths are deleted;
+- the sole supported publication contract and public path remain named `v1`;
 - Harbor Hub and HF publication can consume the same native bundle
   independently;
 - no endpoint is left running after publication or projection work.
@@ -356,5 +386,6 @@ The migration is complete when:
 - Replacing Harbor Hub or requiring its hosted Supabase backend.
 - Moving HF endpoint or campaign logic into Harbor.
 - Publishing raw sessions or task-sensitive evidence publicly.
-- Rewriting current v1 Dataset history.
+- Serving unverifiable historical rows from the active production catalog.
+- Preserving the temporary v2 or dual-publication contract for compatibility.
 - Making the Results Space part of benchmark correctness.
