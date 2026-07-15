@@ -27,7 +27,7 @@ paths and digests in `harbor-native-bundle.json`.
 | --- | --- |
 | campaign and run IDs | campaign and run locks |
 | physical execution ID and attempt | execution lock |
-| physical execution bundle status | verified bundle presence or explicit legacy/unavailable classification |
+| physical execution bundle status | verified bundle presence or `not_available` for failed or cancelled execution |
 | infrastructure status and retry reason | campaign recovery events |
 | provider, region, hardware, and accelerator count | resolved deployment lock |
 | model repository, revision, engine, quantization, context, and concurrency | resolved model and deployment profiles |
@@ -38,9 +38,10 @@ paths and digests in `harbor-native-bundle.json`.
 
 ## Derived Query Values
 
-The current `runs`, `trials`, `executions`, `metrics`, and `artifacts` v1
-Parquet tables are query projections. Their stable schema remains readable,
-but they are not canonical evidence.
+The `runs`, `trials`, `executions`, `metrics`, and `artifacts` Parquet tables are
+query projections, not canonical evidence. The cutover replaces their contract
+in place under the `v1` identifier; superseded shapes are not retained by the
+production reader.
 
 The following catalog values are derived:
 
@@ -50,10 +51,10 @@ The following catalog values are derived:
 - `infrastructure_failures`: count of physical executions classified as infrastructure failures;
 - row counts: counts of validated projection rows.
 
-Every native v2 catalog row points to a checksummed projection manifest. That
-manifest binds the derived tables to one v2 execution envelope and its Harbor
-archive digests. Legacy v1 rows are marked `legacy-v1` and do not claim native
-bundle provenance.
+Every catalog row points to a checksummed projection manifest. That manifest
+binds the derived tables to one canonical v1 execution envelope and its Harbor
+archive digests. A successful run without verified native bundle provenance is
+excluded from the active catalog until it is rebuilt or rerun.
 
 ## Privacy Boundary
 
