@@ -18,6 +18,7 @@ from harbor_hf.results import (
     GlobalIndexRow,
     ResultPublication,
     ResultTables,
+    build_catalog_lookup_file,
     build_catalog_row,
     build_catalog_window_file,
     build_global_index_row,
@@ -254,8 +255,9 @@ class HubDatasetPublisher:
                 result_revision=indexed_result_revision,
             )
             catalog_windows = self._catalog_windows(index_dataset, head, catalog)
+            catalog_lookup = build_catalog_lookup_file(catalog)
             if receipt is not None and self._windows_match(
-                index_dataset, head, [*windows, *catalog_windows]
+                index_dataset, head, [*windows, *catalog_windows, catalog_lookup]
             ):
                 return receipt.result_revision, head
             receipt = receipt or self._index_receipt(row, index_file)
@@ -264,7 +266,7 @@ class HubDatasetPublisher:
                     path_in_repo=window.path,
                     path_or_fileobj=window.content,
                 )
-                for window in [*windows, *catalog_windows]
+                for window in [*windows, *catalog_windows, catalog_lookup]
             ]
             if not self._exists(index_dataset, receipt_path, head):
                 operations.extend(

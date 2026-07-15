@@ -85,17 +85,20 @@ controls endpoints, publishes results, or stores authoritative state.
 ### Publication Layer
 
 The existing result publisher remains responsible for producing immutable,
-versioned normalized tables. Extend it with two derived projections:
+versioned normalized tables. Extend it with three derived projections:
 
 - **catalog snapshot**: one compact row per run with aggregate score, status,
   benchmark, model, agent, hardware, runtime, cost, token, timing, and
   provenance fields needed by list and comparison pages;
+- **run lookup**: one immutable, run-keyed catalog row that keeps permanent
+  detail links independent of bounded list-page compaction;
 - **presentation artifact manifest**: one row per viewable artifact with a
   stable artifact ID, visibility, redaction status, media type, size, checksum,
   and immutable source reference.
 
 Catalog snapshots use power-of-two compaction windows, as the current global
 index does. A list request reads one bounded snapshot instead of five files per
+publication. A direct link reads one hashed run lookup before loading the
 publication. Per-publication tables remain the detail source and retain their
 current trace validation.
 
@@ -165,8 +168,8 @@ same Docker container as the API. Required routes are:
 /campaigns/{campaign_id}
 /runs/{run_id}
 /runs/{run_id}/compare/{other_run_id}
-/trials/{trial_id}
-/executions/{execution_id}
+/runs/{run_id}/trials/{trial_id}
+/runs/{run_id}/executions/{execution_id}
 ```
 
 The first production slice includes:

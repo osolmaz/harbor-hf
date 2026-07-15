@@ -23,6 +23,7 @@ from harbor_hf.results import (
     ResultPublication,
     ResultTables,
     RunRow,
+    build_catalog_lookup_file,
     build_global_index_row,
     build_index_file,
     build_result_publication,
@@ -222,6 +223,8 @@ def test_serializes_result_and_index_with_parent_checked_leases(
     catalog = read_catalog_file(api.files["org/index"][catalog_path])
     assert catalog[0].run_id == publication.tables.runs[0].run_id
     assert catalog[0].score == 0.0
+    lookup = build_catalog_lookup_file(catalog[0])
+    assert read_catalog_file(api.files["org/index"][lookup.path]) == catalog
 
 
 def test_duplicate_publication_is_a_no_op(

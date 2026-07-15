@@ -9,6 +9,7 @@ from typing import Protocol
 
 import pyarrow.parquet as parquet
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 from pydantic import BaseModel, ValidationError
 
 from harbor_hf.presentation.config import PresentationConfig
@@ -21,6 +22,7 @@ from harbor_hf.results import (
     RunRow,
     TraceRow,
     TrialRow,
+    catalog_lookup_path,
 )
 
 _TABLE_MODELS = {
@@ -34,6 +36,10 @@ _TABLE_MODELS = {
 
 class PresentationError(RuntimeError):
     """Raised when public result data is missing, malformed, or inconsistent."""
+
+
+class DatasetPathNotFound(PresentationError):
+    """Raised when an exact public Dataset path does not exist."""
 
 
 class DatasetReader(Protocol):
@@ -116,6 +122,10 @@ class AnonymousHubReader:
                 token=False,
             )
             return self._parse_parquet(Path(downloaded))
+        except EntryNotFoundError as error:
+            raise DatasetPathNotFound(
+                f"{path} does not exist in Dataset {dataset}"
+            ) from error
         except Exception as error:
             raise PresentationError(
                 f"failed to read {path} from Dataset {dataset}"
@@ -207,7 +217,20 @@ class ResultRepository:
     def find_catalog(self, run_id: str) -> CatalogRow:
         """Resolve a stable run link outside the configured list-page window."""
         revision = self._current_revision()
-        rows = self._load_catalog(revision, largest=True)
+        path = catalog_lookup_path(run_id)
+        try:
+            rows = [
+                _validate(CatalogRow, value, path)
+                for value in self._reader.read_rows(
+                    self.config.index_dataset, revision, path
+                )
+            ]
+            if len(rows) != 1 or rows[0].run_id != run_id:
+                raise PresentationError(f"catalog lookup for {run_id} is inconsistent")
+            return rows[0]
+        except (DatasetPathNotFound, KeyError):
+            # Keep pre-lookup catalog migrations readable during rollout.
+            rows = self._load_catalog(revision, largest=True)
         for row in rows:
             if row.run_id == run_id:
                 return row
@@ -296,22 +319,12 @@ class ResultRepository:
         paths = sorted(
             path
             for path in self._reader.list_files(self.config.index_dataset, revision)
-            if path.startswith("data/index/schema=v1/") and path.endswith(".parquet")
+            if path.startswith("data/index/schema=v1/")
+            and path.endswith(".parquet")
+            and "/windows/" not in path
         )
         if not paths:
             raise PresentationError("the configured index has no v1 Parquet rows")
-        windows = [path for path in paths if "/windows/" in path]
-        if windows:
-            requested = self.config.max_publications
-            paths = [
-                min(
-                    windows,
-                    key=lambda path: (
-                        _window_size(path) < requested,
-                        abs(_window_size(path) - requested),
-                    ),
-                )
-            ]
         parsed = [
             _validate(GlobalIndexRow, value, path)
             for path in paths
@@ -327,9 +340,7 @@ class ResultRepository:
                     f"index has conflicting rows for publication {row.publication_id}"
                 )
             unique[row.publication_id] = row
-        return sorted(
-            unique.values(), key=lambda item: item.completed_at, reverse=True
-        )[: self.config.max_publications]
+        return sorted(unique.values(), key=lambda item: item.completed_at, reverse=True)
 
     def _load_publication(self, index: GlobalIndexRow) -> dict[str, list[BaseModel]]:
         with ThreadPoolExecutor(max_workers=len(_TABLE_MODELS)) as executor:

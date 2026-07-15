@@ -31,9 +31,10 @@ Dataset:
 
 Both use deterministic power-of-two sizes from 1 through 2,048 rows. A catalog
 request downloads one bounded Parquet snapshot. Opening a run then downloads
-only that publication's revision-pinned run, trial, execution, metric, and
-artifact tables. Catalog aggregates are recomputed and compared with detail
-tables before a detail response is returned.
+one immutable run-keyed lookup and only that publication's revision-pinned run,
+trial, execution, metric, and artifact tables. The lookup keeps direct links
+stable after list-window compaction. Catalog aggregates are recomputed and
+compared with detail tables before a detail response is returned.
 
 The Docker Space serves a versioned FastAPI contract and one React application.
 It provides filtered and paginated run and campaign lists, stable detail URLs,
@@ -48,7 +49,7 @@ leaderboard and comparison patterns only.
 
 ## Verification
 
-- Python: 1,414 tests with branch coverage above the required 85% gate.
+- Python: 1,416 tests with branch coverage above the required 85% gate.
 - Frontend: TypeScript and Vite production build.
 - Hosted API: health, catalog, run detail, comparison, restricted content, and
   permanent-route smoke requests.

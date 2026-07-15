@@ -631,11 +631,7 @@ def build_catalog_row(
     tables: ResultTables, *, result_dataset: str, result_revision: str
 ) -> CatalogRow:
     run = tables.runs[0]
-    rewards = [
-        metric.value
-        for metric in tables.metrics
-        if metric.owner_type == "trial" and metric.name == "reward"
-    ]
+    rewards = _trial_reward_scores(tables)
     score = sum(rewards) / len(rewards) if rewards else 0.0
     return CatalogRow(
         publication_id=tables.publication_id,
@@ -680,6 +676,18 @@ def build_catalog_window_file(rows: Sequence[CatalogRow], size: int) -> DatasetF
     )
 
 
+def catalog_lookup_path(run_id: str) -> str:
+    identity = hashlib.sha256(run_id.encode()).hexdigest()
+    return f"data/catalog/schema=v1/runs/{identity}.parquet"
+
+
+def build_catalog_lookup_file(row: CatalogRow) -> DatasetFile:
+    return DatasetFile(
+        path=catalog_lookup_path(row.run_id),
+        content=_parquet_bytes([row], catalog_parquet_schema()),
+    )
+
+
 def read_catalog_file(content: bytes) -> list[CatalogRow]:
     try:
         values = pq.read_table(
@@ -688,6 +696,42 @@ def read_catalog_file(content: bytes) -> list[CatalogRow]:
     except (pa.ArrowException, OSError) as error:
         raise ValueError("result catalog Parquet is invalid") from error
     return [CatalogRow.model_validate(value) for value in values.to_pylist()]
+
+
+def _trial_reward_scores(tables: ResultTables) -> list[float]:
+    by_trial: dict[str, list[MetricRow]] = {}
+    for metric in tables.metrics:
+        if metric.owner_type == "trial" and metric.unit == "score":
+            by_trial.setdefault(metric.owner_id, []).append(metric)
+
+    scores: list[float] = []
+    for trial in tables.trials:
+        metrics = by_trial.get(trial.trial_id, [])
+        if not metrics:
+            continue
+        preferred = next(
+            (
+                metric
+                for name in ("reward", "score", "verifier_reward")
+                for metric in metrics
+                if metric.name.casefold() == name
+            ),
+            None,
+        )
+        if preferred is None:
+            score_metrics = [
+                metric
+                for metric in metrics
+                if any(
+                    term in metric.name.casefold()
+                    for term in ("reward", "score", "verifier")
+                )
+            ]
+            selected = score_metrics or metrics
+            scores.append(sum(metric.value for metric in selected) / len(selected))
+        else:
+            scores.append(preferred.value)
+    return scores
 
 
 def read_index_file(content: bytes) -> list[GlobalIndexRow]:

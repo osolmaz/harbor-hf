@@ -5,7 +5,7 @@ from pathlib import Path
 
 from harbor_hf.presentation.config import PresentationConfig
 from harbor_hf.presentation.repository import ResultRepository
-from harbor_hf.results import build_catalog_window_file
+from harbor_hf.results import build_catalog_lookup_file, build_catalog_window_file
 
 _WINDOW_SIZES = tuple(2**power for power in range(12))
 
@@ -22,6 +22,11 @@ def rebuild(dataset: str, revision: str, output: Path) -> int:
     output.mkdir(parents=True, exist_ok=True)
     for size in _WINDOW_SIZES:
         artifact = build_catalog_window_file(rows, size)
+        destination = output / artifact.path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(artifact.content)
+    for row in rows:
+        artifact = build_catalog_lookup_file(row)
         destination = output / artifact.path
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(artifact.content)

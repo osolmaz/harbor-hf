@@ -28,6 +28,7 @@ from harbor_hf.results import (
     ResultTables,
     RunRow,
     TrialRow,
+    build_catalog_lookup_file,
     build_catalog_row,
 )
 
@@ -86,7 +87,16 @@ class FakeReader:
             self.rows[("org/index", INDEX_REVISION, index_path)] = [
                 row.model_dump(mode="python") for row in snapshot.index_rows
             ]
+        for row in snapshot.catalog_rows:
+            lookup = build_catalog_lookup_file(row)
+            self.rows[("org/index", INDEX_REVISION, lookup.path)] = [
+                row.model_dump(mode="python")
+            ]
         for index in snapshot.index_rows:
+            index_path = f"data/index/schema=v1/{index.publication_id}.parquet"
+            self.rows[("org/index", INDEX_REVISION, index_path)] = [
+                index.model_dump(mode="python")
+            ]
             for table in ("runs", "trials", "executions", "metrics", "artifacts"):
                 values = [
                     row
@@ -112,6 +122,10 @@ class FakeReader:
             "data/catalog/schema=v1/windows/0008.parquet",
             "data/index/schema=v1/windows/0004.parquet",
             "data/index/schema=v1/windows/0008.parquet",
+            *[
+                f"data/index/schema=v1/{row.publication_id}.parquet"
+                for row in self.snapshot.index_rows
+            ],
         ]
 
     def read_rows(
@@ -332,7 +346,55 @@ def test_historical_links_resolve_outside_list_window(
     assert client.get("/api/v1/runs/run-1/trials/trial-1").status_code == 200
     assert client.get("/api/v1/runs/run-1/executions/execution-1").status_code == 200
     assert client.get("/api/v1/runs/run-1/trials/missing").status_code == 404
-    assert len([path for path in reader.read_calls if "/windows/" not in path]) == 5
+    assert len([path for path in reader.read_calls if "/windows/" not in path]) == 6
+
+
+def test_catalog_uses_valid_nonstandard_reward_names() -> None:
+    index, run, trial, execution, metric, artifact = _publication(1, 1.0)
+    del index
+    renamed = metric.model_copy(update={"name": "task_success", "value": 0.75})
+    tables = ResultTables(
+        publication_id=run.publication_id,
+        runs=[run],
+        trials=[trial],
+        executions=[execution],
+        metrics=[renamed],
+        artifacts=[artifact],
+    )
+
+    catalog = build_catalog_row(
+        tables,
+        result_dataset="org/results",
+        result_revision=RESULT_REVISION,
+    )
+
+    assert catalog.score == 0.75
+    assert catalog.passed_trials == 0
+
+
+def test_catalog_prefers_primary_reward_over_secondary_metrics() -> None:
+    index, run, trial, execution, metric, artifact = _publication(1, 1.0)
+    del index
+    speed = metric.model_copy(
+        update={"metric_id": "metric-speed", "name": "speed", "value": 0.2}
+    )
+    tables = ResultTables(
+        publication_id=run.publication_id,
+        runs=[run],
+        trials=[trial],
+        executions=[execution],
+        metrics=[speed, metric],
+        artifacts=[artifact],
+    )
+
+    catalog = build_catalog_row(
+        tables,
+        result_dataset="org/results",
+        result_revision=RESULT_REVISION,
+    )
+
+    assert catalog.score == 1.0
+    assert catalog.passed_trials == 1
 
 
 def test_api_exposes_comparison_details_and_denies_private_content(
