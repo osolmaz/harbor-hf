@@ -163,6 +163,10 @@ operation and result publication. The
 the current checksummed request and typed result boundary. The
 [Harbor integration refactor plan](docs/harbor-integration-refactor.md) tracks
 the migration to a stable Harbor-owned protocol. The
+[Harbor-native result publication plan](docs/harbor-native-result-publication.md)
+defines the non-breaking migration from duplicated result models to canonical
+Harbor bundles, a minimal Hugging Face execution envelope, and rebuildable
+query projections. The
 [implementation plan](docs/implementation-plan.md) tracks the complete path to
 remote execution.
 

@@ -14,6 +14,12 @@ refactor is intended to remove. See the
 [frozen compatibility contract](harbor-integration-contract.md) for the exact
 implemented boundary and parity evidence.
 
+The [Harbor-native result publication plan](harbor-native-result-publication.md)
+defines the publication-specific v2 migration under this broader integration
+boundary. It freezes existing v1 publications, makes native Harbor bundles
+canonical, and limits new `harbor-hf` schemas to HF execution envelopes and
+rebuildable query projections.
+
 ## Goal
 
 Make Harbor the single authority for benchmark configuration and trial output,
