@@ -49,7 +49,7 @@ leaderboard and comparison patterns only.
 
 ## Verification
 
-- Python: 1,416 tests with branch coverage above the required 85% gate.
+- Python: 1,417 tests with branch coverage above the required 85% gate.
 - Frontend: TypeScript and Vite production build.
 - Hosted API: health, catalog, run detail, comparison, restricted content, and
   permanent-route smoke requests.

@@ -13,6 +13,7 @@ from harbor_hf.results import (
     MetricRow,
     RunRow,
     TrialRow,
+    trial_reward_score,
 )
 
 RunCatalog = RunRow | CatalogRow
@@ -291,25 +292,16 @@ class ResultService:
 
     def _score(self, run: RunRow) -> float:
         return _average(
-            metric.value
-            for metric in self.snapshot.metrics
-            if metric.run_id == run.run_id
-            and metric.owner_type == "trial"
-            and metric.name == "reward"
+            score
+            for trial in self.snapshot.trials
+            if trial.run_id == run.run_id
+            if (score := self._trial_score(trial)) is not None
         )
 
     def _trial_score(self, trial: TrialRow | None) -> float | None:
         if trial is None:
             return None
-        values = [
-            metric.value
-            for metric in self.snapshot.metrics
-            if metric.run_id == trial.run_id
-            and metric.owner_type == "trial"
-            and metric.owner_id == trial.trial_id
-            and metric.name == "reward"
-        ]
-        return _average(values) if values else None
+        return trial_reward_score(self.snapshot.metrics, trial.trial_id)
 
     def _run(self, run_id: str) -> RunRow:
         return self._find(self.snapshot.runs, "run_id", run_id)
