@@ -220,7 +220,7 @@ def test_recovery_terminal_decision_matrix_has_complete_canonical_structures(
         )
 
     assert _hash(corpus) == (
-        "683319885e980719e2d7f142ab8acfaa9a3f3d2a6ee023ba8a4111b4e2670431"
+        "5bb580721fd7fc8b26a42fc095a280a00877db25d1c192b274f9091fe593a315"
     )
 
 

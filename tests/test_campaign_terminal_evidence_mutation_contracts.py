@@ -40,6 +40,7 @@ from harbor_hf.recovery import (
     RecoveryProjection,
     RunProjection,
     TerminalDecision,
+    TrialProjection,
 )
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.wave_worker import ExecutionLock
@@ -230,6 +231,7 @@ def _finalizer_files(
 
 def _projection(lock: CampaignLock, status: str) -> RecoveryProjection:
     run = lock.runs[0]
+    trial = run.shards[0].trials[0]
     return RecoveryProjection(
         campaign=CampaignProjection(
             campaign_id=lock.campaign_id,
@@ -250,7 +252,14 @@ def _projection(lock: CampaignLock, status: str) -> RecoveryProjection:
             )
         },
         shards={},
-        trials={},
+        trials={
+            trial.trial_id: TrialProjection(
+                trial_id=trial.trial_id,
+                shard_id=run.shards[0].shard_id,
+                logical_attempt=trial.logical_attempt,
+                status="complete",
+            )
+        },
         executions={},
         waves={},
         spend_microusd=0,
@@ -435,6 +444,40 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
             "run_checksums": {run.run_id: _sha(checksum_bytes)},
         }
     )
+
+
+def test_failed_trial_becomes_zero_score_terminal_evidence(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    run = lock.runs[0]
+    trial = run.shards[0].trials[0]
+    base = f"runs/{run.run_id}"
+    trial_prefix = f"{base}/trials/{trial.trial_id}"
+    files = _finalizer_files(remote_spec, lock)
+    for path in list(files):
+        if path.startswith(f"{trial_prefix}/executions/execution-two/"):
+            del files[path]
+    del files[f"{trial_prefix}/_SUCCESS"]
+    del files[f"{trial_prefix}/trial-summary.json"]
+    finalizer = BucketCampaignFinalizer(_Reader(files), _Writer())
+
+    records = finalizer._failed_trial_records(
+        remote_spec,
+        lock,
+        base,
+        campaign_finalizer._under(sorted(files), base),
+        trial,
+        "endpoint",
+        "invalid",
+    )
+
+    assert records.trial.outcome == "failed"
+    assert records.trial.selected_execution_id == "execution-one"
+    assert records.executions[0].status == "failed_infrastructure"
+    assert [(metric.name, metric.value) for metric in records.metrics] == [
+        ("reward", 0.0)
+    ]
 
 
 def test_finalize_preserves_cancelled_execution_status_and_timestamp(

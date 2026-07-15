@@ -4,6 +4,7 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -344,6 +345,33 @@ def test_builds_deterministic_traceable_rows_and_parquet(
         assert b"harbor_hf.schema_version" in table.schema.metadata
         assert SECRET_SESSION not in item.content
         assert SHELLBENCH_TASK not in item.content
+
+
+def test_exhausted_trial_failure_is_a_zero_score_result(
+    source: EvidenceSource,
+) -> None:
+    summary = sample_summary()
+    trials = summary["trials"]
+    assert isinstance(trials, list)
+    failed_trial = cast(dict[str, object], trials[0])
+    failed_trial["outcome"] = "failed"
+    executions = summary["executions"]
+    assert isinstance(executions, list)
+    failed_execution = cast(dict[str, object], executions[0])
+    failed_execution["status"] = "failed_infrastructure"
+
+    tables = build_result_tables(
+        _evidence(summary), source, control_commit=CONTROL_COMMIT
+    )
+
+    observed = next(row for row in tables.trials if row.trial_id == "trial-two")
+    assert observed.outcome == "failed"
+    reward = next(
+        row
+        for row in tables.metrics
+        if row.owner_id == "trial-two" and row.name == "reward"
+    )
+    assert reward.value == 0.0
 
 
 def test_builds_projection_bound_to_native_envelope(

@@ -123,7 +123,7 @@ class TrialEvidence(FrozenModel):
     task_digest: Digest
     logical_attempt: int = Field(ge=1)
     selected_execution_id: EntityId
-    outcome: Literal["complete"] = "complete"
+    outcome: Literal["complete", "failed"] = "complete"
 
 
 class ExecutionEvidence(FrozenModel):
@@ -202,9 +202,13 @@ class ResultEvidence(FrozenModel):
             if (
                 not isinstance(selected, ExecutionEvidence)
                 or selected.trial_id != trial.trial_id
-                or selected.status != "succeeded"
+                or (trial.outcome == "complete" and selected.status != "succeeded")
+                or (
+                    trial.outcome == "failed"
+                    and selected.status != "failed_infrastructure"
+                )
             ):
-                raise ValueError("trial selected execution is not a valid success")
+                raise ValueError("trial selected execution conflicts with its outcome")
         if any(execution.trial_id not in trials for execution in self.executions):
             raise ValueError("execution references an unknown trial")
         owners = {
@@ -289,7 +293,7 @@ class TrialRow(TraceRow):
     task_digest: Digest
     logical_attempt: int = Field(ge=1)
     selected_execution_id: EntityId
-    outcome: Literal["complete"]
+    outcome: Literal["complete", "failed"]
 
 
 class ExecutionRow(TraceRow):

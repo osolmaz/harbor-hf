@@ -69,8 +69,16 @@ WaveStatus = Literal[
 ]
 TerminalStatus = Literal["completed", "partial", "failed", "cancelled"]
 
-_RETRYABLE_CATEGORIES = {"lost", "transient", "quota", "rate-limit", "ambiguous"}
+_RETRYABLE_CATEGORIES = {
+    "lost",
+    "transient",
+    "quota",
+    "rate-limit",
+    "ambiguous",
+    "benchmark",
+}
 _TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure", "cancelled"}
+_SCORED_TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure"}
 _CAMPAIGN_TERMINAL = {"completed", "partial", "failed", "cancelled"}
 
 
@@ -268,7 +276,7 @@ def project_recovery(
     counts = _counts(trials)
     if campaign.status == "queued" and (executions or waves):
         campaign = campaign.model_copy(update={"status": "active"})
-    terminal = _terminal_decision(lock, campaign, trials, waves, counts)
+    terminal = _terminal_decision(lock, campaign, runs, trials, waves, counts)
     cancel_requested_at = next(
         (
             event.observed_at
@@ -680,12 +688,10 @@ def _failed_trial_state(
     lock: CampaignLock, execution: ExecutionProjection, execution_count: int
 ) -> tuple[TrialStatus, datetime | None]:
     category = execution.category
-    if category == "benchmark":
-        return "invalid", None
     if category not in _RETRYABLE_CATEGORIES:
         return "failed_infrastructure", None
     if execution_count >= lock.recovery_policy.max_physical_executions_per_trial:
-        return "failed_infrastructure", None
+        return ("invalid" if category == "benchmark" else "failed_infrastructure"), None
     delay = retry_delay_seconds(
         lock,
         category,
@@ -710,13 +716,10 @@ def _aggregate_shard(
 ) -> ShardStatus:
     statuses = [trials[trial_id].status for trial_id in shard.trial_ids]
     _validate_observed_terminal(shard.observed_status, statuses, "shard")
-    if all(status == "complete" for status in statuses):
-        return "complete"
+    scored = _scored_terminal_status(statuses)
+    if scored is not None:
+        return cast(ShardStatus, scored)
     if all(status in _TERMINAL_STATUSES for status in statuses):
-        if any(status == "failed_infrastructure" for status in statuses):
-            return "failed_infrastructure"
-        if any(status == "invalid" for status in statuses):
-            return "invalid"
         return "cancelled"
     if any(status == "active" for status in statuses):
         return "active"
@@ -737,17 +740,26 @@ def _derive_runs(
 def _aggregate_run(run: RunProjection, shards: dict[str, ShardProjection]) -> RunStatus:
     statuses = [shards[shard_id].status for shard_id in run.shard_ids]
     _validate_observed_terminal(run.observed_status, statuses, "run")
-    if all(status == "complete" for status in statuses):
-        return "complete"
+    scored = _scored_terminal_status(statuses)
+    if scored is not None:
+        return cast(RunStatus, scored)
     if all(status in _TERMINAL_STATUSES for status in statuses):
-        if any(status == "failed_infrastructure" for status in statuses):
-            return "failed_infrastructure"
-        if any(status == "invalid" for status in statuses):
-            return "invalid"
         return "cancelled"
     if any(status in {"active", "retry_wait"} for status in statuses):
         return "active"
     return run.observed_status or "planned"
+
+
+def _scored_terminal_status(
+    statuses: list[TrialStatus] | list[ShardStatus],
+) -> Literal["complete", "invalid", "failed_infrastructure"] | None:
+    if not all(status in _SCORED_TERMINAL_STATUSES for status in statuses):
+        return None
+    if any(status == "complete" for status in statuses):
+        return "complete"
+    if any(status == "failed_infrastructure" for status in statuses):
+        return "failed_infrastructure"
+    return "invalid"
 
 
 def _validate_observed_terminal(
@@ -759,8 +771,9 @@ def _validate_observed_terminal(
         return
     if not all(status in _TERMINAL_STATUSES for status in child_statuses):
         raise ValueError(f"{subject} became terminal before its children")
-    if observed == "complete" and not all(
-        status == "complete" for status in child_statuses
+    if observed == "complete" and (
+        not all(status in _SCORED_TERMINAL_STATUSES for status in child_statuses)
+        or not any(status == "complete" for status in child_statuses)
     ):
         raise ValueError(f"{subject} completed with non-complete children")
 
@@ -785,6 +798,7 @@ def _counts(trials: dict[str, TrialProjection]) -> ProjectionCounts:
 def _terminal_decision(
     lock: CampaignLock,
     campaign: CampaignProjection,
+    runs: dict[str, RunProjection],
     trials: dict[str, TrialProjection],
     waves: dict[str, WaveProjection],
     counts: ProjectionCounts,
@@ -802,13 +816,24 @@ def _terminal_decision(
         for trial in trials.values()
     ):
         return None
-    if decision_counts.complete == len(trials):
+    run_statuses = [run.status for run in runs.values()]
+    if run_statuses and all(status == "complete" for status in run_statuses):
         return _decision(
-            lock, "completed", decision_counts, "all logical trials completed"
+            lock,
+            "completed",
+            decision_counts,
+            "all logical trials reached a scored terminal outcome",
         )
-    if decision_counts.complete:
+    if cancelling and decision_counts.complete:
         return _decision(
-            lock, "partial", decision_counts, "some logical trials completed"
+            lock,
+            "partial",
+            decision_counts,
+            "cancellation preserved some scored trial outcomes",
+        )
+    if any(status == "complete" for status in run_statuses):
+        return _decision(
+            lock, "partial", decision_counts, "some runs reached a scored outcome"
         )
     if cancelling or decision_counts.cancelled:
         return _decision(

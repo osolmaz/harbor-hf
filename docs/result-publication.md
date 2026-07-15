@@ -10,8 +10,10 @@ idempotent path for explicit operation and recovery.
 A run is publishable only when its evidence prefix has `_SUCCESS`, has no other
 top-level terminal marker, and every non-marker object is present in and matches
 `checksums.json`. The checksummed `run-summary.json` must declare that it was
-sanitized and must describe an ordinary, complete run. The checksummed
-`run.lock.json` must contain the same immutable `run_id`.
+sanitized and must describe an ordinary, complete run. Complete means every
+logical trial reached a scored terminal outcome: a valid verifier result, or a
+zero-score failed trial after its bounded physical retry budget was exhausted.
+The checksummed `run.lock.json` must contain the same immutable `run_id`.
 
 The publisher reads normalized values only from `run-summary.json`. It never
 copies evidence object bytes into a Dataset. Raw Harbor job trees, sessions,
@@ -45,12 +47,14 @@ Common trace fields:
 `runs` adds campaign, experiment, benchmark, result classification, completion
 times, model, deployment, agent, and aggregate child-count fields. `trials` adds
 the logical trial identity, task name and digest, attempt, selected execution,
-and outcome. `executions` adds the physical execution identity, trial identity,
-attempt, runtime kind, status, timestamps, retry reason, and optional remote Job
-identity. `metrics` adds a deterministic metric identity, typed owner, name,
-value, unit, and optional aggregation. `artifacts` adds a deterministic artifact
-identity, typed owner, safe artifact kind, private canonical path, checksum,
-media type, and size. Artifact rows are metadata and pointers only.
+and `complete` or `failed` outcome. A failed trial has a zero reward metric and
+selects its final failed execution. `executions` adds the physical execution
+identity, trial identity, attempt, runtime kind, status, timestamps, retry
+reason, and optional remote Job identity. `metrics` adds a deterministic metric
+identity, typed owner, name, value, unit, and optional aggregation. `artifacts`
+adds a deterministic artifact identity, typed owner, safe artifact kind, private
+canonical path, checksum, media type, and size. Artifact rows are metadata and
+pointers only.
 
 For endpoint-backed runs, `model_revision` is the Hub revision verified in the
 endpoint configuration. HF Inference Providers neither accept nor report a
@@ -63,6 +67,12 @@ publication: run and campaign IDs, benchmark, ordinary/complete labels,
 completion time, model and agent identity, result Dataset and exact revision,
 source checksum, and control commit. It contains no trial, execution, metric,
 artifact, session, or task-content data.
+
+Task failures remain visible through trial outcomes, execution statuses, retry
+counts, and the catalog's infrastructure-failure count. They stay in the score
+denominator instead of suppressing valid results from the rest of the run. A
+run with no valid completed trial, missing terminal evidence, or inconsistent
+checksums is not publishable as an ordinary complete result.
 
 Each publication keeps its immutable index row. The publisher also rewrites
 consolidated power-of-two windows containing the newest 1, 2, 4, and so on up

@@ -338,7 +338,6 @@ def test_reserved_retry_targets_are_excluded_from_later_retry_wave(
 @pytest.mark.parametrize(
     ("category", "expected"),
     [
-        ("benchmark", "invalid"),
         ("configuration", "failed_infrastructure"),
         ("authentication", "failed_infrastructure"),
         ("cleanup", "failed_infrastructure"),
@@ -360,6 +359,40 @@ def test_terminal_failure_categories_never_retry(
 
     assert next(iter(projection.trials.values())).status == expected
     assert all(action.kind != "retry-shard" for action in plan.actions)
+
+
+def test_benchmark_failure_retries_then_becomes_scored_invalid(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    first = _execution_events(
+        lock, 2, execution_id="execution-one", attempt=1, category="benchmark"
+    )
+
+    projected = project_recovery(lock, [submitted, *first])
+    retry_at = next(iter(projected.trials.values())).retry_not_before
+    assert retry_at is not None
+    _projection, retry = plan_reconciliation(lock, [submitted, *first], now=retry_at)
+    assert [action.kind for action in retry.actions] == ["retry-shard"]
+
+    exhausted_lock, exhausted_submitted = _campaign(
+        remote_spec, max_physical_executions_per_trial=1
+    )
+    exhausted = _execution_events(
+        exhausted_lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="benchmark",
+    )
+    exhausted_projection, exhausted_plan = plan_reconciliation(
+        exhausted_lock,
+        [exhausted_submitted, *exhausted],
+        now=NOW + timedelta(days=1),
+    )
+    assert next(iter(exhausted_projection.trials.values())).status == "invalid"
+    assert exhausted_plan.terminal_decision is not None
+    assert exhausted_plan.terminal_decision.status == "failed"
 
 
 @pytest.mark.parametrize(
@@ -1054,7 +1087,7 @@ def test_cleanup_bypasses_budgets_and_action_limit_before_billable_work(
     ("trial_kinds", "cancelled", "expected", "marker"),
     [
         (["trial.complete", "trial.complete"], False, "completed", "_SUCCESS"),
-        (["trial.complete", "trial.invalid"], False, "partial", "_PARTIAL"),
+        (["trial.complete", "trial.invalid"], False, "completed", "_SUCCESS"),
         (["trial.invalid", "trial.invalid"], False, "failed", "_FAILED"),
         (["trial.cancelled", "trial.cancelled"], True, "cancelled", "_CANCELLED"),
     ],
@@ -1877,5 +1910,5 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
         corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "b1957937018fd24870ad91d0f08a59356a1d821bb2890c24932f18e6ba9eccd3"
+        "83102ef0f3b28dc652e3daf4dc5c7c004683377a86521bcf7aac013a08785a61"
     )

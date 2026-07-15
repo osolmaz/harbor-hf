@@ -2012,7 +2012,7 @@ def test_terminal_summary_requires_configured_finalizer(
     assert store.events[-1].kind == "action.failed"
 
 
-def test_partial_terminal_status_is_recorded_without_result_publication(
+def test_exhausted_task_failure_is_published_as_a_completed_scored_run(
     remote_spec: ExperimentSpec,
 ) -> None:
     benchmark = remote_spec.benchmark.model_copy(
@@ -2053,11 +2053,12 @@ def test_partial_terminal_status_is_recorded_without_result_publication(
     ).apply_campaign(lock.campaign_id)
 
     assert result.plan.terminal_decision is not None
-    assert result.plan.terminal_decision.status == "partial"
+    assert result.plan.terminal_decision.status == "completed"
     assert [entry[0] for entry in interactions if isinstance(entry, tuple)] == [
-        "finalize"
+        "finalize",
+        "publish",
     ]
-    assert store.events[-1].kind == "campaign.partial"
+    assert store.events[-1].kind == "campaign.completed"
 
 
 @pytest.mark.parametrize(

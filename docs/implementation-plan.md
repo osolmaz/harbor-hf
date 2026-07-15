@@ -186,9 +186,12 @@ planned -> acquiring -> provisioning -> ready -> active -> draining
 ```
 
 A verifier reward of zero is a valid completed benchmark result. `invalid`
-means evidence or benchmark semantics failed validation. `failed_infrastructure`
-means no valid benchmark result was produced after the allowed physical
-executions.
+means evidence or benchmark semantics failed validation after bounded retries.
+`failed_infrastructure` means no valid benchmark result was produced after the
+allowed physical executions. When a run also contains valid completed trials,
+both terminal failure states contribute zero to its fixed denominator instead
+of making the whole run partial. A run with no valid completed trial still
+fails closed.
 
 ### Event Rules
 
