@@ -258,7 +258,8 @@ export command remains upstream work and is not required for current runs.
 Exit criterion: dual publication is idempotent and produces equivalent visible
 results for all supported run shapes.
 
-Status: complete locally; bounded hosted verification is required for release.
+Status: complete. The hosted Dataset migration remained idempotent at revision
+`d2708c4b379f1886d53409c09dcb771538fbaf09` with six publications.
 
 ### Phase 4: Move Readers
 
@@ -271,8 +272,9 @@ Status: complete locally; bounded hosted verification is required for release.
 Exit criterion: the Space uses v2 by default and mixed v1/v2 history remains
 searchable and comparable.
 
-Status: reader and publisher complete; hosted Dataset migration and Space
-verification are required for release.
+Status: complete. The public Results Space runs the v2-first reader at revision
+`4facb5778f1239fe9578d1eff36d09255df4a36e`; hosted API and desktop/mobile
+browser checks passed against the migrated mixed-history catalog.
 
 ### Phase 5: Stop New V1 Writes
 
