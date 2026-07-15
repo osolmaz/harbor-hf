@@ -267,7 +267,7 @@ class ResultService:
             "outcome": run.outcome,
             "score": self._score(run),
             "passed_trials": sum(
-                self._trial_score(trial) == 1
+                (self._trial_score(trial) or 0.0) >= 1.0
                 for trial in self.snapshot.trials
                 if trial.run_id == run.run_id
             ),

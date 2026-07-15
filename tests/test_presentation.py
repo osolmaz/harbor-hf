@@ -401,7 +401,7 @@ def test_detail_and_comparison_use_nonstandard_reward_names(
     snapshot: ResultSnapshot,
 ) -> None:
     metrics = tuple(
-        metric.model_copy(update={"name": "task_success", "value": 0.75})
+        metric.model_copy(update={"name": "task_success", "value": 1.25})
         if metric.run_id == "run-1"
         else metric
         for metric in snapshot.metrics
@@ -411,9 +411,10 @@ def test_detail_and_comparison_use_nonstandard_reward_names(
     detail = service.run("run-1")
     comparison = service.compare("run-1", "run-2")
 
-    assert detail["summary"]["score"] == 0.75
-    assert detail["trials"][0]["score"] == 0.75
-    assert comparison["tasks"][0]["left_score"] == 0.75
+    assert detail["summary"]["score"] == 1.25
+    assert detail["summary"]["passed_trials"] == 1
+    assert detail["trials"][0]["score"] == 1.25
+    assert comparison["tasks"][0]["left_score"] == 1.25
 
 
 def test_api_exposes_comparison_details_and_denies_private_content(
