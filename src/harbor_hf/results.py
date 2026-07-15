@@ -699,10 +699,14 @@ def read_catalog_file(content: bytes) -> list[CatalogRow]:
 
 
 def _trial_reward_scores(tables: ResultTables) -> list[float]:
+    by_trial: dict[str, list[MetricRow]] = {}
+    for metric in tables.metrics:
+        if metric.owner_type == "trial" and metric.unit == "score":
+            by_trial.setdefault(metric.owner_id, []).append(metric)
     return [
         score
         for trial in tables.trials
-        if (score := trial_reward_score(tables.metrics, trial.trial_id)) is not None
+        if (score := _select_reward_score(by_trial.get(trial.trial_id, []))) is not None
     ]
 
 
@@ -714,6 +718,10 @@ def trial_reward_score(metrics: Sequence[MetricRow], trial_id: str) -> float | N
         and metric.owner_id == trial_id
         and metric.unit == "score"
     ]
+    return _select_reward_score(candidates)
+
+
+def _select_reward_score(candidates: Sequence[MetricRow]) -> float | None:
     if not candidates:
         return None
     preferred = next(
