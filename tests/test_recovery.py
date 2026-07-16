@@ -1247,6 +1247,20 @@ def test_faulted_history_rejects_wave_state_regression(
     assert str(captured.value) == "invalid wave transition: active -> ready"
 
 
+def test_late_terminal_evidence_supersedes_synthetic_wave_drain(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    closed = _wave_event(lock, 2, "closed").model_copy(
+        update={"producer": "wave-controller"}
+    )
+    synthetic_drain = _wave_event(lock, 3, "draining")
+
+    projection = project_recovery(lock, [submitted, closed, synthetic_drain])
+
+    assert projection.waves["wave-one"].status == "closed"
+
+
 def test_wave_transition_matrix_is_exhaustive(remote_spec: ExperimentSpec) -> None:
     lock, submitted = _campaign(remote_spec)
     allowed = {
@@ -1266,7 +1280,9 @@ def test_wave_transition_matrix_is_exhaustive(remote_spec: ExperimentSpec) -> No
             history = [
                 submitted,
                 _wave_event(lock, 2, previous),
-                _wave_event(lock, 3, current),
+                _wave_event(lock, 3, current).model_copy(
+                    update={"producer": "wave-controller"}
+                ),
             ]
             if current == previous or current in allowed[previous]:
                 projection = project_recovery(lock, history)
