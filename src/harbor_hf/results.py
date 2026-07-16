@@ -22,7 +22,14 @@ from pydantic import (
 from harbor_hf.control import RetryCategory
 from harbor_hf.publication_envelope import (
     PUBLICATION_ENVELOPE_PATH,
+    PhysicalExecutionReference,
+    ProfileDigests,
     PublicationEnvelope,
+    RuntimeIdentity,
+    SourcePublicationReference,
+    canonical_digest,
+    canonical_json_bytes,
+    object_reference,
 )
 
 Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
@@ -35,17 +42,20 @@ DatasetId = Annotated[
 OwnerType = Literal["run", "trial", "execution"]
 RuntimeKind = Literal["endpoint", "provider"]
 RunQuality = Literal["clean", "degraded"]
+ResultKind = Literal["ordinary", "composed"]
 TaskOutcome = Literal[
     "scored",
     "agent_failed",
     "benchmark_failed",
     "infrastructure_exhausted",
+    "unsupported",
 ]
 ArtifactKind = Literal[
     "run_lock",
     "verification",
     "runtime_environment",
     "endpoint_snapshot",
+    "composition",
 ]
 TableName = Literal["runs", "trials", "executions", "metrics", "artifacts"]
 
@@ -70,9 +80,17 @@ _ARTIFACT_PATHS: Mapping[ArtifactKind, str] = {
     "verification": "verification.json",
     "runtime_environment": "runtime-environment.json",
     "endpoint_snapshot": "endpoint.snapshot.json",
+    "composition": "composition.json",
 }
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 _CHECKSUM_MAP = TypeAdapter(dict[str, Digest])
+_TASK_OUTCOMES: tuple[TaskOutcome, ...] = (
+    "scored",
+    "agent_failed",
+    "benchmark_failed",
+    "infrastructure_exhausted",
+    "unsupported",
+)
 
 
 class ResultPublicationError(RuntimeError):
@@ -102,7 +120,7 @@ class RunEvidence(FrozenModel):
     experiment: str = Field(min_length=1)
     benchmark: str = Field(min_length=1)
     benchmark_revision: str = Field(min_length=1)
-    result_kind: Literal["ordinary"] = "ordinary"
+    result_kind: ResultKind = "ordinary"
     outcome: Literal["complete"] = "complete"
     quality: RunQuality
     created_at: AwareDatetime
@@ -131,7 +149,7 @@ class TrialEvidence(FrozenModel):
     task_name: str = Field(min_length=1)
     task_digest: Digest
     logical_attempt: int = Field(ge=1)
-    selected_execution_id: EntityId
+    selected_execution_id: EntityId | None
     outcome: TaskOutcome
 
 
@@ -163,6 +181,8 @@ def task_outcome_matches_execution(
     status: str,
     failure_category: RetryCategory | None,
 ) -> bool:
+    if outcome == "unsupported":
+        return False
     if outcome == "scored":
         return status == "succeeded" and failure_category is None
     if status != "failed" or failure_category is None:
@@ -172,6 +192,31 @@ def task_outcome_matches_execution(
     if outcome == "benchmark_failed":
         return failure_category == "benchmark"
     return failure_category not in {"agent", "benchmark"}
+
+
+def _validate_trial_execution_reference(
+    trial: TrialEvidence,
+    executions: Mapping[str, object],
+) -> None:
+    if trial.outcome == "unsupported":
+        if trial.selected_execution_id is not None:
+            raise ValueError("unsupported trial has a selected execution")
+        if any(
+            isinstance(execution, ExecutionEvidence)
+            and execution.trial_id == trial.trial_id
+            for execution in executions.values()
+        ):
+            raise ValueError("unsupported trial has a physical execution")
+        return
+    selected = executions.get(trial.selected_execution_id)
+    if (
+        not isinstance(selected, ExecutionEvidence)
+        or selected.trial_id != trial.trial_id
+        or not task_outcome_matches_execution(
+            trial.outcome, selected.status, selected.failure_category
+        )
+    ):
+        raise ValueError("trial selected execution conflicts with its outcome")
 
 
 class MetricEvidence(FrozenModel):
@@ -226,15 +271,7 @@ class ResultEvidence(FrozenModel):
         trials = _unique_by_id(self.trials, "trial_id", "trial")
         executions = _unique_by_id(self.executions, "execution_id", "execution")
         for trial in self.trials:
-            selected = executions.get(trial.selected_execution_id)
-            if (
-                not isinstance(selected, ExecutionEvidence)
-                or selected.trial_id != trial.trial_id
-                or not task_outcome_matches_execution(
-                    trial.outcome, selected.status, selected.failure_category
-                )
-            ):
-                raise ValueError("trial selected execution conflicts with its outcome")
+            _validate_trial_execution_reference(trial, executions)
         if any(execution.trial_id not in trials for execution in self.executions):
             raise ValueError("execution references an unknown trial")
         owners = {
@@ -288,7 +325,7 @@ class RunRow(TraceRow):
     experiment: str = Field(min_length=1)
     benchmark: str = Field(min_length=1)
     benchmark_revision: str = Field(min_length=1)
-    result_kind: Literal["ordinary"]
+    result_kind: ResultKind
     outcome: Literal["complete"]
     quality: RunQuality
     created_at: AwareDatetime
@@ -309,6 +346,7 @@ class RunRow(TraceRow):
     agent_failed_count: int = Field(ge=0)
     benchmark_failed_count: int = Field(ge=0)
     infrastructure_exhausted_count: int = Field(ge=0)
+    unsupported_count: int = Field(ge=0)
     execution_count: int = Field(ge=0)
 
     @model_validator(mode="after")
@@ -320,6 +358,7 @@ class RunRow(TraceRow):
             + self.agent_failed_count
             + self.benchmark_failed_count
             + self.infrastructure_exhausted_count
+            + self.unsupported_count
         )
         if outcome_count != self.planned_trial_count:
             raise ValueError("run task outcome counts do not match trial count")
@@ -338,7 +377,7 @@ class TrialRow(TraceRow):
     task_name: str = Field(min_length=1)
     task_digest: Digest
     logical_attempt: int = Field(ge=1)
-    selected_execution_id: EntityId
+    selected_execution_id: EntityId | None
     outcome: TaskOutcome
 
 
@@ -444,7 +483,7 @@ class GlobalIndexRow(FrozenModel):
     run_id: EntityId
     campaign_id: EntityId
     benchmark: str = Field(min_length=1)
-    result_kind: Literal["ordinary"]
+    result_kind: ResultKind
     outcome: Literal["complete"]
     quality: RunQuality
     completed_at: AwareDatetime
@@ -467,7 +506,7 @@ class CatalogRow(FrozenModel):
     campaign_id: EntityId
     benchmark: str = Field(min_length=1)
     benchmark_revision: str = Field(min_length=1)
-    result_kind: Literal["ordinary"]
+    result_kind: ResultKind
     outcome: Literal["complete"]
     quality: RunQuality
     created_at: AwareDatetime
@@ -487,6 +526,7 @@ class CatalogRow(FrozenModel):
     agent_failed_count: int = Field(ge=0)
     benchmark_failed_count: int = Field(ge=0)
     infrastructure_exhausted_count: int = Field(ge=0)
+    unsupported_count: int = Field(ge=0)
     execution_count: int = Field(ge=0)
     failed_executions: int = Field(ge=0)
     duration_seconds: float = Field(ge=0)
@@ -510,6 +550,7 @@ class CatalogRow(FrozenModel):
             + self.agent_failed_count
             + self.benchmark_failed_count
             + self.infrastructure_exhausted_count
+            + self.unsupported_count
         )
         if outcome_count != self.planned_trial_count:
             raise ValueError("catalog task outcome counts do not match trial count")
@@ -533,6 +574,57 @@ class ResultPublication(FrozenModel):
     files: list[DatasetFile]
     receipt_path: str
     receipt: bytes
+
+
+class UnsupportedTask(FrozenModel):
+    task_name: str = Field(min_length=1)
+    task_digest: Digest
+    logical_attempt: int = Field(default=1, ge=1)
+
+
+class ResultCompositionManifest(FrozenModel):
+    schema_version: Literal["harbor-hf/result-composition/v1"] = (
+        "harbor-hf/result-composition/v1"
+    )
+    run_id: EntityId
+    campaign_id: EntityId
+    experiment: str = Field(min_length=1)
+    created_at: AwareDatetime
+    completed_at: AwareDatetime
+    evidence_bucket: str = Field(min_length=1)
+    evidence_prefix: str = Field(min_length=1)
+    sources: list[SourcePublicationReference] = Field(min_length=1)
+    unsupported_tasks: list[UnsupportedTask] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def values_are_consistent(self) -> ResultCompositionManifest:
+        if self.completed_at < self.created_at:
+            raise ValueError("composition completion precedes creation")
+        if sum(source.role == "base" for source in self.sources) != 1:
+            raise ValueError("composition requires exactly one base publication")
+        selected = [
+            (trial.task_name, trial.logical_attempt)
+            for source in self.sources
+            for trial in source.selected_trials
+        ]
+        unsupported = [
+            (task.task_name, task.logical_attempt) for task in self.unsupported_tasks
+        ]
+        if len(selected) != len(set(selected)):
+            raise ValueError("composition selects a task from multiple publications")
+        if len(unsupported) != len(set(unsupported)):
+            raise ValueError("composition has duplicate unsupported tasks")
+        if set(selected).intersection(unsupported):
+            raise ValueError("unsupported task is also selected from a publication")
+        _validate_relative_path(self.evidence_prefix)
+        return self
+
+
+class ComposedResult(FrozenModel):
+    manifest: ResultCompositionManifest
+    envelope: PublicationEnvelope
+    tables: ResultTables
+    evidence_files: list[DatasetFile]
 
 
 class ProjectionFileReference(FrozenModel):
@@ -613,12 +705,7 @@ def build_result_tables(
     run_evidence = summary.run
     outcome_counts = {
         outcome: sum(trial.outcome == outcome for trial in summary.trials)
-        for outcome in (
-            "scored",
-            "agent_failed",
-            "benchmark_failed",
-            "infrastructure_exhausted",
-        )
+        for outcome in _TASK_OUTCOMES
     }
     run = RunRow(
         **trace,
@@ -647,6 +734,7 @@ def build_result_tables(
         agent_failed_count=outcome_counts["agent_failed"],
         benchmark_failed_count=outcome_counts["benchmark_failed"],
         infrastructure_exhausted_count=outcome_counts["infrastructure_exhausted"],
+        unsupported_count=outcome_counts["unsupported"],
         execution_count=len(summary.executions),
     )
     trials = [
@@ -715,7 +803,89 @@ def build_result_tables(
     )
 
 
-def build_result_publication(tables: ResultTables) -> ResultPublication:
+def compose_result_tables(
+    manifest: ResultCompositionManifest,
+    sources: Mapping[str, ResultTables],
+    *,
+    control_commit: str,
+) -> ComposedResult:
+    if not _is_commit(control_commit):
+        raise ValueError("control commit must be a 40- or 64-character hex digest")
+    _validate_composition_sources(manifest, sources)
+    base_reference = next(
+        source for source in manifest.sources if source.role == "base"
+    )
+    base = sources[base_reference.publication_id]
+    base_run = base.runs[0]
+    _validate_composition_compatibility(manifest, sources, base_run)
+    selected_rows = _select_composition_rows(manifest, sources, base)
+    manifest_bytes = canonical_json_bytes(manifest.model_dump(mode="json"))
+    manifest_digest = _sha256_bytes(manifest_bytes)
+    trace = _composition_trace(manifest, manifest_digest, control_commit)
+    trials, executions, metrics = _compose_child_rows(manifest, selected_rows, trace)
+    _require_unique_composed_rows(trials, executions, metrics)
+    run = _build_composed_run(manifest, base_run, trace, trials, executions)
+    source_pairs = sorted(
+        {
+            pair
+            for tables in sources.values()
+            for pair in zip(
+                tables.provenance.harbor_bundle_manifest_sha256s,
+                tables.provenance.harbor_archive_sha256s,
+                strict=True,
+            )
+        }
+    )
+    envelope = _build_composition_envelope(
+        manifest, manifest_bytes, base_run, executions
+    )
+    envelope_bytes = canonical_json_bytes(envelope.model_dump(mode="json"))
+    artifacts = [
+        ArtifactRow(
+            **trace,
+            artifact_id=_composition_entity_id(
+                "artifact", manifest.run_id, "composition.json"
+            ),
+            owner_type="run",
+            owner_id=manifest.run_id,
+            kind="composition",
+            path="composition.json",
+            sha256=manifest_digest,
+            media_type="application/json",
+            size_bytes=len(manifest_bytes),
+        )
+    ]
+    tables = ResultTables(
+        publication_id=trace["publication_id"],
+        runs=[run],
+        trials=sorted(trials, key=lambda item: item.trial_id),
+        executions=sorted(executions, key=lambda item: item.execution_id),
+        metrics=sorted(metrics, key=lambda item: item.metric_id),
+        artifacts=artifacts,
+        provenance=PublicationProvenance(
+            envelope_sha256=_sha256_bytes(envelope_bytes),
+            projection_version=envelope.projection_version,
+            sanitizer_version=envelope.sanitizer_version,
+            harbor_bundle_manifest_sha256s=[pair[0] for pair in source_pairs],
+            harbor_archive_sha256s=[pair[1] for pair in source_pairs],
+        ),
+    )
+    return ComposedResult(
+        manifest=manifest,
+        envelope=envelope,
+        tables=tables,
+        evidence_files=[
+            DatasetFile(path="composition.json", content=manifest_bytes),
+            DatasetFile(path=PUBLICATION_ENVELOPE_PATH, content=envelope_bytes),
+        ],
+    )
+
+
+def build_result_publication(
+    tables: ResultTables,
+    *,
+    extra_files: Sequence[DatasetFile] = (),
+) -> ResultPublication:
     campaign_id = tables.runs[0].campaign_id
     files = [
         DatasetFile(
@@ -728,6 +898,7 @@ def build_result_publication(tables: ResultTables) -> ResultPublication:
         for table in _table_names()
     ]
     files.append(_build_projection_file(tables, files))
+    files.extend(extra_files)
     receipt_path = f"publications/{tables.publication_id}.json"
     receipt_value = {
         "schema_version": "harbor-hf/result-publication/v1",
@@ -742,6 +913,349 @@ def build_result_publication(tables: ResultTables) -> ResultPublication:
         receipt_path=receipt_path,
         receipt=_canonical_json(receipt_value),
     )
+
+
+def build_composed_result_publication(result: ComposedResult) -> ResultPublication:
+    manifest_bytes = canonical_json_bytes(result.manifest.model_dump(mode="json"))
+    return build_result_publication(
+        result.tables,
+        extra_files=[
+            DatasetFile(
+                path=f"compositions/{result.tables.publication_id}.json",
+                content=manifest_bytes,
+            )
+        ],
+    )
+
+
+def _validate_composition_sources(
+    manifest: ResultCompositionManifest,
+    sources: Mapping[str, ResultTables],
+) -> None:
+    expected_sources = {source.publication_id for source in manifest.sources}
+    if set(sources) != expected_sources:
+        raise ResultPublicationError("composition sources do not match its manifest")
+    for source in manifest.sources:
+        tables = sources[source.publication_id]
+        run = tables.runs[0]
+        if (
+            tables.publication_id != source.publication_id
+            or run.run_id != source.run_id
+            or run.source_checksum != source.source_checksum
+        ):
+            raise ResultPublicationError("composition source identity conflicts")
+
+
+def _select_composition_rows(
+    manifest: ResultCompositionManifest,
+    sources: Mapping[str, ResultTables],
+    base: ResultTables,
+) -> list[tuple[TrialRow, ResultTables]]:
+    selected_rows: list[tuple[TrialRow, ResultTables]] = []
+    selected_base_keys: set[tuple[str, int]] = set()
+    base_trials = {_trial_key(trial): trial for trial in base.trials}
+    for source in manifest.sources:
+        tables = sources[source.publication_id]
+        by_key = {_trial_key(trial): trial for trial in tables.trials}
+        if len(by_key) != len(tables.trials):
+            raise ResultPublicationError("composition source has duplicate trials")
+        for selection in source.selected_trials:
+            trial = by_key.get((selection.task_name, selection.logical_attempt))
+            if trial is None:
+                raise ResultPublicationError(
+                    "composition selects an unknown source task"
+                )
+            _validate_correction_trial(source, trial, base_trials)
+            selected_base_keys.add(_trial_key(trial))
+            selected_rows.append((trial, tables))
+    if set(base_trials) != selected_base_keys:
+        raise ResultPublicationError(
+            "composition does not resolve every task in the base publication"
+        )
+    return selected_rows
+
+
+def _validate_correction_trial(
+    source: SourcePublicationReference,
+    trial: TrialRow,
+    base_trials: Mapping[tuple[str, int], TrialRow],
+) -> None:
+    if source.role != "correction":
+        return
+    base_trial = base_trials.get(_trial_key(trial))
+    if base_trial is None or base_trial.task_digest != trial.task_digest:
+        raise ResultPublicationError(
+            "correction task conflicts with the base publication"
+        )
+
+
+def _composition_trace(
+    manifest: ResultCompositionManifest,
+    manifest_digest: Digest,
+    control_commit: str,
+) -> TraceValues:
+    source = EvidenceSource(
+        bucket=manifest.evidence_bucket,
+        prefix=manifest.evidence_prefix,
+        run_lock_path="composition.json",
+    )
+    return {
+        "publication_id": _publication_id(
+            manifest.run_id,
+            source,
+            manifest_digest,
+            manifest_digest,
+        ),
+        "run_id": manifest.run_id,
+        "source_bucket": manifest.evidence_bucket,
+        "source_prefix": manifest.evidence_prefix,
+        "source_checksum": manifest_digest,
+        "run_lock_path": "composition.json",
+        "run_lock_sha256": manifest_digest,
+        "control_commit": control_commit,
+    }
+
+
+def _compose_child_rows(
+    manifest: ResultCompositionManifest,
+    selected_rows: Sequence[tuple[TrialRow, ResultTables]],
+    trace: TraceValues,
+) -> tuple[list[TrialRow], list[ExecutionRow], list[MetricRow]]:
+    trials: list[TrialRow] = []
+    executions: list[ExecutionRow] = []
+    metrics: list[MetricRow] = []
+    for trial, tables in selected_rows:
+        trials.append(trial.model_copy(update={**trace}))
+        trial_executions = [
+            execution
+            for execution in tables.executions
+            if execution.trial_id == trial.trial_id
+        ]
+        executions.extend(
+            execution.model_copy(update={**trace}) for execution in trial_executions
+        )
+        metrics.extend(_copy_selected_metrics(trial, trial_executions, tables, trace))
+    for unsupported in manifest.unsupported_tasks:
+        trial, reward = _unsupported_rows(manifest.run_id, unsupported, trace)
+        trials.append(trial)
+        metrics.append(reward)
+    return trials, executions, metrics
+
+
+def _copy_selected_metrics(
+    trial: TrialRow,
+    executions: Sequence[ExecutionRow],
+    tables: ResultTables,
+    trace: TraceValues,
+) -> list[MetricRow]:
+    execution_ids = {execution.execution_id for execution in executions}
+    return [
+        metric.model_copy(update={**trace})
+        for metric in tables.metrics
+        if (metric.owner_type == "trial" and metric.owner_id == trial.trial_id)
+        or (metric.owner_type == "execution" and metric.owner_id in execution_ids)
+    ]
+
+
+def _unsupported_rows(
+    run_id: str,
+    unsupported: UnsupportedTask,
+    trace: TraceValues,
+) -> tuple[TrialRow, MetricRow]:
+    trial_id = _composition_entity_id(
+        "trial",
+        run_id,
+        unsupported.task_name,
+        str(unsupported.logical_attempt),
+        "unsupported",
+    )
+    trial = TrialRow(
+        **trace,
+        trial_id=trial_id,
+        task_name=unsupported.task_name,
+        task_digest=unsupported.task_digest,
+        logical_attempt=unsupported.logical_attempt,
+        selected_execution_id=None,
+        outcome="unsupported",
+    )
+    metric = MetricEvidence(
+        owner_type="trial",
+        owner_id=trial_id,
+        name="reward",
+        value=0.0,
+        unit="score",
+    )
+    reward = MetricRow(
+        **trace,
+        metric_id=_metric_id(run_id, metric),
+        **metric.model_dump(mode="python"),
+    )
+    return trial, reward
+
+
+def _build_composed_run(
+    manifest: ResultCompositionManifest,
+    base: RunRow,
+    trace: TraceValues,
+    trials: Sequence[TrialRow],
+    executions: Sequence[ExecutionRow],
+) -> RunRow:
+    counts = {
+        outcome: sum(trial.outcome == outcome for trial in trials)
+        for outcome in _TASK_OUTCOMES
+    }
+    return RunRow(
+        **trace,
+        campaign_id=manifest.campaign_id,
+        experiment=manifest.experiment,
+        benchmark=base.benchmark,
+        benchmark_revision=base.benchmark_revision,
+        result_kind="composed",
+        outcome="complete",
+        quality="degraded" if counts["scored"] < len(trials) else "clean",
+        created_at=manifest.created_at,
+        completed_at=manifest.completed_at,
+        model_id=base.model_id,
+        model_repo=base.model_repo,
+        model_revision=base.model_revision,
+        deployment_id=base.deployment_id,
+        provider=base.provider,
+        region=base.region,
+        hardware=base.hardware,
+        accelerator_count=base.accelerator_count,
+        agent_id=base.agent_id,
+        agent_name=base.agent_name,
+        agent_revision=base.agent_revision,
+        planned_trial_count=len(trials),
+        scored_trial_count=counts["scored"],
+        agent_failed_count=counts["agent_failed"],
+        benchmark_failed_count=counts["benchmark_failed"],
+        infrastructure_exhausted_count=counts["infrastructure_exhausted"],
+        unsupported_count=counts["unsupported"],
+        execution_count=len(executions),
+    )
+
+
+def _build_composition_envelope(
+    manifest: ResultCompositionManifest,
+    manifest_bytes: bytes,
+    base: RunRow,
+    executions: Sequence[ExecutionRow],
+) -> PublicationEnvelope:
+    physical_executions = [
+        PhysicalExecutionReference(
+            execution_id=execution.execution_id,
+            trial_id=execution.trial_id,
+            physical_attempt=execution.physical_attempt,
+            status=execution.status,
+            failure_category=execution.failure_category,
+            started_at=execution.started_at,
+            completed_at=execution.completed_at,
+            retry_reason=execution.retry_reason,
+            remote_job_id=execution.remote_job_id,
+            bundle_status="source_publication",
+        )
+        for execution in executions
+    ]
+    return PublicationEnvelope(
+        run_id=manifest.run_id,
+        campaign_id=manifest.campaign_id,
+        created_at=manifest.created_at,
+        completed_at=manifest.completed_at,
+        evidence_bucket=manifest.evidence_bucket,
+        evidence_prefix=manifest.evidence_prefix,
+        run_lock=object_reference("composition.json", manifest_bytes),
+        profiles=ProfileDigests(
+            experiment=canonical_digest(
+                {
+                    "experiment": manifest.experiment,
+                    "sources": [
+                        source.model_dump(mode="json") for source in manifest.sources
+                    ],
+                }
+            ),
+            model=canonical_digest(
+                {"repo": base.model_repo, "revision": base.model_revision}
+            ),
+            deployment=canonical_digest(
+                {
+                    "deployment_id": base.deployment_id,
+                    "provider": base.provider,
+                    "region": base.region,
+                    "hardware": base.hardware,
+                    "accelerator_count": base.accelerator_count,
+                }
+            ),
+            agent=canonical_digest(
+                {"name": base.agent_name, "revision": base.agent_revision}
+            ),
+        ),
+        runtime=RuntimeIdentity(
+            kind=executions[0].runtime_kind,
+            provider=base.provider,
+            region=base.region,
+            hardware=base.hardware,
+            accelerator_count=base.accelerator_count,
+        ),
+        cleanup_outcome=(
+            "not_applicable" if executions[0].runtime_kind == "provider" else "verified"
+        ),
+        executions=physical_executions,
+        sources=manifest.sources,
+    )
+
+
+def _validate_composition_compatibility(
+    manifest: ResultCompositionManifest,
+    sources: Mapping[str, ResultTables],
+    base: RunRow,
+) -> None:
+    fields = (
+        "benchmark_revision",
+        "model_id",
+        "model_repo",
+        "model_revision",
+        "deployment_id",
+        "provider",
+        "region",
+        "hardware",
+        "accelerator_count",
+        "agent_id",
+        "agent_name",
+        "agent_revision",
+    )
+    for reference in manifest.sources:
+        run = sources[reference.publication_id].runs[0]
+        if run.result_kind != "ordinary" or any(
+            getattr(run, field) != getattr(base, field) for field in fields
+        ):
+            raise ResultPublicationError("composition sources are incompatible")
+    if not any(tables.executions for tables in sources.values()):
+        raise ResultPublicationError("composition sources contain no executions")
+
+
+def _trial_key(trial: TrialRow) -> tuple[str, int]:
+    return trial.task_name, trial.logical_attempt
+
+
+def _composition_entity_id(kind: str, *parts: str) -> str:
+    digest = hashlib.sha256(":".join(parts).encode()).hexdigest()[:24]
+    return f"{kind}-{digest}"
+
+
+def _require_unique_composed_rows(
+    trials: Sequence[TrialRow],
+    executions: Sequence[ExecutionRow],
+    metrics: Sequence[MetricRow],
+) -> None:
+    checks = (
+        ("trial", [row.trial_id for row in trials]),
+        ("execution", [row.execution_id for row in executions]),
+        ("metric", [row.metric_id for row in metrics]),
+    )
+    for kind, identities in checks:
+        if len(identities) != len(set(identities)):
+            raise ResultPublicationError(f"composition has duplicate {kind} identities")
 
 
 def _build_projection_file(
@@ -864,6 +1378,7 @@ def build_catalog_row(
         agent_failed_count=run.agent_failed_count,
         benchmark_failed_count=run.benchmark_failed_count,
         infrastructure_exhausted_count=run.infrastructure_exhausted_count,
+        unsupported_count=run.unsupported_count,
         execution_count=run.execution_count,
         failed_executions=sum(
             execution.status == "failed" for execution in tables.executions
@@ -1484,6 +1999,7 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             _field("agent_failed_count", pa.int64()),
             _field("benchmark_failed_count", pa.int64()),
             _field("infrastructure_exhausted_count", pa.int64()),
+            _field("unsupported_count", pa.int64()),
             _field("execution_count", pa.int64()),
         ],
     ),
@@ -1495,7 +2011,7 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             _field("task_name", pa.string()),
             _field("task_digest", pa.string()),
             _field("logical_attempt", pa.int64()),
-            _field("selected_execution_id", pa.string()),
+            _field("selected_execution_id", pa.string(), nullable=True),
             _field("outcome", pa.string()),
         ],
     ),
@@ -1596,6 +2112,7 @@ _CATALOG_SCHEMA = _make_schema(
         _field("agent_failed_count", pa.int64()),
         _field("benchmark_failed_count", pa.int64()),
         _field("infrastructure_exhausted_count", pa.int64()),
+        _field("unsupported_count", pa.int64()),
         _field("execution_count", pa.int64()),
         _field("failed_executions", pa.int64()),
         _field("duration_seconds", pa.float64()),

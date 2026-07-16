@@ -155,7 +155,10 @@
       "type": "string"
     },
     "result_kind": {
-      "const": "ordinary",
+      "enum": [
+        "ordinary",
+        "composed"
+      ],
       "title": "Result Kind",
       "type": "string"
     },
@@ -188,6 +191,11 @@
       "pattern": "^sha256:[0-9a-f]{64}$",
       "title": "Source Checksum",
       "type": "string"
+    },
+    "unsupported_count": {
+      "minimum": 0,
+      "title": "Unsupported Count",
+      "type": "integer"
     }
   },
   "required": [
@@ -216,6 +224,7 @@
     "agent_failed_count",
     "benchmark_failed_count",
     "infrastructure_exhausted_count",
+    "unsupported_count",
     "execution_count",
     "failed_executions",
     "duration_seconds",

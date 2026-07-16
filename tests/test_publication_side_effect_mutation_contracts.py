@@ -83,6 +83,7 @@ def _publication() -> ResultPublication:
             "agent_failed_count": 0,
             "benchmark_failed_count": 0,
             "infrastructure_exhausted_count": 0,
+            "unsupported_count": 0,
             "execution_count": 0,
         }
     )
@@ -209,7 +210,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "f2400adf740a6da384c5ccf059274d42f2f8f553f51c83883a4577990869282d"
+        "648719b683b0026b668e1d3a433d3e63679b457c4793b901624c2999ef789df4"
     )
 
 

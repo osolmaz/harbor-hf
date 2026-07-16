@@ -503,6 +503,7 @@ def _validate_publication_relations(
         run.agent_failed_count,
         run.benchmark_failed_count,
         run.infrastructure_exhausted_count,
+        run.unsupported_count,
     )
     observed_outcomes = tuple(
         sum(row.outcome == outcome for row in trials)
@@ -511,6 +512,7 @@ def _validate_publication_relations(
             "agent_failed",
             "benchmark_failed",
             "infrastructure_exhausted",
+            "unsupported",
         )
     )
     if observed_outcomes != expected_outcomes:
@@ -537,7 +539,14 @@ def _validate_selected_executions(
     trials: Sequence[TrialRow], executions: Sequence[ExecutionRow]
 ) -> None:
     execution_by_id = {row.execution_id: row for row in executions}
+    executed_trials = {row.trial_id for row in executions}
     for trial in trials:
+        if trial.outcome == "unsupported":
+            if trial.selected_execution_id is not None:
+                raise PresentationError("unsupported trial has a selected execution")
+            if trial.trial_id in executed_trials:
+                raise PresentationError("unsupported trial has a physical execution")
+            continue
         selected = execution_by_id.get(trial.selected_execution_id)
         if (
             selected is None

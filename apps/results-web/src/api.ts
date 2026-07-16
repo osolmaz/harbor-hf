@@ -22,6 +22,7 @@ export interface RunSummary {
   agent_failed_count: number;
   benchmark_failed_count: number;
   infrastructure_exhausted_count: number;
+  unsupported_count: number;
   execution_count: number;
   failed_executions: number;
   duration_seconds: number;
@@ -46,7 +47,12 @@ export interface RunDetail {
   trials: Array<Record<string, unknown> & {
     trial_id: string;
     task_name: string;
-    outcome: "scored" | "agent_failed" | "benchmark_failed" | "infrastructure_exhausted";
+    outcome:
+      | "scored"
+      | "agent_failed"
+      | "benchmark_failed"
+      | "infrastructure_exhausted"
+      | "unsupported";
     score: number | null;
     execution_count: number;
   }>;

@@ -80,7 +80,8 @@
         "bundle_status": {
           "enum": [
             "verified",
-            "not_available"
+            "not_available",
+            "source_publication"
           ],
           "title": "Bundle Status",
           "type": "string"
@@ -265,6 +266,84 @@
       ],
       "title": "RuntimeIdentity",
       "type": "object"
+    },
+    "SourcePublicationReference": {
+      "additionalProperties": false,
+      "properties": {
+        "publication_id": {
+          "minLength": 1,
+          "title": "Publication Id",
+          "type": "string"
+        },
+        "result_dataset": {
+          "minLength": 1,
+          "title": "Result Dataset",
+          "type": "string"
+        },
+        "result_revision": {
+          "pattern": "^[0-9a-f]{40,64}$",
+          "title": "Result Revision",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "base",
+            "correction"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "run_id": {
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "selected_trials": {
+          "items": {
+            "$ref": "#/$defs/SourceTrialSelection"
+          },
+          "minItems": 1,
+          "title": "Selected Trials",
+          "type": "array"
+        },
+        "source_checksum": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Checksum",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "publication_id",
+        "run_id",
+        "result_dataset",
+        "result_revision",
+        "source_checksum",
+        "selected_trials"
+      ],
+      "title": "SourcePublicationReference",
+      "type": "object"
+    },
+    "SourceTrialSelection": {
+      "additionalProperties": false,
+      "properties": {
+        "logical_attempt": {
+          "minimum": 1,
+          "title": "Logical Attempt",
+          "type": "integer"
+        },
+        "task_name": {
+          "minLength": 1,
+          "title": "Task Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_name",
+        "logical_attempt"
+      ],
+      "title": "SourceTrialSelection",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -341,6 +420,13 @@
       "default": "harbor-hf/publication-envelope/v1",
       "title": "Schema Version",
       "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/SourcePublicationReference"
+      },
+      "title": "Sources",
+      "type": "array"
     }
   },
   "required": [

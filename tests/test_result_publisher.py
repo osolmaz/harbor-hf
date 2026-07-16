@@ -162,6 +162,7 @@ def publication() -> ResultPublication:
             "agent_failed_count": 0,
             "benchmark_failed_count": 0,
             "infrastructure_exhausted_count": 0,
+            "unsupported_count": 0,
             "execution_count": 0,
         }
     )
