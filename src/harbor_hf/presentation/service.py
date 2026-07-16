@@ -277,6 +277,7 @@ class ResultService:
             "agent_failed_count": run.agent_failed_count,
             "benchmark_failed_count": run.benchmark_failed_count,
             "infrastructure_exhausted_count": (run.infrastructure_exhausted_count),
+            "unsupported_count": run.unsupported_count,
             "execution_count": run.execution_count,
             "failed_executions": sum(
                 execution.status == "failed"

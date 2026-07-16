@@ -11,23 +11,33 @@ import pyarrow.parquet as pq
 import pytest
 from pydantic import ValidationError
 
+from harbor_hf.publication_envelope import (
+    SourcePublicationReference,
+    SourceTrialSelection,
+)
 from harbor_hf.results import (
     ArtifactRow,
     EvidenceSource,
     ExecutionRow,
     GlobalIndexRow,
     MetricRow,
+    PublicationProvenance,
     RebuildRequest,
+    ResultCompositionManifest,
     ResultEvidence,
     ResultPublicationError,
+    ResultTables,
     RunRow,
     TableName,
     TraceRow,
     TrialRow,
+    UnsupportedTask,
     audit_result_tables,
+    build_composed_result_publication,
     build_global_index_row,
     build_result_publication,
     build_result_tables,
+    compose_result_tables,
     index_parquet_schema,
     parquet_schema,
     rebuild_result_tables,
@@ -724,6 +734,252 @@ def test_rejects_inconsistent_summary_references(
 
     with pytest.raises(ValidationError, match=message):
         ResultEvidence.model_validate(summary)
+
+
+def test_unsupported_trial_has_no_execution(
+    summary_value: dict[str, object],
+) -> None:
+    summary = json.loads(json.dumps(summary_value))
+    unsupported = summary["trials"][0]
+    unsupported["selected_execution_id"] = None
+    unsupported["outcome"] = "unsupported"
+    summary["run"]["quality"] = "degraded"
+    unsupported_trial_id = unsupported["trial_id"]
+    summary["executions"] = [
+        execution
+        for execution in summary["executions"]
+        if execution["trial_id"] != unsupported_trial_id
+    ]
+
+    assert ResultEvidence.model_validate(summary).trials[0].outcome == "unsupported"
+
+    summary_with_execution = json.loads(json.dumps(summary_value))
+    summary_with_execution["trials"][0]["selected_execution_id"] = None
+    summary_with_execution["trials"][0]["outcome"] = "unsupported"
+    summary_with_execution["run"]["quality"] = "degraded"
+    with pytest.raises(ValidationError, match="physical execution"):
+        ResultEvidence.model_validate(summary_with_execution)
+
+
+def test_composes_correction_and_unsupported_trials(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+
+    result = compose_result_tables(manifest, sources, control_commit=CONTROL_COMMIT)
+    repeated = compose_result_tables(manifest, sources, control_commit=CONTROL_COMMIT)
+
+    assert result == repeated
+    run = result.tables.runs[0]
+    assert run.result_kind == "composed"
+    assert run.planned_trial_count == 3
+    assert run.scored_trial_count == 1
+    assert run.benchmark_failed_count == 1
+    assert run.unsupported_count == 1
+    assert run.execution_count == 2
+    trials = {trial.task_name: trial for trial in result.tables.trials}
+    assert trials["task-one"].outcome == "benchmark_failed"
+    assert trials["task-two"].outcome == "scored"
+    assert trials["task-three"].outcome == "unsupported"
+    assert trials["task-three"].selected_execution_id is None
+    assert {row.execution_id for row in result.tables.executions} == {
+        "execution-three",
+        "execution-correction",
+    }
+    assert all(
+        execution.bundle_status == "source_publication"
+        for execution in result.envelope.executions
+    )
+
+    publication = build_composed_result_publication(result)
+    composition_path = f"compositions/{result.tables.publication_id}.json"
+    assert composition_path in {item.path for item in publication.files}
+    receipt = json.loads(publication.receipt)
+    assert composition_path in receipt["files"]
+
+
+def test_composition_rejects_unresolved_base_trial(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+    base_reference = next(item for item in manifest.sources if item.role == "base")
+    incomplete = manifest.model_copy(update={"sources": [base_reference]})
+
+    with pytest.raises(ResultPublicationError, match="resolve every task"):
+        compose_result_tables(
+            incomplete,
+            {base_reference.publication_id: sources[base_reference.publication_id]},
+            control_commit=CONTROL_COMMIT,
+        )
+
+
+def test_composition_rejects_incompatible_correction(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+    correction_reference = next(
+        item for item in manifest.sources if item.role == "correction"
+    )
+    correction = sources[correction_reference.publication_id]
+    incompatible_run = correction.runs[0].model_copy(
+        update={"model_revision": "d" * 40}
+    )
+    incompatible = correction.model_copy(update={"runs": [incompatible_run]})
+
+    with pytest.raises(ResultPublicationError, match="incompatible"):
+        compose_result_tables(
+            manifest,
+            {**sources, correction_reference.publication_id: incompatible},
+            control_commit=CONTROL_COMMIT,
+        )
+
+
+def test_composition_rejects_mixed_runtime_kinds(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+    correction_reference = next(
+        item for item in manifest.sources if item.role == "correction"
+    )
+    correction = sources[correction_reference.publication_id]
+    provider_execution = correction.executions[0].model_copy(
+        update={"runtime_kind": "provider"}
+    )
+    mixed = correction.model_copy(update={"executions": [provider_execution]})
+
+    with pytest.raises(ResultPublicationError, match="mixed runtime kinds"):
+        compose_result_tables(
+            manifest,
+            {**sources, correction_reference.publication_id: mixed},
+            control_commit=CONTROL_COMMIT,
+        )
+
+
+def _composition_inputs(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> tuple[ResultCompositionManifest, dict[str, ResultTables]]:
+    base = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+    base = base.model_copy(
+        update={
+            "executions": [
+                execution.model_copy(update={"runtime_kind": "endpoint"})
+                for execution in base.executions
+            ]
+        }
+    )
+    base_run = base.runs[0]
+    base_trial = next(trial for trial in base.trials if trial.task_name == "task-one")
+    correction_trace = {
+        "publication_id": "pub-correction",
+        "run_id": "run-correction",
+        "source_bucket": base_run.source_bucket,
+        "source_prefix": "campaigns/campaign-correction/runs/run-correction",
+        "source_checksum": "sha256:" + "4" * 64,
+        "run_lock_path": "run.lock.json",
+        "run_lock_sha256": "sha256:" + "5" * 64,
+        "control_commit": CONTROL_COMMIT,
+    }
+    correction_run = RunRow.model_validate(
+        {
+            **base_run.model_dump(mode="python"),
+            **correction_trace,
+            "campaign_id": "campaign-correction",
+            "quality": "degraded",
+            "completed_at": NOW + timedelta(minutes=7),
+            "planned_trial_count": 1,
+            "scored_trial_count": 0,
+            "benchmark_failed_count": 1,
+            "execution_count": 1,
+        }
+    )
+    correction_trial = TrialRow.model_validate(
+        {
+            **base_trial.model_dump(mode="python"),
+            **correction_trace,
+            "trial_id": "trial-correction",
+            "selected_execution_id": "execution-correction",
+            "outcome": "benchmark_failed",
+        }
+    )
+    correction_execution = ExecutionRow.model_validate(
+        {
+            **correction_trace,
+            "execution_id": "execution-correction",
+            "trial_id": correction_trial.trial_id,
+            "physical_attempt": 1,
+            "runtime_kind": "endpoint",
+            "status": "failed",
+            "failure_category": "benchmark",
+            "started_at": NOW + timedelta(minutes=5),
+            "completed_at": NOW + timedelta(minutes=6),
+            "retry_reason": None,
+            "remote_job_id": "job-correction",
+        }
+    )
+    correction_metric = MetricRow.model_validate(
+        {
+            **correction_trace,
+            "metric_id": "metric-correction",
+            "owner_type": "trial",
+            "owner_id": correction_trial.trial_id,
+            "name": "reward",
+            "value": 0.0,
+            "unit": "score",
+            "aggregation": None,
+        }
+    )
+    correction = ResultTables(
+        publication_id=correction_trace["publication_id"],
+        runs=[correction_run],
+        trials=[correction_trial],
+        executions=[correction_execution],
+        metrics=[correction_metric],
+        artifacts=[],
+        provenance=PublicationProvenance.model_validate(base.provenance),
+    )
+    base_reference = SourcePublicationReference(
+        role="base",
+        publication_id=base.publication_id,
+        run_id=base_run.run_id,
+        result_dataset="org/results",
+        result_revision="a" * 40,
+        source_checksum=base_run.source_checksum,
+        selected_trials=[SourceTrialSelection(task_name="task-two", logical_attempt=1)],
+    )
+    correction_reference = SourcePublicationReference(
+        role="correction",
+        publication_id=correction.publication_id,
+        run_id=correction_run.run_id,
+        result_dataset="org/results",
+        result_revision="b" * 40,
+        source_checksum=correction_run.source_checksum,
+        selected_trials=[SourceTrialSelection(task_name="task-one", logical_attempt=1)],
+    )
+    manifest = ResultCompositionManifest(
+        run_id="run-composed",
+        campaign_id="campaign-composed",
+        experiment="experiment-composed",
+        created_at=base_run.created_at,
+        completed_at=correction_run.completed_at,
+        evidence_bucket=source.bucket,
+        evidence_prefix="compositions/run-composed",
+        sources=[base_reference, correction_reference],
+        unsupported_tasks=[
+            UnsupportedTask(
+                task_name="task-three",
+                task_digest="sha256:" + "3" * 64,
+            )
+        ],
+    )
+    return manifest, {
+        base.publication_id: base,
+        correction.publication_id: correction,
+    }
 
 
 def test_frozen_parquet_schema_matches_golden() -> None:

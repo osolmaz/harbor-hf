@@ -224,6 +224,11 @@
           "type": "int64"
         },
         {
+          "name": "unsupported_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
           "name": "execution_count",
           "nullable": false,
           "type": "int64"
@@ -729,6 +734,11 @@
           "type": "int64"
         },
         {
+          "name": "unsupported_count",
+          "nullable": false,
+          "type": "int64"
+        },
+        {
           "name": "execution_count",
           "nullable": false,
           "type": "int64"
@@ -805,7 +815,7 @@
         },
         {
           "name": "selected_execution_id",
-          "nullable": false,
+          "nullable": true,
           "type": "string"
         },
         {

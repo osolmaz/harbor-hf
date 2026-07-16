@@ -56,6 +56,30 @@ class HarborBundleReference(FrozenModel):
     document_count: int = Field(ge=1)
 
 
+class SourceTrialSelection(FrozenModel):
+    task_name: str = Field(min_length=1)
+    logical_attempt: int = Field(ge=1)
+
+
+class SourcePublicationReference(FrozenModel):
+    role: Literal["base", "correction"]
+    publication_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    result_dataset: str = Field(min_length=1)
+    result_revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    source_checksum: Sha256Digest
+    selected_trials: list[SourceTrialSelection] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def trials_are_unique(self) -> SourcePublicationReference:
+        identities = [
+            (trial.task_name, trial.logical_attempt) for trial in self.selected_trials
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("source publication has duplicate selected trials")
+        return self
+
+
 class PhysicalExecutionReference(FrozenModel):
     execution_id: str = Field(min_length=1)
     trial_id: str = Field(min_length=1)
@@ -66,7 +90,7 @@ class PhysicalExecutionReference(FrozenModel):
     completed_at: AwareDatetime
     retry_reason: str | None = None
     remote_job_id: str | None = None
-    bundle_status: Literal["verified", "not_available"]
+    bundle_status: Literal["verified", "not_available", "source_publication"]
     harbor_bundle: HarborBundleReference | None = None
 
     @model_validator(mode="after")
@@ -77,7 +101,10 @@ class PhysicalExecutionReference(FrozenModel):
             raise ValueError("verified Harbor bundle is missing")
         if self.bundle_status != "verified" and self.harbor_bundle is not None:
             raise ValueError("unavailable Harbor bundle is present")
-        if self.status == "succeeded" and self.bundle_status != "verified":
+        if self.status == "succeeded" and self.bundle_status not in {
+            "verified",
+            "source_publication",
+        }:
             raise ValueError("successful execution requires a verified Harbor bundle")
         if (self.status == "failed") != (self.failure_category is not None):
             raise ValueError(
@@ -105,6 +132,7 @@ class PublicationEnvelope(FrozenModel):
     projection_version: Literal["harbor-hf/results-projection/v1"] = PROJECTION_VERSION
     cleanup_outcome: Literal["verified", "not_applicable"]
     executions: list[PhysicalExecutionReference]
+    sources: list[SourcePublicationReference] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def values_are_consistent(self) -> PublicationEnvelope:
@@ -115,6 +143,17 @@ class PublicationEnvelope(FrozenModel):
             raise ValueError("publication envelope has duplicate executions")
         if not any(execution.status == "succeeded" for execution in self.executions):
             raise ValueError("publication envelope has no successful execution")
+        source_ids = [source.publication_id for source in self.sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("publication envelope has duplicate source publications")
+        sourced = any(
+            execution.bundle_status == "source_publication"
+            for execution in self.executions
+        )
+        if sourced != bool(self.sources):
+            raise ValueError(
+                "source-backed executions conflict with publication sources"
+            )
         _relative_path(self.evidence_prefix)
         return self
 
