@@ -1395,6 +1395,30 @@ def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     assert projection.trials[trial.trial_id].outcome == "benchmark_failed"
 
 
+def test_spend_exhaustion_rejects_an_empty_trial_set(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    action = ReconcileAction(
+        action_id="act-" + "2" * 24,
+        action_key="2" * 24,
+        kind="exhaust-trials",
+        campaign_id=lock.campaign_id,
+        deployment_digest=lock.runs[0].deployment_digest,
+    )
+    reconciler = CampaignReconciler(
+        FakeStore(lock, request, [submitted]),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    with pytest.raises(
+        ActionExecutionError, match="spend exhaustion action has no trials"
+    ):
+        reconciler._exhaust_trials(lock, action, project_recovery(lock, [submitted]))
+
+
 def test_apply_uses_configured_clock_for_reconciliation_planning(
     remote_spec: ExperimentSpec,
 ) -> None:

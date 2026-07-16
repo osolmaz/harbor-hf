@@ -24,6 +24,7 @@ _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.manual-intervention-required",
     "execution.failed",
     "execution.cancelled",
+    "trial.invalid",
     "wave.draining",
     "wave.cleaning",
     "wave.closed",

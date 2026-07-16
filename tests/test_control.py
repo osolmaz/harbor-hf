@@ -525,6 +525,30 @@ def test_hub_store_adopts_deterministic_event_with_a_new_observation_time(
     )
 
 
+def test_hub_store_adopts_deterministic_trial_exhaustion_with_a_new_time(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    store = HubCampaignStore("org", api=FakeCampaignApi(tmp_path))
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    trial = lock.runs[0].shards[0].trials[0]
+    event = new_event(
+        subject_type="trial",
+        subject_id=trial.trial_id,
+        kind="trial.invalid",
+        producer="reconciler",
+        payload=LifecyclePayload(message="retry spend cap exhausted"),
+        clock=lambda: NOW,
+        identifier=lambda: "9" * 32,
+    )
+
+    assert store.ensure_event(lock.campaign_id, event)
+    assert not store.ensure_event(
+        lock.campaign_id,
+        event.model_copy(update={"observed_at": NOW + timedelta(minutes=5)}),
+    )
+
+
 @pytest.mark.parametrize(
     ("kind", "producer"),
     [

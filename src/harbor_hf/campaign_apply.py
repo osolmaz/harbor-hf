@@ -775,6 +775,8 @@ class CampaignReconciler:
         action: ReconcileAction,
         projection: RecoveryProjection,
     ) -> str:
+        if not action.trial_ids:
+            raise ActionExecutionError("spend exhaustion action has no trials")
         for trial_id in action.trial_ids:
             trial = projection.trials.get(trial_id)
             if trial is None or trial.status not in {"retry_wait", "invalid"}:
