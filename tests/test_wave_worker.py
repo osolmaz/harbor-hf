@@ -174,6 +174,38 @@ def test_sandbox_failure_uses_trusted_exception_evidence(
     )
 
 
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox job job-one did not "
+            "become ready within 120s.",
+            "transient",
+        ),
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox API error (400): "
+            "failed to spawn '/bin/bash': No such file or directory",
+            "benchmark",
+        ),
+    ],
+)
+def test_wrapped_harbor_exit_uses_sandbox_exception_evidence(
+    tmp_path: Path, detail: str, expected: str
+) -> None:
+    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
+    exception.parent.mkdir(parents=True)
+    exception.write_text(detail, encoding="utf-8")
+
+    assert (
+        _execution_failure_category(
+            WorkerError("Harbor exited with status 1"),
+            "execution",
+            evidence_root=tmp_path,
+        )
+        == expected
+    )
+
+
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
     tmp_path: Path,
 ) -> None:

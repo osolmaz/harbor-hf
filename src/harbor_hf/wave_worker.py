@@ -1131,6 +1131,9 @@ def _execution_failure_category(
         return "benchmark"
     if isinstance(error, HarborTrialFailure):
         return _harbor_trial_failure_category(error, evidence_root)
+    sandbox_category = _sandbox_failure_category(evidence_root)
+    if sandbox_category is not None:
+        return sandbox_category
     if phase == "configuration":
         return "configuration"
     if phase == "execution":
@@ -1158,18 +1161,21 @@ def _sandbox_failure_category(evidence_root: Path | None) -> RetryCategory | Non
     if evidence_root is None:
         return None
     resolved_root = evidence_root.resolve()
+    saw_sandbox_error = False
     for exception_path in sorted(evidence_root.glob("harbor-jobs/*/*/exception.txt")):
         if not _safe_evidence_file(exception_path, resolved_root):
             continue
         try:
             with exception_path.open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
-                    category = _sandbox_exception_line_category(line.lower())
+                    lowered = line.lower()
+                    saw_sandbox_error = saw_sandbox_error or "sandboxerror" in lowered
+                    category = _sandbox_exception_line_category(lowered)
                     if category is not None:
                         return category
         except OSError:
             continue
-    return None
+    return "benchmark" if saw_sandbox_error else None
 
 
 def _sandbox_exception_line_category(value: str) -> RetryCategory | None:
