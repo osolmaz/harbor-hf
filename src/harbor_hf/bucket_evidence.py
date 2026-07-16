@@ -19,6 +19,8 @@ from harbor_hf.coordination import (
     bucket_id,
 )
 
+_DOWNLOAD_BATCH_SIZE = 1024
+
 
 class BucketEvidenceError(RuntimeError):
     """Raised when canonical evidence cannot be read safely from a Bucket."""
@@ -70,6 +72,7 @@ class HubBucketEvidenceReader:
         self.cache_root = cache_root
         self.api = api or cast(BucketEvidenceApi, HfApi())
         self._listings: dict[tuple[str, str], dict[str, object]] = {}
+        self._prefetched: set[tuple[str, str]] = set()
 
     def list_files(self, *, bucket: str, prefix: str) -> list[str]:
         key = (bucket_id(bucket), prefix.rstrip("/"))
@@ -83,27 +86,8 @@ class HubBucketEvidenceReader:
         remote = listing.get(path)
         if remote is None:
             raise BucketEvidenceError(f"Bucket evidence object is missing: {path}")
-        identity = hashlib.sha256(
-            f"{normalized_bucket}/{normalized_prefix}/{path}".encode()
-        ).hexdigest()
-        destination = self.cache_root / identity
-        if not destination.exists():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{identity}-", dir=destination.parent
-            )
-            os.close(descriptor)
-            temporary = Path(temporary_name)
-            temporary.unlink()
-            try:
-                self.api.download_bucket_files(
-                    normalized_bucket,
-                    [(remote, temporary)],
-                    raise_on_missing_files=True,
-                )
-                temporary.replace(destination)
-            finally:
-                temporary.unlink(missing_ok=True)
+        self._prefetch(normalized_bucket, normalized_prefix, listing)
+        destination = self._cache_path(normalized_bucket, normalized_prefix, path)
         try:
             return destination.read_bytes()
         except OSError as error:
@@ -114,6 +98,7 @@ class HubBucketEvidenceReader:
     def refresh(self) -> None:
         """Discard listings after another component has published new objects."""
         self._listings.clear()
+        self._prefetched.clear()
         if self.cache_root.exists():
             for path in self.cache_root.iterdir():
                 if path.is_file():
@@ -141,6 +126,46 @@ class HubBucketEvidenceReader:
             listing[relative] = item
         self._listings[key] = listing
         return listing
+
+    def _prefetch(self, bucket: str, prefix: str, listing: dict[str, object]) -> None:
+        key = (bucket, prefix)
+        if key in self._prefetched:
+            return
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        missing = [
+            (path, remote, self._cache_path(bucket, prefix, path))
+            for path, remote in sorted(listing.items())
+            if not self._cache_path(bucket, prefix, path).exists()
+        ]
+        for offset in range(0, len(missing), _DOWNLOAD_BATCH_SIZE):
+            batch = missing[offset : offset + _DOWNLOAD_BATCH_SIZE]
+            staged: list[tuple[Path, Path]] = []
+            try:
+                downloads: list[tuple[object, str | Path]] = []
+                for _path, remote, destination in batch:
+                    descriptor, temporary_name = tempfile.mkstemp(
+                        prefix=f".{destination.name}-", dir=self.cache_root
+                    )
+                    os.close(descriptor)
+                    temporary = Path(temporary_name)
+                    temporary.unlink()
+                    staged.append((temporary, destination))
+                    downloads.append((remote, temporary))
+                self.api.download_bucket_files(
+                    bucket,
+                    downloads,
+                    raise_on_missing_files=True,
+                )
+                for temporary, destination in staged:
+                    temporary.replace(destination)
+            finally:
+                for temporary, _destination in staged:
+                    temporary.unlink(missing_ok=True)
+        self._prefetched.add(key)
+
+    def _cache_path(self, bucket: str, prefix: str, path: str) -> Path:
+        identity = hashlib.sha256(f"{bucket}/{prefix}/{path}".encode()).hexdigest()
+        return self.cache_root / identity
 
 
 class HubBucketEvidenceWriter:
