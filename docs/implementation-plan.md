@@ -23,7 +23,9 @@ not a separate execution architecture. Completed and normally failed executions
 publish complete sanitized evidence, but a worker or Sandbox killed before
 finalization can lose its Job-local in-progress session files. Milestone 8 plans
 incremental private evidence checkpoints for that remaining failure window; it
-is not implemented yet.
+is not implemented yet. Provider execution also requires the planned
+[evidence recorder cutover](provider-evidence-recorder-plan.md) before new
+production campaigns can cross the HF Job and Harbor Sandbox network boundary.
 
 ## Starting Point
 
@@ -590,8 +592,9 @@ Deliverables:
 - implement a provider target adapter separate from endpoint deployments;
 - preserve provider request, model, routing, quota, retry, usage, and latency
   evidence without inventing hidden runtime details;
-- forward OpenClaw traffic through a hosted loopback proxy that records typed,
-  content-free evidence for the actual benchmark requests;
+- forward OpenClaw traffic through the authenticated hosted recorder defined by
+  the [provider evidence recorder plan](provider-evidence-recorder-plan.md),
+  recording typed, content-free evidence for the actual benchmark requests;
 - apply provider-specific concurrency and spend budgets;
 - run provider-backed shards through the same Harbor and artifact contracts;
 - make endpoint and provider runs comparable only on shared observed fields.
