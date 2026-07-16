@@ -265,6 +265,26 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
             {
                 "run_id": run.run_id,
                 "attempts": 1,
+                "model": {
+                    "id": "model-one",
+                    "repo": "org/model",
+                    "revision": "a" * 40,
+                    "weights": {"format": "safetensors"},
+                },
+                "deployment": {
+                    "id": "deployment-one",
+                    "provider": "hf-inference-endpoints",
+                    "hardware": "cpu-basic",
+                    "accelerator_count": 1,
+                    "region": "aws-us-east-1",
+                    "engine": {"name": "test", "image": "test:latest"},
+                },
+                "agent": {
+                    "id": "agent-one",
+                    "name": "agent",
+                    "revision": "1.0.0",
+                    "revision_kind": "package",
+                },
                 "benchmark_task_digests": {
                     trial.task_name: trial.task_digest,
                 },

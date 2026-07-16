@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from harbor_hf.publication_envelope import (
     SourcePublicationReference,
     SourceTrialSelection,
+    execution_profile_digest,
 )
 from harbor_hf.results import (
     ArtifactRow,
@@ -217,6 +218,29 @@ def _evidence(summary: dict[str, object], marker: str = "_SUCCESS") -> MemoryEvi
                 "run_id": "run-one",
                 "cell_digest": "x",
                 "attempts": 1,
+                "model": {
+                    "id": "model-one",
+                    "repo": "org/model",
+                    "revision": "a" * 40,
+                    "weights": {"format": "safetensors"},
+                },
+                "deployment": {
+                    "id": "deployment-one",
+                    "provider": "hf-inference-endpoints",
+                    "hardware": "a100",
+                    "accelerator_count": 1,
+                    "region": "aws-us-east-1",
+                    "engine": {
+                        "name": "vllm",
+                        "image": "vllm/vllm-openai:latest",
+                    },
+                },
+                "agent": {
+                    "id": "agent-one",
+                    "name": "example-agent",
+                    "revision": "1.2.3",
+                    "revision_kind": "package",
+                },
                 "benchmark_task_digests": {
                     "task-one": "sha256:" + "1" * 64,
                     "task-two": "sha256:" + "2" * 64,
@@ -799,6 +823,93 @@ def test_composes_correction_and_unsupported_trials(
     assert composition_path in receipt["files"]
 
 
+def test_composition_accepts_different_profile_labels(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+    correction_reference = next(
+        item for item in manifest.sources if item.role == "correction"
+    )
+    correction = sources[correction_reference.publication_id]
+    relabeled_run = correction.runs[0].model_copy(
+        update={
+            "model_id": "model-correction",
+            "deployment_id": "deployment-correction",
+            "agent_id": "agent-correction",
+        }
+    )
+    relabeled = correction.model_copy(update={"runs": [relabeled_run]})
+
+    result = compose_result_tables(
+        manifest,
+        {**sources, correction_reference.publication_id: relabeled},
+        control_commit=CONTROL_COMMIT,
+    )
+
+    base_run = sources[manifest.sources[0].publication_id].runs[0]
+    composed_run = result.tables.runs[0]
+    assert composed_run.model_id == base_run.model_id
+    assert composed_run.deployment_id == base_run.deployment_id
+    assert composed_run.agent_id == base_run.agent_id
+
+
+def test_execution_profile_digest_ignores_only_labels_and_endpoint_binding() -> None:
+    profiles = {
+        "model": {"id": "model-base", "repo": "org/model", "revision": "abc"},
+        "deployment": {
+            "id": "deployment-base",
+            "endpoint": {
+                "namespace": "org",
+                "name": "endpoint-base",
+                "served_model_name": "/repository",
+            },
+            "engine": {"arguments": ["--max-model-len", "65536"]},
+        },
+        "agent": {
+            "id": "agent-base",
+            "name": "openclaw",
+            "parameters": {"thinking": "high"},
+        },
+    }
+    expected = execution_profile_digest(**profiles)
+    relabeled = {
+        **profiles,
+        "model": {**profiles["model"], "id": "model-correction"},
+        "deployment": {
+            **profiles["deployment"],
+            "id": "deployment-correction",
+            "endpoint": {
+                "namespace": "org",
+                "name": "endpoint-correction",
+                "served_model_name": "/repository",
+            },
+        },
+        "agent": {**profiles["agent"], "id": "agent-correction"},
+    }
+    changed = {
+        **relabeled,
+        "agent": {
+            **relabeled["agent"],
+            "parameters": {"thinking": "off"},
+        },
+    }
+    changed_served_name = {
+        **relabeled,
+        "deployment": {
+            **relabeled["deployment"],
+            "endpoint": {
+                **relabeled["deployment"]["endpoint"],
+                "served_model_name": "different-model",
+            },
+        },
+    }
+
+    assert execution_profile_digest(**relabeled) == expected
+    assert execution_profile_digest(**changed) != expected
+    assert execution_profile_digest(**changed_served_name) != expected
+
+
 def test_composition_rejects_unresolved_base_trial(
     evidence: MemoryEvidence,
     source: EvidenceSource,
@@ -828,6 +939,31 @@ def test_composition_rejects_incompatible_correction(
         update={"model_revision": "d" * 40}
     )
     incompatible = correction.model_copy(update={"runs": [incompatible_run]})
+
+    with pytest.raises(ResultPublicationError, match="incompatible"):
+        compose_result_tables(
+            manifest,
+            {**sources, correction_reference.publication_id: incompatible},
+            control_commit=CONTROL_COMMIT,
+        )
+
+
+def test_composition_rejects_incompatible_execution_profile(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+    correction_reference = next(
+        item for item in manifest.sources if item.role == "correction"
+    )
+    correction = sources[correction_reference.publication_id]
+    incompatible = correction.model_copy(
+        update={
+            "provenance": correction.provenance.model_copy(
+                update={"execution_profile_sha256": "sha256:" + "7" * 64}
+            )
+        }
+    )
 
     with pytest.raises(ResultPublicationError, match="incompatible"):
         compose_result_tables(

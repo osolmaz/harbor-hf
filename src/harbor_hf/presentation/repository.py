@@ -604,6 +604,7 @@ def _projection_provenance(
         envelope_sha256=projection.envelope_sha256,
         projection_version=projection.projection_version,
         sanitizer_version=projection.sanitizer_version,
+        execution_profile_sha256=projection.execution_profile_sha256,
         harbor_bundle_manifest_sha256s=(projection.harbor_bundle_manifest_sha256s),
         harbor_archive_sha256s=projection.harbor_archive_sha256s,
     )

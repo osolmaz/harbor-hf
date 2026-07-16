@@ -141,6 +141,7 @@ def _provenance(publication_id: str) -> PublicationProvenance:
         envelope_sha256="sha256:" + identity * 64,
         projection_version="harbor-hf/results-projection/v1",
         sanitizer_version="harbor-hf/public-results/v1",
+        execution_profile_sha256="sha256:" + "4" * 64,
         harbor_bundle_manifest_sha256s=["sha256:" + "2" * 64],
         harbor_archive_sha256s=["sha256:" + "3" * 64],
     )

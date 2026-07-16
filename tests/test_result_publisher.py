@@ -184,6 +184,7 @@ def publication() -> ResultPublication:
             envelope_sha256="sha256:" + "7" * 64,
             projection_version="harbor-hf/results-projection/v1",
             sanitizer_version="harbor-hf/public-results/v1",
+            execution_profile_sha256="sha256:" + "6" * 64,
             harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
             harbor_archive_sha256s=["sha256:" + "9" * 64],
         ),

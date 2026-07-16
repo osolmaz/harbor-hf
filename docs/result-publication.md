@@ -118,6 +118,15 @@ canonical bytes exactly. Conflicting historical publications are rejected
 instead of being silently adopted. Auditing compares rows while checking
 referential and evidence-trace invariants.
 
+Every result projection records a canonical digest of the complete model,
+deployment, and agent profiles from its verified run lock after removing only
+local profile IDs and endpoint resource identity. The served model name remains
+part of the digest. Composed publications reference every source at an exact
+Dataset revision and source checksum, then require the source-owned profile
+digests to match. Corrections may rename profiles and run on a different
+otherwise-identical endpoint, but they cannot change weights, serving
+arguments, inference parameters, or agent configuration.
+
 ## Serialized commits and interruption recovery
 
 The Hub adapter acquires a publisher lease for the benchmark Dataset, rereads
