@@ -100,10 +100,14 @@ join or an implicit filename convention.
 
 Rows are sorted by stable IDs. Metric and artifact IDs are hashes of their
 stable owner and measurement or artifact identity. A publication ID is a hash
-of the run ID, source location, verified source checksum, and run-lock
-checksum. `control_commit` is the Hub commit that last modified the immutable
+of the active v1 publication contract, run ID, source location, verified source
+checksum, and run-lock checksum. Contract binding gives a projection cutover a
+new immutable identity without rewriting earlier receipts. `control_commit` is
+the Hub commit that last modified the immutable
 campaign lock, not the moving control-repository head. Later events and leases
 therefore change neither the publication identity nor its Parquet bytes.
+Active index and catalog windows keep one row per run ID, so a contract-bound
+replacement hides the prior projection without deleting its immutable files.
 Parquet files use deterministic paths:
 
 ```text

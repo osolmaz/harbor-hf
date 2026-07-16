@@ -298,10 +298,9 @@ class HubDatasetPublisher:
             existing = read_index_file(self._read(dataset, largest_path, revision))
         else:
             existing = self._individual_index_rows(dataset, revision)
-        by_publication = {item.publication_id: item for item in existing}
-        by_publication[row.publication_id] = row
+        by_run = _replace_active_run(existing, row)
         ordered = sorted(
-            by_publication.values(),
+            by_run.values(),
             key=lambda item: (item.completed_at, item.publication_id),
             reverse=True,
         )[:_LARGEST_INDEX_WINDOW]
@@ -341,10 +340,9 @@ class HubDatasetPublisher:
                     "canonical catalog snapshot is required before publication"
                 )
             existing = []
-        by_publication = {item.publication_id: item for item in existing}
-        by_publication[row.publication_id] = row
+        by_run = _replace_active_run(existing, row)
         ordered = sorted(
-            by_publication.values(),
+            by_run.values(),
             key=lambda item: (item.completed_at, item.publication_id),
             reverse=True,
         )[:_LARGEST_INDEX_WINDOW]
@@ -455,6 +453,20 @@ def _json_bytes(value: object) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def _replace_active_run[Row: GlobalIndexRow | CatalogRow](
+    existing: list[Row], row: Row
+) -> dict[str, Row]:
+    by_run = {
+        item.run_id: item
+        for item in sorted(
+            existing,
+            key=lambda item: (item.completed_at, item.publication_id),
+        )
+    }
+    by_run[row.run_id] = row
+    return by_run
 
 
 def _projection_file(publication: ResultPublication) -> DatasetFile:

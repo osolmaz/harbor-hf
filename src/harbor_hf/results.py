@@ -35,6 +35,7 @@ from harbor_hf.publication_envelope import (
 )
 
 Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+RESULT_PUBLICATION_CONTRACT = "harbor-hf/result-publication/v1"
 EntityId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
 Commit = Annotated[str, Field(pattern=r"^[0-9a-f]{40,64}$")]
 DatasetId = Annotated[
@@ -1843,6 +1844,7 @@ def _publication_id(
     lock_checksum: str,
 ) -> str:
     value = {
+        "publication_contract": RESULT_PUBLICATION_CONTRACT,
         "run_id": run_id,
         "source_bucket": source.bucket,
         "source_prefix": source.prefix,
