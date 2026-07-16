@@ -24,6 +24,8 @@ _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.manual-intervention-required",
     "execution.failed",
     "execution.cancelled",
+    "trial.invalid",
+    "trial.failed-infrastructure",
     "wave.draining",
     "wave.cleaning",
     "wave.closed",
@@ -71,6 +73,7 @@ EventKind = Literal[
     "shard.cancelled",
     "trial.complete",
     "trial.invalid",
+    "trial.failed-infrastructure",
     "trial.cancelled",
     "execution.started",
     "execution.completed",
@@ -97,6 +100,7 @@ ActionKind = Literal[
     "cancel-wave",
     "drain-wave",
     "cleanup-wave",
+    "exhaust-trials",
     "publish-results",
     "publish-summary",
     "manual-intervention",
@@ -109,6 +113,10 @@ class ControlError(RuntimeError):
 
 class CampaignConflict(ControlError):
     """Raised when a campaign identity or action reservation already exists."""
+
+
+class CampaignCancellationWon(ControlError):
+    """Raised when cancellation commits before guarded terminal events."""
 
 
 class FrozenModel(BaseModel):
@@ -491,6 +499,10 @@ class CampaignStore(Protocol):
 
     def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool: ...
 
+    def ensure_events_unless_cancelled(
+        self, campaign_id: str, events: list[CampaignEvent]
+    ) -> bool: ...
+
     def load_snapshot(self, campaign_id: str) -> CampaignSnapshot: ...
 
     def reserve_action(
@@ -622,6 +634,8 @@ class HubCampaignStore:
 
     def append_event(self, campaign_id: str, event: CampaignEvent) -> None:
         _validate_event_scope(campaign_id, event)
+        if event.kind == "campaign.cancel-requested":
+            raise ValueError("cancellation events require an atomic marker")
         path = _event_path(campaign_id, event.event_id)
         self._create_absent(
             path,
@@ -638,6 +652,8 @@ class HubCampaignStore:
     def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool:
         """Append an event once, adopting an identical concurrent request."""
         _validate_event_scope(campaign_id, event)
+        if event.kind == "campaign.cancel-requested":
+            return self._ensure_cancellation_event(campaign_id, event)
         path = _event_path(campaign_id, event.event_id)
         expected = event.model_dump(mode="json")
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
@@ -666,6 +682,103 @@ class HubCampaignStore:
                 if not _is_parent_conflict(error):
                     raise
         raise ControlError("control repository remained contended")
+
+    def _ensure_cancellation_event(
+        self, campaign_id: str, event: CampaignEvent
+    ) -> bool:
+        event_path = _event_path(campaign_id, event.event_id)
+        marker_path = _campaign_cancellation_path(campaign_id)
+        expected = event.model_dump(mode="json")
+        marker = {"campaign_id": campaign_id, "event_id": event.event_id}
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            event_exists = self._exists(event_path, head)
+            marker_exists = self._exists(marker_path, head)
+            if event_exists != marker_exists:
+                raise ControlError("campaign cancellation state is incomplete")
+            if event_exists:
+                observed = self._read_json(event_path, head)
+                observed_marker = self._read_json(marker_path, head)
+                if not _same_event_request(observed, expected):
+                    raise CampaignConflict(f"event conflicts: {event.event_id}")
+                if observed_marker != marker:
+                    raise CampaignConflict("campaign cancellation marker conflicts")
+                return False
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=event_path,
+                            path_or_fileobj=_json_bytes(expected),
+                        ),
+                        CommitOperationAdd(
+                            path_in_repo=marker_path,
+                            path_or_fileobj=_json_bytes(marker),
+                        ),
+                    ],
+                    commit_message="chore: request campaign cancellation",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def ensure_events_unless_cancelled(
+        self, campaign_id: str, events: list[CampaignEvent]
+    ) -> bool:
+        """Commit terminal events atomically unless cancellation won the race."""
+        expected_by_path = _guarded_event_payloads(campaign_id, events)
+
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            missing = self._missing_events(expected_by_path, head)
+            if not missing:
+                return False
+            if self._cancellation_requested(campaign_id, head):
+                raise CampaignCancellationWon(
+                    "campaign cancellation superseded guarded terminal events"
+                )
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=path,
+                            path_or_fileobj=_json_bytes(expected),
+                        )
+                        for path, expected in missing.items()
+                    ],
+                    commit_message="chore: record guarded terminal events",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def _missing_events(
+        self, expected_by_path: dict[str, dict[str, JsonValue]], head: str
+    ) -> dict[str, dict[str, JsonValue]]:
+        missing: dict[str, dict[str, JsonValue]] = {}
+        for path, expected in expected_by_path.items():
+            if not self._exists(path, head):
+                missing[path] = expected
+                continue
+            observed = self._read_json(path, head)
+            if not _same_event_request(observed, expected):
+                raise CampaignConflict(f"event conflicts: {path}")
+        return missing
+
+    def _cancellation_requested(self, campaign_id: str, head: str) -> bool:
+        return self._exists(_campaign_cancellation_path(campaign_id), head)
 
     def reserve_action(
         self,
@@ -812,11 +925,36 @@ def _campaign_request_path(campaign_id: str) -> str:
     return f"campaigns/{campaign_id}/request.yaml"
 
 
+def _campaign_cancellation_path(campaign_id: str) -> str:
+    return f"campaigns/{campaign_id}/cancellation.json"
+
+
 def _validate_event_scope(campaign_id: str, event: CampaignEvent) -> None:
     if _CAMPAIGN_ID.fullmatch(campaign_id) is None:
         raise ValueError("event campaign scope is invalid")
     if event.subject_type == "campaign" and event.subject_id != campaign_id:
         raise ValueError("campaign event subject does not match its scope")
+
+
+def _guarded_event_payloads(
+    campaign_id: str, events: list[CampaignEvent]
+) -> dict[str, dict[str, JsonValue]]:
+    if not events:
+        raise ValueError("guarded event commit requires at least one event")
+    for event in events:
+        _validate_event_scope(campaign_id, event)
+        if event.subject_type != "trial" or event.kind not in {
+            "trial.invalid",
+            "trial.failed-infrastructure",
+        }:
+            raise ValueError("guarded batches require terminal trial events")
+    expected_by_path = {
+        _event_path(campaign_id, event.event_id): event.model_dump(mode="json")
+        for event in events
+    }
+    if len(expected_by_path) != len(events):
+        raise CampaignConflict("guarded events contain duplicate identities")
+    return expected_by_path
 
 
 def _campaign_lock_path(campaign_id: str) -> str:

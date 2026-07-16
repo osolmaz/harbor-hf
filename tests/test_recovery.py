@@ -99,6 +99,17 @@ def _campaign(
     return lock, submitted
 
 
+def _with_locked_estimate(lock: CampaignLock, value: int) -> CampaignLock:
+    return lock.model_copy(
+        update={
+            "runs": [
+                run.model_copy(update={"estimated_wave_cost_microusd": value})
+                for run in lock.runs
+            ]
+        }
+    )
+
+
 def _event(
     lock: CampaignLock,
     sequence: int,
@@ -126,8 +137,9 @@ def _execution_events(
     attempt: int,
     category: RetryCategory | None,
     spend: int = 0,
+    shard_index: int = 0,
 ) -> list[CampaignEvent]:
-    shard = lock.runs[0].shards[0]
+    shard = lock.runs[0].shards[shard_index]
     trial = shard.trials[0]
     started = _event(
         lock,
@@ -1059,6 +1071,114 @@ def test_spend_cap_fails_closed_without_deployment_estimate(
 
     assert plan.actions == []
     assert plan.blocked[0].reason == "spend-estimate-missing"
+
+
+def test_spend_cap_exhausts_retryable_trials_without_another_wave(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, spend_cap_microusd=100)
+    lock = _with_locked_estimate(lock, 100)
+    failure = _execution_events(
+        lock,
+        3,
+        execution_id="execution-one",
+        attempt=1,
+        category="benchmark",
+    )
+    events = [
+        submitted,
+        _wave_event(lock, 2, "active"),
+        *failure,
+        _wave_event(lock, 5, "cleaning"),
+        _wave_event(lock, 6, "closed"),
+    ]
+    digest = lock.runs[0].deployment_digest
+    context = ReconcileContext(
+        deployments={digest: DeploymentAdmission(estimated_wave_cost_microusd=100)}
+    )
+
+    _projection, plan = plan_reconciliation(lock, events, context=context)
+
+    assert [action.kind for action in plan.actions] == ["exhaust-trials"]
+    assert plan.actions[0].trial_ids == [lock.runs[0].shards[0].trials[0].trial_id]
+    assert plan.blocked == []
+
+
+def test_provisional_admission_does_not_exhaust_another_retry(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(
+        remote_spec,
+        tasks=2,
+        max_trials_per_shard=1,
+        spend_cap_microusd=100,
+    )
+    lock = _with_locked_estimate(lock, 100)
+    events = [
+        submitted,
+        *_execution_events(
+            lock,
+            2,
+            execution_id="execution-one",
+            attempt=1,
+            category="benchmark",
+        ),
+        *_execution_events(
+            lock,
+            4,
+            execution_id="execution-two",
+            attempt=1,
+            category="benchmark",
+            shard_index=1,
+        ),
+    ]
+    digest = lock.runs[0].deployment_digest
+    context = ReconcileContext(
+        limits=AdmissionLimits(
+            global_active_waves=2,
+            deployment_active_waves=2,
+            provider_active_waves=2,
+            campaign_active_waves=2,
+        ),
+        deployments={digest: DeploymentAdmission(estimated_wave_cost_microusd=100)},
+    )
+
+    _projection, plan = plan_reconciliation(
+        lock, events, context=context, now=NOW + timedelta(days=1)
+    )
+
+    assert [action.kind for action in plan.actions] == ["retry-shard"]
+    assert [blocked.reason for blocked in plan.blocked] == ["spend-cap"]
+
+
+def test_mutable_estimate_cannot_irreversibly_exhaust_a_retry(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, spend_cap_microusd=150)
+    lock = _with_locked_estimate(lock, 50)
+    failure = _execution_events(
+        lock,
+        3,
+        execution_id="execution-one",
+        attempt=1,
+        category="benchmark",
+    )
+    events = [
+        submitted,
+        _wave_event(lock, 2, "active"),
+        *failure,
+        _wave_event(lock, 5, "cleaning"),
+        _wave_event(lock, 6, "closed"),
+    ]
+    digest = lock.runs[0].deployment_digest
+    context = ReconcileContext(
+        deployments={digest: DeploymentAdmission(estimated_wave_cost_microusd=100)}
+    )
+
+    _projection, plan = plan_reconciliation(lock, events, context=context)
+
+    assert plan.actions == []
+    assert [blocked.reason for blocked in plan.blocked] == ["spend-cap"]
 
 
 def test_cleanup_bypasses_budgets_and_action_limit_before_billable_work(

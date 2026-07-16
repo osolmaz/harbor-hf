@@ -33,6 +33,7 @@ from harbor_hf.control import (
     ActionOutcomePayload,
     ActionProjection,
     ActionReservedPayload,
+    CampaignCancellationWon,
     CampaignEvent,
     CampaignStore,
     Clock,
@@ -93,11 +94,12 @@ _ACTION_PRIORITY = {
     "cancel-wave": 1,
     "drain-wave": 2,
     "cleanup-wave": 3,
-    "manual-intervention": 4,
-    "publish-summary": 5,
-    "publish-results": 6,
-    "retry-shard": 7,
-    "submit-wave": 8,
+    "exhaust-trials": 4,
+    "manual-intervention": 5,
+    "publish-summary": 6,
+    "publish-results": 7,
+    "retry-shard": 8,
+    "submit-wave": 9,
 }
 _OUTCOME_KINDS: dict[
     Literal["succeeded", "failed", "ambiguous"],
@@ -731,6 +733,8 @@ class CampaignReconciler:
                 projection=projection,
                 allow_submission=allow_billable,
             )
+        if action.kind == "exhaust-trials":
+            return self._exhaust_trials(lock, action, projection)
         return self._execute_lifecycle_action(
             lock,
             spec,
@@ -765,6 +769,63 @@ class CampaignReconciler:
         raise ActionExecutionError(
             f"action execution is not supported by configured adapters: {action.kind}"
         )
+
+    def _exhaust_trials(
+        self,
+        lock: CampaignLock,
+        action: ReconcileAction,
+        projection: RecoveryProjection,
+    ) -> str:
+        if projection.cancel_requested_at is not None:
+            raise ActionExecutionError(
+                "campaign cancellation superseded retry exhaustion"
+            )
+        _validate_spend_exhaustion_targets(lock, action)
+        for trial_id in action.trial_ids:
+            trial = projection.trials.get(trial_id)
+            if trial is None or trial.status not in {
+                "retry_wait",
+                "invalid",
+                "failed_infrastructure",
+            }:
+                raise ActionExecutionError(
+                    f"spend exhaustion target is not retryable: {trial_id}"
+                )
+        events: list[CampaignEvent] = []
+        for trial_id in action.trial_ids:
+            trial = projection.trials[trial_id]
+            latest = max(
+                trial.executions.values(),
+                key=lambda execution: execution.physical_attempt,
+            )
+            kind: EventKind = (
+                "trial.invalid"
+                if latest.category in {"agent", "benchmark"}
+                else "trial.failed-infrastructure"
+            )
+            observed_at = self._next_observed()
+            event_identity = hashlib.sha256(
+                f"{lock.campaign_id}:{trial_id}:spend-cap-exhausted".encode()
+            ).hexdigest()[:32]
+            events.append(
+                new_event(
+                    subject_type="trial",
+                    subject_id=trial_id,
+                    kind=kind,
+                    producer="reconciler",
+                    payload=LifecyclePayload(
+                        parent_id=trial.shard_id,
+                        message="retry spend cap exhausted",
+                    ),
+                    clock=lambda observed_at=observed_at: observed_at,
+                    identifier=lambda event_identity=event_identity: event_identity,
+                )
+            )
+        try:
+            self.store.ensure_events_unless_cancelled(lock.campaign_id, events)
+        except CampaignCancellationWon as error:
+            raise ActionExecutionError(str(error)) from error
+        return action.action_id
 
     def _publish_summary(
         self,
@@ -1099,7 +1160,7 @@ class CampaignReconciler:
         self,
         lock: CampaignLock,
         *,
-        subject_type: Literal["campaign", "execution", "wave"],
+        subject_type: Literal["campaign", "trial", "execution", "wave"],
         subject_id: str,
         kind: EventKind,
         payload: LifecyclePayload | ExecutionOutcomePayload | WaveLifecyclePayload,
@@ -1244,6 +1305,31 @@ _AMBIGUOUS_ENDPOINT_ERRORS = (
     AmbiguousEndpointDelete,
     EndpointVerificationTimeout,
 )
+
+
+def _validate_spend_exhaustion_targets(
+    lock: CampaignLock, action: ReconcileAction
+) -> None:
+    if not action.trial_ids:
+        raise ActionExecutionError("spend exhaustion action has no trials")
+    if action.trial_ids != action.target_ids or len(action.trial_ids) != len(
+        set(action.trial_ids)
+    ):
+        raise ActionExecutionError("spend exhaustion trial identity is malformed")
+    matched_shards: set[str] = set()
+    allowed_trials: set[str] = set()
+    for run in lock.runs:
+        if run.deployment_digest != action.deployment_digest:
+            continue
+        for shard in run.shards:
+            if shard.shard_id not in action.shard_ids:
+                continue
+            matched_shards.add(shard.shard_id)
+            allowed_trials.update(trial.trial_id for trial in shard.trials)
+    if matched_shards != set(action.shard_ids) or not set(action.trial_ids).issubset(
+        allowed_trials
+    ):
+        raise ActionExecutionError("spend exhaustion targets the wrong deployment")
 
 
 def _context_with_unobserved_actions(

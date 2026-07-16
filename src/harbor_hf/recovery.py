@@ -523,7 +523,7 @@ def _record_trial_status(
     trial = trials.get(event.subject_id)
     if trial is None:
         raise ValueError(f"event references unknown trial: {event.subject_id}")
-    status = cast(TrialStatus, event.kind.removeprefix("trial."))
+    status = cast(TrialStatus, event.kind.removeprefix("trial.").replace("-", "_"))
     trials[event.subject_id] = trial.model_copy(update={"status": status})
 
 

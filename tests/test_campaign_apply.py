@@ -55,12 +55,15 @@ from harbor_hf.control import (
     ActionOutcomePayload,
     ActionProjection,
     ActionReservedPayload,
+    CampaignCancellationWon,
     CampaignEvent,
     CampaignSnapshot,
     CampaignSubmittedPayload,
     CancellationPayload,
+    ExecutionOutcomePayload,
     ExecutionStartedPayload,
     LifecyclePayload,
+    RetryCategory,
     TerminalPayload,
     WaveLifecyclePayload,
     new_event,
@@ -88,6 +91,7 @@ from harbor_hf.provider_models import (
 from harbor_hf.reconciler import (
     AdmissionLimits,
     AdmissionUsage,
+    DeploymentAdmission,
     ReconcileAction,
     ReconcileContext,
     _Candidate,
@@ -148,6 +152,19 @@ class FakeStore:
             return False
         self.events.append(event)
         return True
+
+    def ensure_events_unless_cancelled(
+        self, campaign_id: str, events: list[CampaignEvent]
+    ) -> bool:
+        assert campaign_id == self.lock.campaign_id
+        if any(event.kind == "campaign.cancel-requested" for event in self.events):
+            raise CampaignCancellationWon(
+                "campaign cancellation superseded guarded terminal events"
+            )
+        changed = False
+        for event in events:
+            changed = self.ensure_event(campaign_id, event) or changed
+        return changed
 
     def load_action_reservations(self, campaign_id: str) -> list[dict[str, JsonValue]]:
         assert campaign_id == self.lock.campaign_id
@@ -1295,6 +1312,240 @@ def test_apply_context_admission_usage_blocks_new_billable_action(
     assert result.plan.actions == []
     assert result.plan.blocked[0].reason == "global-budget"
     assert result.applied == []
+
+
+@pytest.mark.parametrize(
+    ("category", "expected_status", "expected_outcome"),
+    [
+        ("benchmark", "invalid", "benchmark_failed"),
+        ("transient", "failed_infrastructure", "infrastructure_exhausted"),
+    ],
+)
+def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
+    remote_spec: ExperimentSpec,
+    category: RetryCategory,
+    expected_status: str,
+    expected_outcome: str,
+) -> None:
+    spec, target = _provider_spec(remote_spec)
+    target = target.model_copy(
+        update={
+            "limits": ProviderLimits(
+                max_attempts=3,
+                max_spend_usd=Decimal("0.0001"),
+                estimated_wave_cost_usd=Decimal("0.0001"),
+            )
+        }
+    )
+    spec = spec.model_copy(
+        update={"matrix": spec.matrix.model_copy(update={"deployments": [target]})}
+    )
+    policy = CampaignRecoveryPolicy(spend_cap_microusd=100)
+    lock, request, submitted = _campaign(spec, recovery_policy=policy)
+    run = lock.runs[0]
+    shard = run.shards[0]
+    trial = shard.trials[0]
+    payload = WaveLifecyclePayload(
+        deployment_digest=run.deployment_digest,
+        provider="hf-inference-providers",
+        shard_ids=[shard.shard_id],
+        estimated_cost_microusd=100,
+    )
+    events = [
+        submitted,
+        new_event(
+            subject_type="wave",
+            subject_id="wave-one",
+            kind="wave.active",
+            producer="wave-controller",
+            payload=payload,
+            clock=lambda: NOW + timedelta(seconds=1),
+            identifier=lambda: "a" * 32,
+        ),
+        new_event(
+            subject_type="execution",
+            subject_id="execution-one",
+            kind="execution.started",
+            producer="wave-controller",
+            payload=ExecutionStartedPayload(
+                trial_id=trial.trial_id,
+                shard_id=shard.shard_id,
+                physical_attempt=1,
+                wave_id="wave-one",
+            ),
+            clock=lambda: NOW + timedelta(seconds=2),
+            identifier=lambda: "b" * 32,
+        ),
+        new_event(
+            subject_type="execution",
+            subject_id="execution-one",
+            kind="execution.failed",
+            producer="wave-controller",
+            payload=ExecutionOutcomePayload(
+                trial_id=trial.trial_id,
+                physical_attempt=1,
+                category=category,
+            ),
+            clock=lambda: NOW + timedelta(seconds=3),
+            identifier=lambda: "c" * 32,
+        ),
+        new_event(
+            subject_type="wave",
+            subject_id="wave-one",
+            kind="wave.cleaning",
+            producer="wave-controller",
+            payload=payload,
+            clock=lambda: NOW + timedelta(seconds=4),
+            identifier=lambda: "d" * 32,
+        ),
+        new_event(
+            subject_type="wave",
+            subject_id="wave-one",
+            kind="wave.closed",
+            producer="wave-controller",
+            payload=payload,
+            clock=lambda: NOW + timedelta(seconds=5),
+            identifier=lambda: "e" * 32,
+        ),
+    ]
+    store = FakeStore(lock, request, events)
+    context = ReconcileContext(
+        deployments={
+            run.deployment_digest: DeploymentAdmission(estimated_wave_cost_microusd=100)
+        }
+    )
+
+    identifiers = itertools.count(20)
+    reconciler = CampaignReconciler(
+        store,
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+        clock=lambda: NOW + timedelta(hours=1),
+        identifier=lambda: f"{next(identifiers):032x}",
+    )
+    result = reconciler.apply_campaign(lock.campaign_id, context=context)
+
+    assert [(item.kind, item.status) for item in result.applied] == [
+        ("exhaust-trials", "succeeded")
+    ]
+    projection = project_recovery(lock, store.events)
+    assert projection.trials[trial.trial_id].status == expected_status
+    assert projection.trials[trial.trial_id].outcome == expected_outcome
+    assert (
+        reconciler._exhaust_trials(lock, result.plan.actions[0], projection)
+        == result.plan.actions[0].action_id
+    )
+
+
+def test_spend_exhaustion_rejects_an_empty_trial_set(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    action = ReconcileAction(
+        action_id="act-" + "2" * 24,
+        action_key="2" * 24,
+        kind="exhaust-trials",
+        campaign_id=lock.campaign_id,
+        deployment_digest=lock.runs[0].deployment_digest,
+    )
+    reconciler = CampaignReconciler(
+        FakeStore(lock, request, [submitted]),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    with pytest.raises(
+        ActionExecutionError, match="spend exhaustion action has no trials"
+    ):
+        reconciler._exhaust_trials(lock, action, project_recovery(lock, [submitted]))
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"target_ids": []}, "spend exhaustion trial identity is malformed"),
+        (
+            {"shard_ids": ["shard-unknown"]},
+            "spend exhaustion targets the wrong deployment",
+        ),
+    ],
+)
+def test_spend_exhaustion_is_bound_to_its_reserved_targets(
+    remote_spec: ExperimentSpec, update: dict[str, list[str]], message: str
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    shard = lock.runs[0].shards[0]
+    trial_id = shard.trials[0].trial_id
+    action = ReconcileAction(
+        action_id="act-" + "2" * 24,
+        action_key="2" * 24,
+        kind="exhaust-trials",
+        campaign_id=lock.campaign_id,
+        deployment_digest=lock.runs[0].deployment_digest,
+        shard_ids=[shard.shard_id],
+        trial_ids=[trial_id],
+        target_ids=[trial_id],
+    ).model_copy(update=update)
+    reconciler = CampaignReconciler(
+        FakeStore(lock, request, [submitted]),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    with pytest.raises(ActionExecutionError, match=message):
+        reconciler._exhaust_trials(lock, action, project_recovery(lock, [submitted]))
+
+
+def test_campaign_cancellation_supersedes_reserved_spend_exhaustion(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    shard = lock.runs[0].shards[0]
+    trial_id = shard.trials[0].trial_id
+    action = ReconcileAction(
+        action_id="act-" + "2" * 24,
+        action_key="2" * 24,
+        kind="exhaust-trials",
+        campaign_id=lock.campaign_id,
+        deployment_digest=lock.runs[0].deployment_digest,
+        shard_ids=[shard.shard_id],
+        trial_ids=[trial_id],
+        target_ids=[trial_id],
+    )
+    cancellation = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "3" * 32,
+    )
+    manual_intervention = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(message="cleanup failed"),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "4" * 32,
+    )
+    events = [submitted, cancellation, manual_intervention]
+    reconciler = CampaignReconciler(
+        FakeStore(lock, request, events),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    with pytest.raises(
+        ActionExecutionError,
+        match="campaign cancellation superseded retry exhaustion",
+    ):
+        reconciler._exhaust_trials(lock, action, project_recovery(lock, events))
 
 
 def test_apply_uses_configured_clock_for_reconciliation_planning(
