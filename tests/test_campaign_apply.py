@@ -59,6 +59,7 @@ from harbor_hf.control import (
     CampaignSnapshot,
     CampaignSubmittedPayload,
     CancellationPayload,
+    ExecutionOutcomePayload,
     ExecutionStartedPayload,
     LifecyclePayload,
     TerminalPayload,
@@ -88,6 +89,7 @@ from harbor_hf.provider_models import (
 from harbor_hf.reconciler import (
     AdmissionLimits,
     AdmissionUsage,
+    DeploymentAdmission,
     ReconcileAction,
     ReconcileContext,
     _Candidate,
@@ -1295,6 +1297,102 @@ def test_apply_context_admission_usage_blocks_new_billable_action(
     assert result.plan.actions == []
     assert result.plan.blocked[0].reason == "global-budget"
     assert result.applied == []
+
+
+def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
+    remote_spec: ExperimentSpec,
+) -> None:
+    policy = CampaignRecoveryPolicy(spend_cap_microusd=100)
+    lock, request, submitted = _campaign(remote_spec, recovery_policy=policy)
+    run = lock.runs[0]
+    shard = run.shards[0]
+    trial = shard.trials[0]
+    payload = WaveLifecyclePayload(
+        deployment_digest=run.deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+        estimated_cost_microusd=100,
+    )
+    events = [
+        submitted,
+        new_event(
+            subject_type="wave",
+            subject_id="wave-one",
+            kind="wave.active",
+            producer="wave-controller",
+            payload=payload,
+            clock=lambda: NOW + timedelta(seconds=1),
+            identifier=lambda: "a" * 32,
+        ),
+        new_event(
+            subject_type="execution",
+            subject_id="execution-one",
+            kind="execution.started",
+            producer="wave-controller",
+            payload=ExecutionStartedPayload(
+                trial_id=trial.trial_id,
+                shard_id=shard.shard_id,
+                physical_attempt=1,
+                wave_id="wave-one",
+            ),
+            clock=lambda: NOW + timedelta(seconds=2),
+            identifier=lambda: "b" * 32,
+        ),
+        new_event(
+            subject_type="execution",
+            subject_id="execution-one",
+            kind="execution.failed",
+            producer="wave-controller",
+            payload=ExecutionOutcomePayload(
+                trial_id=trial.trial_id,
+                physical_attempt=1,
+                category="benchmark",
+            ),
+            clock=lambda: NOW + timedelta(seconds=3),
+            identifier=lambda: "c" * 32,
+        ),
+        new_event(
+            subject_type="wave",
+            subject_id="wave-one",
+            kind="wave.cleaning",
+            producer="wave-controller",
+            payload=payload,
+            clock=lambda: NOW + timedelta(seconds=4),
+            identifier=lambda: "d" * 32,
+        ),
+        new_event(
+            subject_type="wave",
+            subject_id="wave-one",
+            kind="wave.closed",
+            producer="wave-controller",
+            payload=payload,
+            clock=lambda: NOW + timedelta(seconds=5),
+            identifier=lambda: "e" * 32,
+        ),
+    ]
+    store = FakeStore(lock, request, events)
+    context = ReconcileContext(
+        deployments={
+            run.deployment_digest: DeploymentAdmission(estimated_wave_cost_microusd=100)
+        }
+    )
+
+    identifiers = itertools.count(20)
+    result = CampaignReconciler(
+        store,
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+        clock=lambda: NOW + timedelta(hours=1),
+        identifier=lambda: f"{next(identifiers):032x}",
+    ).apply_campaign(lock.campaign_id, context=context)
+
+    assert [(item.kind, item.status) for item in result.applied] == [
+        ("exhaust-trials", "succeeded")
+    ]
+    projection = project_recovery(lock, store.events)
+    assert projection.trials[trial.trial_id].status == "invalid"
+    assert projection.trials[trial.trial_id].outcome == "benchmark_failed"
 
 
 def test_apply_uses_configured_clock_for_reconciliation_planning(

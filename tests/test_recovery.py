@@ -1061,6 +1061,36 @@ def test_spend_cap_fails_closed_without_deployment_estimate(
     assert plan.blocked[0].reason == "spend-estimate-missing"
 
 
+def test_spend_cap_exhausts_retryable_trials_without_another_wave(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, spend_cap_microusd=100)
+    failure = _execution_events(
+        lock,
+        3,
+        execution_id="execution-one",
+        attempt=1,
+        category="benchmark",
+    )
+    events = [
+        submitted,
+        _wave_event(lock, 2, "active"),
+        *failure,
+        _wave_event(lock, 5, "cleaning"),
+        _wave_event(lock, 6, "closed"),
+    ]
+    digest = lock.runs[0].deployment_digest
+    context = ReconcileContext(
+        deployments={digest: DeploymentAdmission(estimated_wave_cost_microusd=100)}
+    )
+
+    _projection, plan = plan_reconciliation(lock, events, context=context)
+
+    assert [action.kind for action in plan.actions] == ["exhaust-trials"]
+    assert plan.actions[0].trial_ids == [lock.runs[0].shards[0].trials[0].trial_id]
+    assert plan.blocked == []
+
+
 def test_cleanup_bypasses_budgets_and_action_limit_before_billable_work(
     remote_spec: ExperimentSpec,
 ) -> None:

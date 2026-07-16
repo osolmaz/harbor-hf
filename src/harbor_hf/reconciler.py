@@ -26,11 +26,12 @@ _PRIORITY: dict[ActionKind, int] = {
     "cancel-wave": 1,
     "drain-wave": 2,
     "cleanup-wave": 3,
-    "manual-intervention": 4,
-    "publish-summary": 5,
-    "publish-results": 6,
-    "retry-shard": 7,
-    "submit-wave": 8,
+    "exhaust-trials": 4,
+    "manual-intervention": 5,
+    "publish-summary": 6,
+    "publish-results": 7,
+    "retry-shard": 8,
+    "submit-wave": 9,
 }
 
 
@@ -539,25 +540,51 @@ def _admit(
         if candidate.kind in _BILLABLE_ACTIONS:
             reason = _budget_reason(lock, candidate, context, usage)
             if reason is not None:
-                billable_kind = cast(
-                    Literal["submit-wave", "retry-shard"], candidate.kind
+                action, denied = _denied_billable_action(
+                    lock, projection, candidate, reason
                 )
-                if billable_kind not in {"submit-wave", "retry-shard"}:
-                    raise AssertionError("only billable actions use admission control")
-                blocked.append(
-                    BlockedAction(
-                        kind=billable_kind,
-                        deployment_digest=candidate.deployment_digest,
-                        shard_ids=candidate.shard_ids,
-                        reason=reason,
-                    )
-                )
-                continue
-            usage.admit(candidate, lock.campaign_id)
+                blocked.extend(denied)
+                if action is None:
+                    continue
+            else:
+                usage.admit(candidate, lock.campaign_id)
         if len(actions) >= context.limits.action_limit:
             break
         actions.append(action)
     return actions, blocked
+
+
+def _denied_billable_action(
+    lock: CampaignLock,
+    projection: RecoveryProjection,
+    candidate: _Candidate,
+    reason: Literal[
+        "global-budget",
+        "deployment-budget",
+        "provider-budget",
+        "campaign-budget",
+        "spend-cap",
+        "spend-estimate-missing",
+    ],
+) -> tuple[ReconcileAction | None, list[BlockedAction]]:
+    kind = cast(Literal["submit-wave", "retry-shard"], candidate.kind)
+    if kind == "retry-shard" and reason == "spend-cap":
+        exhaustion = _Candidate(
+            kind="exhaust-trials",
+            deployment_digest=candidate.deployment_digest,
+            shard_ids=candidate.shard_ids,
+            trial_ids=candidate.trial_ids,
+            target_ids=candidate.trial_ids,
+        )
+        return _materialize(lock, projection, exhaustion), []
+    return None, [
+        BlockedAction(
+            kind=kind,
+            deployment_digest=candidate.deployment_digest,
+            shard_ids=candidate.shard_ids,
+            reason=reason,
+        )
+    ]
 
 
 def _budget_reason(

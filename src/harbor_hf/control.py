@@ -97,6 +97,7 @@ ActionKind = Literal[
     "cancel-wave",
     "drain-wave",
     "cleanup-wave",
+    "exhaust-trials",
     "publish-results",
     "publish-summary",
     "manual-intervention",

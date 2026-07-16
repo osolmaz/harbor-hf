@@ -93,11 +93,12 @@ _ACTION_PRIORITY = {
     "cancel-wave": 1,
     "drain-wave": 2,
     "cleanup-wave": 3,
-    "manual-intervention": 4,
-    "publish-summary": 5,
-    "publish-results": 6,
-    "retry-shard": 7,
-    "submit-wave": 8,
+    "exhaust-trials": 4,
+    "manual-intervention": 5,
+    "publish-summary": 6,
+    "publish-results": 7,
+    "retry-shard": 8,
+    "submit-wave": 9,
 }
 _OUTCOME_KINDS: dict[
     Literal["succeeded", "failed", "ambiguous"],
@@ -731,6 +732,8 @@ class CampaignReconciler:
                 projection=projection,
                 allow_submission=allow_billable,
             )
+        if action.kind == "exhaust-trials":
+            return self._exhaust_trials(lock, action, projection)
         return self._execute_lifecycle_action(
             lock,
             spec,
@@ -765,6 +768,33 @@ class CampaignReconciler:
         raise ActionExecutionError(
             f"action execution is not supported by configured adapters: {action.kind}"
         )
+
+    def _exhaust_trials(
+        self,
+        lock: CampaignLock,
+        action: ReconcileAction,
+        projection: RecoveryProjection,
+    ) -> str:
+        for trial_id in action.trial_ids:
+            trial = projection.trials.get(trial_id)
+            if trial is None or trial.status not in {"retry_wait", "invalid"}:
+                raise ActionExecutionError(
+                    f"spend exhaustion target is not retryable: {trial_id}"
+                )
+        for trial_id in action.trial_ids:
+            trial = projection.trials[trial_id]
+            self._record_durable_event(
+                lock,
+                subject_type="trial",
+                subject_id=trial_id,
+                kind="trial.invalid",
+                payload=LifecyclePayload(
+                    parent_id=trial.shard_id,
+                    message="retry spend cap exhausted",
+                ),
+                identity=f"{trial_id}:spend-cap-exhausted",
+            )
+        return action.action_id
 
     def _publish_summary(
         self,
@@ -1099,7 +1129,7 @@ class CampaignReconciler:
         self,
         lock: CampaignLock,
         *,
-        subject_type: Literal["campaign", "execution", "wave"],
+        subject_type: Literal["campaign", "trial", "execution", "wave"],
         subject_id: str,
         kind: EventKind,
         payload: LifecyclePayload | ExecutionOutcomePayload | WaveLifecyclePayload,
