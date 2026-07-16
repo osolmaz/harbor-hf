@@ -30,6 +30,7 @@ from harbor_hf.results import (
 DatasetApi = CampaignStoreApi
 
 _MAX_COMMIT_ATTEMPTS = 8
+_MAX_REGULAR_BLOB_BYTES = 5 * 1024 * 1024
 _PUBLISHER_LEASE_TTL = timedelta(minutes=15)
 _INDEX_WINDOW_SIZES = tuple(2**power for power in range(12))
 _LARGEST_INDEX_WINDOW = _INDEX_WINDOW_SIZES[-1]
@@ -150,18 +151,9 @@ class HubDatasetPublisher:
 
     def _publish_result(self, publication: ResultPublication, dataset: str) -> str:
         operations: list[object] = [
-            CommitOperationAdd(
-                path_in_repo=item.path,
-                path_or_fileobj=item.content,
-            )
-            for item in publication.files
+            _regular_blob(item.path, item.content) for item in publication.files
         ]
-        operations.append(
-            CommitOperationAdd(
-                path_in_repo=publication.receipt_path,
-                path_or_fileobj=publication.receipt,
-            )
-        )
+        operations.append(_regular_blob(publication.receipt_path, publication.receipt))
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
             head = self._head(dataset)
             if self._exists(dataset, publication.receipt_path, head):
@@ -269,24 +261,15 @@ class HubDatasetPublisher:
                 return receipt.result_revision, head
             receipt = receipt or self._index_receipt(row, index_file)
             operations: list[object] = [
-                CommitOperationAdd(
-                    path_in_repo=window.path,
-                    path_or_fileobj=window.content,
-                )
-                for window in index_updates
+                _regular_blob(window.path, window.content) for window in index_updates
             ]
             if not self._exists(index_dataset, receipt_path, head):
                 operations.extend(
                     (
-                        CommitOperationAdd(
-                            path_in_repo=index_file.path,
-                            path_or_fileobj=index_file.content,
-                        ),
-                        CommitOperationAdd(
-                            path_in_repo=receipt_path,
-                            path_or_fileobj=_json_bytes(
-                                receipt.model_dump(mode="json")
-                            ),
+                        _regular_blob(index_file.path, index_file.content),
+                        _regular_blob(
+                            receipt_path,
+                            _json_bytes(receipt.model_dump(mode="json")),
                         ),
                     )
                 )
@@ -490,3 +473,13 @@ def _projection_file(publication: ResultPublication) -> DatasetFile:
 def _is_parent_conflict(error: HfHubHTTPError) -> bool:
     response = getattr(error, "response", None)
     return getattr(response, "status_code", None) in {409, 412}
+
+
+def _regular_blob(path: str, content: bytes) -> CommitOperationAdd:
+    if len(content) > _MAX_REGULAR_BLOB_BYTES:
+        raise DatasetPublicationError(
+            f"generated publication file exceeds the regular blob limit: {path}"
+        )
+    operation = CommitOperationAdd(path_in_repo=path, path_or_fileobj=content)
+    operation._upload_mode = "regular"
+    return operation

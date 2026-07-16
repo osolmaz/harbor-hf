@@ -17,6 +17,7 @@ from harbor_hf.result_publisher import (
     DatasetPublicationError,
     HubDatasetPublisher,
     PublicationConflict,
+    _regular_blob,
     publisher_lease_path,
 )
 from harbor_hf.results import (
@@ -109,6 +110,7 @@ class FakeDatasetApi:
         for operation in operations:
             assert isinstance(operation, CommitOperationAdd)
             assert isinstance(operation.path_or_fileobj, bytes)
+            assert operation._upload_mode == "regular"
             self.files[repo_id][operation.path_in_repo] = operation.path_or_fileobj
         self.generations[repo_id] += 1
         self.commits.append((repo_id, kwargs))
@@ -120,6 +122,11 @@ def _http_error(status: int) -> HfHubHTTPError:
     return HfHubHTTPError(
         "commit failed", response=httpx.Response(status, request=request)
     )
+
+
+def test_regular_blob_rejects_oversized_generated_files() -> None:
+    with pytest.raises(DatasetPublicationError, match="regular blob limit"):
+        _regular_blob("data/oversized.parquet", b"x" * (5 * 1024 * 1024 + 1))
 
 
 @pytest.fixture
