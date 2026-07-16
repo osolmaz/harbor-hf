@@ -33,6 +33,7 @@ from harbor_hf.control import (
     ActionOutcomePayload,
     ActionProjection,
     ActionReservedPayload,
+    CampaignCancellationWon,
     CampaignEvent,
     CampaignStore,
     Clock,
@@ -790,6 +791,7 @@ class CampaignReconciler:
                 raise ActionExecutionError(
                     f"spend exhaustion target is not retryable: {trial_id}"
                 )
+        events: list[CampaignEvent] = []
         for trial_id in action.trial_ids:
             trial = projection.trials[trial_id]
             latest = max(
@@ -801,17 +803,28 @@ class CampaignReconciler:
                 if latest.category in {"agent", "benchmark"}
                 else "trial.failed-infrastructure"
             )
-            self._record_durable_event(
-                lock,
-                subject_type="trial",
-                subject_id=trial_id,
-                kind=kind,
-                payload=LifecyclePayload(
-                    parent_id=trial.shard_id,
-                    message="retry spend cap exhausted",
-                ),
-                identity=f"{trial_id}:spend-cap-exhausted",
+            observed_at = self._next_observed()
+            event_identity = hashlib.sha256(
+                f"{lock.campaign_id}:{trial_id}:spend-cap-exhausted".encode()
+            ).hexdigest()[:32]
+            events.append(
+                new_event(
+                    subject_type="trial",
+                    subject_id=trial_id,
+                    kind=kind,
+                    producer="reconciler",
+                    payload=LifecyclePayload(
+                        parent_id=trial.shard_id,
+                        message="retry spend cap exhausted",
+                    ),
+                    clock=lambda observed_at=observed_at: observed_at,
+                    identifier=lambda event_identity=event_identity: event_identity,
+                )
             )
+        try:
+            self.store.ensure_events_unless_cancelled(lock.campaign_id, events)
+        except CampaignCancellationWon as error:
+            raise ActionExecutionError(str(error)) from error
         return action.action_id
 
     def _publish_summary(

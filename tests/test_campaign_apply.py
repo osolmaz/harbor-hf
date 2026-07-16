@@ -55,6 +55,7 @@ from harbor_hf.control import (
     ActionOutcomePayload,
     ActionProjection,
     ActionReservedPayload,
+    CampaignCancellationWon,
     CampaignEvent,
     CampaignSnapshot,
     CampaignSubmittedPayload,
@@ -151,6 +152,19 @@ class FakeStore:
             return False
         self.events.append(event)
         return True
+
+    def ensure_events_unless_cancelled(
+        self, campaign_id: str, events: list[CampaignEvent]
+    ) -> bool:
+        assert campaign_id == self.lock.campaign_id
+        if any(event.kind == "campaign.cancel-requested" for event in self.events):
+            raise CampaignCancellationWon(
+                "campaign cancellation superseded guarded terminal events"
+            )
+        changed = False
+        for event in events:
+            changed = self.ensure_event(campaign_id, event) or changed
+        return changed
 
     def load_action_reservations(self, campaign_id: str) -> list[dict[str, JsonValue]]:
         assert campaign_id == self.lock.campaign_id

@@ -18,6 +18,7 @@ from harbor_hf.control import (
     ActionKind,
     ActionOutcomePayload,
     ActionReservedPayload,
+    CampaignCancellationWon,
     CampaignConflict,
     CampaignEvent,
     CampaignSnapshot,
@@ -500,6 +501,60 @@ def test_hub_store_ensures_identical_event_once(
     )
     with pytest.raises(CampaignConflict, match="event conflicts"):
         store.ensure_event(lock.campaign_id, conflicting)
+
+
+def test_hub_store_guarded_events_lose_atomically_to_concurrent_cancellation(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    cancellation = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "8" * 32,
+    )
+
+    class CancellingApi(FakeCampaignApi):
+        inject_cancellation = False
+
+        def create_commit(
+            self, repo_id: str, operations: list[object], **kwargs: object
+        ) -> object:
+            if self.inject_cancellation:
+                self.inject_cancellation = False
+                path = (
+                    f"campaigns/{lock.campaign_id}/events/{cancellation.event_id}.json"
+                )
+                self.files[path] = json.dumps(
+                    cancellation.model_dump(mode="json"), default=str
+                ).encode()
+                self.generation += 1
+                raise _http_error(409)
+            return super().create_commit(repo_id, operations, **kwargs)
+
+    api = CancellingApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    terminal = new_event(
+        subject_type="trial",
+        subject_id=lock.runs[0].shards[0].trials[0].trial_id,
+        kind="trial.invalid",
+        producer="reconciler",
+        payload=LifecyclePayload(message="exhausted"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "9" * 32,
+    )
+    api.inject_cancellation = True
+
+    with pytest.raises(CampaignCancellationWon, match="cancellation superseded"):
+        store.ensure_events_unless_cancelled(lock.campaign_id, [terminal])
+
+    _lock_value, events = store.load_campaign(lock.campaign_id)
+    assert cancellation in events
+    assert terminal not in events
 
 
 def test_hub_store_adopts_deterministic_event_with_a_new_observation_time(
