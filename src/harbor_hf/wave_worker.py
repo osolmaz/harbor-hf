@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -15,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from harbor_hf.campaigns import (
@@ -69,7 +71,7 @@ from harbor_hf.provider_models import (
     ProviderTarget,
     unavailable,
 )
-from harbor_hf.provider_proxy import ProviderEvidenceProxy
+from harbor_hf.provider_proxy import PROVIDER_RECORDER_PORT, ProviderEvidenceProxy
 from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import (
     RunLock,
@@ -166,6 +168,8 @@ _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
 )
 
 _TERMINAL_MARKERS = ("_SUCCESS", "_FAILED", "_CANCELLED")
+_HF_JOB_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_PROVIDER_RECORDER_READY_TIMEOUT_SECONDS = 120
 
 
 class LockedSubmitWaveAction(FrozenModel):
@@ -465,6 +469,7 @@ def _run_staged_wave(
             identifier,
             clock,
             monotonic,
+            provider_proxy=provider_proxy,
         )
     except Exception as caught:
         error = caught
@@ -527,7 +532,83 @@ def _prepare_wave_transport(
         token=token,
         evidence_path=wave_root / "provider-requests.jsonl",
     )
-    return proxy.start(), proxy
+    base_url = _provider_recorder_base_url()
+    try:
+        proxy.start(host="0.0.0.0", port=PROVIDER_RECORDER_PORT)
+        append_event(events, "provider_recorder_listening", port=PROVIDER_RECORDER_PORT)
+        _wait_for_provider_recorder(base_url, token, deadline, monotonic)
+    except Exception:
+        proxy.close()
+        raise
+    append_event(
+        events,
+        "provider_recorder_ready",
+        host=f"{os.environ['JOB_ID']}--{PROVIDER_RECORDER_PORT}.hf.jobs",
+        port=PROVIDER_RECORDER_PORT,
+    )
+    return base_url, proxy
+
+
+def _provider_recorder_base_url() -> str:
+    job_id = os.environ.get("JOB_ID", "")
+    if not _HF_JOB_ID.fullmatch(job_id):
+        raise WorkerError("provider recorder requires a valid HF JOB_ID")
+    return f"https://{job_id}--{PROVIDER_RECORDER_PORT}.hf.jobs"
+
+
+def _wait_for_provider_recorder(
+    base_url: str,
+    token: str,
+    deadline: float,
+    monotonic: Callable[[], float],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    client: httpx.Client | None = None,
+) -> None:
+    if not token:
+        raise WorkerError("provider recorder readiness requires an HF token")
+    ready_deadline = min(
+        deadline, monotonic() + _PROVIDER_RECORDER_READY_TIMEOUT_SECONDS
+    )
+    owned_client = client is None
+    selected_client = client or httpx.Client(follow_redirects=False)
+    last_failure = "no response"
+    try:
+        while True:
+            remaining = ready_deadline - monotonic()
+            if remaining <= 0:
+                raise WorkerError(
+                    "provider recorder ingress readiness timed out: " + last_failure
+                )
+            try:
+                response = selected_client.get(
+                    f"{base_url}/healthz",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=min(5.0, remaining),
+                )
+            except httpx.TransportError as error:
+                last_failure = type(error).__name__
+            else:
+                failure = _provider_recorder_readiness_failure(response)
+                if failure is None:
+                    return
+                last_failure = failure
+            sleep(min(1.0, max(0.0, ready_deadline - monotonic())))
+    finally:
+        if owned_client:
+            selected_client.close()
+
+
+def _provider_recorder_readiness_failure(response: httpx.Response) -> str | None:
+    if response.status_code in {401, 403}:
+        raise WorkerError("provider recorder ingress rejected HF authentication")
+    try:
+        healthy = response.json() == {"status": "ok"}
+    except ValueError:
+        healthy = False
+    if response.status_code == 200 and healthy:
+        return None
+    return f"HTTP {response.status_code}"
 
 
 def _cleanup_wave_transport(
@@ -559,6 +640,8 @@ def _execute_shards(
     identifier: IdentifierFactory,
     clock: Clock,
     monotonic: Callable[[], float],
+    *,
+    provider_proxy: ProviderEvidenceProxy | None = None,
 ) -> dict[str, str]:
     shards = [(run, shard) for run in lock.runs for shard in run.shards]
     workers = min(lock.max_concurrent_shards, len(shards))
@@ -587,6 +670,7 @@ def _execute_shards(
                 clock,
                 monotonic,
                 trial_executor=trial_executor,
+                provider_proxy=provider_proxy,
             ): shard.shard.shard_id
             for run, shard in shards
         }
@@ -626,8 +710,14 @@ def _prepare_provider_target(
                     "timeout_seconds": target.timeout_seconds,
                 },
                 "transport": {
-                    "kind": "loopback-evidence-proxy",
+                    "kind": "hf-job-evidence-recorder",
                     "evidence_path": "provider-requests.jsonl",
+                    "ingress_host": (
+                        f"{os.environ.get('JOB_ID', '')}--"
+                        f"{PROVIDER_RECORDER_PORT}.hf.jobs"
+                    ),
+                    "port": PROVIDER_RECORDER_PORT,
+                    "route_authorization": "opaque-capability",
                 },
                 "endpoint": ProviderEndpointEvidence().model_dump(mode="json"),
             },
@@ -660,6 +750,7 @@ def _execute_shard(
     monotonic: Callable[[], float],
     *,
     trial_executor: Executor | None = None,
+    provider_proxy: ProviderEvidenceProxy | None = None,
 ) -> str | None:
     with _trial_execution_pool(
         trial_executor, wave.max_concurrent_shards
@@ -681,6 +772,7 @@ def _execute_shard(
             clock,
             monotonic,
             selected_executor,
+            provider_proxy=provider_proxy,
         )
 
 
@@ -712,6 +804,8 @@ def _execute_shard_with_executor(
     clock: Clock,
     monotonic: Callable[[], float],
     trial_executor: Executor,
+    *,
+    provider_proxy: ProviderEvidenceProxy | None = None,
 ) -> str | None:
     shard = locked_shard.shard
     shard_root = (
@@ -767,6 +861,7 @@ def _execute_shard_with_executor(
                 identifier,
                 clock,
                 monotonic,
+                provider_proxy=provider_proxy,
             )
             pending[future] = (trial_index, trial, trial_root)
             continue
@@ -823,6 +918,8 @@ def _execute_trial(
     identifier: IdentifierFactory,
     clock: Clock,
     monotonic: Callable[[], float],
+    *,
+    provider_proxy: ProviderEvidenceProxy | None = None,
 ) -> None:
     trial_root.mkdir(parents=True, exist_ok=True)
     executions = trial_root / "executions"
@@ -854,14 +951,18 @@ def _execute_trial(
     events = execution_root / "events.jsonl"
     append_event(events, "execution_started", execution_id=execution_id)
     error: Exception | None = None
+    capability: str | None = None
     failure_phase: Literal["configuration", "execution", "verification"] = (
         "configuration"
     )
     try:
-        trial_base_url = (
-            ProviderEvidenceProxy.scoped_base_url(base_url, trial.trial_id)
-            if isinstance(wave.target, ProviderWaveTarget)
-            else base_url
+        trial_base_url, capability = _register_trial_provider_route(
+            wave,
+            provider_proxy,
+            base_url,
+            execution_id,
+            execution_root,
+            events,
         )
         adapter = FilesystemHarborExecutionAdapter()
         prepared = adapter.prepare(
@@ -916,8 +1017,10 @@ def _execute_trial(
     except Exception as caught:
         error = caught
         append_event(events, "execution_failed", error_type=type(caught).__name__)
+    finally:
+        _revoke_trial_provider_route(provider_proxy, capability, events)
     failure_record: dict[str, object] | None = None
-    secrets = _wave_secret_values(wave, token)
+    secrets = _secret_values_with(_wave_secret_values(wave, token), capability)
     if error is not None:
         failure_record = {
             "category": _execution_failure_category(
@@ -967,6 +1070,51 @@ def _execute_trial(
         / run.run_id
         / "trials"
         / trial.trial_id,
+    )
+
+
+def _register_trial_provider_route(
+    wave: WaveLock,
+    provider_proxy: ProviderEvidenceProxy | None,
+    base_url: str,
+    execution_id: str,
+    execution_root: Path,
+    events: Path,
+) -> tuple[str, str | None]:
+    if not isinstance(wave.target, ProviderWaveTarget):
+        return base_url, None
+    if provider_proxy is None:
+        raise WorkerError("provider execution requires an evidence recorder")
+    capability = provider_proxy.register_scope(execution_id)
+    capability_digest = provider_proxy.capability_digest(capability)
+    write_json(
+        execution_root / "provider-route.json",
+        {
+            "capability_digest": capability_digest,
+            "transport": "hf-job-evidence-recorder",
+        },
+    )
+    append_event(
+        events,
+        "provider_route_registered",
+        capability_digest=capability_digest,
+    )
+    return provider_proxy.scoped_base_url(base_url, capability), capability
+
+
+def _revoke_trial_provider_route(
+    provider_proxy: ProviderEvidenceProxy | None,
+    capability: str | None,
+    events: Path,
+) -> None:
+    if capability is None or provider_proxy is None:
+        return
+    capability_digest = provider_proxy.capability_digest(capability)
+    provider_proxy.revoke_scope(capability)
+    append_event(
+        events,
+        "provider_route_revoked",
+        capability_digest=capability_digest,
     )
 
 
@@ -1321,6 +1469,14 @@ def _wave_secret_values(lock: WaveLock, token: str) -> SecretValues:
         run_values = run_secret_values(run.configuration, token)
         values.extend((run_values,) if isinstance(run_values, str) else run_values)
     unique = tuple(dict.fromkeys(value for value in values if value))
+    return unique[0] if len(unique) == 1 else unique
+
+
+def _secret_values_with(secrets: SecretValues, value: str | None) -> SecretValues:
+    values = [secrets] if isinstance(secrets, str) else list(secrets)
+    if value:
+        values.append(value)
+    unique = tuple(dict.fromkeys(candidate for candidate in values if candidate))
     return unique[0] if len(unique) == 1 else unique
 
 

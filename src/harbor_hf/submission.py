@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 from harbor_hf.campaigns import EndpointWaveTarget, WaveLock
 from harbor_hf.coordination import bucket_id, coordination_repository
 from harbor_hf.models import DeploymentProfile, EndpointRef, SourcePin
+from harbor_hf.provider_proxy import PROVIDER_RECORDER_PORT
 from harbor_hf.runs import RunLock
 
 _JOB_ID = re.compile(r"(?<![a-f0-9])[a-f0-9]{24}(?![a-f0-9])")
@@ -282,6 +283,7 @@ def build_submit_wave_command(
 ) -> list[str]:
     job = lock.remote.job
     labels = ["--label", f"harbor-hf-wave={lock.wave_id}"]
+    exposed_port: list[str] = []
     if isinstance(lock.target, EndpointWaveTarget):
         labels.extend(
             (
@@ -293,6 +295,7 @@ def build_submit_wave_command(
             )
         )
     else:
+        exposed_port = ["--expose", str(PROVIDER_RECORDER_PORT)]
         labels.extend(
             (
                 "--label",
@@ -313,6 +316,7 @@ def build_submit_wave_command(
         job.flavor,
         "--timeout",
         f"{job.timeout_seconds}s",
+        *exposed_port,
         *_secret_arguments(lock),
         *labels,
         "--volume",

@@ -202,6 +202,7 @@ def test_build_submit_wave_command_targets_hidden_worker(
         "--output-root",
         "/output",
     ]
+    assert "--expose" not in command
     assert "test-token" not in " ".join(command)
 
 
@@ -310,6 +311,8 @@ def test_provider_wave_submission_has_no_endpoint_lease_label(
 
     assert "harbor-hf-provider=" in rendered
     assert "harbor-hf-endpoint=" not in rendered
+    expose = command.index("--expose")
+    assert command[expose : expose + 2] == ["--expose", "8000"]
 
 
 def test_submit_wave_parses_job_id_and_checks_private_stores(

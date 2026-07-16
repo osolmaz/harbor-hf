@@ -75,8 +75,9 @@ def test_proxy_forwards_stream_and_records_content_free_provider_evidence(
         evidence_path=evidence_path,
         client=upstream_client,
     )
-    base_url = proxy.start()
-    scoped_url = proxy.scoped_base_url(base_url, "trial-one")
+    base_url = proxy.start(host="127.0.0.1", port=0)
+    capability = proxy.register_scope("trial-one")
+    scoped_url = proxy.scoped_base_url(base_url, capability)
     try:
         response = httpx.post(
             f"{scoped_url}/v1/chat/completions",
@@ -130,6 +131,107 @@ def test_proxy_forwards_stream_and_records_content_free_provider_evidence(
     ttft = evidence["evidence"]["latency"]["time_to_first_token_ms"]
     assert ttft["status"] == "observed"
     assert ttft["value"] >= 0
+
+
+def test_proxy_health_and_capability_lifecycle_isolate_trials(
+    tmp_path: Path,
+) -> None:
+    upstream_calls: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-one",
+                "model": "org/model",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "answer"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+
+    generated = iter(("A" * 22, "B" * 22))
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(
+            id="provider",
+            model="org/model",
+            limits=ProviderLimits(max_attempts=1),
+        ),
+        token="secret-token",
+        evidence_path=tmp_path / "evidence.jsonl",
+        client=client,
+        capability_factory=generated.__next__,
+    )
+    base_url = proxy.start(host="127.0.0.1", port=0)
+    first = proxy.register_scope("execution-one")
+    second = proxy.register_scope("execution-two")
+    first_url = proxy.scoped_base_url(base_url, first)
+    second_url = proxy.scoped_base_url(base_url, second)
+    payload = {"messages": [{"role": "user", "content": "private"}]}
+    try:
+        health = httpx.get(f"{base_url}/healthz", timeout=5)
+        unknown = httpx.post(
+            f"{base_url}/scopes/{'C' * 22}/v1/chat/completions",
+            json=payload,
+            timeout=5,
+        )
+        first_response = httpx.post(
+            f"{first_url}/v1/chat/completions", json=payload, timeout=5
+        )
+        second_response = httpx.post(
+            f"{second_url}/v1/chat/completions", json=payload, timeout=5
+        )
+        proxy.revoke_scope(first)
+        revoked = httpx.post(
+            f"{first_url}/v1/chat/completions", json=payload, timeout=5
+        )
+    finally:
+        proxy.close()
+        client.close()
+
+    assert (health.status_code, health.json()) == (200, {"status": "ok"})
+    assert unknown.status_code == 404
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert revoked.status_code == 404
+    assert len(upstream_calls) == 2
+    assert "execution-one" not in first_url
+    assert "execution-two" not in second_url
+    assert proxy.capability_digest(first).startswith("sha256:")
+
+
+def test_proxy_rejects_invalid_scope_and_capability(tmp_path: Path) -> None:
+    def reject_upstream(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid routes must not reach the provider")
+
+    client = httpx.Client(transport=httpx.MockTransport(reject_upstream))
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(id="provider", model="org/model"),
+        token="secret-token",
+        evidence_path=tmp_path / "evidence.jsonl",
+        client=client,
+        capability_factory=lambda: "short",
+    )
+    try:
+        with pytest.raises(ValueError, match="request scope is invalid"):
+            proxy.register_scope("invalid/scope")
+        with pytest.raises(ProviderProxyError, match="route capability is invalid"):
+            proxy.register_scope("valid-scope")
+        with pytest.raises(ValueError, match="bind address is invalid"):
+            proxy.start(host="", port=8000)
+    finally:
+        proxy.close()
+        client.close()
 
 
 def test_proxy_request_translation_preserves_openai_tool_contract() -> None:
@@ -306,12 +408,16 @@ def test_proxy_lifecycle_and_http_failure_matrix(tmp_path: Path) -> None:
         evidence_path=evidence_path,
         client=upstream_client,
     )
-    base_url = proxy.start()
-    throttled_url = proxy.scoped_base_url(base_url, "trial-throttled")
-    complete_url = proxy.scoped_base_url(base_url, "trial-complete")
-    timeout_url = proxy.scoped_base_url(base_url, "trial-timeout")
+    base_url = proxy.start(host="127.0.0.1", port=0)
+    throttled_url = proxy.scoped_base_url(
+        base_url, proxy.register_scope("trial-throttled")
+    )
+    complete_url = proxy.scoped_base_url(
+        base_url, proxy.register_scope("trial-complete")
+    )
+    timeout_url = proxy.scoped_base_url(base_url, proxy.register_scope("trial-timeout"))
     with pytest.raises(ProviderProxyError, match="already running"):
-        proxy.start()
+        proxy.start(host="127.0.0.1", port=0)
     try:
         invalid_route = httpx.post(f"{base_url}/unsupported", json={}, timeout=5)
         invalid_message = httpx.post(
@@ -413,10 +519,11 @@ def test_proxy_preserves_encoding_and_decodes_evidence(
         evidence_path=evidence,
         client=client,
     )
-    base_url = proxy.start()
+    base_url = proxy.start(host="127.0.0.1", port=0)
+    capability = proxy.register_scope("trial")
     try:
         response = httpx.post(
-            f"{proxy.scoped_base_url(base_url, 'trial')}/v1/chat/completions",
+            f"{proxy.scoped_base_url(base_url, capability)}/v1/chat/completions",
             json={"messages": [{"role": "user", "content": "prompt"}]},
         )
     finally:

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 from pydantic import ValidationError
 from test_wave_worker import _provider_wave_inputs
@@ -27,6 +28,7 @@ from harbor_hf.wave_worker import (
     _file_digest,
     _prepare_trial_recovery,
     _prepare_wave_transport,
+    _provider_recorder_base_url,
     _publish_digest_sidecar,
     _publish_immutable_file,
     _publish_unit,
@@ -35,6 +37,7 @@ from harbor_hf.wave_worker import (
     _trial_destination,
     _valid_terminal_trial,
     _validate_execution_identity,
+    _wait_for_provider_recorder,
     _wave_worker_lease,
 )
 
@@ -805,8 +808,8 @@ def test_provider_transport_start_and_cleanup_are_exact(
             calls.append(("init", target, token, evidence_path))
             self.error: Exception | None = None
 
-        def start(self) -> str:
-            calls.append(("start",))
+        def start(self, *, host: str, port: int) -> str:
+            calls.append(("start", host, port))
             return "http://127.0.0.1:12345"
 
         def close(self) -> None:
@@ -826,7 +829,7 @@ def test_provider_transport_start_and_cleanup_are_exact(
         lambda: 0.0,
     )
 
-    assert base_url == "http://127.0.0.1:12345"
+    assert base_url == "https://test-wave-job--8000.hf.jobs"
     assert isinstance(proxy, FakeProxy)
     assert calls == [
         (
@@ -835,7 +838,7 @@ def test_provider_transport_start_and_cleanup_are_exact(
             "test-token",
             tmp_path / "provider-requests.jsonl",
         ),
-        ("start",),
+        ("start", "0.0.0.0", 8000),
     ]
     assert (
         _cleanup_wave_transport(None, cast(wave_worker.ProviderEvidenceProxy, proxy))
@@ -852,6 +855,88 @@ def test_provider_transport_start_and_cleanup_are_exact(
         == "close failed"
     )
     assert _cleanup_wave_transport(None, None) is None
+
+
+def test_provider_recorder_base_url_validates_job_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JOB_ID", "0123456789abcdef01234567")
+    assert _provider_recorder_base_url() == (
+        "https://0123456789abcdef01234567--8000.hf.jobs"
+    )
+
+    for invalid in ("", "UPPERCASE", "bad.id", "-leading", "trailing-"):
+        monkeypatch.setenv("JOB_ID", invalid)
+        with pytest.raises(WorkerError, match="requires a valid HF JOB_ID"):
+            _provider_recorder_base_url()
+
+
+def test_provider_recorder_readiness_retries_external_ingress() -> None:
+    attempts: list[httpx.Request] = []
+
+    def ingress(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        assert request.headers["authorization"] == "Bearer test-token"
+        if len(attempts) == 1:
+            return httpx.Response(503, json={"error": "starting"})
+        return httpx.Response(200, json={"status": "ok"})
+
+    now = [0.0]
+    client = httpx.Client(transport=httpx.MockTransport(ingress))
+    try:
+        _wait_for_provider_recorder(
+            "https://job--8000.hf.jobs",
+            "test-token",
+            10.0,
+            lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            client=client,
+        )
+    finally:
+        client.close()
+
+    assert len(attempts) == 2
+    assert attempts[0].url == "https://job--8000.hf.jobs/healthz"
+    assert now[0] == 1.0
+
+
+def test_provider_recorder_readiness_fails_closed() -> None:
+    unauthorized = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(401, json={"error": "unauthorized"})
+        )
+    )
+    try:
+        with pytest.raises(WorkerError, match="rejected HF authentication"):
+            _wait_for_provider_recorder(
+                "https://job--8000.hf.jobs",
+                "test-token",
+                10.0,
+                lambda: 0.0,
+                sleep=lambda _seconds: None,
+                client=unauthorized,
+            )
+    finally:
+        unauthorized.close()
+
+    now = [0.0]
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unavailable", request=request)
+
+    disconnected = httpx.Client(transport=httpx.MockTransport(unavailable))
+    try:
+        with pytest.raises(WorkerError, match="readiness timed out: ConnectError"):
+            _wait_for_provider_recorder(
+                "https://job--8000.hf.jobs",
+                "test-token",
+                2.0,
+                lambda: now[0],
+                sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                client=disconnected,
+            )
+    finally:
+        disconnected.close()
 
 
 def test_endpoint_transport_delegates_prepare_and_cleanup() -> None:

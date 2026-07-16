@@ -25,7 +25,7 @@ from harbor_hf.campaigns import (
     build_wave_lock,
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
-from harbor_hf.evidence import verify_checksums, write_checksums
+from harbor_hf.evidence import assert_secret_absent, verify_checksums, write_checksums
 from harbor_hf.harbor_adapter import HarborTrialFailure, HarborVerificationFailure
 from harbor_hf.models import (
     EndpointRef,
@@ -36,6 +36,7 @@ from harbor_hf.models import (
 )
 from harbor_hf.process import CommandRunner
 from harbor_hf.provider_models import ProviderLimits, ProviderTarget
+from harbor_hf.provider_proxy import ProviderEvidenceProxy
 from harbor_hf.reconciler import (
     DeploymentAdmission,
     ReconcileContext,
@@ -489,7 +490,7 @@ class HarborStream:
         if self.expected_base_url is not None:
             assert base_url == self.expected_base_url
         else:
-            assert base_url.startswith("http://127.0.0.1:")
+            assert base_url.startswith("https://test-wave-job--8000.hf.jobs/scopes/")
             assert base_url.endswith("/v1")
         assert timeout_seconds > 0
         config_path = Path(command[command.index("--config") + 1])
@@ -808,7 +809,27 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     assert runner.commands == []
     assert harbor.max_active == 2
     assert len(set(harbor.base_urls)) == 2
-    assert all("/scopes/trial-" in base_url for base_url in harbor.base_urls)
+    assert all(
+        base_url.startswith("https://test-wave-job--8000.hf.jobs/scopes/")
+        for base_url in harbor.base_urls
+    )
+    assert all(
+        trial.trial_id not in " ".join(harbor.base_urls)
+        for trial in wave.runs[0].shards[0].shard.trials
+    )
+    capabilities = [
+        base_url.split("/scopes/", maxsplit=1)[1].removesuffix("/v1")
+        for base_url in harbor.base_urls
+    ]
+    assert_secret_absent(output, capabilities)
+    route_records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in output.rglob("provider-route.json")
+    ]
+    assert {record["capability_digest"] for record in route_records} == {
+        ProviderEvidenceProxy.capability_digest(capability)
+        for capability in capabilities
+    }
     assert all(
         config["agents"][0]["model_name"] == f"openai/{routed_model}"
         for config in harbor.configs
@@ -831,8 +852,11 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         "timeout_seconds": 60.0,
     }
     assert runtime["provider"]["transport"] == {
-        "kind": "loopback-evidence-proxy",
         "evidence_path": "provider-requests.jsonl",
+        "ingress_host": "test-wave-job--8000.hf.jobs",
+        "kind": "hf-job-evidence-recorder",
+        "port": 8000,
+        "route_authorization": "opaque-capability",
     }
     assert (destination / "provider-requests.jsonl").read_text() == ""
     endpoint = runtime["provider"]["endpoint"]
@@ -847,6 +871,12 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
             "event": "provider_target_validated",
             "service": "hf-inference-providers",
             "target_id": "hf-provider",
+        },
+        {"event": "provider_recorder_listening", "port": 8000},
+        {
+            "event": "provider_recorder_ready",
+            "host": "test-wave-job--8000.hf.jobs",
+            "port": 8000,
         },
         {"event": "wave_succeeded"},
     ]
