@@ -990,6 +990,7 @@ def _execute_trial(
             token=token,
             inference_base_url=trial_base_url,
             blocked_secret_names=blocked_secret_names,
+            redaction_secrets=(capability,) if capability is not None else (),
         ) as environment:
             outcome = adapter.execute(
                 prepared,
