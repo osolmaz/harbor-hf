@@ -793,11 +793,20 @@ class CampaignReconciler:
                 )
         for trial_id in action.trial_ids:
             trial = projection.trials[trial_id]
+            latest = max(
+                trial.executions.values(),
+                key=lambda execution: execution.physical_attempt,
+            )
+            kind: EventKind = (
+                "trial.invalid"
+                if latest.category in {"agent", "benchmark"}
+                else "trial.failed-infrastructure"
+            )
             self._record_durable_event(
                 lock,
                 subject_type="trial",
                 subject_id=trial_id,
-                kind="trial.invalid",
+                kind=kind,
                 payload=LifecyclePayload(
                     parent_id=trial.shard_id,
                     message="retry spend cap exhausted",

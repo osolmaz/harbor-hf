@@ -541,7 +541,13 @@ def _admit(
             reason = _budget_reason(lock, candidate, context, usage)
             if reason is not None:
                 action, denied = _denied_billable_action(
-                    lock, projection, candidate, reason
+                    lock,
+                    projection,
+                    candidate,
+                    reason,
+                    exhaust_retry=_durable_spend_cap_blocks_retry(
+                        lock, projection, candidate
+                    ),
                 )
                 blocked.extend(denied)
                 if action is None:
@@ -566,9 +572,11 @@ def _denied_billable_action(
         "spend-cap",
         "spend-estimate-missing",
     ],
+    *,
+    exhaust_retry: bool,
 ) -> tuple[ReconcileAction | None, list[BlockedAction]]:
     kind = cast(Literal["submit-wave", "retry-shard"], candidate.kind)
-    if kind == "retry-shard" and reason == "spend-cap":
+    if kind == "retry-shard" and reason == "spend-cap" and exhaust_retry:
         exhaustion = _Candidate(
             kind="exhaust-trials",
             deployment_digest=candidate.deployment_digest,
@@ -585,6 +593,27 @@ def _denied_billable_action(
             reason=reason,
         )
     ]
+
+
+def _durable_spend_cap_blocks_retry(
+    lock: CampaignLock,
+    projection: RecoveryProjection,
+    candidate: _Candidate,
+) -> bool:
+    caps = [
+        cap
+        for cap in (
+            lock.recovery_policy.spend_cap_microusd,
+            candidate.spend_cap_microusd,
+        )
+        if cap is not None
+    ]
+    if not caps or candidate.estimated_cost_microusd is None:
+        return False
+    durable_spend = projection.spend_microusd + sum(
+        wave.estimated_cost_microusd for wave in projection.waves.values()
+    )
+    return durable_spend + candidate.estimated_cost_microusd > min(caps)
 
 
 def _budget_reason(

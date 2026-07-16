@@ -62,6 +62,7 @@ from harbor_hf.control import (
     ExecutionOutcomePayload,
     ExecutionStartedPayload,
     LifecyclePayload,
+    RetryCategory,
     TerminalPayload,
     WaveLifecyclePayload,
     new_event,
@@ -1299,8 +1300,18 @@ def test_apply_context_admission_usage_blocks_new_billable_action(
     assert result.applied == []
 
 
+@pytest.mark.parametrize(
+    ("category", "expected_status", "expected_outcome"),
+    [
+        ("benchmark", "invalid", "benchmark_failed"),
+        ("transient", "failed_infrastructure", "infrastructure_exhausted"),
+    ],
+)
 def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     remote_spec: ExperimentSpec,
+    category: RetryCategory,
+    expected_status: str,
+    expected_outcome: str,
 ) -> None:
     policy = CampaignRecoveryPolicy(spend_cap_microusd=100)
     lock, request, submitted = _campaign(remote_spec, recovery_policy=policy)
@@ -1346,7 +1357,7 @@ def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
             payload=ExecutionOutcomePayload(
                 trial_id=trial.trial_id,
                 physical_attempt=1,
-                category="benchmark",
+                category=category,
             ),
             clock=lambda: NOW + timedelta(seconds=3),
             identifier=lambda: "c" * 32,
@@ -1391,8 +1402,8 @@ def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
         ("exhaust-trials", "succeeded")
     ]
     projection = project_recovery(lock, store.events)
-    assert projection.trials[trial.trial_id].status == "invalid"
-    assert projection.trials[trial.trial_id].outcome == "benchmark_failed"
+    assert projection.trials[trial.trial_id].status == expected_status
+    assert projection.trials[trial.trial_id].outcome == expected_outcome
 
 
 def test_spend_exhaustion_rejects_an_empty_trial_set(
