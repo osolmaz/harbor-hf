@@ -156,15 +156,14 @@ published `model_revision` is `not_observed`. Never present it as equivalent to
 an endpoint run whose served revision was verified.
 
 The remote wave controller owns an OpenAI-compatible evidence recorder. The
-planned production transport exposes it through authenticated HF Job ingress
-so agents running in separate Harbor Sandboxes can reach it. OpenClaw will send
-its normal requests to an opaque trial-scoped route; the recorder forwards them
+production transport exposes it through authenticated HF Job ingress so agents
+running in separate Harbor Sandboxes can reach it. OpenClaw sends its normal
+requests to an opaque trial-scoped route; the recorder forwards them
 to HF Inference Providers and writes `provider-requests.jsonl`. Each row
 contains typed request metadata, response routing and quota headers, retry
 attempt, usage, and latency. It never stores prompts, tool arguments, response
 text, or credentials. The recorder is part of the hosted controller Job and
-does not run inference itself. Provider-backed production campaigns remain
-blocked while the current loopback-only implementation is replaced. The
+does not run inference itself. The
 [provider evidence recorder plan](provider-evidence-recorder-plan.md) defines
 the implementation, isolation, verification, and cutover requirements.
 

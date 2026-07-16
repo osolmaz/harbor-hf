@@ -23,9 +23,10 @@ not a separate execution architecture. Completed and normally failed executions
 publish complete sanitized evidence, but a worker or Sandbox killed before
 finalization can lose its Job-local in-progress session files. Milestone 8 plans
 incremental private evidence checkpoints for that remaining failure window; it
-is not implemented yet. Provider execution also requires the planned
-[evidence recorder cutover](provider-evidence-recorder-plan.md) before new
-production campaigns can cross the HF Job and Harbor Sandbox network boundary.
+is not implemented yet. The
+[provider evidence recorder cutover](provider-evidence-recorder-plan.md) is
+complete and remotely verified across the HF Job and Harbor Sandbox network
+boundary.
 
 ## Starting Point
 

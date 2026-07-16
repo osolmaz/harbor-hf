@@ -8,9 +8,9 @@ date: "2026-07-16"
 
 ## Status
 
-Planned. The current loopback-only proxy cannot serve agents running in a
-separate HF Sandbox. New provider-backed production campaigns remain blocked
-until Phases 1 through 3 pass their local contracts and remote canary.
+Implemented. Phases 1 through 3 passed local contracts and a remote
+Sandbox-to-Job canary on 2026-07-16. Provider-backed campaigns use the hosted
+recorder exclusively; the loopback-only transport has been removed.
 
 ## Purpose
 
@@ -187,16 +187,42 @@ Exit criteria: the full provider-backed campaign can run at its selected
 concurrency without connection refusals, mixed evidence, leaked secrets, or
 unclassified transport failures.
 
-### Phase 4: Optional Harbor-Native Colocation
+### Future Harbor-Native Colocation
 
 If Harbor later exposes a public lifecycle API for agent-side helper processes,
 propose a small upstream contract that can start a helper beside the agent,
 wait for readiness, collect declared artifacts, and guarantee cleanup. Move the
 same recorder behind that contract only after remote parity tests pass.
 
-This phase is optional. Until Harbor owns such an API, the authenticated
-per-wave recorder remains the production design. Harbor-HF does not maintain a
-custom Harbor fork or an OpenClaw-only bootstrap shim.
+This is not an incomplete Harbor-HF implementation phase. Harbor does not
+currently expose the required public lifecycle API, so the authenticated
+per-wave recorder is the complete production design. Harbor-HF does not
+maintain a custom Harbor fork or an OpenClaw-only bootstrap shim.
+
+## Remote Verification
+
+The cutover was verified with a one-task provider campaign using the exact
+worker commit `e935d7f095ac43cf41172777054e4e4edb7da4dd`. The HF Job controller
+and OpenClaw Sandbox ran in separate environments, and the Job exposed only the
+recorder's fixed port through authenticated HF ingress.
+
+The canary produced:
+
+- one scored trial with reward `1.0` and no exception;
+- 18 provider requests, all successful on their first attempt;
+- 220,298 reported input tokens and 3,767 reported output tokens;
+- 52 tool calls with 52 matching tool results in the retained OpenClaw session;
+- reasoning records and multi-turn tool use without provider schema errors;
+- a non-empty content-free provider ledger with observed request IDs, usage,
+  latency, response model, and finish reasons;
+- matching route-registration and route-revocation events;
+- only the route capability digest in evidence, with the raw capability
+  redacted from retained URLs, logs, sessions, and configuration;
+- valid checksums, private artifact inventory, Harbor bundle, verifier output,
+  and terminal success markers.
+
+The controller Job completed in 239 seconds of running time. No Inference
+Endpoint was created, and no HF Job remained running after completion.
 
 ## Required Tests
 
