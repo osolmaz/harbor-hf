@@ -1230,8 +1230,15 @@ def _validate_composition_compatibility(
             getattr(run, field) != getattr(base, field) for field in fields
         ):
             raise ResultPublicationError("composition sources are incompatible")
-    if not any(tables.executions for tables in sources.values()):
+    runtime_kinds = {
+        execution.runtime_kind
+        for tables in sources.values()
+        for execution in tables.executions
+    }
+    if not runtime_kinds:
         raise ResultPublicationError("composition sources contain no executions")
+    if len(runtime_kinds) != 1:
+        raise ResultPublicationError("composition sources use mixed runtime kinds")
 
 
 def _trial_key(trial: TrialRow) -> tuple[str, int]:

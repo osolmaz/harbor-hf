@@ -837,11 +837,41 @@ def test_composition_rejects_incompatible_correction(
         )
 
 
+def test_composition_rejects_mixed_runtime_kinds(
+    evidence: MemoryEvidence,
+    source: EvidenceSource,
+) -> None:
+    manifest, sources = _composition_inputs(evidence, source)
+    correction_reference = next(
+        item for item in manifest.sources if item.role == "correction"
+    )
+    correction = sources[correction_reference.publication_id]
+    provider_execution = correction.executions[0].model_copy(
+        update={"runtime_kind": "provider"}
+    )
+    mixed = correction.model_copy(update={"executions": [provider_execution]})
+
+    with pytest.raises(ResultPublicationError, match="mixed runtime kinds"):
+        compose_result_tables(
+            manifest,
+            {**sources, correction_reference.publication_id: mixed},
+            control_commit=CONTROL_COMMIT,
+        )
+
+
 def _composition_inputs(
     evidence: MemoryEvidence,
     source: EvidenceSource,
 ) -> tuple[ResultCompositionManifest, dict[str, ResultTables]]:
     base = build_result_tables(evidence, source, control_commit=CONTROL_COMMIT)
+    base = base.model_copy(
+        update={
+            "executions": [
+                execution.model_copy(update={"runtime_kind": "endpoint"})
+                for execution in base.executions
+            ]
+        }
+    )
     base_run = base.runs[0]
     base_trial = next(trial for trial in base.trials if trial.task_name == "task-one")
     correction_trace = {
