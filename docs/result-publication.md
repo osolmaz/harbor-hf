@@ -101,8 +101,10 @@ join or an implicit filename convention.
 Rows are sorted by stable IDs. Metric and artifact IDs are hashes of their
 stable owner and measurement or artifact identity. A publication ID is a hash
 of the active v1 publication contract, run ID, source location, verified source
-checksum, and run-lock checksum. Contract binding gives a projection cutover a
-new immutable identity without rewriting earlier receipts. `control_commit` is
+checksum, run-lock checksum, and normalized execution-profile digest. Contract
+binding gives a projection cutover a new immutable identity without rewriting
+earlier receipts, while profile normalization changes rotate identity
+automatically. `control_commit` is
 the Hub commit that last modified the immutable
 campaign lock, not the moving control-repository head. Later events and leases
 therefore change neither the publication identity nor its Parquet bytes.
@@ -123,9 +125,12 @@ instead of being silently adopted. Auditing compares rows while checking
 referential and evidence-trace invariants.
 
 Every result projection records a canonical digest of the complete model,
-deployment, and agent profiles from its verified run lock after removing only
-local profile IDs and endpoint resource identity. The served model name remains
-part of the digest. Composed publications reference every source at an exact
+deployment, and agent profiles from its verified run lock after removing local
+profile IDs, endpoint resource identity, and provider admission-cost estimates.
+The cost estimates limit campaign spending but do not change inference. The
+served model name, concurrency, retry count, routing, timeout, generation
+parameters, and agent settings remain part of the digest. Composed publications
+reference every source at an exact
 Dataset revision and source checksum, then require the source-owned profile
 digests to match. Corrections may rename profiles and run on a different
 otherwise-identical endpoint, but they cannot change weights, serving

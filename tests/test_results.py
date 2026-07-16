@@ -854,7 +854,7 @@ def test_composition_accepts_different_profile_labels(
     assert composed_run.agent_id == base_run.agent_id
 
 
-def test_execution_profile_digest_ignores_only_labels_and_endpoint_binding() -> None:
+def test_execution_profile_digest_ignores_labels_binding_and_cost_estimates() -> None:
     profiles = {
         "model": {"id": "model-base", "repo": "org/model", "revision": "abc"},
         "deployment": {
@@ -863,6 +863,12 @@ def test_execution_profile_digest_ignores_only_labels_and_endpoint_binding() -> 
                 "namespace": "org",
                 "name": "endpoint-base",
                 "served_model_name": "/repository",
+            },
+            "limits": {
+                "max_concurrent_requests": 16,
+                "max_attempts": 3,
+                "max_spend_usd": "250",
+                "estimated_wave_cost_usd": "150",
             },
             "engine": {"arguments": ["--max-model-len", "65536"]},
         },
@@ -884,6 +890,11 @@ def test_execution_profile_digest_ignores_only_labels_and_endpoint_binding() -> 
                 "name": "endpoint-correction",
                 "served_model_name": "/repository",
             },
+            "limits": {
+                **profiles["deployment"]["limits"],
+                "max_spend_usd": "100",
+                "estimated_wave_cost_usd": "50",
+            },
         },
         "agent": {**profiles["agent"], "id": "agent-correction"},
     }
@@ -904,10 +915,21 @@ def test_execution_profile_digest_ignores_only_labels_and_endpoint_binding() -> 
             },
         },
     }
+    changed_concurrency = {
+        **relabeled,
+        "deployment": {
+            **relabeled["deployment"],
+            "limits": {
+                **relabeled["deployment"]["limits"],
+                "max_concurrent_requests": 8,
+            },
+        },
+    }
 
     assert execution_profile_digest(**relabeled) == expected
     assert execution_profile_digest(**changed) != expected
     assert execution_profile_digest(**changed_served_name) != expected
+    assert execution_profile_digest(**changed_concurrency) != expected
 
 
 def test_composition_rejects_unresolved_base_trial(
