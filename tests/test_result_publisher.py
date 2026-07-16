@@ -126,7 +126,7 @@ def _http_error(status: int) -> HfHubHTTPError:
 
 def test_regular_blob_rejects_oversized_generated_files() -> None:
     with pytest.raises(DatasetPublicationError, match="regular blob limit"):
-        _regular_blob("data/oversized.parquet", b"x" * (8 * 1024 * 1024 + 1))
+        _regular_blob("data/oversized.parquet", b"x" * (5 * 1024 * 1024 + 1))
 
 
 @pytest.fixture

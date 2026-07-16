@@ -30,7 +30,7 @@ from harbor_hf.results import (
 DatasetApi = CampaignStoreApi
 
 _MAX_COMMIT_ATTEMPTS = 8
-_MAX_REGULAR_BLOB_BYTES = 8 * 1024 * 1024
+_MAX_REGULAR_BLOB_BYTES = 5 * 1024 * 1024
 _PUBLISHER_LEASE_TTL = timedelta(minutes=15)
 _INDEX_WINDOW_SIZES = tuple(2**power for power in range(12))
 _LARGEST_INDEX_WINDOW = _INDEX_WINDOW_SIZES[-1]
