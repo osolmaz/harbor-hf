@@ -9,6 +9,21 @@ from harbor_hf.evidence import is_sensitive_key
 
 ProviderProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 
+type ProviderContentPart = Annotated[dict[str, JsonValue], Field(min_length=1)]
+type ProviderMessageContent = (
+    str | Annotated[list[ProviderContentPart], Field(min_length=1)]
+)
+
+
+def _validate_content_parts(content: ProviderMessageContent | None) -> None:
+    if not isinstance(content, list):
+        return
+    for part in content:
+        part_type = part.get("type")
+        if not isinstance(part_type, str) or not part_type:
+            raise ValueError("message content parts require a non-empty type")
+
+
 EvidenceStatus = Literal[
     "observed",
     "not_observed",
@@ -129,7 +144,7 @@ class ProviderToolCall(FrozenModel):
 
 class ProviderMessage(FrozenModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
+    content: ProviderMessageContent | None = None
     reasoning_content: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -139,6 +154,7 @@ class ProviderMessage(FrozenModel):
 
     @model_validator(mode="after")
     def content_matches_role(self) -> ProviderMessage:
+        _validate_content_parts(self.content)
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:

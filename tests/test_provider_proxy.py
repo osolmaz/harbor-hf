@@ -210,6 +210,65 @@ def test_proxy_health_and_capability_lifecycle_isolate_trials(
     assert proxy.capability_digest(first).startswith("sha256:")
 
 
+def test_proxy_forwards_multipart_message_content(tmp_path: Path) -> None:
+    observed: list[dict[str, object]] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        observed.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-one",
+                "model": "org/model",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "summary"},
+                    }
+                ],
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    proxy = ProviderEvidenceProxy(
+        ProviderTarget(id="provider", model="org/model"),
+        token="secret-token",
+        evidence_path=tmp_path / "evidence.jsonl",
+        client=client,
+    )
+    base_url = proxy.start(host="127.0.0.1", port=0)
+    capability = proxy.register_scope("compaction")
+    content = [{"type": "text", "text": "summarize the conversation"}]
+    try:
+        response = httpx.post(
+            f"{proxy.scoped_base_url(base_url, capability)}/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": content}]},
+            timeout=5,
+        )
+    finally:
+        proxy.close()
+        client.close()
+
+    assert response.status_code == 200
+    assert observed == [
+        {
+            "messages": [{"role": "user", "content": content}],
+            "model": "org/model:fastest",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [[], [{}], [{"type": ""}], [{"text": "missing type"}]],
+)
+def test_proxy_rejects_malformed_multipart_message_content(
+    content: list[dict[str, str]],
+) -> None:
+    with pytest.raises(ValidationError):
+        _provider_message(cast(JsonValue, {"role": "user", "content": content}))
+
+
 def test_proxy_rejects_invalid_scope_and_capability(tmp_path: Path) -> None:
     def reject_upstream(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("invalid routes must not reach the provider")
