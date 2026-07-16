@@ -2519,10 +2519,20 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     monkeypatch.setattr(huggingface_hub, "HfApi", create_api)
     token = "publication-token"
     monkeypatch.setattr(huggingface_hub, "get_token", lambda: token)
+    cleanup_calls: list[bool] = []
+
+    class FakeTemporaryDirectory:
+        def __init__(self, *, prefix: str) -> None:
+            cache_prefixes.append(prefix)
+            self.name = str(cache_root)
+
+        def cleanup(self) -> None:
+            cleanup_calls.append(True)
+
     monkeypatch.setattr(
         campaign_apply_module.tempfile,
-        "mkdtemp",
-        lambda *, prefix: cache_prefixes.append(prefix) or str(cache_root),
+        "TemporaryDirectory",
+        FakeTemporaryDirectory,
     )
     monkeypatch.setattr(
         campaign_apply_module.uuid,
@@ -2573,6 +2583,9 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     assert leases.api is evidence_api
     action_claims = cast(HubClaimStore, reconciler.action_claims)
     assert action_claims.repository == "osolmaz/harbor-hf-coordination"
+    reconciler.close()
+    reconciler.close()
+    assert cleanup_calls == [True]
 
 
 def test_hugging_face_reconciler_factory_requires_hf_token(

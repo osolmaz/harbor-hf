@@ -18,6 +18,7 @@ class FakeBucketApi:
         self.files = files
         self.list_calls: list[tuple[str, str | None, bool]] = []
         self.downloads = 0
+        self.download_batches: list[list[str]] = []
 
     def list_bucket_tree(
         self, bucket_id: str, prefix: str | None = None, **kwargs: object
@@ -36,10 +37,13 @@ class FakeBucketApi:
         assert bucket_id == "org/evidence"
         assert kwargs == {"raise_on_missing_files": True}
         self.downloads += 1
+        batch: list[str] = []
         for remote, destination in files:
             path = cast(SimpleNamespace, remote).path
             assert isinstance(path, str)
+            batch.append(path)
             Path(destination).write_bytes(self.files[path])
+        self.download_batches.append(batch)
 
 
 class FakeBucketWriterApi:
@@ -134,6 +138,9 @@ def test_lists_and_caches_bucket_evidence(tmp_path: Path) -> None:
     )
     assert api.list_calls == [("org/evidence", prefix, True)]
     assert api.downloads == 1
+    assert api.download_batches == [
+        [f"{prefix}/_SUCCESS", f"{prefix}/run-summary.json"]
+    ]
 
 
 def test_interrupted_download_never_becomes_a_cached_evidence_object(
@@ -156,7 +163,12 @@ def test_interrupted_download_never_becomes_a_cached_evidence_object(
                 raise OSError("download interrupted")
             super().download_bucket_files(bucket_id, files, **kwargs)
 
-    api = InterruptedApi({f"{prefix}/record.json": b"complete"})
+    api = InterruptedApi(
+        {
+            f"{prefix}/record.json": b"complete",
+            f"{prefix}/second.json": b"also complete",
+        }
+    )
     reader = HubBucketEvidenceReader(tmp_path, api=api)
 
     with pytest.raises(OSError, match="download interrupted"):
@@ -167,6 +179,7 @@ def test_interrupted_download_never_becomes_a_cached_evidence_object(
         == b"complete"
     )
     assert not any(path.read_bytes() == b"truncated" for path in tmp_path.iterdir())
+    assert api.download_batches == [[f"{prefix}/record.json", f"{prefix}/second.json"]]
 
 
 def test_refresh_discards_cached_evidence_bytes(tmp_path: Path) -> None:

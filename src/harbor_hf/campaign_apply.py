@@ -4,11 +4,11 @@ import hashlib
 import json
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, Self, cast
 
 import httpx
 from huggingface_hub.errors import HfHubHTTPError
@@ -337,6 +337,7 @@ class CampaignReconciler:
         observer: CampaignObserver | None = None,
         finalizer: CampaignFinalizer | None = None,
         result_publisher: CampaignPublicationPort | None = None,
+        cleanup: Callable[[], None] = lambda: None,
         clock: Clock = lambda: datetime.now(UTC),
         identifier: IdentifierFactory = lambda: uuid.uuid4().hex,
     ) -> None:
@@ -347,9 +348,20 @@ class CampaignReconciler:
         self.observer = observer
         self.finalizer = finalizer
         self.result_publisher = result_publisher
+        self._cleanup = cleanup
         self.clock = clock
         self.identifier = identifier
         self._last_observed_at: datetime | None = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        cleanup, self._cleanup = self._cleanup, lambda: None
+        cleanup()
 
     def apply_campaign(
         self,
@@ -1584,8 +1596,9 @@ def hugging_face_campaign_reconciler(
     from harbor_hf.result_publisher import DatasetApi, HubDatasetPublisher
 
     evidence_api = HfApi()
+    evidence_cache = tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-")
     reader = HubBucketEvidenceReader(
-        Path(tempfile.mkdtemp(prefix="harbor-hf-evidence-")),
+        Path(evidence_cache.name),
         api=cast(BucketEvidenceApi, evidence_api),
     )
     token = get_token()
@@ -1627,6 +1640,7 @@ def hugging_face_campaign_reconciler(
         observer=BucketCampaignObserver(reader),
         finalizer=BucketCampaignFinalizer(reader, writer),
         result_publisher=result_publisher,
+        cleanup=evidence_cache.cleanup,
     )
 
 
