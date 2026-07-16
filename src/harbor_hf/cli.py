@@ -246,9 +246,8 @@ def campaign_reconcile(
         raise typer.Exit(code=2)
     try:
         if apply:
-            result = hugging_face_campaign_reconciler(namespace).apply_campaign(
-                campaign_id
-            )
+            with hugging_face_campaign_reconciler(namespace) as reconciler:
+                result = reconciler.apply_campaign(campaign_id)
         else:
             lock, events = HubCampaignStore(namespace).load_campaign(campaign_id)
             _projection, result = plan_reconciliation(lock, events)
@@ -269,7 +268,8 @@ def campaign_reconcile_all(
         raise typer.Exit(code=2)
     try:
         if apply:
-            results = hugging_face_campaign_reconciler(namespace).apply_all()
+            with hugging_face_campaign_reconciler(namespace) as reconciler:
+                results = reconciler.apply_all()
         else:
             store = HubCampaignStore(namespace)
             results = [
