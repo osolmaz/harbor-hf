@@ -1064,11 +1064,15 @@ class _ApiStub:
 
 
 def _index_row(
-    publication_id: str, completed_at: datetime, revision: str
+    publication_id: str,
+    completed_at: datetime,
+    revision: str,
+    *,
+    run_id: str | None = None,
 ) -> GlobalIndexRow:
     return GlobalIndexRow(
         publication_id=publication_id,
-        run_id=f"run-{publication_id}",
+        run_id=run_id or f"run-{publication_id}",
         campaign_id="campaign-one",
         benchmark="shellbench",
         result_kind="ordinary",
@@ -1092,8 +1096,18 @@ def test_result_index_windows_are_deduplicated_sorted_and_power_sized(
     now = datetime(2026, 7, 14, tzinfo=UTC)
     old = _index_row("pub-old", now, "1" * 40)
     same_time_later_id = _index_row("pub-z", now + timedelta(minutes=1), "2" * 40)
-    replaced = _index_row("pub-new", now + timedelta(minutes=2), "3" * 40)
-    replacement = _index_row("pub-new", now + timedelta(minutes=3), "4" * 40)
+    prior_contract = _index_row(
+        "pub-prior-contract",
+        now + timedelta(minutes=2),
+        "3" * 40,
+        run_id="run-rotated",
+    )
+    replacement = _index_row(
+        "pub-new",
+        now + timedelta(minutes=3),
+        "4" * 40,
+        run_id="run-rotated",
+    )
     publisher = HubDatasetPublisher(
         publisher_id="publisher-one",
         leases=_LeaseStub(),
@@ -1103,7 +1117,7 @@ def test_result_index_windows_are_deduplicated_sorted_and_power_sized(
     monkeypatch.setattr(
         publisher,
         "_individual_index_rows",
-        lambda *args: [same_time_later_id, replaced, old],
+        lambda *args: [same_time_later_id, prior_contract, old],
     )
 
     windows = publisher._index_windows("org/index", "d" * 40, replacement)
