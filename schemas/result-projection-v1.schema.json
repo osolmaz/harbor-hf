@@ -30,6 +30,11 @@
   },
   "additionalProperties": false,
   "properties": {
+    "execution_profile_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Execution Profile Sha256",
+      "type": "string"
+    },
     "control_commit": {
       "pattern": "^[0-9a-f]{40,64}$",
       "title": "Control Commit",
@@ -130,6 +135,7 @@
     "envelope_sha256",
     "projection_version",
     "sanitizer_version",
+    "execution_profile_sha256",
     "harbor_bundle_manifest_sha256s",
     "harbor_archive_sha256s",
     "tables"

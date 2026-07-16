@@ -190,6 +190,26 @@ def _reader() -> RecordingEvidence:
                 "run_id": "run-mutation",
                 "cell_digest": "sha256:" + "d" * 64,
                 "attempts": 1,
+                "model": {
+                    "id": "model-mutation",
+                    "repo": "org/model",
+                    "revision": "a" * 40,
+                    "weights": {"format": "safetensors"},
+                },
+                "deployment": {
+                    "id": "deployment-mutation",
+                    "provider": "hf-inference-endpoints",
+                    "hardware": "h100",
+                    "accelerator_count": 1,
+                    "region": "aws-us-east-1",
+                    "engine": {"name": "test", "image": "test:latest"},
+                },
+                "agent": {
+                    "id": "agent-mutation",
+                    "name": "example-agent",
+                    "revision": "1.2.3",
+                    "revision_kind": "package",
+                },
                 "benchmark_task_digests": {
                     "task-a": "sha256:" + "1" * 64,
                     "task-z": "sha256:" + "2" * 64,
@@ -301,7 +321,7 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
     index_file = build_index_file(index_row)
 
     assert _canonical_hash(tables.model_dump(mode="json")) == (
-        "bfd7bcb1348e138e0576a777b8c8bcb7aa8e9d9154c1e095cf73f745584c41d6"
+        "92ecff1acba4fcf8e19c31469dfa0d07c773d11e9bdfa963a510b2ec2b33e03c"
     )
     assert (
         _canonical_hash(
@@ -323,15 +343,15 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
                 "index_size": len(index_file.content),
             }
         )
-        == "ed2de6f2608359794c28dcb0b4a42f47319c64ab48d329206d5cbdf2db41a34d"
+        == "87c57802f1b9bc6c675a48260f4f306aee46f896c1357d3b0705c30bfc30eb8e"
     )
     assert [_sha256(item.content) for item in publication.files] == [
-        "sha256:2d3c03441f30e2675e13c10ac88363cd6a6e04d9e6b9875a109fedbaa603f0e8",
-        "sha256:fcf10dbdb1b065c84689d4e350d1edf5b297743dfca4796df4a47bcb7e5501b2",
-        "sha256:977993819e1fd35cd2f6bba2ea1a8790b73c15b3eea5646b4d1de7e2568540c6",
-        "sha256:c159bc7f67104d8ecf0241de63c775597cabe4fbeb30c4a415daca9d66931a9f",
-        "sha256:132f1f6714bf97631bdd33ce066bfcf56953c202f42b47be3f9f255391390164",
-        "sha256:7008946a3958b4896ab8f85fb1934d5344c8a3da4b54d1490172846684a9ab97",
+        "sha256:c820a7faf8677096b52d5b4e56b5131784334520cb94789ea3068ba0e2a68264",
+        "sha256:c47034e3528c29ed336c12d8b00ff491755355970b751e11d4ca14b2cfb604d3",
+        "sha256:8d7437f3438a3fa1eed2043cec883def2d0af3324852f777570931eb7ea5c082",
+        "sha256:1240484890983421f4eb1d01f9372002dced57e8c58fb856466802f835eacf44",
+        "sha256:799a013a71abd87d9353cecafb7057e2affd21813d2887569c8fcc69708100fa",
+        "sha256:8fe2c5f3a7a0d657cbb85ce70f82e52f77ae680b66af672a0c6ad387d2585995",
     ]
 
     common = ("hf://buckets/private-evidence", SOURCE.prefix)

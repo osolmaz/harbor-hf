@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from harbor_hf.control import RetryCategory
+from harbor_hf.models import AgentProfile, DeploymentTarget, ModelProfile
 from harbor_hf.publication_envelope import (
     PUBLICATION_ENVELOPE_PATH,
     PhysicalExecutionReference,
@@ -29,6 +30,7 @@ from harbor_hf.publication_envelope import (
     SourcePublicationReference,
     canonical_digest,
     canonical_json_bytes,
+    execution_profile_digest,
     object_reference,
 )
 
@@ -442,6 +444,7 @@ class PublicationProvenance(FrozenModel):
     envelope_sha256: Digest
     projection_version: str = Field(min_length=1)
     sanitizer_version: str = Field(min_length=1)
+    execution_profile_sha256: Digest
     harbor_bundle_manifest_sha256s: list[Digest]
     harbor_archive_sha256s: list[Digest]
 
@@ -652,6 +655,7 @@ class ResultProjection(FrozenModel):
     envelope_sha256: Digest
     projection_version: str = Field(min_length=1)
     sanitizer_version: str = Field(min_length=1)
+    execution_profile_sha256: Digest
     harbor_bundle_manifest_sha256s: list[Digest]
     harbor_archive_sha256s: list[Digest]
     tables: dict[TableName, ProjectionFileReference]
@@ -682,10 +686,10 @@ def build_result_tables(
 ) -> ResultTables:
     if not _is_commit(control_commit):
         raise ValueError("control commit must be a 40- or 64-character hex digest")
-    summary, source_checksum, lock_checksum, checksums = _verify_evidence(
+    summary, lock, source_checksum, lock_checksum, checksums = _verify_evidence(
         reader, source
     )
-    provenance = _load_publication_provenance(reader, source, summary, checksums)
+    provenance = _load_publication_provenance(reader, source, summary, lock, checksums)
     trace: TraceValues = {
         "publication_id": _publication_id(
             summary.run.run_id,
@@ -866,6 +870,7 @@ def compose_result_tables(
             envelope_sha256=_sha256_bytes(envelope_bytes),
             projection_version=envelope.projection_version,
             sanitizer_version=envelope.sanitizer_version,
+            execution_profile_sha256=base.provenance.execution_profile_sha256,
             harbor_bundle_manifest_sha256s=[pair[0] for pair in source_pairs],
             harbor_archive_sha256s=[pair[1] for pair in source_pairs],
         ),
@@ -1210,17 +1215,19 @@ def _validate_composition_compatibility(
     sources: Mapping[str, ResultTables],
     base: RunRow,
 ) -> None:
+    if (
+        len({tables.provenance.execution_profile_sha256 for tables in sources.values()})
+        != 1
+    ):
+        raise ResultPublicationError("composition sources are incompatible")
     fields = (
         "benchmark_revision",
-        "model_id",
         "model_repo",
         "model_revision",
-        "deployment_id",
         "provider",
         "region",
         "hardware",
         "accelerator_count",
-        "agent_id",
         "agent_name",
         "agent_revision",
     )
@@ -1299,6 +1306,7 @@ def _build_projection_file(
         envelope_sha256=provenance.envelope_sha256,
         projection_version=provenance.projection_version,
         sanitizer_version=provenance.sanitizer_version,
+        execution_profile_sha256=provenance.execution_profile_sha256,
         harbor_bundle_manifest_sha256s=(provenance.harbor_bundle_manifest_sha256s),
         harbor_archive_sha256s=provenance.harbor_archive_sha256s,
         tables=references,
@@ -1562,7 +1570,7 @@ def catalog_parquet_schema() -> pa.Schema:
 
 def _verify_evidence(
     reader: EvidenceReader, source: EvidenceSource
-) -> tuple[ResultEvidence, str, str, dict[str, Digest]]:
+) -> tuple[ResultEvidence, dict[str, JsonValue], str, str, dict[str, Digest]]:
     paths = _verified_listing(reader, source)
     checksums = _load_checksums(reader, source)
     expected_paths = set(paths) - {"_SUCCESS", _CHECKSUMS_PATH}
@@ -1577,7 +1585,13 @@ def _verify_evidence(
     _validate_summary_tasks_against_lock(summary, lock)
     _verify_artifact_evidence(reader, source, checksums, summary.artifacts)
     source_checksum = _digest(checksums)
-    return summary, source_checksum, checksums[source.run_lock_path], checksums
+    return (
+        summary,
+        lock,
+        source_checksum,
+        checksums[source.run_lock_path],
+        checksums,
+    )
 
 
 def _validate_summary_tasks_against_lock(
@@ -1612,6 +1626,7 @@ def _load_publication_provenance(
     reader: EvidenceReader,
     source: EvidenceSource,
     summary: ResultEvidence,
+    lock: Mapping[str, JsonValue],
     checksums: Mapping[str, str],
 ) -> PublicationProvenance:
     envelope_digest = checksums.get(PUBLICATION_ENVELOPE_PATH)
@@ -1649,6 +1664,7 @@ def _load_publication_provenance(
         envelope_sha256=envelope_digest,
         projection_version=envelope.projection_version,
         sanitizer_version=envelope.sanitizer_version,
+        execution_profile_sha256=_execution_profile_from_lock(lock),
         harbor_bundle_manifest_sha256s=manifests,
         harbor_archive_sha256s=archives,
     )
@@ -1782,6 +1798,24 @@ def _load_summary_and_lock(
             "evidence summary or run lock is invalid"
         ) from error
     return summary, lock
+
+
+def _execution_profile_from_lock(lock: Mapping[str, JsonValue]) -> Digest:
+    try:
+        model = ModelProfile.model_validate(lock.get("model"))
+        deployment = TypeAdapter(DeploymentTarget).validate_python(
+            lock.get("deployment")
+        )
+        agent = AgentProfile.model_validate(lock.get("agent"))
+    except Exception as error:
+        raise ResultPublicationError(
+            "run lock omits a valid execution profile"
+        ) from error
+    return execution_profile_digest(
+        model=model,
+        deployment=deployment,
+        agent=agent,
+    )
 
 
 def _verify_artifact_evidence(

@@ -183,6 +183,44 @@ def profile_digest(value: object) -> str:
     return canonical_digest(value)
 
 
+def execution_profile_digest(
+    *, model: object, deployment: object, agent: object
+) -> str:
+    return canonical_digest(
+        {
+            "model": _profile_value(model, exclude={"id"}),
+            "deployment": _deployment_profile_value(deployment),
+            "agent": _profile_value(agent, exclude={"id"}),
+        }
+    )
+
+
+def _deployment_profile_value(value: object) -> object:
+    profile = _profile_value(value, exclude={"id"})
+    if not isinstance(profile, dict):
+        raise TypeError("deployment profile must serialize to a mapping")
+    return {
+        key: (
+            {
+                endpoint_key: endpoint_item
+                for endpoint_key, endpoint_item in item.items()
+                if endpoint_key == "served_model_name"
+            }
+            if key == "endpoint" and isinstance(item, dict)
+            else item
+        )
+        for key, item in profile.items()
+    }
+
+
+def _profile_value(value: object, *, exclude: set[str]) -> object:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json", exclude=exclude, exclude_none=True)
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if key not in exclude}
+    raise TypeError("execution profile must be a model or mapping")
+
+
 def publication_envelope_schema() -> dict[str, object]:
     return PublicationEnvelope.model_json_schema()
 

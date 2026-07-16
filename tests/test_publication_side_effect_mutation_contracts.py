@@ -99,6 +99,7 @@ def _publication() -> ResultPublication:
                 envelope_sha256="sha256:" + "7" * 64,
                 projection_version="harbor-hf/results-projection/v1",
                 sanitizer_version="harbor-hf/public-results/v1",
+                execution_profile_sha256="sha256:" + "6" * 64,
                 harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
                 harbor_archive_sha256s=["sha256:" + "9" * 64],
             ),
@@ -210,7 +211,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "648719b683b0026b668e1d3a433d3e63679b457c4793b901624c2999ef789df4"
+        "97f1613d1e264a2d254caadfe56da9bb5db12647a4d304179e5b8f7eaf670c53"
     )
 
 
