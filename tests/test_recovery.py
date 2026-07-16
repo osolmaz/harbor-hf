@@ -99,6 +99,17 @@ def _campaign(
     return lock, submitted
 
 
+def _with_locked_estimate(lock: CampaignLock, value: int) -> CampaignLock:
+    return lock.model_copy(
+        update={
+            "runs": [
+                run.model_copy(update={"estimated_wave_cost_microusd": value})
+                for run in lock.runs
+            ]
+        }
+    )
+
+
 def _event(
     lock: CampaignLock,
     sequence: int,
@@ -1066,6 +1077,7 @@ def test_spend_cap_exhausts_retryable_trials_without_another_wave(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock, submitted = _campaign(remote_spec, spend_cap_microusd=100)
+    lock = _with_locked_estimate(lock, 100)
     failure = _execution_events(
         lock,
         3,
@@ -1101,6 +1113,7 @@ def test_provisional_admission_does_not_exhaust_another_retry(
         max_trials_per_shard=1,
         spend_cap_microusd=100,
     )
+    lock = _with_locked_estimate(lock, 100)
     events = [
         submitted,
         *_execution_events(
@@ -1135,6 +1148,36 @@ def test_provisional_admission_does_not_exhaust_another_retry(
     )
 
     assert [action.kind for action in plan.actions] == ["retry-shard"]
+    assert [blocked.reason for blocked in plan.blocked] == ["spend-cap"]
+
+
+def test_mutable_estimate_cannot_irreversibly_exhaust_a_retry(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, spend_cap_microusd=150)
+    lock = _with_locked_estimate(lock, 50)
+    failure = _execution_events(
+        lock,
+        3,
+        execution_id="execution-one",
+        attempt=1,
+        category="benchmark",
+    )
+    events = [
+        submitted,
+        _wave_event(lock, 2, "active"),
+        *failure,
+        _wave_event(lock, 5, "cleaning"),
+        _wave_event(lock, 6, "closed"),
+    ]
+    digest = lock.runs[0].deployment_digest
+    context = ReconcileContext(
+        deployments={digest: DeploymentAdmission(estimated_wave_cost_microusd=100)}
+    )
+
+    _projection, plan = plan_reconciliation(lock, events, context=context)
+
+    assert plan.actions == []
     assert [blocked.reason for blocked in plan.blocked] == ["spend-cap"]
 
 

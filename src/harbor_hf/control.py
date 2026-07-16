@@ -634,6 +634,8 @@ class HubCampaignStore:
 
     def append_event(self, campaign_id: str, event: CampaignEvent) -> None:
         _validate_event_scope(campaign_id, event)
+        if event.kind == "campaign.cancel-requested":
+            raise ValueError("cancellation events require an atomic marker")
         path = _event_path(campaign_id, event.event_id)
         self._create_absent(
             path,
@@ -650,6 +652,8 @@ class HubCampaignStore:
     def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool:
         """Append an event once, adopting an identical concurrent request."""
         _validate_event_scope(campaign_id, event)
+        if event.kind == "campaign.cancel-requested":
+            return self._ensure_cancellation_event(campaign_id, event)
         path = _event_path(campaign_id, event.event_id)
         expected = event.model_dump(mode="json")
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
@@ -669,6 +673,51 @@ class HubCampaignStore:
                         )
                     ],
                     commit_message=f"chore: record {event.kind}",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def _ensure_cancellation_event(
+        self, campaign_id: str, event: CampaignEvent
+    ) -> bool:
+        event_path = _event_path(campaign_id, event.event_id)
+        marker_path = _campaign_cancellation_path(campaign_id)
+        expected = event.model_dump(mode="json")
+        marker = {"campaign_id": campaign_id, "event_id": event.event_id}
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            event_exists = self._exists(event_path, head)
+            marker_exists = self._exists(marker_path, head)
+            if event_exists != marker_exists:
+                raise ControlError("campaign cancellation state is incomplete")
+            if event_exists:
+                observed = self._read_json(event_path, head)
+                observed_marker = self._read_json(marker_path, head)
+                if not _same_event_request(observed, expected):
+                    raise CampaignConflict(f"event conflicts: {event.event_id}")
+                if observed_marker != marker:
+                    raise CampaignConflict("campaign cancellation marker conflicts")
+                return False
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=event_path,
+                            path_or_fileobj=_json_bytes(expected),
+                        ),
+                        CommitOperationAdd(
+                            path_in_repo=marker_path,
+                            path_or_fileobj=_json_bytes(marker),
+                        ),
+                    ],
+                    commit_message="chore: request campaign cancellation",
                     repo_type="dataset",
                     revision="main",
                     parent_commit=head,
@@ -729,21 +778,7 @@ class HubCampaignStore:
         return missing
 
     def _cancellation_requested(self, campaign_id: str, head: str) -> bool:
-        prefix = f"campaigns/{campaign_id}/events/"
-        paths = (
-            path
-            for path in self.api.list_repo_files(
-                self.repository,
-                repo_type="dataset",
-                revision=head,
-            )
-            if path.startswith(prefix) and path.endswith(".json")
-        )
-        return any(
-            CampaignEvent.model_validate(self._read_json(path, head)).kind
-            == "campaign.cancel-requested"
-            for path in paths
-        )
+        return self._exists(_campaign_cancellation_path(campaign_id), head)
 
     def reserve_action(
         self,
@@ -888,6 +923,10 @@ def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> boo
 
 def _campaign_request_path(campaign_id: str) -> str:
     return f"campaigns/{campaign_id}/request.yaml"
+
+
+def _campaign_cancellation_path(campaign_id: str) -> str:
+    return f"campaigns/{campaign_id}/cancellation.json"
 
 
 def _validate_event_scope(campaign_id: str, event: CampaignEvent) -> None:

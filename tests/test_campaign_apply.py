@@ -1327,14 +1327,27 @@ def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     expected_status: str,
     expected_outcome: str,
 ) -> None:
+    spec, target = _provider_spec(remote_spec)
+    target = target.model_copy(
+        update={
+            "limits": ProviderLimits(
+                max_attempts=3,
+                max_spend_usd=Decimal("0.0001"),
+                estimated_wave_cost_usd=Decimal("0.0001"),
+            )
+        }
+    )
+    spec = spec.model_copy(
+        update={"matrix": spec.matrix.model_copy(update={"deployments": [target]})}
+    )
     policy = CampaignRecoveryPolicy(spend_cap_microusd=100)
-    lock, request, submitted = _campaign(remote_spec, recovery_policy=policy)
+    lock, request, submitted = _campaign(spec, recovery_policy=policy)
     run = lock.runs[0]
     shard = run.shards[0]
     trial = shard.trials[0]
     payload = WaveLifecyclePayload(
         deployment_digest=run.deployment_digest,
-        provider="hf-inference-endpoints",
+        provider="hf-inference-providers",
         shard_ids=[shard.shard_id],
         estimated_cost_microusd=100,
     )

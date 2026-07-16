@@ -608,12 +608,15 @@ def _durable_spend_cap_blocks_retry(
         )
         if cap is not None
     ]
-    if not caps or candidate.estimated_cost_microusd is None:
+    locked_estimate = _run_admission(
+        lock, candidate.deployment_digest
+    ).estimated_wave_cost_microusd
+    if not caps or locked_estimate is None:
         return False
     durable_spend = projection.spend_microusd + sum(
         wave.estimated_cost_microusd for wave in projection.waves.values()
     )
-    return durable_spend + candidate.estimated_cost_microusd > min(caps)
+    return durable_spend + locked_estimate > min(caps)
 
 
 def _budget_reason(
