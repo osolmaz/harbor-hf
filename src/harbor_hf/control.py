@@ -943,6 +943,11 @@ def _guarded_event_payloads(
         raise ValueError("guarded event commit requires at least one event")
     for event in events:
         _validate_event_scope(campaign_id, event)
+        if event.subject_type != "trial" or event.kind not in {
+            "trial.invalid",
+            "trial.failed-infrastructure",
+        }:
+            raise ValueError("guarded batches require terminal trial events")
     expected_by_path = {
         _event_path(campaign_id, event.event_id): event.model_dump(mode="json")
         for event in events

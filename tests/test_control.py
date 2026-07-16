@@ -499,6 +499,8 @@ def test_hub_store_ensures_identical_event_once(
     assert store.ensure_event(lock.campaign_id, event)
     assert not store.ensure_event(lock.campaign_id, event)
     assert f"campaigns/{lock.campaign_id}/cancellation.json" in api.files
+    with pytest.raises(ValueError, match="terminal trial events"):
+        store.ensure_events_unless_cancelled(lock.campaign_id, [event])
     conflicting = event.model_copy(
         update={"payload": CancellationPayload(reason="different")}
     )
