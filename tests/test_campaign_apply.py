@@ -1497,7 +1497,16 @@ def test_campaign_cancellation_supersedes_reserved_spend_exhaustion(
         clock=lambda: NOW + timedelta(seconds=2),
         identifier=lambda: "3" * 32,
     )
-    events = [submitted, cancellation]
+    manual_intervention = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(message="cleanup failed"),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "4" * 32,
+    )
+    events = [submitted, cancellation, manual_intervention]
     reconciler = CampaignReconciler(
         FakeStore(lock, request, events),
         endpoints=FakeEndpoints(),

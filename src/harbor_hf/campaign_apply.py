@@ -775,12 +775,7 @@ class CampaignReconciler:
         action: ReconcileAction,
         projection: RecoveryProjection,
     ) -> str:
-        if projection.campaign.status in {
-            "cancel_requested",
-            "draining",
-            "cancelled",
-            "partial",
-        }:
+        if projection.cancel_requested_at is not None:
             raise ActionExecutionError(
                 "campaign cancellation superseded retry exhaustion"
             )
