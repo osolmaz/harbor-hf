@@ -144,6 +144,34 @@ def test_records_successful_response_usage_quota_and_latency() -> None:
     assert result.evidence.latency.time_to_first_token_ms.status == "not_applicable"
 
 
+def test_adapter_forwards_multipart_message_content() -> None:
+    content = [{"type": "text", "text": "summarize the conversation"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _JSON_OBJECT.validate_json(request.content)
+        assert payload["messages"] == [{"role": "user", "content": content}]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "summary"},
+                    }
+                ]
+            },
+        )
+
+    request = ProviderChatRequest(
+        request_id="compaction-request",
+        messages=[ProviderMessage(role="user", content=content)],
+    )
+
+    result = _adapter(handler).chat_completion(_target(), request, token="mock-token")
+
+    assert result.status == "succeeded"
+
+
 def test_explicit_provider_route_preserves_tool_request_and_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = _JSON_OBJECT.validate_json(request.content)
