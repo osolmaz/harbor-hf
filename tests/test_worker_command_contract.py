@@ -377,6 +377,94 @@ def test_provider_command_applies_locked_openclaw_request_controls(
     }
 
 
+def test_provider_command_preserves_locked_openclaw_model_capabilities(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    model = remote_spec.matrix.models[0]
+    target = ProviderTarget(
+        id="provider-contract",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        parameters={"reasoning_effort": "high", "max_tokens": 8192},
+    )
+    agent = remote_spec.matrix.agents[0].model_copy(
+        update={
+            "parameters": {
+                "openclaw_config": {
+                    "models": {
+                        "providers": {
+                            "openai": {
+                                "models": [
+                                    {
+                                        "id": model.repo,
+                                        "name": "GLM",
+                                        "contextWindow": 65536,
+                                        "contextTokens": 65536,
+                                        "maxTokens": 8192,
+                                        "reasoning": True,
+                                        "params": {"unlocked": "ignored"},
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [target], "agents": [agent]}
+            )
+        }
+    )
+    lock = build_run_lock(spec, run_id="provider-model-contract", allow_provider=True)
+    task_name = next(iter(lock.benchmark_task_digests))
+
+    request = build_execution_request(
+        lock,
+        tmp_path / "jobs",
+        "https://router.huggingface.co",
+        task_names=[task_name],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={task_name: lock.benchmark_task_digests[task_name]},
+    )
+
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    configured_agent = agents[0]
+    assert isinstance(configured_agent, dict)
+    kwargs = configured_agent["kwargs"]
+    assert isinstance(kwargs, dict)
+    configured = kwargs["openclaw_config"]
+    assert isinstance(configured, dict)
+    models = configured["models"]
+    assert isinstance(models, dict)
+    providers = models["providers"]
+    assert isinstance(providers, dict)
+    openai = providers["openai"]
+    assert isinstance(openai, dict)
+    provider_models = openai["models"]
+    assert isinstance(provider_models, list)
+    provider_model = provider_models[0]
+    assert provider_model == {
+        "id": f"{model.repo}:fireworks-ai",
+        "name": f"{model.repo}:fireworks-ai",
+        "contextWindow": 65536,
+        "contextTokens": 65536,
+        "maxTokens": 8192,
+        "reasoning": True,
+        "params": {
+            "reasoning_effort": "high",
+            "max_tokens": 8192,
+            "maxRetries": 0,
+            "timeoutMs": 60000,
+        },
+    }
+
+
 def test_provider_command_rejects_an_agent_without_request_control_support(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

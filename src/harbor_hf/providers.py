@@ -53,6 +53,8 @@ class _RawToolCall(BoundaryModel):
 class _RawMessage(BoundaryModel):
     role: Literal["assistant"] = "assistant"
     content: str | None = None
+    reasoning_content: str | None = None
+    reasoning: str | None = None
     tool_calls: list[_RawToolCall] = Field(default_factory=list)
 
 
@@ -352,6 +354,10 @@ def _message_payload(message: ProviderMessage) -> dict[str, JsonValue]:
     payload: dict[str, JsonValue] = {"role": message.role}
     if message.content is not None:
         payload["content"] = message.content
+    if message.reasoning_content is not None:
+        payload["reasoning_content"] = message.reasoning_content
+    if message.reasoning is not None:
+        payload["reasoning"] = message.reasoning
     if message.tool_call_id is not None:
         payload["tool_call_id"] = message.tool_call_id
     if message.tool_calls:
@@ -549,6 +555,8 @@ def _provider_message(value: _RawMessage) -> ProviderMessage:
     return ProviderMessage(
         role="assistant",
         content=value.content,
+        reasoning_content=value.reasoning_content,
+        reasoning=value.reasoning,
         tool_calls=[
             ProviderToolCall(
                 id=tool.id,

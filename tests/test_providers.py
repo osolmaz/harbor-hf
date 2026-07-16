@@ -162,6 +162,7 @@ def test_explicit_provider_route_preserves_tool_request_and_response() -> None:
                         "message": {
                             "role": "assistant",
                             "content": None,
+                            "reasoning_content": "I need the weather tool.",
                             "tool_calls": [
                                 {
                                     "id": "call-1",
@@ -187,6 +188,7 @@ def test_explicit_provider_route_preserves_tool_request_and_response() -> None:
     assert result.status == "succeeded"
     assert result.message is not None
     assert result.message.content is None
+    assert result.message.reasoning_content == "I need the weather tool."
     assert result.message.tool_calls[0].function_name == "get_weather"
     assert result.message.tool_calls[0].arguments == '{"city":"Paris"}'
     assert result.evidence.routing.requested_kind == "provider"

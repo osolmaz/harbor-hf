@@ -148,6 +148,7 @@ def test_proxy_request_translation_preserves_openai_tool_contract() -> None:
                 {
                     "role": "assistant",
                     "content": None,
+                    "reasoning_content": "I should call the shell tool.",
                     "tool_calls": [
                         {
                             "id": "call-one",
@@ -187,6 +188,7 @@ def test_proxy_request_translation_preserves_openai_tool_contract() -> None:
             {
                 "role": "assistant",
                 "content": None,
+                "reasoning_content": "I should call the shell tool.",
                 "tool_call_id": None,
                 "tool_calls": [
                     {
