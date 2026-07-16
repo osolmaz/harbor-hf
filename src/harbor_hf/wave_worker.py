@@ -1145,11 +1145,41 @@ def _harbor_trial_failure_category(
     category = _retry_category_from_text(exception_type)
     if category is not None:
         return category
+    if exception_type == "sandboxerror":
+        return _sandbox_failure_category(evidence_root) or "benchmark"
     if exception_type == "nonzeroagentexitcodeerror":
         return _openclaw_transport_failure_category(evidence_root) or "agent"
     if "agent" in exception_type:
         return "agent"
     return "benchmark"
+
+
+def _sandbox_failure_category(evidence_root: Path | None) -> RetryCategory | None:
+    if evidence_root is None:
+        return None
+    resolved_root = evidence_root.resolve()
+    for exception_path in sorted(evidence_root.glob("harbor-jobs/*/*/exception.txt")):
+        if not _safe_evidence_file(exception_path, resolved_root):
+            continue
+        try:
+            with exception_path.open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    category = _sandbox_exception_line_category(line.lower())
+                    if category is not None:
+                        return category
+        except OSError:
+            continue
+    return None
+
+
+def _sandbox_exception_line_category(value: str) -> RetryCategory | None:
+    if "did not become ready within" in value:
+        return "transient"
+    if "sandbox api error (429)" in value:
+        return "rate-limit"
+    if any(f"sandbox api error ({status})" in value for status in (500, 502, 503, 504)):
+        return "transient"
+    return None
 
 
 def _retry_category_from_text(value: str) -> RetryCategory | None:
