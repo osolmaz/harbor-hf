@@ -775,8 +775,16 @@ class CampaignReconciler:
         action: ReconcileAction,
         projection: RecoveryProjection,
     ) -> str:
-        if not action.trial_ids:
-            raise ActionExecutionError("spend exhaustion action has no trials")
+        if projection.campaign.status in {
+            "cancel_requested",
+            "draining",
+            "cancelled",
+            "partial",
+        }:
+            raise ActionExecutionError(
+                "campaign cancellation superseded retry exhaustion"
+            )
+        _validate_spend_exhaustion_targets(lock, action)
         for trial_id in action.trial_ids:
             trial = projection.trials.get(trial_id)
             if trial is None or trial.status not in {"retry_wait", "invalid"}:
@@ -1276,6 +1284,31 @@ _AMBIGUOUS_ENDPOINT_ERRORS = (
     AmbiguousEndpointDelete,
     EndpointVerificationTimeout,
 )
+
+
+def _validate_spend_exhaustion_targets(
+    lock: CampaignLock, action: ReconcileAction
+) -> None:
+    if not action.trial_ids:
+        raise ActionExecutionError("spend exhaustion action has no trials")
+    if action.trial_ids != action.target_ids or len(action.trial_ids) != len(
+        set(action.trial_ids)
+    ):
+        raise ActionExecutionError("spend exhaustion trial identity is malformed")
+    matched_shards: set[str] = set()
+    allowed_trials: set[str] = set()
+    for run in lock.runs:
+        if run.deployment_digest != action.deployment_digest:
+            continue
+        for shard in run.shards:
+            if shard.shard_id not in action.shard_ids:
+                continue
+            matched_shards.add(shard.shard_id)
+            allowed_trials.update(trial.trial_id for trial in shard.trials)
+    if matched_shards != set(action.shard_ids) or not set(action.trial_ids).issubset(
+        allowed_trials
+    ):
+        raise ActionExecutionError("spend exhaustion targets the wrong deployment")
 
 
 def _context_with_unobserved_actions(

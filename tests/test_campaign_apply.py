@@ -1419,6 +1419,83 @@ def test_spend_exhaustion_rejects_an_empty_trial_set(
         reconciler._exhaust_trials(lock, action, project_recovery(lock, [submitted]))
 
 
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"target_ids": []}, "spend exhaustion trial identity is malformed"),
+        (
+            {"shard_ids": ["shard-unknown"]},
+            "spend exhaustion targets the wrong deployment",
+        ),
+    ],
+)
+def test_spend_exhaustion_is_bound_to_its_reserved_targets(
+    remote_spec: ExperimentSpec, update: dict[str, list[str]], message: str
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    shard = lock.runs[0].shards[0]
+    trial_id = shard.trials[0].trial_id
+    action = ReconcileAction(
+        action_id="act-" + "2" * 24,
+        action_key="2" * 24,
+        kind="exhaust-trials",
+        campaign_id=lock.campaign_id,
+        deployment_digest=lock.runs[0].deployment_digest,
+        shard_ids=[shard.shard_id],
+        trial_ids=[trial_id],
+        target_ids=[trial_id],
+    ).model_copy(update=update)
+    reconciler = CampaignReconciler(
+        FakeStore(lock, request, [submitted]),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    with pytest.raises(ActionExecutionError, match=message):
+        reconciler._exhaust_trials(lock, action, project_recovery(lock, [submitted]))
+
+
+def test_campaign_cancellation_supersedes_reserved_spend_exhaustion(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+    shard = lock.runs[0].shards[0]
+    trial_id = shard.trials[0].trial_id
+    action = ReconcileAction(
+        action_id="act-" + "2" * 24,
+        action_key="2" * 24,
+        kind="exhaust-trials",
+        campaign_id=lock.campaign_id,
+        deployment_digest=lock.runs[0].deployment_digest,
+        shard_ids=[shard.shard_id],
+        trial_ids=[trial_id],
+        target_ids=[trial_id],
+    )
+    cancellation = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="operator"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "3" * 32,
+    )
+    events = [submitted, cancellation]
+    reconciler = CampaignReconciler(
+        FakeStore(lock, request, events),
+        endpoints=FakeEndpoints(),
+        jobs=FakeJobs(),
+        action_claims=FakeClaims(),
+    )
+
+    with pytest.raises(
+        ActionExecutionError,
+        match="campaign cancellation superseded retry exhaustion",
+    ):
+        reconciler._exhaust_trials(lock, action, project_recovery(lock, events))
+
+
 def test_apply_uses_configured_clock_for_reconciliation_planning(
     remote_spec: ExperimentSpec,
 ) -> None:
