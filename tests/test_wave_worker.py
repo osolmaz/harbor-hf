@@ -135,6 +135,45 @@ def test_openclaw_structured_transport_timeout_is_retryable(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox job job-one did not "
+            "become ready within 120s.",
+            "transient",
+        ),
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox API error (503): "
+            "service unavailable",
+            "transient",
+        ),
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox API error (429): "
+            "rate limited",
+            "rate-limit",
+        ),
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox API error (400): "
+            "failed to spawn '/bin/bash': No such file or directory",
+            "benchmark",
+        ),
+    ],
+)
+def test_sandbox_failure_uses_trusted_exception_evidence(
+    tmp_path: Path, detail: str, expected: str
+) -> None:
+    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
+    exception.parent.mkdir(parents=True)
+    exception.write_text(detail, encoding="utf-8")
+    error = HarborTrialFailure("sandbox failed", "SandboxError")
+
+    assert (
+        _execution_failure_category(error, "execution", evidence_root=tmp_path)
+        == expected
+    )
+
+
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
     tmp_path: Path,
 ) -> None:
