@@ -321,7 +321,7 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
     index_file = build_index_file(index_row)
 
     assert _canonical_hash(tables.model_dump(mode="json")) == (
-        "4f696b444967aad35755d24147810aa59ef97eb0b56316a61195b37cab60cac0"
+        "6688012fbaaef438f6c77d7fb764cdc73b8b93565a9066d05e75342d6d90b1aa"
     )
     assert (
         _canonical_hash(
@@ -343,15 +343,15 @@ def test_full_result_rows_publication_and_index_have_canonical_hashes() -> None:
                 "index_size": len(index_file.content),
             }
         )
-        == "e754db4eae91999290a473ec424ebf772e3e7ce9c0b9f018ebba1ffacb44ced4"
+        == "28aaff793cb4167822afff2260b112ba1de5b3dc965b521870809edca8ec1a18"
     )
     assert [_sha256(item.content) for item in publication.files] == [
-        "sha256:e696233851f19622b78f0da9fe2c83bb53cc4a1bf73307cbe011aa9ac09a4106",
-        "sha256:d1966e8697d0458651733c360b73c50e1edb6ba76fefbc778592500868628c37",
-        "sha256:d7a5aca2795b22146dac1895bb99a758734cc2a4b281ad8cf61bc01de2aa2ee6",
-        "sha256:d42bbd06b7bd8bb921643337beb6a92da0c404b54419993a3c19d800761f57c9",
-        "sha256:ddb654e7381cefa82eb01f7d2858c06e45f277e7d583de73ad55ce0cae341def",
-        "sha256:365ba3fc5690e427f725780c4c9d08a8a9cdb0c57fc431553efa168951f99e69",
+        "sha256:711835073b17d04e384ed59fca61b5d3a2763557ba350f60f9b16f616e6def29",
+        "sha256:8396a33fc7faeead13be0523ce8abbff4e2288e40ad8013327a5f3d2e6965274",
+        "sha256:262240172ae04089b7c224bdbc13ead9915af51aa6a24bd5363f06735e82c48a",
+        "sha256:5d6ea194f2096a0bbd9ec00eb7d1dd457a0a17edbf126196d72db9fa6a93e425",
+        "sha256:2eb8b69b26e256a2a5cfbec28a97350f701b7ebdd3d2a40639bc4e7ed2d2e31e",
+        "sha256:4ff4a535174be96960abf4ce5bbb7f8f3b8d59842030d82ff44b05eeacb72f64",
     ]
 
     common = ("hf://buckets/private-evidence", SOURCE.prefix)

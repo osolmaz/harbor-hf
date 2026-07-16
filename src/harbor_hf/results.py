@@ -697,6 +697,7 @@ def build_result_tables(
             source,
             source_checksum,
             lock_checksum,
+            provenance.execution_profile_sha256,
         ),
         "run_id": summary.run.run_id,
         "source_bucket": source.bucket,
@@ -826,7 +827,12 @@ def compose_result_tables(
     selected_rows = _select_composition_rows(manifest, sources, base)
     manifest_bytes = canonical_json_bytes(manifest.model_dump(mode="json"))
     manifest_digest = _sha256_bytes(manifest_bytes)
-    trace = _composition_trace(manifest, manifest_digest, control_commit)
+    trace = _composition_trace(
+        manifest,
+        manifest_digest,
+        base.provenance.execution_profile_sha256,
+        control_commit,
+    )
     trials, executions, metrics = _compose_child_rows(manifest, selected_rows, trace)
     _require_unique_composed_rows(trials, executions, metrics)
     run = _build_composed_run(manifest, base_run, trace, trials, executions)
@@ -998,6 +1004,7 @@ def _validate_correction_trial(
 def _composition_trace(
     manifest: ResultCompositionManifest,
     manifest_digest: Digest,
+    execution_profile_sha256: Digest,
     control_commit: str,
 ) -> TraceValues:
     source = EvidenceSource(
@@ -1011,6 +1018,7 @@ def _composition_trace(
             source,
             manifest_digest,
             manifest_digest,
+            execution_profile_sha256,
         ),
         "run_id": manifest.run_id,
         "source_bucket": manifest.evidence_bucket,
@@ -1842,6 +1850,7 @@ def _publication_id(
     source: EvidenceSource,
     source_checksum: str,
     lock_checksum: str,
+    execution_profile_sha256: str,
 ) -> str:
     value = {
         "publication_contract": RESULT_PUBLICATION_CONTRACT,
@@ -1850,6 +1859,7 @@ def _publication_id(
         "source_prefix": source.prefix,
         "source_checksum": source_checksum,
         "run_lock_sha256": lock_checksum,
+        "execution_profile_sha256": execution_profile_sha256,
     }
     return f"pub-{_digest(value).removeprefix('sha256:')[:32]}"
 

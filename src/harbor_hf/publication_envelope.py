@@ -207,6 +207,12 @@ def _deployment_profile_value(value: object) -> object:
                 if endpoint_key == "served_model_name"
             }
             if key == "endpoint" and isinstance(item, dict)
+            else {
+                limit_key: limit_item
+                for limit_key, limit_item in item.items()
+                if limit_key not in {"max_spend_usd", "estimated_wave_cost_usd"}
+            }
+            if key == "limits" and isinstance(item, dict)
             else item
         )
         for key, item in profile.items()
