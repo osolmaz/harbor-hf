@@ -1247,6 +1247,45 @@ def test_faulted_history_rejects_wave_state_regression(
     assert str(captured.value) == "invalid wave transition: active -> ready"
 
 
+@pytest.mark.parametrize(
+    ("terminal_phase", "synthetic_phase", "expected"),
+    [
+        ("closed", "draining", "closed"),
+        ("closed", "cleaning", "closed"),
+        ("cleanup-failed", "draining", "cleanup_failed"),
+    ],
+)
+def test_late_terminal_evidence_supersedes_stale_reconciler_transition(
+    remote_spec: ExperimentSpec,
+    terminal_phase: str,
+    synthetic_phase: str,
+    expected: str,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    terminal = _wave_event(lock, 2, terminal_phase).model_copy(
+        update={"producer": "wave-controller"}
+    )
+    synthetic = _wave_event(lock, 3, synthetic_phase)
+
+    projection = project_recovery(lock, [submitted, terminal, synthetic])
+
+    assert projection.waves["wave-one"].status == expected
+
+
+def test_cleanup_retry_can_advance_worker_cleanup_failure(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    cleanup_failed = _wave_event(lock, 2, "cleanup-failed").model_copy(
+        update={"producer": "wave-controller"}
+    )
+    cleanup_retry = _wave_event(lock, 3, "cleaning")
+
+    projection = project_recovery(lock, [submitted, cleanup_failed, cleanup_retry])
+
+    assert projection.waves["wave-one"].status == "cleaning"
+
+
 def test_wave_transition_matrix_is_exhaustive(remote_spec: ExperimentSpec) -> None:
     lock, submitted = _campaign(remote_spec)
     allowed = {
@@ -1266,7 +1305,9 @@ def test_wave_transition_matrix_is_exhaustive(remote_spec: ExperimentSpec) -> No
             history = [
                 submitted,
                 _wave_event(lock, 2, previous),
-                _wave_event(lock, 3, current),
+                _wave_event(lock, 3, current).model_copy(
+                    update={"producer": "wave-controller"}
+                ),
             ]
             if current == previous or current in allowed[previous]:
                 projection = project_recovery(lock, history)
