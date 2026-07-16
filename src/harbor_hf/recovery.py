@@ -612,11 +612,11 @@ def _record_wave_status(
         )
         if observed != identity:
             raise ValueError("wave lifecycle identity changed")
-        if (
-            previous.status == "closed"
-            and status == "draining"
-            and event.producer == "reconciler"
-        ):
+        stale_reconciler_transition = event.producer == "reconciler" and (
+            (previous.status == "closed" and status in {"draining", "cleaning"})
+            or (previous.status == "cleanup_failed" and status == "draining")
+        )
+        if stale_reconciler_transition:
             return
         _validate_wave_transition(previous.status, status)
     waves[event.subject_id] = WaveProjection(
