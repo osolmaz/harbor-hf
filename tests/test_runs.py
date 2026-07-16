@@ -142,8 +142,11 @@ def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
         assert environment["GIT_CONFIG_VALUE_4"] == "harbor-hf"
         assert environment["GIT_TERMINAL_PROMPT"] == "0"
         assert environment["HARBOR_HF_GIT_REPOSITORY"] == "ShellBench/public-tasks"
-        assert environment["HARBOR_HF_REDACTION_SECRET_FILE"] == credential_file
+        redaction_file = environment["HARBOR_HF_REDACTION_SECRET_FILE"]
+        assert redaction_file != credential_file
+        assert Path(redaction_file).read_text(encoding="utf-8") == "github-secret\n"
     assert not os.path.exists(credential_file)
+    assert not os.path.exists(redaction_file)
 
     monkeypatch.delenv("GITHUB_TOKEN")
     with (
@@ -153,6 +156,23 @@ def test_authenticated_git_environment_uses_scoped_helper_and_redacted_secret(
         ),
     ):
         pass
+
+
+def test_harbor_environment_registers_extra_live_log_redactions(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = build_run_lock(remote_spec)
+
+    with harbor_process_environment(
+        lock,
+        token="hf-secret",
+        inference_base_url="https://route-secret.example",
+        redaction_secrets=("route-secret", "route-secret"),
+    ) as environment:
+        redaction_file = environment["HARBOR_HF_REDACTION_SECRET_FILE"]
+        assert Path(redaction_file).read_text(encoding="utf-8") == "route-secret\n"
+
+    assert not os.path.exists(redaction_file)
 
 
 def test_authenticated_git_environment_is_scoped_by_real_git(

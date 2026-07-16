@@ -194,6 +194,7 @@ def harbor_process_environment(
     token: str,
     inference_base_url: str,
     blocked_secret_names: Iterable[str] = (),
+    redaction_secrets: Iterable[str] = (),
 ) -> Iterator[dict[str, str]]:
     environment = {
         "HF_TOKEN": token,
@@ -209,8 +210,10 @@ def harbor_process_environment(
             }
         )
     blocked = set(blocked_secret_names)
+    redaction_values = [value for value in redaction_secrets if value]
     source = lock.benchmark_source
     credential_path: Path | None = None
+    redaction_path: Path | None = None
     try:
         if source is not None and source.credentials is not None:
             secret_name = source.credentials.secret_name
@@ -218,6 +221,7 @@ def harbor_process_environment(
             if not source_token:
                 raise ValueError(f"required secret {secret_name} is not available")
             blocked.add(secret_name)
+            redaction_values.append(source_token)
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -251,15 +255,35 @@ def harbor_process_environment(
                     "GIT_TERMINAL_PROMPT": "0",
                     _GIT_CREDENTIAL_FILE_ENV: str(credential_path),
                     _GIT_REPOSITORY_ENV: source.repository,
-                    _REDACTION_SECRET_FILE_ENV: str(credential_path),
                 }
             )
+        redaction_path = _write_redaction_secrets(redaction_values)
+        if redaction_path is not None:
+            environment[_REDACTION_SECRET_FILE_ENV] = str(redaction_path)
         for secret_name in blocked:
             environment[secret_name] = ""
         yield environment
     finally:
         if credential_path is not None:
             credential_path.unlink(missing_ok=True)
+        if redaction_path is not None:
+            redaction_path.unlink(missing_ok=True)
+
+
+def _write_redaction_secrets(values: list[str]) -> Path | None:
+    if not values:
+        return None
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="harbor-hf-redaction-secrets-",
+        delete=False,
+    ) as stream:
+        path = Path(stream.name)
+        os.fchmod(stream.fileno(), 0o600)
+        for value in dict.fromkeys(values):
+            stream.write(value + "\n")
+    return path
 
 
 def require_benchmark_source_secret(lock: RunLock) -> None:

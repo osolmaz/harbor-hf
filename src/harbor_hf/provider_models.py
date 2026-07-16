@@ -130,6 +130,10 @@ class ProviderToolCall(FrozenModel):
 class ProviderMessage(FrozenModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
+    reasoning_content: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    reasoning: str | None = Field(default=None, exclude_if=lambda value: value is None)
     tool_call_id: str | None = Field(default=None, min_length=1)
     tool_calls: list[ProviderToolCall] = Field(default_factory=list)
 
@@ -141,7 +145,16 @@ class ProviderMessage(FrozenModel):
             raise ValueError("only tool messages may set tool_call_id")
         if self.role != "assistant" and self.tool_calls:
             raise ValueError("only assistant messages may contain tool calls")
-        if self.content is None and not self.tool_calls:
+        if self.role != "assistant" and (
+            self.reasoning_content is not None or self.reasoning is not None
+        ):
+            raise ValueError("only assistant messages may contain reasoning")
+        if (
+            self.content is None
+            and self.reasoning_content is None
+            and self.reasoning is None
+            and not self.tool_calls
+        ):
             raise ValueError("messages require content or tool calls")
         return self
 

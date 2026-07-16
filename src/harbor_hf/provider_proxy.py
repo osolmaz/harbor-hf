@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import threading
 import zlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,9 +31,11 @@ from harbor_hf.providers import (
 
 _MAX_REQUEST_BYTES = 32 * 1024 * 1024
 _MAX_EVIDENCE_RESPONSE_BYTES = 32 * 1024 * 1024
+PROVIDER_RECORDER_PORT = 8000
 _REQUEST_SCOPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ROUTE_CAPABILITY = re.compile(r"^[A-Za-z0-9_-]{22,128}$")
 _SCOPED_COMPLETIONS = re.compile(
-    r"^/scopes/(?P<scope>[A-Za-z0-9][A-Za-z0-9._-]{0,127})/v1/chat/completions/?$"
+    r"^/scopes/(?P<capability>[A-Za-z0-9_-]{22,128})/v1/chat/completions/?$"
 )
 _FORWARDED_RESPONSE_HEADERS = {
     "content-type",
@@ -74,6 +77,7 @@ class ProviderEvidenceProxy:
         token: str,
         evidence_path: Path,
         client: httpx.Client | None = None,
+        capability_factory: Callable[[], str] | None = None,
     ) -> None:
         if not token:
             raise ValueError("provider proxy token must not be empty")
@@ -81,16 +85,22 @@ class ProviderEvidenceProxy:
         self.token = token
         self.evidence_path = evidence_path
         self.client = client or httpx.Client(headers={"Accept-Encoding": "identity"})
+        self.capability_factory = capability_factory or (
+            lambda: secrets.token_urlsafe(32)
+        )
         self._owns_client = client is None
         self._lock = threading.Lock()
         self._attempts: dict[tuple[str, str], int] = {}
+        self._scopes: dict[str, str] = {}
         self._request_counter = 0
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
-    def start(self) -> str:
+    def start(self, *, host: str, port: int) -> str:
         if self._server is not None:
             raise ProviderProxyError("provider evidence proxy is already running")
+        if not host or port < 0 or port > 65535:
+            raise ValueError("provider evidence proxy bind address is invalid")
         proxy = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -99,12 +109,15 @@ class ProviderEvidenceProxy:
             def do_POST(self) -> None:
                 proxy._handle(self)
 
+            def do_GET(self) -> None:
+                proxy._handle_health(self)
+
             def log_message(self, format: str, *args: object) -> None:
                 del format, args
 
         self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
         self.evidence_path.touch(exist_ok=True)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = ThreadingHTTPServer((host, port), Handler)
         thread = threading.Thread(
             target=server.serve_forever,
             name="harbor-hf-provider-proxy",
@@ -113,30 +126,74 @@ class ProviderEvidenceProxy:
         self._server = server
         self._thread = thread
         thread.start()
-        host, port = server.server_address[:2]
-        return f"http://{host}:{port}"
+        bound_host = str(server.server_address[0])
+        bound_port = int(server.server_address[1])
+        return f"http://{bound_host}:{bound_port}"
 
     def close(self) -> None:
         server = self._server
         thread = self._thread
-        if server is None or thread is None:
-            return
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-        self._server = None
-        self._thread = None
+        if server is not None and thread is not None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            self._server = None
+            self._thread = None
+        with self._lock:
+            self._scopes.clear()
+            self._attempts.clear()
         if self._owns_client:
             self.client.close()
 
-    @staticmethod
-    def scoped_base_url(base_url: str, scope: str) -> str:
+    def register_scope(self, scope: str) -> str:
         if not _REQUEST_SCOPE.fullmatch(scope):
             raise ValueError("provider request scope is invalid")
-        return f"{base_url.rstrip('/')}/scopes/{scope}"
+        for _attempt in range(8):
+            capability = self.capability_factory()
+            if not _ROUTE_CAPABILITY.fullmatch(capability):
+                raise ProviderProxyError("provider route capability is invalid")
+            with self._lock:
+                if capability not in self._scopes:
+                    self._scopes[capability] = scope
+                    return capability
+        raise ProviderProxyError("provider route capability generation collided")
+
+    def revoke_scope(self, capability: str) -> None:
+        with self._lock:
+            scope = self._scopes.pop(capability, None)
+            if scope is None:
+                return
+            self._attempts = {
+                key: attempt
+                for key, attempt in self._attempts.items()
+                if key[0] != scope
+            }
+
+    @staticmethod
+    def capability_digest(capability: str) -> str:
+        if not _ROUTE_CAPABILITY.fullmatch(capability):
+            raise ValueError("provider route capability is invalid")
+        return "sha256:" + hashlib.sha256(capability.encode()).hexdigest()
+
+    @staticmethod
+    def scoped_base_url(base_url: str, capability: str) -> str:
+        if not _ROUTE_CAPABILITY.fullmatch(capability):
+            raise ValueError("provider route capability is invalid")
+        return f"{base_url.rstrip('/')}/scopes/{capability}"
+
+    def _handle_health(self, handler: BaseHTTPRequestHandler) -> None:
+        if handler.path.rstrip("/") != "/healthz":
+            self._send_json(handler, 404, {"error": "unsupported provider route"})
+            return
+        self._send_json(handler, 200, {"status": "ok"})
 
     def _handle(self, handler: BaseHTTPRequestHandler) -> None:
-        scope = _request_scope(handler.path)
+        capability = _route_capability(handler.path)
+        if capability is None:
+            self._send_json(handler, 404, {"error": "unsupported provider route"})
+            return
+        with self._lock:
+            scope = self._scopes.get(capability)
         if scope is None:
             self._send_json(handler, 404, {"error": "unsupported provider route"})
             return
@@ -408,9 +465,9 @@ def _json_object(content: bytes) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], value)
 
 
-def _request_scope(path: str) -> str | None:
+def _route_capability(path: str) -> str | None:
     matched = _SCOPED_COMPLETIONS.fullmatch(path)
-    return matched.group("scope") if matched is not None else None
+    return matched.group("capability") if matched is not None else None
 
 
 def _relay_response(

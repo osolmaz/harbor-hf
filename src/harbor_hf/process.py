@@ -89,9 +89,9 @@ def run_streaming(
     )
     redaction_file = environment.get(_REDACTION_SECRET_FILE_ENV, "")
     if redaction_file:
-        value = Path(redaction_file).read_bytes()
-        if value:
-            secret_values.append(value)
+        secret_values.extend(
+            value for value in Path(redaction_file).read_bytes().splitlines() if value
+        )
     with log_path.open("w", encoding="utf-8") as log:  # pragma: no mutate
         process = subprocess.Popen(
             command,

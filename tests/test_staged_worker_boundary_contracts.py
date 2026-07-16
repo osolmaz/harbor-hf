@@ -263,6 +263,7 @@ def test_staged_provider_wave_finalizes_then_publishes_exact_success(
     campaign_root = tmp_path / "stage" / campaign.artifact_prefix
     output_root = tmp_path / "output"
     calls: list[tuple[object, ...]] = []
+    shard_kwargs: dict[str, object] = {}
     proxy = object()
     checksums = {"shard-z": "sha256:z", "shard-a": "sha256:a"}
 
@@ -276,8 +277,9 @@ def test_staged_provider_wave_finalizes_then_publishes_exact_success(
         calls.append(("transport", *args))
         return "http://127.0.0.1:4321", proxy
 
-    def execute_shards(*args: object) -> dict[str, str]:
+    def execute_shards(*args: object, **kwargs: object) -> dict[str, str]:
         calls.append(("shards", *args))
+        shard_kwargs.update(kwargs)
         return checksums
 
     def cleanup(lifecycle: object, provider_proxy: object) -> None:
@@ -337,6 +339,7 @@ def test_staged_provider_wave_finalizes_then_publishes_exact_success(
         / f"harbor-{wave.remote.harbor.source.revision}"
     )
     assert calls[4] == ("cleanup", None, proxy)
+    assert shard_kwargs == {"provider_proxy": proxy}
     assert calls[5] == ("finalize", wave_root, "contract-token", False)
     assert calls[6] == (
         "publish",

@@ -155,13 +155,17 @@ The private run lock preserves the selected model-profile revision, while the
 published `model_revision` is `not_observed`. Never present it as equivalent to
 an endpoint run whose served revision was verified.
 
-The remote wave controller starts a loopback OpenAI-compatible evidence proxy.
-OpenClaw sends its normal requests to that local address; the proxy forwards
-them to HF Inference Providers and writes `provider-requests.jsonl`. Each row
+The remote wave controller owns an OpenAI-compatible evidence recorder. The
+production transport exposes it through authenticated HF Job ingress so agents
+running in separate Harbor Sandboxes can reach it. OpenClaw sends its normal
+requests to an opaque trial-scoped route; the recorder forwards them
+to HF Inference Providers and writes `provider-requests.jsonl`. Each row
 contains typed request metadata, response routing and quota headers, retry
 attempt, usage, and latency. It never stores prompts, tool arguments, response
-text, or credentials. The proxy is part of the hosted controller Job and does
-not run inference itself.
+text, or credentials. The recorder is part of the hosted controller Job and
+does not run inference itself. The
+[provider evidence recorder plan](provider-evidence-recorder-plan.md) defines
+the implementation, isolation, verification, and cutover requirements.
 
 A provider spend cap requires an explicit `estimated_wave_cost_usd` in the
 same provider limits block. The reconciler reserves that estimate while a wave

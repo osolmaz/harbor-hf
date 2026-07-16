@@ -122,6 +122,10 @@ class _WaveClaims:
 def wave_worker_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JOB_ID", "test-wave-job")
     monkeypatch.setattr(
+        "harbor_hf.wave_worker._wait_for_provider_recorder",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
         "harbor_hf.wave_worker.HubClaimStore",
         lambda *_args, **_kwargs: _WaveClaims(),
     )

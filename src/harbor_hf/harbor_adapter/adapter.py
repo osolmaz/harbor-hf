@@ -421,6 +421,9 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
             "OpenClaw OpenAI provider configuration must be a JSON object"
         )
     routed_model = routed_provider_model(target)
+    model_template = _openclaw_provider_model_template(
+        provider, requested_model=target.model, routed_model=routed_model
+    )
     request_parameters = dict(target.parameters)
     request_parameters.update(
         {
@@ -434,6 +437,7 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
             "timeoutSeconds": math.ceil(target.timeout_seconds),
             "models": [
                 {
+                    **model_template,
                     "id": routed_model,
                     "name": routed_model,
                     "params": request_parameters,
@@ -443,6 +447,33 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
     )
     parameters["openclaw_config"] = config
     return parameters
+
+
+def _openclaw_provider_model_template(
+    provider: dict[str, JsonValue], *, requested_model: str, routed_model: str
+) -> dict[str, JsonValue]:
+    configured = provider.get("models", [])
+    if not isinstance(configured, list):
+        raise WorkerError("OpenClaw provider models configuration must be a list")
+    if not configured:
+        return {}
+    if not all(isinstance(model, dict) for model in configured):
+        raise WorkerError("OpenClaw provider model configuration must be an object")
+    matches = [
+        model
+        for model in configured
+        if model.get("id") in {requested_model, routed_model}
+    ]
+    if not matches and len(configured) == 1:
+        matches = configured
+    if len(matches) != 1:
+        raise WorkerError(
+            "OpenClaw provider configuration must identify exactly one model template"
+        )
+    template = deepcopy(matches[0])
+    for key in ("id", "name", "params"):
+        template.pop(key, None)
+    return template
 
 
 def _write_new(path: Path, content: bytes) -> None:

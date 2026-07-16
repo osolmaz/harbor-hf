@@ -166,7 +166,11 @@ the migration to a stable Harbor-owned protocol. The
 [Harbor-native result publication plan](docs/harbor-native-result-publication.md)
 defines the hard cutover from duplicated result models to canonical Harbor
 bundles, a minimal Hugging Face execution envelope, and rebuildable query
-projections. The [field ownership inventory](docs/result-field-ownership.md)
+projections. The
+[provider evidence recorder plan](docs/provider-evidence-recorder-plan.md)
+defines the secure transport that connects provider-backed HF Jobs to agents
+running in separate Harbor Sandboxes. The
+[field ownership inventory](docs/result-field-ownership.md)
 records each projected value's authority, and checked-in JSON Schemas under
 [`schemas/`](schemas/) define the single canonical publication contract under
 the `v1` identifier. The
