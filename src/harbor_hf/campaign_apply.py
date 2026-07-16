@@ -787,7 +787,11 @@ class CampaignReconciler:
         _validate_spend_exhaustion_targets(lock, action)
         for trial_id in action.trial_ids:
             trial = projection.trials.get(trial_id)
-            if trial is None or trial.status not in {"retry_wait", "invalid"}:
+            if trial is None or trial.status not in {
+                "retry_wait",
+                "invalid",
+                "failed_infrastructure",
+            }:
                 raise ActionExecutionError(
                     f"spend exhaustion target is not retryable: {trial_id}"
                 )

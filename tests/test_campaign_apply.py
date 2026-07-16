@@ -1389,14 +1389,15 @@ def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     )
 
     identifiers = itertools.count(20)
-    result = CampaignReconciler(
+    reconciler = CampaignReconciler(
         store,
         endpoints=FakeEndpoints(),
         jobs=FakeJobs(),
         action_claims=FakeClaims(),
         clock=lambda: NOW + timedelta(hours=1),
         identifier=lambda: f"{next(identifiers):032x}",
-    ).apply_campaign(lock.campaign_id, context=context)
+    )
+    result = reconciler.apply_campaign(lock.campaign_id, context=context)
 
     assert [(item.kind, item.status) for item in result.applied] == [
         ("exhaust-trials", "succeeded")
@@ -1404,6 +1405,10 @@ def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     projection = project_recovery(lock, store.events)
     assert projection.trials[trial.trial_id].status == expected_status
     assert projection.trials[trial.trial_id].outcome == expected_outcome
+    assert (
+        reconciler._exhaust_trials(lock, result.plan.actions[0], projection)
+        == result.plan.actions[0].action_id
+    )
 
 
 def test_spend_exhaustion_rejects_an_empty_trial_set(
