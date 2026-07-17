@@ -103,6 +103,7 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
         profile_timeout_seconds=plan.profile_timeout_seconds,
         estimated_profile_cost_usd=plan.estimated_profile_cost_usd,
         sample_task_count=plan.workload.sample_task_count,
+        sample_task_names=plan.workload.sample_task_names,
         objective=plan.objective,
     )
     if rebuilt != plan:
@@ -943,7 +944,7 @@ def _sample_tasks(plan: ProfilePlan) -> dict[str, str]:
     digests = plan.benchmark.get("task_digests")
     if not isinstance(digests, dict):
         raise ProfileWorkerError("profile benchmark has no resolved task digests")
-    selected = sorted(digests)[: plan.workload.sample_task_count]
+    selected = plan.workload.sample_task_names
     tasks = {
         task: digest for task in selected if isinstance(digest := digests[task], str)
     }

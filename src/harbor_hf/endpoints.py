@@ -401,7 +401,7 @@ def served_model_name(
     model: ModelProfile,
 ) -> str:
     arguments = deployment.engine.arguments
-    for option in ("--served-model-name", "--model"):
+    for option in ("--served-model-name", "--alias", "-a", "--model"):
         try:
             index = arguments.index(option)
         except ValueError:

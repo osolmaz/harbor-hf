@@ -12,6 +12,7 @@
     "max_output_tokens": 8192,
     "reasoning_required": true,
     "sample_task_count": 8,
+    "sample_task_names": ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f", "task-g", "task-h"],
     "sample_tasks_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
   },
   "objective": {
@@ -21,6 +22,7 @@
   "workload": {
     "kind": "benchmark",
     "sample_task_count": 8,
+    "sample_task_names": ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f", "task-g", "task-h"],
     "sample_tasks_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "minimum_observations_per_point": 8,
     "boundary_repetitions": 3

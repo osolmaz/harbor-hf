@@ -63,6 +63,14 @@
           "title": "Sample Task Count",
           "type": "integer"
         },
+        "sample_task_names": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Sample Task Names",
+          "type": "array"
+        },
         "sample_tasks_sha256": {
           "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Sample Tasks Sha256",
@@ -84,6 +92,7 @@
         "max_output_tokens",
         "reasoning_required",
         "sample_task_count",
+        "sample_task_names",
         "sample_tasks_sha256"
       ],
       "title": "ProfileIdentity",
@@ -555,6 +564,14 @@
           "title": "Sample Task Count",
           "type": "integer"
         },
+        "sample_task_names": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Sample Task Names",
+          "type": "array"
+        },
         "sample_tasks_sha256": {
           "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Sample Tasks Sha256",
@@ -563,6 +580,7 @@
       },
       "required": [
         "sample_task_count",
+        "sample_task_names",
         "sample_tasks_sha256"
       ],
       "title": "ProfileWorkload",

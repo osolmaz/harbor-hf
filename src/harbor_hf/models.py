@@ -335,6 +335,7 @@ class ServingProfileBinding(StrictModel):
     max_output_tokens: int = Field(ge=1)
     reasoning_required: bool
     sample_task_count: int = Field(ge=1)
+    sample_task_names: list[TaskName] = Field(min_length=1)
     sample_tasks_sha256: ContentDigest
 
 
@@ -492,9 +493,19 @@ def _validate_binding_identity(
             raise ValueError(f"serving profile {field} does not match the experiment")
     if binding.reasoning_required != spec.execution.reasoning_required:
         raise ValueError("serving profile reasoning mode does not match execution")
-    sampled_tasks = sorted(spec.benchmark.task_digests)[: binding.sample_task_count]
+    _validate_binding_sample(spec, binding)
+
+
+def _validate_binding_sample(
+    spec: ExperimentSpec, binding: ServingProfileBinding
+) -> None:
+    sampled_tasks = binding.sample_task_names
     if len(sampled_tasks) != binding.sample_task_count:
-        raise ValueError("serving profile sample count exceeds benchmark tasks")
+        raise ValueError("serving profile sample count does not match its task names")
+    if len(sampled_tasks) != len(set(sampled_tasks)):
+        raise ValueError("serving profile sampled task names must be unique")
+    if any(task not in spec.benchmark.task_digests for task in sampled_tasks):
+        raise ValueError("serving profile sample contains an unknown benchmark task")
     sample_digest = _canonical_profile_digest(
         {task: spec.benchmark.task_digests[task] for task in sampled_tasks}
     )

@@ -25,7 +25,11 @@ from harbor_hf.harbor_adapter.validation import (
     load_compatibility_bundle,
     validate_compatibility_bundle,
 )
-from harbor_hf.models import DeploymentProfile, pinned_harbor_dataset_reference
+from harbor_hf.models import (
+    DeploymentProfile,
+    DeploymentTarget,
+    pinned_harbor_dataset_reference,
+)
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock
@@ -448,15 +452,25 @@ def _expected_agent_version(lock: RunLock) -> str:
 def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
     parameters = deepcopy(lock.agent.parameters)
     target = lock.deployment
-    if not isinstance(target, ProviderTarget):
-        return parameters
     if lock.agent.name != "openclaw":
-        raise WorkerError(
-            "Inference Provider request controls require the OpenClaw Harbor agent"
-        )
+        if isinstance(target, ProviderTarget):
+            raise WorkerError(
+                "Inference Provider request controls require the OpenClaw Harbor agent"
+            )
+        return parameters
+    if not isinstance(target, ProviderTarget) and "openclaw_config" not in parameters:
+        return parameters
+    return _effective_openclaw_agent_parameters(lock, parameters, target)
+
+
+def _effective_openclaw_agent_parameters(
+    lock: RunLock,
+    parameters: dict[str, JsonValue],
+    target: DeploymentTarget,
+) -> dict[str, JsonValue]:
     existing = parameters.get("openclaw_config", {})
     if not isinstance(existing, dict):
-        raise WorkerError("OpenClaw provider configuration must be a JSON object")
+        raise WorkerError("OpenClaw configuration must be a JSON object")
     config = deepcopy(existing)
     models = config.setdefault("models", {})
     if not isinstance(models, dict):
@@ -469,10 +483,30 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
         raise WorkerError(
             "OpenClaw OpenAI provider configuration must be a JSON object"
         )
-    routed_model = routed_provider_model(target)
-    model_template = _openclaw_provider_model_template(
-        provider, requested_model=target.model, routed_model=routed_model
+    routed_model = (
+        routed_provider_model(target)
+        if isinstance(target, ProviderTarget)
+        else _served_model_name(lock)
     )
+    model_template = _openclaw_provider_model_template(
+        provider, requested_model=lock.model.repo, routed_model=routed_model
+    )
+    if not isinstance(target, ProviderTarget):
+        provider.update(
+            {
+                "api": "openai-completions",
+                "models": [
+                    {
+                        **model_template,
+                        "id": routed_model,
+                        "name": routed_model,
+                    }
+                ],
+            }
+        )
+        _set_openclaw_primary_model(config, routed_model)
+        parameters["openclaw_config"] = config
+        return parameters
     request_parameters = dict(target.parameters)
     request_parameters.update(
         {
@@ -496,6 +530,21 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
     )
     parameters["openclaw_config"] = config
     return parameters
+
+
+def _set_openclaw_primary_model(config: dict[str, JsonValue], model_name: str) -> None:
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        raise WorkerError("OpenClaw agents configuration must be a JSON object")
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise WorkerError("OpenClaw agent defaults must be a JSON object")
+    selected = f"openai/{model_name}"
+    for key in ("model", "pdfModel"):
+        value = defaults.setdefault(key, {})
+        if not isinstance(value, dict):
+            raise WorkerError(f"OpenClaw {key} configuration must be a JSON object")
+        value["primary"] = selected
 
 
 def _openclaw_provider_model_template(

@@ -28,6 +28,7 @@ from harbor_hf.endpoints import (
     effective_configuration_mismatches,
     managed_endpoint_identity,
     require_paused_zero_ready,
+    served_model_name,
     verify_exact_endpoint,
 )
 from harbor_hf.models import DeploymentProfile, EndpointRef, ExperimentSpec
@@ -168,6 +169,31 @@ def test_builds_complete_deterministic_desired_endpoint(
         "region": "us-east-1",
         "account_id": "account-one",
     }
+
+
+@pytest.mark.parametrize("alias_flag", ["--alias", "-a"])
+def test_llama_cpp_alias_defines_served_model_name(
+    remote_spec: ExperimentSpec, alias_flag: str
+) -> None:
+    model = remote_spec.matrix.models[0]
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(
+        update={
+            "engine": deployment.engine.model_copy(
+                update={
+                    "arguments": [
+                        "-m",
+                        "/repository/model.gguf",
+                        alias_flag,
+                        "/repository",
+                    ]
+                }
+            )
+        }
+    )
+
+    assert served_model_name(deployment, model) == "/repository"
 
 
 def test_deployment_digest_ignores_labels_and_prebound_endpoint_name(

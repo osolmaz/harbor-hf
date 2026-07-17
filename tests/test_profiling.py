@@ -833,6 +833,54 @@ def test_provider_profile_uses_distinct_tasks_at_maximum_concurrency(
     assert low_attempts == high_attempts == 1
 
 
+def test_provider_profile_uses_explicit_compatible_task_cohort(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(max_concurrent_requests=2),
+    )
+    spec = profiled_provider_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"deployments": [provider]}
+                ),
+            }
+        )
+    )
+    task_digests = spec.benchmark.task_digests
+    compatible = [
+        "provider-task-00",
+        "provider-task-02",
+        "provider-task-04",
+        "provider-task-05",
+        "provider-task-06",
+        "provider-task-07",
+        "provider-task-08",
+        "provider-task-09",
+    ]
+
+    resolved = build_profile_plan(
+        spec,
+        profile_id="compatible-provider-profile",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="25",
+        profile_timeout_seconds=5400,
+        sample_task_names=compatible,
+    )
+
+    assert resolved.workload.sample_task_names == compatible
+    assert resolved.identity.sample_task_names == compatible
+    assert _point_workload(resolved, 2) == (
+        {task: task_digests[task] for task in compatible},
+        1,
+    )
+
+
 def test_profile_without_endpoint_gets_deterministic_managed_binding(
     remote_spec: ExperimentSpec,
 ) -> None:

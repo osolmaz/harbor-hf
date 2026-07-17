@@ -48,7 +48,16 @@ class ProfileIdentity(FrozenModel):
     max_output_tokens: int = Field(ge=1)
     reasoning_required: bool
     sample_task_count: int = Field(ge=1)
+    sample_task_names: list[str] = Field(min_length=1)
     sample_tasks_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def sample_names_match_count(self) -> ProfileIdentity:
+        if len(self.sample_task_names) != self.sample_task_count:
+            raise ValueError("profile sample count does not match its task names")
+        if len(self.sample_task_names) != len(set(self.sample_task_names)):
+            raise ValueError("profile sampled task names must be unique")
+        return self
 
 
 class ProfileObjective(FrozenModel):
@@ -62,9 +71,18 @@ class ProfileObjective(FrozenModel):
 class ProfileWorkload(FrozenModel):
     kind: Literal["benchmark"] = "benchmark"
     sample_task_count: int = Field(ge=1)
+    sample_task_names: list[str] = Field(min_length=1)
     sample_tasks_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     minimum_observations_per_point: int = Field(default=8, ge=8)
     boundary_repetitions: int = Field(default=3, ge=3)
+
+    @model_validator(mode="after")
+    def sample_names_match_count(self) -> ProfileWorkload:
+        if len(self.sample_task_names) != self.sample_task_count:
+            raise ValueError("profile workload count does not match its task names")
+        if len(self.sample_task_names) != len(set(self.sample_task_names)):
+            raise ValueError("profile workload task names must be unique")
+        return self
 
 
 class ProfileArtifacts(FrozenModel):
@@ -240,6 +258,7 @@ def build_profile_plan(
     profile_timeout_seconds: int,
     estimated_profile_cost_usd: str | None = None,
     sample_task_count: int = 8,
+    sample_task_names: list[str] | None = None,
     objective: ProfileObjective | None = None,
 ) -> ProfilePlan:
     cells = resolved_cells(spec)
@@ -257,8 +276,6 @@ def build_profile_plan(
         raise ValueError(
             "profile concurrency exceeds the provider request concurrency limit"
         )
-    if isinstance(deployment, ProviderTarget):
-        sample_task_count = max(sample_task_count, 2 * max(candidate_concurrency))
     max_spend_usd = str(spend_cap)
     profile_cost_estimate = _profile_cost_estimate(
         deployment,
@@ -270,14 +287,13 @@ def build_profile_plan(
         raise ValueError(
             "profile planning requires execution context and output token limits"
         )
-    tasks = sorted(spec.benchmark.task_digests)
-    if not tasks:
-        raise ValueError("profile planning requires resolved benchmark task digests")
-    sampled = tasks[: min(sample_task_count, len(tasks))]
-    if isinstance(deployment, ProviderTarget) and len(sampled) < sample_task_count:
-        raise ValueError(
-            "provider profiling requires enough distinct tasks for maximum concurrency"
-        )
+    sampled = _profile_sample_tasks(
+        spec,
+        deployment,
+        candidate_concurrency,
+        sample_task_count,
+        sample_task_names,
+    )
     benchmark = spec.benchmark.model_dump(mode="json", exclude_none=True)
     assert spec.remote is not None
     sample_tasks_sha256 = canonical_digest(
@@ -293,10 +309,12 @@ def build_profile_plan(
         max_output_tokens=output,
         reasoning_required=spec.execution.reasoning_required,
         sample_task_count=len(sampled),
+        sample_task_names=sampled,
         sample_tasks_sha256=sample_tasks_sha256,
     )
     workload = ProfileWorkload(
         sample_task_count=len(sampled),
+        sample_task_names=sampled,
         sample_tasks_sha256=sample_tasks_sha256,
     )
     artifacts = ProfileArtifacts(
@@ -336,6 +354,41 @@ def build_profile_plan(
             **core,
         }
     )
+
+
+def _profile_sample_tasks(
+    spec: ExperimentSpec,
+    deployment: DeploymentTarget,
+    candidate_concurrency: list[int],
+    sample_task_count: int,
+    sample_task_names: list[str] | None,
+) -> list[str]:
+    tasks = sorted(spec.benchmark.task_digests)
+    if not tasks:
+        raise ValueError("profile planning requires resolved benchmark task digests")
+    minimum = (
+        max(8, 2 * max(candidate_concurrency))
+        if isinstance(deployment, ProviderTarget)
+        else 1
+    )
+    if sample_task_names is None:
+        requested = max(sample_task_count, minimum)
+        sampled = tasks[: min(requested, len(tasks))]
+    else:
+        sampled = sorted(sample_task_names)
+        if len(sampled) != len(set(sampled)):
+            raise ValueError("profile sampled task names must be unique")
+        unknown = sorted(set(sampled) - set(tasks))
+        if unknown:
+            raise ValueError(
+                "profile sample contains unknown benchmark tasks: " + ", ".join(unknown)
+            )
+    if len(sampled) < minimum:
+        raise ValueError(
+            "provider profiling requires at least eight tasks and twice the "
+            "maximum concurrency in distinct sampled tasks"
+        )
+    return sampled
 
 
 def _profile_cost_estimate(

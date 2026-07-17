@@ -25,6 +25,7 @@ runs benchmark tasks on the operator machine.
     "max_output_tokens": 8192,
     "reasoning_required": true,
     "sample_task_count": 8,
+    "sample_task_names": ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f", "task-g", "task-h"],
     "sample_tasks_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
   },
   "objective": {
@@ -34,6 +35,7 @@ runs benchmark tasks on the operator machine.
   "workload": {
     "kind": "benchmark",
     "sample_task_count": 8,
+    "sample_task_names": ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f", "task-g", "task-h"],
     "sample_tasks_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "minimum_observations_per_point": 8,
     "boundary_repetitions": 3
@@ -64,9 +66,12 @@ template, reasoning parser, sampling, caching, and speculative decoding.
 The deployment digest excludes the endpoint resource reference. A managed
 endpoint receives its deterministic name only after planning, and that
 transient address must not change the serving configuration identity.
-`harbor_runtime_sha256`, reasoning mode, sample count, and sampled-task digest
-bind the selected concurrency to the exact Harbor client runtime and benchmark
-workload used to measure it.
+`harbor_runtime_sha256`, reasoning mode, exact sampled task names, and the
+sampled-task digest bind the selected concurrency to the exact Harbor client
+runtime and benchmark workload used to measure it. Plans may choose an explicit
+cohort when some benchmark tasks require sandbox capabilities unavailable on
+the profiling backend. That cohort is immutable evidence, not a runtime skip
+list.
 
 `benchmark_sha256` covers the benchmark revision, task digests, and the sampled
 workload distribution. It prevents a short synthetic sweep from being treated
