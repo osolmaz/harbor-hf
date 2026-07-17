@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/harbor-hf-logo-dark.svg">
-    <img alt="harbor-hf" src="assets/harbor-hf-logo.svg" width="440">
-  </picture>
+  <img alt="harbor-hf" src="assets/harbor-hf-logo.svg" width="440">
 </p>
 
 `harbor-hf` is a Harbor companion CLI for reproducible benchmark execution on
