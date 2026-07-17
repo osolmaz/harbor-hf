@@ -316,7 +316,9 @@ class FakeProviderApi(FakeApi):
         del repo, kwargs
         return SimpleNamespace(
             sha="a" * 40,
-            inference_provider_mapping={"fireworks-ai": {}},
+            inference_provider_mapping=[
+                SimpleNamespace(provider="fireworks-ai", status="live")
+            ],
         )
 
 
@@ -340,9 +342,10 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
     response = {
         "vendors": [
             {
+                "name": "aws",
                 "regions": [
                     {
-                        "name": deployment.region,
+                        "name": deployment.region.removeprefix("aws-"),
                         "computes": [
                             {
                                 "instanceType": deployment.hardware,
@@ -356,7 +359,7 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
                             }
                         ],
                     }
-                ]
+                ],
             }
         ]
     }
@@ -399,9 +402,10 @@ def test_managed_endpoint_preflight_uses_remote_namespace(
     response = {
         "vendors": [
             {
+                "name": "aws",
                 "regions": [
                     {
-                        "name": deployment.region,
+                        "name": deployment.region.removeprefix("aws-"),
                         "computes": [
                             {
                                 "instanceType": deployment.hardware,
@@ -415,7 +419,7 @@ def test_managed_endpoint_preflight_uses_remote_namespace(
                             }
                         ],
                     }
-                ]
+                ],
             }
         ]
     }

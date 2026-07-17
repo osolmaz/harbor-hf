@@ -68,7 +68,7 @@ def _preflight_provider(
             expand=["inferenceProviderMapping"],
         )
         mapping = getattr(model_info, "inference_provider_mapping", None)
-    providers = set(mapping or {})
+    providers = _live_provider_names(mapping)
     requested = getattr(target.routing, "provider", None)
     if requested is not None and requested not in providers:
         raise ValueError(f"requested Inference Provider is unavailable: {requested}")
@@ -168,26 +168,44 @@ def _find_compute(value: object, target: DeploymentProfile) -> dict[str, object]
         raise ValueError("endpoint compute catalog is malformed")
     catalog = cast(dict[str, object], value)
     hardware = target.hardware
-    for vendor in _dictionary_list(catalog, "vendors"):
-        for region in _dictionary_list(vendor, "regions"):
-            if region.get("name") != target.region:
-                continue
-            for compute in _dictionary_list(region, "computes"):
-                instance_type = compute.get("instanceType")
-                normalized_hardware = (
-                    instance_type.removeprefix("nvidia-")
-                    if isinstance(instance_type, str)
-                    else None
-                )
-                if (
-                    normalized_hardware == hardware
-                    and compute.get("numAccelerators") == target.accelerator_count
-                    and compute.get("status") == "available"
-                ):
-                    return compute
+    requested_vendor, separator, requested_region = target.region.partition("-")
+    if not separator:
+        raise ValueError("endpoint region must use vendor-region form")
+    computes = _region_computes(catalog, requested_vendor, requested_region)
+    for compute in computes:
+        if _compute_matches(compute, hardware, target.accelerator_count):
+            return compute
     raise ValueError(
         "endpoint compute is unavailable: "
         f"{target.region}/{hardware}x{target.accelerator_count}"
+    )
+
+
+def _region_computes(
+    catalog: Mapping[str, object], requested_vendor: str, requested_region: str
+) -> list[dict[str, object]]:
+    for vendor in _dictionary_list(catalog, "vendors"):
+        if vendor.get("name") != requested_vendor:
+            continue
+        for region in _dictionary_list(vendor, "regions"):
+            if region.get("name") == requested_region:
+                return _dictionary_list(region, "computes")
+    return []
+
+
+def _compute_matches(
+    compute: Mapping[str, object], hardware: str, accelerator_count: int
+) -> bool:
+    instance_type = compute.get("instanceType")
+    normalized_hardware = (
+        instance_type.removeprefix("nvidia-")
+        if isinstance(instance_type, str)
+        else None
+    )
+    return (
+        normalized_hardware == hardware
+        and compute.get("numAccelerators") == accelerator_count
+        and compute.get("status") == "available"
     )
 
 
@@ -223,3 +241,18 @@ def _dictionary_list(value: Mapping[str, object], key: str) -> list[dict[str, ob
     if not isinstance(items, list):
         raise ValueError(f"endpoint compute catalog has invalid {key}")
     return [cast(dict[str, object], item) for item in items if isinstance(item, dict)]
+
+
+def _live_provider_names(value: object) -> set[str]:
+    if isinstance(value, Mapping):
+        return {str(name) for name in value}
+    if not isinstance(value, list):
+        return set()
+    providers: set[str] = set()
+    for mapping in value:
+        provider = getattr(mapping, "provider", None)
+        status = getattr(mapping, "status", None)
+        status_value = getattr(status, "value", status)
+        if isinstance(provider, str) and status_value in {None, "live"}:
+            providers.add(provider)
+    return providers
