@@ -454,6 +454,33 @@ def test_finalize_writes_exact_run_and_campaign_evidence(
     )
 
 
+def test_seal_runs_writes_run_evidence_without_rewriting_campaign_summary(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _campaign(remote_spec)
+    run = lock.runs[0]
+    writer = _Writer()
+
+    checksums = BucketCampaignFinalizer(
+        _Reader(_finalizer_files(remote_spec, lock)), writer
+    ).seal_runs(lock, remote_spec, _projection(lock, "complete"))
+
+    base = f"{lock.artifact_prefix}/runs/{run.run_id}"
+    assert [path for _bucket, path, _content in writer.writes] == [
+        f"{base}/verification.json",
+        f"{base}/run-summary.json",
+        f"{base}/publication-envelope.v1.json",
+        f"{base}/checksums.json",
+        f"{base}/_SUCCESS",
+    ]
+    checksum_bytes = next(
+        content
+        for _bucket, path, content in writer.writes
+        if path == f"{base}/checksums.json"
+    )
+    assert checksums == {run.run_id: _sha(checksum_bytes)}
+
+
 def test_failed_trial_becomes_zero_score_terminal_evidence(
     remote_spec: ExperimentSpec,
 ) -> None:

@@ -6,9 +6,18 @@ from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict
 
+from harbor_hf.campaign_finalizer import (
+    BucketCampaignFinalizer,
+    ImmutableEvidenceWriter,
+)
 from harbor_hf.control import CampaignEvent, CampaignSnapshot
 from harbor_hf.io import load_experiment_bytes
-from harbor_hf.recovery import durable_cancellation_event, durable_shard_retry_event
+from harbor_hf.recovery import (
+    durable_cancellation_event,
+    durable_shard_retry_event,
+    project_recovery,
+    seal_partial_projection,
+)
 from harbor_hf.result_publisher import PublicationResult
 from harbor_hf.results import (
     EvidenceReader,
@@ -66,6 +75,19 @@ class CampaignPublicationReport(FrozenModel):
     control_commit: str
     dry_run: bool
     runs: list[PublishedRun]
+
+
+class SealedRun(FrozenModel):
+    run_id: str
+    source_prefix: str
+    source_checksum: str | None = None
+
+
+class CampaignSealReport(FrozenModel):
+    campaign_id: str
+    artifact_bucket: str
+    dry_run: bool
+    runs: list[SealedRun]
 
 
 class CampaignEventStore(Protocol):
@@ -226,6 +248,47 @@ def retry_campaign_shard(
         kind=event.kind,
         recorded=recorded,
         dry_run=dry_run,
+    )
+
+
+def seal_partial_campaign_runs(
+    snapshot: CampaignSnapshot,
+    *,
+    namespace: str,
+    reader: EvidenceReader,
+    writer: ImmutableEvidenceWriter | None,
+    dry_run: bool,
+) -> CampaignSealReport:
+    spec = load_experiment_bytes(
+        snapshot.request,
+        source=f"campaign {snapshot.lock.campaign_id} request",
+    )
+    if spec.remote is None or spec.remote.job.namespace != namespace:
+        raise ValueError("campaign request does not match the control namespace")
+    projection = seal_partial_projection(
+        project_recovery(snapshot.lock, snapshot.events)
+    )
+    checksums: dict[str, str] = {}
+    if not dry_run:
+        if writer is None:
+            raise ValueError("evidence writer is required outside dry-run")
+        checksums = BucketCampaignFinalizer(reader, writer).seal_runs(
+            snapshot.lock,
+            spec,
+            projection,
+        )
+    return CampaignSealReport(
+        campaign_id=snapshot.lock.campaign_id,
+        artifact_bucket=spec.artifacts.bucket,
+        dry_run=dry_run,
+        runs=[
+            SealedRun(
+                run_id=run.run_id,
+                source_prefix=f"{snapshot.lock.artifact_prefix}/runs/{run.run_id}",
+                source_checksum=checksums.get(run.run_id),
+            )
+            for run in snapshot.lock.runs
+        ],
     )
 
 

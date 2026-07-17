@@ -43,6 +43,7 @@ from harbor_hf.recovery import (
     durable_cancellation_event,
     durable_shard_retry_event,
     project_recovery,
+    seal_partial_projection,
 )
 
 NOW = datetime(2026, 7, 14, tzinfo=UTC)
@@ -473,6 +474,110 @@ def test_recorded_cancellation_keeps_normalized_retry_counts_after_reload(
     assert projection.terminal_decision.status == "cancelled"
     assert projection.terminal_decision.counts.retrying == 0
     assert projection.terminal_decision.counts.cancelled == 1
+
+
+def test_seal_partial_projection_preserves_scores_and_types_failed_retry(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec, tasks=2)
+    shard = lock.runs[0].shards[0]
+    scored_trial, failed_trial = shard.trials
+    scored = _execution_events(
+        lock, 2, execution_id="execution-scored", attempt=1, category=None
+    )
+    failed = [
+        _event(
+            lock,
+            4,
+            "execution",
+            "execution-failed",
+            "execution.started",
+            ExecutionStartedPayload(
+                trial_id=failed_trial.trial_id,
+                shard_id=shard.shard_id,
+                physical_attempt=1,
+                wave_id=None,
+            ),
+        ),
+        _event(
+            lock,
+            5,
+            "execution",
+            "execution-failed",
+            "execution.failed",
+            ExecutionOutcomePayload(
+                trial_id=failed_trial.trial_id,
+                physical_attempt=1,
+                category="benchmark",
+            ),
+        ),
+    ]
+    terminal = _event(
+        lock,
+        7,
+        "campaign",
+        lock.campaign_id,
+        "campaign.partial",
+        TerminalPayload(message="partial"),
+    )
+    projection = project_recovery(
+        lock,
+        [submitted, *scored, *failed, _cancel_event(lock, sequence=6), terminal],
+    )
+
+    sealed = seal_partial_projection(projection)
+
+    assert sealed.trials[scored_trial.trial_id].outcome == "scored"
+    assert sealed.trials[failed_trial.trial_id].status == "invalid"
+    assert sealed.trials[failed_trial.trial_id].outcome == "benchmark_failed"
+    assert sealed.runs[lock.runs[0].run_id].status == "complete"
+    assert sealed.counts.complete == 1
+    assert sealed.counts.invalid == 1
+    assert sealed.counts.retrying == 0
+
+
+def test_seal_partial_projection_rejects_all_failed_run(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock, 2, execution_id="execution-failed", attempt=1, category="benchmark"
+    )
+    terminal = _event(
+        lock,
+        5,
+        "campaign",
+        lock.campaign_id,
+        "campaign.partial",
+        TerminalPayload(message="partial"),
+    )
+    projection = project_recovery(
+        lock,
+        [submitted, *failed, _cancel_event(lock, sequence=4), terminal],
+    )
+
+    with pytest.raises(ValueError, match="at least one scored trial"):
+        seal_partial_projection(projection)
+
+
+def test_seal_partial_projection_rejects_unresolved_trial(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    terminal = _event(
+        lock,
+        3,
+        "campaign",
+        lock.campaign_id,
+        "campaign.partial",
+        TerminalPayload(message="partial"),
+    )
+    projection = project_recovery(
+        lock, [submitted, _cancel_event(lock, sequence=2), terminal]
+    )
+
+    with pytest.raises(ValueError, match="partial trial cannot be sealed"):
+        seal_partial_projection(projection)
 
 
 def test_valid_completed_trial_is_not_retried_after_reconcile_kill(

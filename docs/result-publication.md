@@ -80,6 +80,19 @@ the denominator or suppressing valid results from the rest of the run. A run is
 no valid completed trial, missing terminal evidence, or inconsistent checksums
 is not publishable as an ordinary complete result.
 
+A recorded partial campaign may be sealed explicitly after every wave is closed:
+
+```bash
+harbor-hf campaign seal CAMPAIGN_ID --namespace NAMESPACE
+```
+
+Sealing preserves scored and exhausted outcomes and converts only `retry_wait`
+trials with a verified latest failed execution into the corresponding typed
+zero-score outcome. It refuses planned, active, cancelled, unverified, or
+all-failed runs. The operation writes canonical `_SUCCESS` run evidence without
+rewriting the immutable partial campaign summary; normal result verification
+and publication remain unchanged.
+
 Each publication keeps its immutable index row. The publisher also rewrites
 consolidated power-of-two windows containing the newest 1, 2, 4, and so on up
 to 2,048 rows in the same parent-checked commit. Readers choose the smallest

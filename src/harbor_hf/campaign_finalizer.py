@@ -129,6 +129,24 @@ class BucketCampaignFinalizer:
             content=b"\n",
         )
 
+    def seal_runs(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        projection: RecoveryProjection,
+    ) -> dict[str, str]:
+        """Finalize publishable runs without rewriting campaign terminal evidence."""
+        if any(run.status != "complete" for run in projection.runs.values()):
+            raise CampaignFinalizationError("sealed projection has an incomplete run")
+        paths = self.reader.list_files(
+            bucket=spec.artifacts.bucket,
+            prefix=lock.artifact_prefix,
+        )
+        return {
+            run.run_id: self._finalize_run(lock, spec, run, paths, projection)
+            for run in lock.runs
+        }
+
     def _finalize_run(
         self,
         campaign: CampaignLock,

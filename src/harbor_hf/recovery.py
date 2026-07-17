@@ -307,6 +307,69 @@ def project_recovery(
     )
 
 
+def seal_partial_projection(projection: RecoveryProjection) -> RecoveryProjection:
+    """Convert drained retry failures into typed terminal scoring outcomes."""
+    decision = projection.terminal_decision
+    if projection.campaign.status != "partial" or decision is None:
+        raise ValueError("only a recorded partial campaign can be sealed")
+    if decision.status != "partial":
+        raise ValueError("only a recorded partial campaign can be sealed")
+    if any(wave.status != "closed" for wave in projection.waves.values()):
+        raise ValueError("partial campaign cleanup is not complete")
+
+    trials: dict[str, TrialProjection] = {}
+    for trial_id, trial in projection.trials.items():
+        if trial.status in _SCORED_TERMINAL_STATUSES:
+            trials[trial_id] = trial
+            continue
+        trials[trial_id] = _seal_retry_wait_trial(trial)
+
+    shards = _derive_shards(projection.shards, trials)
+    runs = _derive_runs(projection.runs, shards)
+    if any(run.status != "complete" for run in runs.values()):
+        raise ValueError("a sealed run requires at least one scored trial")
+    return projection.model_copy(
+        update={
+            "runs": runs,
+            "shards": shards,
+            "trials": trials,
+            "counts": _counts(trials),
+        }
+    )
+
+
+def _seal_retry_wait_trial(trial: TrialProjection) -> TrialProjection:
+    if trial.status != "retry_wait" or not trial.executions:
+        raise ValueError(f"partial trial cannot be sealed: {trial.trial_id}")
+    latest = max(
+        trial.executions.values(),
+        key=lambda execution: execution.physical_attempt,
+    )
+    if latest.status != "failed" or latest.category is None:
+        raise ValueError(f"partial trial has no failed execution: {trial.trial_id}")
+    status: TrialStatus = (
+        "invalid"
+        if latest.category in {"agent", "benchmark"}
+        else "failed_infrastructure"
+    )
+    outcome: TaskOutcome = (
+        "agent_failed"
+        if latest.category == "agent"
+        else (
+            "benchmark_failed"
+            if latest.category == "benchmark"
+            else "infrastructure_exhausted"
+        )
+    )
+    return trial.model_copy(
+        update={
+            "status": status,
+            "retry_not_before": None,
+            "outcome": outcome,
+        }
+    )
+
+
 def _apply_retry_requests(
     lock: CampaignLock,
     events: list[CampaignEvent],
