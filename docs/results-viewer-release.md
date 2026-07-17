@@ -2,21 +2,21 @@
 
 ## Canonical V1 Cutover
 
-- Source revision: `064c3081549215a6fa319a7e7f586ed8f8d4ac1d`
-- Space revision: `cb9a3c45d8fad6ea0bc94f33f08cf3245fb5d3e8`
-- Active catalog revision: `978f4cd94982e5ddfc8cddb41dcbd19d2e8e75c1`
-- Active ShellBench result revision: `836aeb589561c83aa6bcb2366beba2fdca1c0b7e`
+- Source revision: `f4c7a888859d95115a512be30406a6d88bc01fc8`
+- Space revision: `08a42a26b72fa8d051101216a599164142470319`
+- Active catalog revision: `b5fbf189b64ee63c0deaf2bb9f997e27d9378b22`
+- Active ShellBench result revision: `bb97497b1e63405d4e460892cf40a44eb4400d40`
 
-The active Dataset and Space now use only the canonical publication `v1`
-contract. The previous six rows had no canonical publication envelopes or
-verified Harbor-native bundle references, so the cutover did not convert or
-relabel them. The active catalog is empty until a new verified run is
-published.
+The active Dataset and Space use only the canonical publication `v1` contract.
+The primary catalog contains five final 115-task ShellBench evaluations. The
+audit catalog contains all 17 immutable publications: five finals, five base
+components, five correction components, and two diagnostics. Composed result
+pages link directly to their source publications.
 
 The pre-cutover Dataset and Space revisions below remain immutable and directly
-addressable for audit. Production readers do not query them. Hosted health and
-run-list API requests passed after cutover, and Chromium checks passed against
-the empty state at desktop and iPhone 13 viewport sizes.
+addressable for audit. Production readers do not query them. Hosted health,
+primary and audit lists, permanent source routes, comparison, and browser checks
+passed after cutover at desktop and mobile viewport sizes.
 
 ## Pre-Cutover Release
 
@@ -78,11 +78,11 @@ leaderboard and comparison patterns only.
 
 ## Verification
 
-- Python: 1,436 tests with 92.73% coverage.
+- Python: 1,516 tests.
 - Frontend: TypeScript and Vite production build.
 - Hosted API: health, catalog, run detail, comparison, restricted content, and
   permanent-route smoke requests.
-- Hosted browser: four Playwright tests passed on desktop Chrome and iPhone 13
+- Hosted browser: six Playwright tests passed on desktop Chrome and iPhone 13
   profiles.
 - Runtime: Space reached `RUNNING`; application startup completed cleanly.
 - Privacy: Space variables are public configuration only and the secret list is
