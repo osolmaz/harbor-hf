@@ -319,9 +319,9 @@ def test_cutover_rejects_non_scalar_execution_profile(tmp_path: Path) -> None:
     path = "projections/schema=v1/publication-one.json"
     projection = json.loads(api.snapshots[("org/results", RESULT_HEAD)][path])
     projection["execution_profile_sha256"] = ["invalid"]
-    api.snapshots[("org/results", RESULT_HEAD)][path] = json.dumps(
-        projection, sort_keys=True, separators=(",", ":")
-    ).encode() + b"\n"
+    api.snapshots[("org/results", RESULT_HEAD)][path] = (
+        json.dumps(projection, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
 
     with pytest.raises(
         CatalogCutoverError,
