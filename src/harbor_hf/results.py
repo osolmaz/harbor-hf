@@ -20,7 +20,14 @@ from pydantic import (
 )
 
 from harbor_hf.control import RetryCategory
-from harbor_hf.models import AgentProfile, DeploymentTarget, ModelProfile
+from harbor_hf.models import (
+    AgentProfile,
+    ComponentKind,
+    DeploymentTarget,
+    EvaluationId,
+    ModelProfile,
+    PublicationRole,
+)
 from harbor_hf.publication_envelope import (
     PUBLICATION_ENVELOPE_PATH,
     PhysicalExecutionReference,
@@ -46,6 +53,8 @@ OwnerType = Literal["run", "trial", "execution"]
 RuntimeKind = Literal["endpoint", "provider"]
 RunQuality = Literal["clean", "degraded"]
 ResultKind = Literal["ordinary", "composed"]
+CatalogScope = Literal["primary", "audit"]
+CatalogDecisionAction = Literal["promote", "withdraw"]
 TaskOutcome = Literal[
     "scored",
     "agent_failed",
@@ -104,6 +113,18 @@ class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class CatalogDecision(FrozenModel):
+    schema_version: Literal["harbor-hf/catalog-decision/v1"] = (
+        "harbor-hf/catalog-decision/v1"
+    )
+    decision_id: EntityId
+    publication_id: EntityId
+    action: CatalogDecisionAction
+    actor: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    created_at: AwareDatetime
+
+
 class EvidenceSource(FrozenModel):
     bucket: str = Field(min_length=1)
     prefix: str = Field(min_length=1)
@@ -121,6 +142,9 @@ class RunEvidence(FrozenModel):
     run_id: EntityId
     campaign_id: EntityId
     experiment: str = Field(min_length=1)
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
     benchmark: str = Field(min_length=1)
     benchmark_revision: str = Field(min_length=1)
     result_kind: ResultKind = "ordinary"
@@ -144,6 +168,8 @@ class RunEvidence(FrozenModel):
     def completion_follows_creation(self) -> RunEvidence:
         if self.completed_at < self.created_at:
             raise ValueError("run completion precedes creation")
+        if (self.publication_role == "component") != (self.component_kind is not None):
+            raise ValueError("run component kind conflicts with publication role")
         return self
 
 
@@ -326,6 +352,10 @@ class RunRow(TraceRow):
     schema_version: Literal["harbor-hf/results/runs/v1"] = "harbor-hf/results/runs/v1"
     campaign_id: EntityId
     experiment: str = Field(min_length=1)
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
+    source_publication_ids: list[EntityId]
     benchmark: str = Field(min_length=1)
     benchmark_revision: str = Field(min_length=1)
     result_kind: ResultKind
@@ -369,6 +399,13 @@ class RunRow(TraceRow):
             self.scored_trial_count < self.planned_trial_count
         ):
             raise ValueError("run quality conflicts with task outcome counts")
+        if (self.publication_role == "component") != (self.component_kind is not None):
+            raise ValueError("run component kind conflicts with publication role")
+        if self.publication_role == "final" and self.result_kind == "composed":
+            if not self.source_publication_ids:
+                raise ValueError("composed final result requires source publications")
+        elif self.source_publication_ids:
+            raise ValueError("only composed final results may reference publications")
         return self
 
 
@@ -486,6 +523,9 @@ class GlobalIndexRow(FrozenModel):
     publication_id: EntityId
     run_id: EntityId
     campaign_id: EntityId
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
     benchmark: str = Field(min_length=1)
     result_kind: ResultKind
     outcome: Literal["complete"]
@@ -508,6 +548,10 @@ class CatalogRow(FrozenModel):
     publication_id: EntityId
     run_id: EntityId
     campaign_id: EntityId
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
+    source_publication_ids: list[EntityId]
     benchmark: str = Field(min_length=1)
     benchmark_revision: str = Field(min_length=1)
     result_kind: ResultKind
@@ -593,6 +637,7 @@ class ResultCompositionManifest(FrozenModel):
     run_id: EntityId
     campaign_id: EntityId
     experiment: str = Field(min_length=1)
+    evaluation_id: EvaluationId
     created_at: AwareDatetime
     completed_at: AwareDatetime
     evidence_bucket: str = Field(min_length=1)
@@ -717,6 +762,10 @@ def build_result_tables(
         **trace,
         campaign_id=run_evidence.campaign_id,
         experiment=run_evidence.experiment,
+        evaluation_id=run_evidence.evaluation_id,
+        publication_role=run_evidence.publication_role,
+        component_kind=run_evidence.component_kind,
+        source_publication_ids=[],
         benchmark=run_evidence.benchmark,
         benchmark_revision=run_evidence.benchmark_revision,
         result_kind=run_evidence.result_kind,
@@ -1122,6 +1171,12 @@ def _build_composed_run(
         **trace,
         campaign_id=manifest.campaign_id,
         experiment=manifest.experiment,
+        evaluation_id=manifest.evaluation_id,
+        publication_role="final",
+        component_kind=None,
+        source_publication_ids=sorted(
+            source.publication_id for source in manifest.sources
+        ),
         benchmark=base.benchmark,
         benchmark_revision=base.benchmark_revision,
         result_kind="composed",
@@ -1242,8 +1297,12 @@ def _validate_composition_compatibility(
     )
     for reference in manifest.sources:
         run = sources[reference.publication_id].runs[0]
-        if run.result_kind != "ordinary" or any(
-            getattr(run, field) != getattr(base, field) for field in fields
+        if (
+            run.result_kind != "ordinary"
+            or run.evaluation_id != manifest.evaluation_id
+            or run.publication_role != "component"
+            or run.component_kind != reference.role
+            or any(getattr(run, field) != getattr(base, field) for field in fields)
         ):
             raise ResultPublicationError("composition sources are incompatible")
     runtime_kinds = {
@@ -1334,6 +1393,9 @@ def build_global_index_row(
         publication_id=tables.publication_id,
         run_id=run.run_id,
         campaign_id=run.campaign_id,
+        evaluation_id=run.evaluation_id,
+        publication_role=run.publication_role,
+        component_kind=run.component_kind,
         benchmark=run.benchmark,
         result_kind=run.result_kind,
         outcome=run.outcome,
@@ -1380,6 +1442,10 @@ def build_catalog_row(
         publication_id=tables.publication_id,
         run_id=run.run_id,
         campaign_id=run.campaign_id,
+        evaluation_id=run.evaluation_id,
+        publication_role=run.publication_role,
+        component_kind=run.component_kind,
+        source_publication_ids=run.source_publication_ids,
         benchmark=run.benchmark,
         benchmark_revision=run.benchmark_revision,
         result_kind=run.result_kind,
@@ -1419,11 +1485,13 @@ def build_catalog_row(
     )
 
 
-def build_catalog_window_file(rows: Sequence[CatalogRow], size: int) -> DatasetFile:
+def build_catalog_window_file(
+    rows: Sequence[CatalogRow], size: int, *, scope: CatalogScope
+) -> DatasetFile:
     if size < 1:
         raise ValueError("catalog window size must be positive")
     return DatasetFile(
-        path=f"data/catalog/schema=v1/windows/{size:04d}.parquet",
+        path=f"data/catalog/schema=v1/{scope}/windows/{size:04d}.parquet",
         content=_parquet_bytes(rows[:size], catalog_parquet_schema()),
     )
 
@@ -1591,6 +1659,14 @@ def _verify_evidence(
     summary, lock = _load_summary_and_lock(reader, source)
     if lock.get("run_id") != summary.run.run_id:
         raise ResultPublicationError("evidence summary does not match its run lock")
+    if (
+        lock.get("evaluation_id") != summary.run.evaluation_id
+        or lock.get("publication_role") != summary.run.publication_role
+        or lock.get("component_kind") != summary.run.component_kind
+    ):
+        raise ResultPublicationError(
+            "evidence publication role does not match its run lock"
+        )
     _validate_summary_tasks_against_lock(summary, lock)
     _verify_artifact_evidence(reader, source, checksums, summary.artifacts)
     source_checksum = _digest(checksums)
@@ -2029,6 +2105,10 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             *_trace_fields(),
             _field("campaign_id", pa.string()),
             _field("experiment", pa.string()),
+            _field("evaluation_id", pa.string()),
+            _field("publication_role", pa.string()),
+            _field("component_kind", pa.string(), nullable=True),
+            _field("source_publication_ids", pa.list_(pa.string())),
             _field("benchmark", pa.string()),
             _field("benchmark_revision", pa.string()),
             _field("result_kind", pa.string()),
@@ -2120,6 +2200,9 @@ _INDEX_SCHEMA = _make_schema(
         _field("publication_id", pa.string()),
         _field("run_id", pa.string()),
         _field("campaign_id", pa.string()),
+        _field("evaluation_id", pa.string()),
+        _field("publication_role", pa.string()),
+        _field("component_kind", pa.string(), nullable=True),
         _field("benchmark", pa.string()),
         _field("result_kind", pa.string()),
         _field("outcome", pa.string()),
@@ -2143,6 +2226,10 @@ _CATALOG_SCHEMA = _make_schema(
         _field("publication_id", pa.string()),
         _field("run_id", pa.string()),
         _field("campaign_id", pa.string()),
+        _field("evaluation_id", pa.string()),
+        _field("publication_role", pa.string()),
+        _field("component_kind", pa.string(), nullable=True),
+        _field("source_publication_ids", pa.list_(pa.string())),
         _field("benchmark", pa.string()),
         _field("benchmark_revision", pa.string()),
         _field("result_kind", pa.string()),

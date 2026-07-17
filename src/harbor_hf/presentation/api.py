@@ -6,7 +6,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -174,11 +174,16 @@ def _register_catalog_routes(app: FastAPI, holder: ServiceHolder) -> None:
         benchmark: Annotated[str, Query(max_length=200)] = "",
         model: Annotated[str, Query(max_length=300)] = "",
         hardware: Annotated[str, Query(max_length=200)] = "",
+        scope: Annotated[Literal["primary", "audit"], Query()] = "primary",
         cursor: Annotated[str, Query(max_length=128)] = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
     ) -> dict[str, Any]:
         result = holder.get().list_runs(
-            search=search, benchmark=benchmark, model=model, hardware=hardware
+            search=search,
+            benchmark=benchmark,
+            model=model,
+            hardware=hardware,
+            scope=scope,
         )
         return _paginate(result, cursor=cursor, limit=limit)
 
@@ -212,14 +217,20 @@ def _register_run_routes(app: FastAPI, holder: ServiceHolder) -> None:
 def _register_campaign_routes(app: FastAPI, holder: ServiceHolder) -> None:
     @app.get("/api/v1/campaigns")
     def campaigns(
+        scope: Annotated[Literal["primary", "audit"], Query()] = "primary",
         cursor: Annotated[str, Query(max_length=128)] = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
     ) -> dict[str, Any]:
-        return _paginate(holder.get().list_campaigns(), cursor=cursor, limit=limit)
+        return _paginate(
+            holder.get().list_campaigns(scope=scope), cursor=cursor, limit=limit
+        )
 
     @app.get("/api/v1/campaigns/{campaign_id}")
-    def campaign(campaign_id: str) -> dict[str, Any]:
-        return holder.get().campaign(campaign_id)
+    def campaign(
+        campaign_id: str,
+        scope: Annotated[Literal["primary", "audit"], Query()] = "primary",
+    ) -> dict[str, Any]:
+        return holder.get().campaign(campaign_id, scope=scope)
 
 
 def _register_entity_routes(app: FastAPI, holder: ServiceHolder) -> None:

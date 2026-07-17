@@ -24,12 +24,15 @@ def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
     assert isinstance(lock.deployment, DeploymentProfile)
 
-    assert lock.run_id == "20260713T010203Z-af768c3088"
+    assert lock.run_id == "20260713T010203Z-a29ba34f33"
     assert lock.benchmark_dataset == "harbor/terminal-bench@2.0"
     assert lock.benchmark_dataset_digest == "sha256:" + "1" * 64
     assert lock.spec_digest == (
-        "sha256:928a50b654af14b1aec17be91e99911a9160ba6139ae346e2f608f66934c66ba"
+        "sha256:8bad1524bf169d89c25d269e2a29fd8886510cfc523ac5d0d9953ab13e96cf00"
     )
+    assert lock.evaluation_id == "shellbench-qwen-hardware"
+    assert lock.publication_role == "final"
+    assert lock.component_kind is None
     assert lock.artifact_bucket == "example/benchmark-runs"
     assert lock.artifact_prefix == f"runs/{remote_spec.metadata.name}/{lock.run_id}"
     assert lock.deployment.endpoint is not None

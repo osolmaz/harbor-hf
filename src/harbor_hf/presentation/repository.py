@@ -18,6 +18,7 @@ from harbor_hf.presentation.config import PresentationConfig
 from harbor_hf.results import (
     ArtifactRow,
     CatalogRow,
+    CatalogScope,
     DatasetFile,
     ExecutionRow,
     GlobalIndexRow,
@@ -173,6 +174,7 @@ class ResultSnapshot:
     executions: tuple[ExecutionRow, ...]
     metrics: tuple[MetricRow, ...]
     artifacts: tuple[ArtifactRow, ...]
+    audit_catalog_rows: tuple[CatalogRow, ...] = ()
 
 
 class ResultRepository:
@@ -190,7 +192,8 @@ class ResultRepository:
             self.config.index_dataset, self.config.index_revision
         )
         self._resolved_revision = revision
-        catalog_rows = self._load_catalog(revision)
+        catalog_rows = self._load_catalog(revision, scope="primary")
+        audit_catalog_rows = self._load_catalog(revision, scope="audit")
         return ResultSnapshot(
             index_dataset=self.config.index_dataset,
             index_revision=revision,
@@ -201,6 +204,7 @@ class ResultRepository:
             executions=(),
             metrics=(),
             artifacts=(),
+            audit_catalog_rows=tuple(audit_catalog_rows),
         )
 
     def load_publication(self, catalog: CatalogRow) -> ResultSnapshot:
@@ -245,6 +249,7 @@ class ResultRepository:
             executions=tuple(_only(rows["executions"], ExecutionRow)),
             metrics=tuple(_only(rows["metrics"], MetricRow)),
             artifacts=tuple(_only(rows["artifacts"], ArtifactRow)),
+            audit_catalog_rows=(catalog,),
         )
 
     def find_catalog(self, run_id: str) -> CatalogRow:
@@ -263,7 +268,7 @@ class ResultRepository:
             return rows[0]
         except (DatasetPathNotFound, KeyError):
             pass
-        rows = self._load_catalog(revision, largest=True)
+        rows = self._load_catalog(revision, scope="audit", largest=True)
         for row in rows:
             if row.run_id == run_id:
                 return row
@@ -295,13 +300,17 @@ class ResultRepository:
         return projection, DatasetFile(path=path, content=content)
 
     def _load_catalog(
-        self, revision: str, *, largest: bool = False
+        self,
+        revision: str,
+        *,
+        scope: CatalogScope,
+        largest: bool = False,
     ) -> list[CatalogRow]:
         all_paths = self._reader.list_files(self.config.index_dataset, revision)
         paths = sorted(
             path
             for path in all_paths
-            if path.startswith("data/catalog/schema=v1/windows/")
+            if path.startswith(f"data/catalog/schema=v1/{scope}/windows/")
             and path.endswith(".parquet")
         )
         if not paths:
@@ -440,6 +449,9 @@ def _validate_index_identity(index: GlobalIndexRow, run: RunRow) -> None:
         index.publication_id,
         index.run_id,
         index.campaign_id,
+        index.evaluation_id,
+        index.publication_role,
+        index.component_kind,
         index.benchmark,
         index.quality,
         index.completed_at,
@@ -454,6 +466,9 @@ def _validate_index_identity(index: GlobalIndexRow, run: RunRow) -> None:
         run.publication_id,
         run.run_id,
         run.campaign_id,
+        run.evaluation_id,
+        run.publication_role,
+        run.component_kind,
         run.benchmark,
         run.quality,
         run.completed_at,
@@ -563,6 +578,9 @@ def _catalog_index(row: CatalogRow) -> GlobalIndexRow:
         publication_id=row.publication_id,
         run_id=row.run_id,
         campaign_id=row.campaign_id,
+        evaluation_id=row.evaluation_id,
+        publication_role=row.publication_role,
+        component_kind=row.component_kind,
         benchmark=row.benchmark,
         result_kind=row.result_kind,
         outcome=row.outcome,

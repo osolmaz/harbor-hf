@@ -49,6 +49,9 @@ artifacts:
   bucket: organization/benchmark-runs
 publishing:
   dataset: organization/terminal-bench-results
+  index_dataset: organization/benchmark-run-index
+  evaluation_id: example-evaluation
+  role: final
 remote:
   job:
     namespace: organization
@@ -243,7 +246,11 @@ must equal `remote.harbor.source.revision`, no package version is passed, and
 `publishing.dataset` identifies the versioned, benchmark-specific publication.
 `index_dataset` identifies the global run catalog. Single-run planning can omit
 it, but campaign submission requires it because completed campaigns publish
-their normalized result and index atomically.
+their normalized result and index atomically. `evaluation_id` groups every
+physical publication that belongs to one logical benchmark evaluation. `role`
+is required and is one of `final`, `component`, or `diagnostic`. A component
+also requires `component_kind: base` or `component_kind: correction`; other
+roles must omit it. Only final publications enter the primary results catalog.
 
 ### Remote Execution
 

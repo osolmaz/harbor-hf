@@ -42,11 +42,19 @@ artifact bytes were not copied into the public datasets or Space repository.
 
 ## Architecture
 
-The result publisher now writes two bounded projections into the global index
-Dataset:
+The result publisher writes a discovery index and two bounded catalog scopes
+into the global index Dataset. The primary scope contains only final logical
+evaluations; the audit scope also contains base, correction, and diagnostic
+publications. Composed result pages link directly to their source publications.
+Append-only promotion and withdrawal decisions change only the primary
+projection.
 
+The published projections are:
+
+- primary catalog windows used by default for scores and comparisons;
+- audit catalog windows selected explicitly by operators;
 - discovery index windows with immutable result Dataset references;
-- compact catalog windows with aggregate score and run metadata.
+- run-keyed lookup rows with aggregate score, role, and provenance metadata.
 
 Both use deterministic power-of-two sizes from 1 through 2,048 rows. A catalog
 request downloads one bounded Parquet snapshot. Opening a run then downloads

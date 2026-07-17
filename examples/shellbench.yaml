@@ -76,3 +76,5 @@ artifacts:
 publishing:
   dataset: example/shellbench-results
   index_dataset: example/benchmark-run-index
+  evaluation_id: shellbench-qwen-hardware
+  role: final

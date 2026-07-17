@@ -57,6 +57,10 @@ main { width: 100%; padding: 0 24px 40px; }
 .summary-stat span { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .summary-stat strong { font-size: 24px; font-weight: 500; }
 .toolbar { min-height: 60px; display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.segmented-control { height: 36px; display: flex; border: 1px solid var(--line); background: var(--surface); }
+.segmented-control button { min-width: 86px; border: 0; border-right: 1px solid var(--line); padding: 0 10px; color: var(--muted); background: transparent; cursor: pointer; }
+.segmented-control button:last-child { border-right: 0; }
+.segmented-control button[aria-pressed="true"] { color: var(--inverse); background: var(--ink); }
 .search-field { min-width: 240px; display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface); }
 .search-field input { min-width: 0; width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; }
 .select-field { height: 36px; display: flex; align-items: center; border: 1px solid var(--line); background: var(--surface); }

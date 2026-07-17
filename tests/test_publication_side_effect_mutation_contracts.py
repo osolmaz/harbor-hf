@@ -60,6 +60,10 @@ def _publication() -> ResultPublication:
             **trace,
             "campaign_id": "campaign-publication",
             "experiment": "experiment-publication",
+            "evaluation_id": "evaluation-publication",
+            "publication_role": "final",
+            "component_kind": None,
+            "source_publication_ids": [],
             "benchmark": "shellbench",
             "benchmark_revision": "sha256:" + "5" * 64,
             "result_kind": "ordinary",
@@ -211,7 +215,7 @@ def test_publication_and_idempotent_adoption_have_complete_side_effect_logs(
     }
 
     assert _hash(corpus) == (
-        "97f1613d1e264a2d254caadfe56da9bb5db12647a4d304179e5b8f7eaf670c53"
+        "a4ea3ad5740ff047dcabc191cc936b709cec2092fc1889f5413090490cc7d38c"
     )
 
 

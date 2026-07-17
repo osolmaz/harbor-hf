@@ -114,6 +114,26 @@
           "type": "string"
         },
         {
+          "name": "evaluation_id",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "publication_role",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "component_kind",
+          "nullable": true,
+          "type": "string"
+        },
+        {
+          "name": "source_publication_ids",
+          "nullable": false,
+          "type": "list<item: string>"
+        },
+        {
           "name": "benchmark",
           "nullable": false,
           "type": "string"
@@ -409,6 +429,21 @@
           "type": "string"
         },
         {
+          "name": "evaluation_id",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "publication_role",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "component_kind",
+          "nullable": true,
+          "type": "string"
+        },
+        {
           "name": "benchmark",
           "nullable": false,
           "type": "string"
@@ -617,6 +652,26 @@
           "name": "experiment",
           "nullable": false,
           "type": "string"
+        },
+        {
+          "name": "evaluation_id",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "publication_role",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "component_kind",
+          "nullable": true,
+          "type": "string"
+        },
+        {
+          "name": "source_publication_ids",
+          "nullable": false,
+          "type": "list<item: string>"
         },
         {
           "name": "benchmark",

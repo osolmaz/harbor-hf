@@ -13,7 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from harbor_hf.control import CampaignStoreApi
 from harbor_hf.results import (
+    CatalogDecision,
     CatalogRow,
+    CatalogScope,
     DatasetFile,
     GlobalIndexRow,
     ResultPublication,
@@ -56,6 +58,14 @@ class PublicationResult(FrozenModel):
     index_revision: str
 
 
+class CatalogDecisionResult(FrozenModel):
+    decision_id: str
+    publication_id: str
+    action: Literal["promote", "withdraw"]
+    index_dataset: str
+    index_revision: str
+
+
 class ResultReceipt(FrozenModel):
     schema_version: Literal["harbor-hf/result-publication/v1"] = (
         "harbor-hf/result-publication/v1"
@@ -86,6 +96,14 @@ class PublisherLeaseStore(Protocol):
 def publisher_lease_path(dataset: str) -> str:
     identity = hashlib.sha256(dataset.encode()).hexdigest()
     return f"coordination/publishers/{identity}.json"
+
+
+def catalog_decision_event_path(decision_id: str) -> str:
+    return _catalog_decision_event_path(decision_id)
+
+
+def catalog_decision_latest_path(publication_id: str) -> str:
+    return _catalog_decision_latest_path(publication_id)
 
 
 class HubDatasetPublisher:
@@ -134,6 +152,24 @@ class HubDatasetPublisher:
             result_revision=result_revision,
             index_dataset=index_dataset,
             index_revision=index_revision,
+        )
+
+    def decide_catalog(
+        self,
+        decision: CatalogDecision,
+        *,
+        index_dataset: str,
+    ) -> CatalogDecisionResult:
+        revision = self._with_lease(
+            index_dataset,
+            lambda: self._record_catalog_decision(decision, index_dataset),
+        )
+        return CatalogDecisionResult(
+            decision_id=decision.decision_id,
+            publication_id=decision.publication_id,
+            action=decision.action,
+            index_dataset=index_dataset,
+            index_revision=revision,
         )
 
     def _with_lease[Value](self, dataset: str, operation: Callable[[], Value]) -> Value:
@@ -248,7 +284,10 @@ class HubDatasetPublisher:
                 result_revision=indexed_result_revision,
                 projection=projection,
             )
-            catalog_windows = self._catalog_windows(index_dataset, head, catalog)
+            catalog_windows = [
+                *self._catalog_windows(index_dataset, head, catalog, scope="audit"),
+                *self._catalog_windows(index_dataset, head, catalog, scope="primary"),
+            ]
             catalog_lookup = build_catalog_lookup_file(catalog)
             index_updates = [
                 *windows,
@@ -323,9 +362,16 @@ class HubDatasetPublisher:
         return rows
 
     def _catalog_windows(
-        self, dataset: str, revision: str, row: CatalogRow
+        self,
+        dataset: str,
+        revision: str,
+        row: CatalogRow,
+        *,
+        scope: CatalogScope,
     ) -> list[DatasetFile]:
-        largest_path = build_catalog_window_file([], _LARGEST_INDEX_WINDOW).path
+        largest_path = build_catalog_window_file(
+            [], _LARGEST_INDEX_WINDOW, scope=scope
+        ).path
         if self._exists(dataset, largest_path, revision):
             existing = read_catalog_file(self._read(dataset, largest_path, revision))
         else:
@@ -340,15 +386,123 @@ class HubDatasetPublisher:
                     "canonical catalog snapshot is required before publication"
                 )
             existing = []
-        by_run = _replace_active_run(existing, row)
+        by_run = {item.run_id: item for item in existing}
+        withdrawn = (
+            scope == "primary"
+            and self._latest_catalog_decision(dataset, revision, row.publication_id)
+            == "withdraw"
+        )
+        if scope == "audit" or (row.publication_role == "final" and not withdrawn):
+            by_run = _replace_active_run(existing, row)
         ordered = sorted(
             by_run.values(),
             key=lambda item: (item.completed_at, item.publication_id),
             reverse=True,
         )[:_LARGEST_INDEX_WINDOW]
         return [
-            build_catalog_window_file(ordered, size) for size in _INDEX_WINDOW_SIZES
+            build_catalog_window_file(ordered, size, scope=scope)
+            for size in _INDEX_WINDOW_SIZES
         ]
+
+    def _record_catalog_decision(self, decision: CatalogDecision, dataset: str) -> str:
+        event_path = _catalog_decision_event_path(decision.decision_id)
+        latest_path = _catalog_decision_latest_path(decision.publication_id)
+        content = _json_bytes(decision.model_dump(mode="json"))
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head(dataset)
+            if self._exists(dataset, event_path, head):
+                if self._read(dataset, event_path, head) != content:
+                    raise PublicationConflict("catalog decision ID conflicts")
+                return head
+            latest = self._read_catalog_decision(dataset, latest_path, head)
+            if latest is not None and decision.created_at <= latest.created_at:
+                raise PublicationConflict("catalog decision is not newer than latest")
+            windows = self._catalog_decision_windows(dataset, head, decision)
+            operations: list[object] = [
+                _regular_blob(event_path, content),
+                _regular_blob(latest_path, content),
+                *(_regular_blob(item.path, item.content) for item in windows),
+            ]
+            try:
+                response = self.api.create_commit(
+                    dataset,
+                    operations,
+                    commit_message=(
+                        f"{decision.action}: catalog {decision.publication_id}"
+                    ),
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return self._commit_oid(response, dataset)
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise DatasetPublicationError("catalog Dataset remained contended")
+
+    def _catalog_decision_windows(
+        self, dataset: str, revision: str, decision: CatalogDecision
+    ) -> list[DatasetFile]:
+        audit = self._read_catalog_window(dataset, revision, scope="audit")
+        target = next(
+            (row for row in audit if row.publication_id == decision.publication_id),
+            None,
+        )
+        if target is None:
+            raise DatasetPublicationError("catalog decision publication is unknown")
+        if decision.action == "promote" and target.publication_role != "final":
+            raise DatasetPublicationError("only final publications can be promoted")
+        primary = {
+            row.run_id: row
+            for row in self._read_catalog_window(dataset, revision, scope="primary")
+        }
+        if decision.action == "withdraw":
+            primary = {
+                run_id: row
+                for run_id, row in primary.items()
+                if row.publication_id != decision.publication_id
+            }
+        else:
+            primary = _replace_active_run(list(primary.values()), target)
+        ordered = sorted(
+            primary.values(),
+            key=lambda item: (item.completed_at, item.publication_id),
+            reverse=True,
+        )[:_LARGEST_INDEX_WINDOW]
+        return [
+            build_catalog_window_file(ordered, size, scope="primary")
+            for size in _INDEX_WINDOW_SIZES
+        ]
+
+    def _read_catalog_window(
+        self, dataset: str, revision: str, *, scope: CatalogScope
+    ) -> list[CatalogRow]:
+        path = build_catalog_window_file([], _LARGEST_INDEX_WINDOW, scope=scope).path
+        if not self._exists(dataset, path, revision):
+            raise DatasetPublicationError("canonical catalog snapshot is required")
+        return read_catalog_file(self._read(dataset, path, revision))
+
+    def _read_catalog_decision(
+        self, dataset: str, path: str, revision: str
+    ) -> CatalogDecision | None:
+        if not self._exists(dataset, path, revision):
+            return None
+        try:
+            return CatalogDecision.model_validate_json(
+                self._read(dataset, path, revision)
+            )
+        except Exception as error:
+            raise DatasetPublicationError("catalog decision is invalid") from error
+
+    def _latest_catalog_decision(
+        self, dataset: str, revision: str, publication_id: str
+    ) -> Literal["promote", "withdraw"] | None:
+        decision = self._read_catalog_decision(
+            dataset,
+            _catalog_decision_latest_path(publication_id),
+            revision,
+        )
+        return decision.action if decision is not None else None
 
     def _windows_match(
         self, dataset: str, revision: str, windows: list[DatasetFile]
@@ -449,6 +603,14 @@ def _json_bytes(value: object) -> bytes:
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         + "\n"
     ).encode()
+
+
+def _catalog_decision_event_path(decision_id: str) -> str:
+    return f"data/catalog/schema=v1/decisions/events/{decision_id}.json"
+
+
+def _catalog_decision_latest_path(publication_id: str) -> str:
+    return f"data/catalog/schema=v1/decisions/latest/{publication_id}.json"
 
 
 def _sha256(value: bytes) -> str:

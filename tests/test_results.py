@@ -87,6 +87,9 @@ def sample_summary() -> dict[str, object]:
             "run_id": "run-one",
             "campaign_id": "campaign-one",
             "experiment": "experiment-one",
+            "evaluation_id": "evaluation-one",
+            "publication_role": "component",
+            "component_kind": "base",
             "benchmark": "shellbench",
             "benchmark_revision": "sha256:" + "b" * 64,
             "result_kind": "ordinary",
@@ -216,6 +219,9 @@ def _evidence(summary: dict[str, object], marker: str = "_SUCCESS") -> MemoryEvi
         "run.lock.json": _json_bytes(
             {
                 "run_id": "run-one",
+                "evaluation_id": "evaluation-one",
+                "publication_role": "component",
+                "component_kind": "base",
                 "cell_digest": "x",
                 "attempts": 1,
                 "model": {
@@ -1047,6 +1053,7 @@ def _composition_inputs(
             **base_run.model_dump(mode="python"),
             **correction_trace,
             "campaign_id": "campaign-correction",
+            "component_kind": "correction",
             "quality": "degraded",
             "completed_at": NOW + timedelta(minutes=7),
             "planned_trial_count": 1,
@@ -1122,6 +1129,7 @@ def _composition_inputs(
         run_id="run-composed",
         campaign_id="campaign-composed",
         experiment="experiment-composed",
+        evaluation_id=base_run.evaluation_id,
         created_at=base_run.created_at,
         completed_at=correction_run.completed_at,
         evidence_bucket=source.bucket,

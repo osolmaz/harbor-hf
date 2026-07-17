@@ -94,7 +94,28 @@ def test_publishing_datasets_must_be_distinct() -> None:
         ValueError,
         match=r"publishing\.index_dataset must differ from publishing\.dataset",
     ):
-        PublishingSpec(dataset="org/results", index_dataset="org/results")
+        PublishingSpec(
+            dataset="org/results",
+            index_dataset="org/results",
+            evaluation_id="evaluation-one",
+            role="final",
+        )
+
+
+def test_component_publication_requires_exact_component_kind() -> None:
+    with pytest.raises(ValueError, match="component_kind is required"):
+        PublishingSpec(
+            dataset="org/results",
+            evaluation_id="evaluation-one",
+            role="component",
+        )
+    with pytest.raises(ValueError, match="component_kind is required"):
+        PublishingSpec(
+            dataset="org/results",
+            evaluation_id="evaluation-one",
+            role="diagnostic",
+            component_kind="base",
+        )
 
 
 def test_remote_job_timeout_preserves_watchdog_cleanup_margin() -> None:

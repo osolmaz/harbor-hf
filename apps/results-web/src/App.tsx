@@ -95,6 +95,7 @@ function App() {
 }
 
 function RunsPage() {
+  const [scope, setScope] = useState<"primary" | "audit">("primary");
   const [search, setSearch] = useState("");
   const [benchmark, setBenchmark] = useState("");
   const [model, setModel] = useState("");
@@ -104,18 +105,18 @@ function RunsPage() {
   const [selected, setSelected] = useState<string[]>([]);
   const navigate = useNavigate();
   const requestPath = useMemo(() => {
-    const parameters = new URLSearchParams({ limit: "50" });
+    const parameters = new URLSearchParams({ limit: "50", scope });
     if (search) parameters.set("search", search);
     if (benchmark) parameters.set("benchmark", benchmark);
     if (model) parameters.set("model", model);
     if (hardware) parameters.set("hardware", hardware);
     if (cursor) parameters.set("cursor", cursor);
     return `/api/v1/runs?${parameters}`;
-  }, [search, benchmark, model, hardware, cursor]);
+  }, [search, benchmark, model, hardware, cursor, scope]);
   const { data, error } = useData<RunsResponse>(requestPath);
-  const updateFilter = (
-    setter: (value: string) => void,
-    value: string,
+  const updateFilter = <Value extends string,>(
+    setter: (value: Value) => void,
+    value: Value,
   ) => {
     setter(value);
     setCursor("");
@@ -134,8 +135,8 @@ function RunsPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Published evaluations"
-        title="Benchmark runs"
+        eyebrow={scope === "primary" ? "Published evaluations" : "Publication audit"}
+        title={scope === "primary" ? "Benchmark evaluations" : "Audit runs"}
         meta={`${data.total} immutable runs`}
       />
       <section className="summary-strip">
@@ -157,6 +158,22 @@ function RunsPage() {
         />
       </section>
       <section className="toolbar" aria-label="Run filters">
+        <div className="segmented-control" aria-label="Catalog scope">
+          <button
+            type="button"
+            aria-pressed={scope === "primary"}
+            onClick={() => updateFilter(setScope, "primary")}
+          >
+            Evaluations
+          </button>
+          <button
+            type="button"
+            aria-pressed={scope === "audit"}
+            onClick={() => updateFilter(setScope, "audit")}
+          >
+            Audit
+          </button>
+        </div>
         <label className="search-field">
           <Search size={15} />
           <input
@@ -226,7 +243,7 @@ function RunsTable({ runs, selected, onToggle, comparable = true }: {
               <td><span className="model-name">{run.model_repo}</span><SmallText>{shortRevision(run.model_revision)}</SmallText></td>
               <td>{run.agent_name}<SmallText>{run.agent_revision}</SmallText></td>
               <td>{run.hardware}<SmallText>{run.accelerator_count} accelerator{run.accelerator_count === 1 ? "" : "s"}</SmallText></td>
-              <td>{run.passed_trials}/{run.planned_trial_count}<SmallText>{run.failed_executions ? `${run.quality}; ${run.failed_executions} failed execution${run.failed_executions === 1 ? "" : "s"}` : run.quality}</SmallText></td>
+              <td>{run.passed_trials}/{run.planned_trial_count}<SmallText>{run.publication_role === "component" ? `${run.component_kind}; ${run.quality}` : `${run.publication_role}; ${run.quality}`}{run.failed_executions ? `; ${run.failed_executions} failed execution${run.failed_executions === 1 ? "" : "s"}` : ""}</SmallText></td>
               <td>{formatDuration(run.duration_seconds)}</td>
               <td>{formatDate(run.completed_at)}</td>
               <td><Link className="icon-button compact" title="Open run" to={`/runs/${run.run_id}`}><ChevronRight size={15} /></Link></td>
@@ -255,6 +272,12 @@ function RunPage() {
         <SummaryStat label="Duration" value={formatDuration(data.summary.duration_seconds)} />
       </section>
       <div className="detail-grid">
+        {data.sources.length > 0 && (
+          <section className="panel span-two">
+            <SectionTitle title="Source runs" meta={`${data.sources.length} publications`} />
+            <RunsTable runs={data.sources} selected={[]} onToggle={() => undefined} comparable={false} />
+          </section>
+        )}
         <section className="panel span-two">
           <SectionTitle title="Task results" meta={`${data.trials.length} trials`} />
           <div className="table-wrap flush"><table><thead><tr><th>Task</th><th>Score</th><th>Outcome</th><th>Attempt</th><th>Executions</th><th /></tr></thead><tbody>

@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+
+from harbor_hf.catalog_cutover import (
+    CatalogClassification,
+    CatalogCutoverError,
+    CatalogCutoverPlan,
+    HubCatalogCutover,
+)
+from harbor_hf.result_publisher import publisher_lease_path
+from harbor_hf.results import (
+    PublicationProvenance,
+    ResultTables,
+    RunRow,
+    build_catalog_row,
+    build_result_publication,
+    read_catalog_file,
+)
+
+NOW = datetime(2026, 7, 17, 1, 2, 3, tzinfo=UTC)
+RESULT_HEAD = "1" * 40
+INDEX_HEAD = "2" * 40
+
+
+class FakeLeases:
+    def __init__(self) -> None:
+        self.held: set[str] = set()
+
+    def acquire(self, path: str, owner: dict[str, str]) -> None:
+        del owner
+        assert path not in self.held
+        self.held.add(path)
+
+    def release(self, path: str, owner: dict[str, str]) -> None:
+        del owner
+        self.held.remove(path)
+
+
+class FakeApi:
+    def __init__(self, root: Path, publication_files: dict[str, bytes]) -> None:
+        self.root = root
+        self.heads = {"org/results": RESULT_HEAD, "org/index": INDEX_HEAD}
+        self.snapshots = {
+            ("org/results", RESULT_HEAD): dict(publication_files),
+            ("org/index", INDEX_HEAD): {},
+        }
+        self.commit_count = 0
+
+    def repo_info(self, repo_id: str, **kwargs: object) -> object:
+        assert kwargs == {"repo_type": "dataset", "revision": "main"}
+        return SimpleNamespace(sha=self.heads[repo_id])
+
+    def hf_hub_download(self, repo_id: str, filename: str, **kwargs: object) -> str:
+        revision = str(kwargs["revision"])
+        content = self.snapshots[(repo_id, revision)][filename]
+        destination = self.root / repo_id.replace("/", "-") / revision / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        return str(destination)
+
+    def list_repo_files(self, repo_id: str, **kwargs: object) -> list[str]:
+        revision = str(kwargs["revision"])
+        return list(self.snapshots[(repo_id, revision)])
+
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object:
+        parent = str(kwargs["parent_commit"])
+        assert parent == self.heads[repo_id]
+        files = dict(self.snapshots[(repo_id, parent)])
+        for operation in operations:
+            if isinstance(operation, CommitOperationAdd):
+                assert isinstance(operation.path_or_fileobj, bytes)
+                files[operation.path_in_repo] = operation.path_or_fileobj
+            else:
+                assert isinstance(operation, CommitOperationDelete)
+                files.pop(operation.path_in_repo)
+        self.commit_count += 1
+        revision = f"{self.commit_count + 2:040x}"
+        self.snapshots[(repo_id, revision)] = files
+        self.heads[repo_id] = revision
+        return SimpleNamespace(oid=revision)
+
+
+def _publication() -> tuple[ResultTables, dict[str, bytes]]:
+    run = RunRow(
+        publication_id="publication-one",
+        run_id="run-one",
+        source_bucket="hf://buckets/private-evidence",
+        source_prefix="campaigns/campaign-one/runs/run-one",
+        source_checksum="sha256:" + "1" * 64,
+        run_lock_path="run.lock.json",
+        run_lock_sha256="sha256:" + "2" * 64,
+        control_commit="3" * 40,
+        campaign_id="campaign-one",
+        experiment="experiment-one",
+        evaluation_id="old-evaluation",
+        publication_role="diagnostic",
+        component_kind=None,
+        source_publication_ids=[],
+        benchmark="shellbench/public-115",
+        benchmark_revision="sha256:" + "4" * 64,
+        result_kind="ordinary",
+        outcome="complete",
+        quality="clean",
+        created_at=NOW,
+        completed_at=NOW + timedelta(minutes=1),
+        model_id="model-one",
+        model_repo="org/model",
+        model_revision="5" * 40,
+        deployment_id="deployment-one",
+        provider="huggingface",
+        region="us-east-1",
+        hardware="h200",
+        accelerator_count=1,
+        agent_id="agent-one",
+        agent_name="openclaw",
+        agent_revision="1.0.0",
+        planned_trial_count=0,
+        scored_trial_count=0,
+        agent_failed_count=0,
+        benchmark_failed_count=0,
+        infrastructure_exhausted_count=0,
+        unsupported_count=0,
+        execution_count=0,
+    )
+    tables = ResultTables(
+        publication_id=run.publication_id,
+        runs=[run],
+        trials=[],
+        executions=[],
+        metrics=[],
+        artifacts=[],
+        provenance=PublicationProvenance(
+            envelope_sha256="sha256:" + "6" * 64,
+            projection_version="harbor-hf/results-projection/v1",
+            sanitizer_version="harbor-hf/public-results/v1",
+            execution_profile_sha256="sha256:" + "7" * 64,
+            harbor_bundle_manifest_sha256s=["sha256:" + "8" * 64],
+            harbor_archive_sha256s=["sha256:" + "9" * 64],
+        ),
+    )
+    publication = build_result_publication(tables)
+    return tables, {
+        **{file.path: file.content for file in publication.files},
+        publication.receipt_path: publication.receipt,
+    }
+
+
+def _plan() -> CatalogCutoverPlan:
+    return CatalogCutoverPlan(
+        cutover_id="primary-catalog-20260717",
+        result_dataset="org/results",
+        index_dataset="org/index",
+        source_catalog_revision=INDEX_HEAD,
+        source_catalog_path="data/catalog/schema=v1/windows/2048.parquet",
+        expected_result_head=RESULT_HEAD,
+        expected_index_head=INDEX_HEAD,
+        classifications=[
+            CatalogClassification(
+                publication_id="publication-one",
+                evaluation_id="evaluation-one",
+                role="final",
+            )
+        ],
+    )
+
+
+def test_cutover_rewrites_v1_and_switches_scoped_catalogs(tmp_path: Path) -> None:
+    tables, files = _publication()
+    projection = next(
+        file
+        for file in build_result_publication(tables).files
+        if file.path.startswith("projections/")
+    )
+    legacy = build_catalog_row(
+        tables,
+        result_dataset="org/results",
+        result_revision=RESULT_HEAD,
+        projection=projection,
+    )
+    sink = pa.BufferOutputStream()
+    pq.write_table(pa.Table.from_pylist([legacy.model_dump(mode="python")]), sink)
+    api = FakeApi(tmp_path, files)
+    legacy_path = "data/catalog/schema=v1/windows/2048.parquet"
+    api.snapshots[("org/index", INDEX_HEAD)][legacy_path] = sink.getvalue().to_pybytes()
+    leases = FakeLeases()
+
+    result = HubCatalogCutover(
+        publisher_id="cutover-one", leases=leases, api=api
+    ).apply(_plan())
+
+    assert result.primary_publications == 1
+    assert result.audit_publications == 1
+    assert not leases.held
+    index_files = api.snapshots[("org/index", result.index_revision)]
+    assert legacy_path not in index_files
+    primary = read_catalog_file(
+        index_files["data/catalog/schema=v1/primary/windows/2048.parquet"]
+    )
+    audit = read_catalog_file(
+        index_files["data/catalog/schema=v1/audit/windows/2048.parquet"]
+    )
+    assert primary == audit
+    assert primary[0].evaluation_id == "evaluation-one"
+    assert primary[0].publication_role == "final"
+    assert publisher_lease_path("org/results") not in leases.held
+
+
+def test_cutover_refuses_a_moved_dataset(tmp_path: Path) -> None:
+    _tables, files = _publication()
+    api = FakeApi(tmp_path, files)
+    api.heads["org/results"] = "f" * 40
+
+    with pytest.raises(CatalogCutoverError, match="moved"):
+        HubCatalogCutover(
+            publisher_id="cutover-one", leases=FakeLeases(), api=api
+        ).apply(_plan())
+
+
+def test_production_cutover_manifest_is_complete() -> None:
+    plan = CatalogCutoverPlan.model_validate_json(
+        Path("docs/catalog-cutovers/2026-07-17-primary-catalog.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert len(plan.classifications) == 17
+    assert sum(item.role == "final" for item in plan.classifications) == 5
+    assert sum(item.role == "component" for item in plan.classifications) == 10
+    assert sum(item.role == "diagnostic" for item in plan.classifications) == 2

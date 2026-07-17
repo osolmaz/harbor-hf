@@ -21,6 +21,9 @@ from harbor_hf.evidence import is_sensitive_key
 from harbor_hf.provider_models import ProviderTarget
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+EvaluationId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+PublicationRole = Literal["final", "component", "diagnostic"]
+ComponentKind = Literal["base", "correction"]
 TaskName = Annotated[str, Field(min_length=1)]
 ContentDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 GitHubRepository = Annotated[
@@ -333,12 +336,19 @@ class ArtifactStoreSpec(StrictModel):
 class PublishingSpec(StrictModel):
     dataset: str = Field(min_length=1)
     index_dataset: str | None = None
+    evaluation_id: EvaluationId
+    role: PublicationRole
+    component_kind: ComponentKind | None = None
 
     @model_validator(mode="after")
     def datasets_are_distinct(self) -> PublishingSpec:
         if self.index_dataset is not None and self.index_dataset == self.dataset:
             raise ValueError(
                 "publishing.index_dataset must differ from publishing.dataset"
+            )
+        if (self.role == "component") != (self.component_kind is not None):
+            raise ValueError(
+                "publishing.component_kind is required only for component runs"
             )
         return self
 

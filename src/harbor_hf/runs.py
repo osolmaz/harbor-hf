@@ -16,10 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from harbor_hf.models import (
     AgentProfile,
     BenchmarkJudgeSpec,
+    ComponentKind,
     DeploymentTarget,
+    EvaluationId,
     ExperimentSpec,
     GitBenchmarkSource,
     ModelProfile,
+    PublicationRole,
     RemoteExecutionSpec,
 )
 from harbor_hf.planner import experiment_digest, resolved_cells
@@ -54,6 +57,9 @@ class RunLock(BaseModel):
     run_id: str
     created_at: datetime
     experiment: str
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
     spec_digest: str
     benchmark_dataset: str
     benchmark_dataset_digest: str
@@ -168,6 +174,9 @@ def build_run_lock(
         run_id=resolved_id,
         created_at=created_at,
         experiment=spec.metadata.name,
+        evaluation_id=spec.publishing.evaluation_id,
+        publication_role=spec.publishing.role,
+        component_kind=spec.publishing.component_kind,
         spec_digest=digest,
         benchmark_dataset=spec.benchmark.dataset,
         benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
