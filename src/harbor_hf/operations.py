@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from harbor_hf.campaign_finalizer import (
     BucketCampaignFinalizer,
     ImmutableEvidenceWriter,
+    ValidatingEvidenceWriter,
 )
 from harbor_hf.control import CampaignEvent, CampaignSnapshot
 from harbor_hf.io import load_experiment_bytes
@@ -268,15 +269,21 @@ def seal_partial_campaign_runs(
     projection = seal_partial_projection(
         project_recovery(snapshot.lock, snapshot.events)
     )
-    checksums: dict[str, str] = {}
-    if not dry_run:
-        if writer is None:
-            raise ValueError("evidence writer is required outside dry-run")
-        checksums = BucketCampaignFinalizer(reader, writer).seal_runs(
-            snapshot.lock,
-            spec,
-            projection,
+    if dry_run:
+        evidence_writer: ImmutableEvidenceWriter = ValidatingEvidenceWriter(
+            reader,
+            bucket=spec.artifacts.bucket,
+            prefix=snapshot.lock.artifact_prefix,
         )
+    elif writer is None:
+        raise ValueError("evidence writer is required outside dry-run")
+    else:
+        evidence_writer = writer
+    checksums = BucketCampaignFinalizer(reader, evidence_writer).seal_runs(
+        snapshot.lock,
+        spec,
+        projection,
+    )
     return CampaignSealReport(
         campaign_id=snapshot.lock.campaign_id,
         artifact_bucket=spec.artifacts.bucket,
@@ -285,7 +292,7 @@ def seal_partial_campaign_runs(
             SealedRun(
                 run_id=run.run_id,
                 source_prefix=f"{snapshot.lock.artifact_prefix}/runs/{run.run_id}",
-                source_checksum=checksums.get(run.run_id),
+                source_checksum=checksums[run.run_id],
             )
             for run in snapshot.lock.runs
         ],

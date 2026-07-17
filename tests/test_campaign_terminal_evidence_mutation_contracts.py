@@ -12,6 +12,7 @@ from harbor_hf import campaign_finalizer, campaign_observer
 from harbor_hf.campaign_finalizer import (
     BucketCampaignFinalizer,
     CampaignFinalizationError,
+    ValidatingEvidenceWriter,
 )
 from harbor_hf.campaign_observer import (
     BucketCampaignObserver,
@@ -34,6 +35,7 @@ from harbor_hf.control import (
 )
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.provider_models import ExplicitProviderRoute, ProviderTarget
+from harbor_hf.publication_envelope import canonical_digest
 from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.recovery import (
     ProjectionCounts,
@@ -478,7 +480,43 @@ def test_seal_runs_writes_run_evidence_without_rewriting_campaign_summary(
         for _bucket, path, content in writer.writes
         if path == f"{base}/checksums.json"
     )
-    assert checksums == {run.run_id: _sha(checksum_bytes)}
+    assert checksums == {run.run_id: canonical_digest(json.loads(checksum_bytes))}
+
+
+def test_validating_writer_accepts_identical_writes_without_mutating() -> None:
+    reader = _Reader({"existing.json": b"{}\n"})
+    writer = ValidatingEvidenceWriter(
+        reader,
+        bucket="namespace/bucket",
+        prefix="campaigns/example",
+    )
+
+    assert not writer.write_immutable(
+        bucket="namespace/bucket",
+        path="campaigns/example/existing.json",
+        content=b"{}\n",
+    )
+    assert writer.write_immutable(
+        bucket="namespace/bucket",
+        path="campaigns/example/new.json",
+        content=b"{}\n",
+    )
+    assert reader.files == {"existing.json": b"{}\n"}
+
+
+def test_validating_writer_rejects_immutable_conflict() -> None:
+    writer = ValidatingEvidenceWriter(
+        _Reader({"existing.json": b"{}\n"}),
+        bucket="namespace/bucket",
+        prefix="campaigns/example",
+    )
+
+    with pytest.raises(CampaignFinalizationError, match="conflicts"):
+        writer.write_immutable(
+            bucket="namespace/bucket",
+            path="campaigns/example/existing.json",
+            content=b"different\n",
+        )
 
 
 def test_failed_trial_becomes_zero_score_terminal_evidence(
