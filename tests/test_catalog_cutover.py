@@ -314,6 +314,24 @@ def test_cutover_rejects_execution_profile_conflict(tmp_path: Path) -> None:
         ).apply(plan)
 
 
+def test_cutover_rejects_non_scalar_execution_profile(tmp_path: Path) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    path = "projections/schema=v1/publication-one.json"
+    projection = json.loads(api.snapshots[("org/results", RESULT_HEAD)][path])
+    projection["execution_profile_sha256"] = ["invalid"]
+    api.snapshots[("org/results", RESULT_HEAD)][path] = json.dumps(
+        projection, sort_keys=True, separators=(",", ":")
+    ).encode() + b"\n"
+
+    with pytest.raises(
+        CatalogCutoverError,
+        match="source projection execution profile conflicts with classification",
+    ):
+        HubCatalogCutover(
+            publisher_id="cutover-one", leases=FakeLeases(), api=api
+        ).apply(_plan())
+
+
 def test_cutover_recovers_after_result_commit_and_is_idempotent(
     tmp_path: Path,
 ) -> None:

@@ -378,7 +378,10 @@ class HubCatalogCutover:
         if not isinstance(projection_value, dict):
             raise CatalogCutoverError("source projection is invalid")
         observed_profile = projection_value.get("execution_profile_sha256")
-        if observed_profile not in {None, classification.execution_profile_sha256}:
+        if (
+            observed_profile is not None
+            and observed_profile != classification.execution_profile_sha256
+        ):
             raise CatalogCutoverError(
                 "source projection execution profile conflicts with classification"
             )
