@@ -1501,9 +1501,21 @@ def catalog_lookup_path(run_id: str) -> str:
     return f"data/catalog/schema=v1/runs/{identity}.parquet"
 
 
+def catalog_publication_lookup_path(publication_id: str) -> str:
+    identity = hashlib.sha256(publication_id.encode()).hexdigest()
+    return f"data/catalog/schema=v1/publications/{identity}.parquet"
+
+
 def build_catalog_lookup_file(row: CatalogRow) -> DatasetFile:
     return DatasetFile(
         path=catalog_lookup_path(row.run_id),
+        content=_parquet_bytes([row], catalog_parquet_schema()),
+    )
+
+
+def build_catalog_publication_lookup_file(row: CatalogRow) -> DatasetFile:
+    return DatasetFile(
+        path=catalog_publication_lookup_path(row.publication_id),
         content=_parquet_bytes([row], catalog_parquet_schema()),
     )
 
@@ -2093,6 +2105,22 @@ def _trace_fields() -> list[pa.Field]:
     ]
 
 
+def _catalog_identity_fields() -> list[pa.Field]:
+    return [
+        _field("evaluation_id", pa.string()),
+        _field("publication_role", pa.string()),
+        _field("component_kind", pa.string(), nullable=True),
+        _field("source_publication_ids", pa.list_(pa.string())),
+        _field("benchmark", pa.string()),
+        _field("benchmark_revision", pa.string()),
+        _field("result_kind", pa.string()),
+        _field("outcome", pa.string()),
+        _field("quality", pa.string()),
+        _field("created_at", _TIMESTAMP),
+        _field("completed_at", _TIMESTAMP),
+    ]
+
+
 def _make_schema(version: str, fields: list[pa.Field]) -> pa.Schema:
     return pa.schema(fields, metadata={b"harbor_hf.schema_version": version.encode()})
 
@@ -2105,17 +2133,7 @@ _PARQUET_SCHEMAS: Mapping[TableName, pa.Schema] = {
             *_trace_fields(),
             _field("campaign_id", pa.string()),
             _field("experiment", pa.string()),
-            _field("evaluation_id", pa.string()),
-            _field("publication_role", pa.string()),
-            _field("component_kind", pa.string(), nullable=True),
-            _field("source_publication_ids", pa.list_(pa.string())),
-            _field("benchmark", pa.string()),
-            _field("benchmark_revision", pa.string()),
-            _field("result_kind", pa.string()),
-            _field("outcome", pa.string()),
-            _field("quality", pa.string()),
-            _field("created_at", _TIMESTAMP),
-            _field("completed_at", _TIMESTAMP),
+            *_catalog_identity_fields(),
             _field("model_id", pa.string()),
             _field("model_repo", pa.string()),
             _field("model_revision", pa.string()),
@@ -2226,17 +2244,7 @@ _CATALOG_SCHEMA = _make_schema(
         _field("publication_id", pa.string()),
         _field("run_id", pa.string()),
         _field("campaign_id", pa.string()),
-        _field("evaluation_id", pa.string()),
-        _field("publication_role", pa.string()),
-        _field("component_kind", pa.string(), nullable=True),
-        _field("source_publication_ids", pa.list_(pa.string())),
-        _field("benchmark", pa.string()),
-        _field("benchmark_revision", pa.string()),
-        _field("result_kind", pa.string()),
-        _field("outcome", pa.string()),
-        _field("quality", pa.string()),
-        _field("created_at", _TIMESTAMP),
-        _field("completed_at", _TIMESTAMP),
+        *_catalog_identity_fields(),
         _field("model_repo", pa.string()),
         _field("model_revision", pa.string()),
         _field("agent_name", pa.string()),

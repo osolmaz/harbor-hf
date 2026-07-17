@@ -22,6 +22,7 @@ from harbor_hf.results import (
     RunRow,
     build_catalog_row,
     build_result_publication,
+    catalog_publication_lookup_path,
     read_catalog_file,
 )
 
@@ -88,6 +89,20 @@ class FakeApi:
         self.snapshots[(repo_id, revision)] = files
         self.heads[repo_id] = revision
         return SimpleNamespace(oid=revision)
+
+
+class FailingIndexApi(FakeApi):
+    def __init__(self, root: Path, publication_files: dict[str, bytes]) -> None:
+        super().__init__(root, publication_files)
+        self.fail_index_once = True
+
+    def create_commit(
+        self, repo_id: str, operations: list[object], **kwargs: object
+    ) -> object:
+        if repo_id == "org/index" and self.fail_index_once:
+            self.fail_index_once = False
+            raise RuntimeError("simulated index interruption")
+        return super().create_commit(repo_id, operations, **kwargs)
 
 
 def _publication() -> tuple[ResultTables, dict[str, bytes]]:
@@ -174,7 +189,7 @@ def _plan() -> CatalogCutoverPlan:
     )
 
 
-def test_cutover_rewrites_v1_and_switches_scoped_catalogs(tmp_path: Path) -> None:
+def _prepared_api[Api: FakeApi](tmp_path: Path, kind: type[Api]) -> Api:
     tables, files = _publication()
     projection = next(
         file
@@ -189,9 +204,15 @@ def test_cutover_rewrites_v1_and_switches_scoped_catalogs(tmp_path: Path) -> Non
     )
     sink = pa.BufferOutputStream()
     pq.write_table(pa.Table.from_pylist([legacy.model_dump(mode="python")]), sink)
-    api = FakeApi(tmp_path, files)
+    api = kind(tmp_path, files)
     legacy_path = "data/catalog/schema=v1/windows/2048.parquet"
     api.snapshots[("org/index", INDEX_HEAD)][legacy_path] = sink.getvalue().to_pybytes()
+    return api
+
+
+def test_cutover_rewrites_v1_and_switches_scoped_catalogs(tmp_path: Path) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    legacy_path = "data/catalog/schema=v1/windows/2048.parquet"
     leases = FakeLeases()
 
     result = HubCatalogCutover(
@@ -212,13 +233,35 @@ def test_cutover_rewrites_v1_and_switches_scoped_catalogs(tmp_path: Path) -> Non
     assert primary == audit
     assert primary[0].evaluation_id == "evaluation-one"
     assert primary[0].publication_role == "final"
+    assert catalog_publication_lookup_path("publication-one") in index_files
     assert publisher_lease_path("org/results") not in leases.held
+
+
+def test_cutover_recovers_after_result_commit_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    api = _prepared_api(tmp_path, FailingIndexApi)
+    cutover = HubCatalogCutover(
+        publisher_id="cutover-one", leases=FakeLeases(), api=api
+    )
+
+    with pytest.raises(RuntimeError, match="simulated index interruption"):
+        cutover.apply(_plan())
+
+    result = cutover.apply(_plan())
+    commit_count = api.commit_count
+    repeated = cutover.apply(_plan())
+
+    assert result == repeated
+    assert commit_count == 2
+    assert api.commit_count == commit_count
 
 
 def test_cutover_refuses_a_moved_dataset(tmp_path: Path) -> None:
     _tables, files = _publication()
     api = FakeApi(tmp_path, files)
     api.heads["org/results"] = "f" * 40
+    api.snapshots[("org/results", "f" * 40)] = dict(files)
 
     with pytest.raises(CatalogCutoverError, match="moved"):
         HubCatalogCutover(

@@ -105,9 +105,10 @@ The index Dataset carries two catalog projections. `primary` contains only
 logical benchmark evaluations whose immutable publication role is `final`.
 `audit` contains final, component, and diagnostic publications. List APIs and
 the hosted viewer use `primary` unless an operator explicitly requests audit
-scope. Run-keyed lookups remain available for every role, and composed final
-rows record the exact base and correction publication IDs shown on their detail
-pages.
+scope. Run-keyed lookups remain available for every role. Publication-keyed
+lookups keep composed-result provenance resolvable after a source leaves the
+bounded audit windows, and composed final rows record the exact base and
+correction publication IDs shown on their detail pages.
 
 Catalog visibility can be changed without deleting or relabeling evidence:
 

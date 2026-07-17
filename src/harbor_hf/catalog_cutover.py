@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, NoReturn, Protocol, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -35,17 +35,21 @@ from harbor_hf.results import (
     RunRow,
     TrialRow,
     build_catalog_lookup_file,
+    build_catalog_publication_lookup_file,
     build_catalog_row,
     build_catalog_window_file,
     build_global_index_row,
     build_index_file,
     build_index_window_file,
     build_result_publication,
+    read_catalog_file,
 )
 
 _WINDOW_SIZES = tuple(2**power for power in range(12))
 _LEASE_TTL = timedelta(minutes=30)
 _LEGACY_CATALOG_PREFIX = "data/catalog/schema=v1/windows/"
+_RESULT_MARKER_PREFIX = "cutovers"
+_INDEX_MARKER_PREFIX = "data/catalog/schema=v1/cutovers"
 
 
 class CatalogCutoverError(RuntimeError):
@@ -165,8 +169,17 @@ class HubCatalogCutover:
         return owner
 
     def _apply_locked(self, plan: CatalogCutoverPlan) -> CatalogCutoverResult:
-        self._require_head(plan.result_dataset, plan.expected_result_head)
-        self._require_head(plan.index_dataset, plan.expected_index_head)
+        index_head = self._head(plan.index_dataset)
+        if index_head != plan.expected_index_head:
+            return self._completed_cutover(plan, index_head)
+        result_head = self._head(plan.result_dataset)
+        result_marker = f"{_RESULT_MARKER_PREFIX}/{plan.cutover_id}.json"
+        if result_head != plan.expected_result_head and not self._marker_matches(
+            plan.result_dataset, result_marker, result_head, plan
+        ):
+            self._raise_moved(
+                plan.result_dataset, plan.expected_result_head, result_head
+            )
         legacy = self._legacy_catalog(plan)
         classified = {item.publication_id: item for item in plan.classifications}
         referenced = {
@@ -184,7 +197,21 @@ class HubCatalogCutover:
             self._migrate_publication(plan, classification)
             for classification in classified.values()
         ]
-        result_revision = self._commit_results(plan, publications)
+        if result_head == plan.expected_result_head:
+            result_revision = self._commit_results(plan, publications)
+        elif self._marker_matches(
+            plan.result_dataset,
+            result_marker,
+            result_head,
+            plan,
+        ):
+            self._verify_result_files(plan, publications, result_head)
+            result_revision = result_head
+        else:
+            self._raise_moved(
+                plan.result_dataset, plan.expected_result_head, result_head
+            )
+        self._require_head(plan.index_dataset, plan.expected_index_head)
         index_revision = self._commit_index(plan, publications, result_revision)
         return CatalogCutoverResult(
             cutover_id=plan.cutover_id,
@@ -196,6 +223,112 @@ class HubCatalogCutover:
                 item.role == "final" for item in plan.classifications
             ),
             audit_publications=len(plan.classifications),
+        )
+
+    def _completed_cutover(
+        self, plan: CatalogCutoverPlan, index_revision: str
+    ) -> CatalogCutoverResult:
+        marker = f"{_INDEX_MARKER_PREFIX}/{plan.cutover_id}.json"
+        if not self._marker_matches(plan.index_dataset, marker, index_revision, plan):
+            self._raise_moved(
+                plan.index_dataset, plan.expected_index_head, index_revision
+            )
+        audit = self._catalog_at(plan, index_revision, scope="audit")
+        primary = self._catalog_at(plan, index_revision, scope="primary")
+        expected = {item.publication_id: item for item in plan.classifications}
+        observed = {item.publication_id: item for item in audit}
+        if set(observed) != set(expected) or any(
+            (
+                row.evaluation_id,
+                row.publication_role,
+                row.component_kind,
+                row.source_publication_ids,
+            )
+            != (
+                expected[publication_id].evaluation_id,
+                expected[publication_id].role,
+                expected[publication_id].component_kind,
+                expected[publication_id].source_publication_ids,
+            )
+            for publication_id, row in observed.items()
+        ):
+            raise CatalogCutoverError("completed cutover audit catalog conflicts")
+        expected_primary = {
+            item.publication_id for item in plan.classifications if item.role == "final"
+        }
+        if {item.publication_id for item in primary} != expected_primary:
+            raise CatalogCutoverError("completed cutover primary catalog conflicts")
+        result_revisions = {item.result_revision for item in audit}
+        if len(result_revisions) != 1:
+            raise CatalogCutoverError("completed cutover has mixed result revisions")
+        result_revision = result_revisions.pop()
+        if not self._marker_matches(
+            plan.result_dataset,
+            f"{_RESULT_MARKER_PREFIX}/{plan.cutover_id}.json",
+            result_revision,
+            plan,
+        ):
+            raise CatalogCutoverError("completed cutover result marker conflicts")
+        return CatalogCutoverResult(
+            cutover_id=plan.cutover_id,
+            result_dataset=plan.result_dataset,
+            result_revision=result_revision,
+            index_dataset=plan.index_dataset,
+            index_revision=index_revision,
+            primary_publications=len(primary),
+            audit_publications=len(audit),
+        )
+
+    def _catalog_at(
+        self,
+        plan: CatalogCutoverPlan,
+        revision: str,
+        *,
+        scope: Literal["primary", "audit"],
+    ) -> list[CatalogRow]:
+        path = f"data/catalog/schema=v1/{scope}/windows/2048.parquet"
+        try:
+            return read_catalog_file(self._read(plan.index_dataset, path, revision))
+        except ValueError as error:
+            raise CatalogCutoverError(
+                f"completed cutover {scope} catalog is invalid"
+            ) from error
+
+    def _verify_result_files(
+        self,
+        plan: CatalogCutoverPlan,
+        publications: Sequence[ResultPublication],
+        revision: str,
+    ) -> None:
+        expected = [
+            file
+            for publication in publications
+            for file in (
+                *publication.files,
+                DatasetFile(
+                    path=publication.receipt_path,
+                    content=publication.receipt,
+                ),
+            )
+        ]
+        for file in expected:
+            if self._read(plan.result_dataset, file.path, revision) != file.content:
+                raise CatalogCutoverError(
+                    f"recovered result file conflicts: {file.path}"
+                )
+
+    def _marker_matches(
+        self,
+        dataset: str,
+        path: str,
+        revision: str,
+        plan: CatalogCutoverPlan,
+    ) -> bool:
+        files = self.api.list_repo_files(
+            dataset, repo_type="dataset", revision=revision
+        )
+        return path in files and self._read(dataset, path, revision) == _json_bytes(
+            plan.model_dump(mode="json")
         )
 
     def _legacy_catalog(
@@ -435,6 +568,7 @@ class HubCatalogCutover:
             for size in _WINDOW_SIZES
         )
         files.extend(build_catalog_lookup_file(row) for row in audit)
+        files.extend(build_catalog_publication_lookup_file(row) for row in audit)
         files.append(
             DatasetFile(
                 path=f"data/catalog/schema=v1/cutovers/{plan.cutover_id}.json",
@@ -444,15 +578,25 @@ class HubCatalogCutover:
         return files
 
     def _require_head(self, dataset: str, expected: str) -> None:
+        observed = self._head(dataset)
+        if observed != expected:
+            self._raise_moved(dataset, expected, observed)
+
+    def _head(self, dataset: str) -> str:
         observed = getattr(
             self.api.repo_info(dataset, repo_type="dataset", revision="main"),
             "sha",
             None,
         )
-        if observed != expected:
-            raise CatalogCutoverError(
-                f"Dataset {dataset} moved: expected {expected}, observed {observed}"
-            )
+        if not isinstance(observed, str) or not observed:
+            raise CatalogCutoverError(f"Dataset {dataset} returned no identity")
+        return observed
+
+    @staticmethod
+    def _raise_moved(dataset: str, expected: str, observed: str) -> NoReturn:
+        raise CatalogCutoverError(
+            f"Dataset {dataset} moved: expected {expected}, observed {observed}"
+        )
 
     def _read(self, dataset: str, path: str, revision: str) -> bytes:
         local_path = self.api.hf_hub_download(

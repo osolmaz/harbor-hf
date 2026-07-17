@@ -36,6 +36,9 @@ class ResultService:
     _historical_catalogs: dict[str, CatalogRow] = field(
         default_factory=dict, init=False, compare=False, repr=False
     )
+    _source_catalogs: dict[str, CatalogRow] = field(
+        default_factory=dict, init=False, compare=False, repr=False
+    )
 
     def health(self) -> dict[str, Any]:
         return {
@@ -175,8 +178,17 @@ class ResultService:
             for publication_id in run.source_publication_ids
             if publication_id not in by_publication
         ]
-        if missing:
-            raise ResultNotFound(missing[0])
+        for publication_id in missing:
+            source = self._source_catalogs.get(publication_id)
+            if source is None:
+                if self.repository is None:
+                    raise ResultNotFound(publication_id)
+                try:
+                    source = self.repository.find_catalog_publication(publication_id)
+                except KeyError as error:
+                    raise ResultNotFound(publication_id) from error
+                self._source_catalogs[publication_id] = source
+            by_publication[publication_id] = source
         return [by_publication[item] for item in run.source_publication_ids]
 
     def compare(self, run_id: str, other_run_id: str) -> dict[str, Any]:

@@ -20,6 +20,7 @@ from harbor_hf.results import (
     GlobalIndexRow,
     ResultPublication,
     build_catalog_lookup_file,
+    build_catalog_publication_lookup_file,
     build_catalog_row,
     build_catalog_window_file,
     build_global_index_row,
@@ -289,10 +290,12 @@ class HubDatasetPublisher:
                 *self._catalog_windows(index_dataset, head, catalog, scope="primary"),
             ]
             catalog_lookup = build_catalog_lookup_file(catalog)
+            publication_lookup = build_catalog_publication_lookup_file(catalog)
             index_updates = [
                 *windows,
                 *catalog_windows,
                 catalog_lookup,
+                publication_lookup,
             ]
             if receipt is not None and self._windows_match(
                 index_dataset, head, index_updates

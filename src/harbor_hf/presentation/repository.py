@@ -32,6 +32,7 @@ from harbor_hf.results import (
     TrialRow,
     build_catalog_row,
     catalog_lookup_path,
+    catalog_publication_lookup_path,
     task_outcome_matches_execution,
 )
 
@@ -257,15 +258,7 @@ class ResultRepository:
         revision = self._current_revision()
         path = catalog_lookup_path(run_id)
         try:
-            rows = [
-                _validate(CatalogRow, value, path)
-                for value in self._reader.read_rows(
-                    self.config.index_dataset, revision, path
-                )
-            ]
-            if len(rows) != 1 or rows[0].run_id != run_id:
-                raise PresentationError(f"catalog lookup for {run_id} is inconsistent")
-            return rows[0]
+            return self._find_catalog_lookup(path, "run_id", run_id, revision)
         except (DatasetPathNotFound, KeyError):
             pass
         rows = self._load_catalog(revision, scope="audit", largest=True)
@@ -273,6 +266,35 @@ class ResultRepository:
             if row.run_id == run_id:
                 return row
         raise KeyError(run_id)
+
+    def find_catalog_publication(self, publication_id: str) -> CatalogRow:
+        """Resolve stable provenance even after a source leaves audit windows."""
+        revision = self._current_revision()
+        path = catalog_publication_lookup_path(publication_id)
+        try:
+            return self._find_catalog_lookup(
+                path, "publication_id", publication_id, revision
+            )
+        except (DatasetPathNotFound, KeyError):
+            pass
+        rows = self._load_catalog(revision, scope="audit", largest=True)
+        for row in rows:
+            if row.publication_id == publication_id:
+                return row
+        raise KeyError(publication_id)
+
+    def _find_catalog_lookup(
+        self, path: str, field: str, identity: str, revision: str
+    ) -> CatalogRow:
+        rows = [
+            _validate(CatalogRow, value, path)
+            for value in self._reader.read_rows(
+                self.config.index_dataset, revision, path
+            )
+        ]
+        if len(rows) != 1 or getattr(rows[0], field) != identity:
+            raise PresentationError(f"catalog lookup for {identity} is inconsistent")
+        return rows[0]
 
     def _load_projection(
         self, catalog: CatalogRow

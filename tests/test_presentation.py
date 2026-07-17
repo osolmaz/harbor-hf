@@ -32,6 +32,7 @@ from harbor_hf.results import (
     RunRow,
     TrialRow,
     build_catalog_lookup_file,
+    build_catalog_publication_lookup_file,
     build_catalog_row,
     build_result_publication,
 )
@@ -110,9 +111,13 @@ class FakeReader:
             self.rows[("org/index", INDEX_REVISION, index_path)] = [
                 row.model_dump(mode="python") for row in snapshot.index_rows
             ]
-        for row in snapshot.catalog_rows:
+        for row in snapshot.audit_catalog_rows:
             lookup = build_catalog_lookup_file(row)
             self.rows[("org/index", INDEX_REVISION, lookup.path)] = [
+                row.model_dump(mode="python")
+            ]
+            publication_lookup = build_catalog_publication_lookup_file(row)
+            self.rows[("org/index", INDEX_REVISION, publication_lookup.path)] = [
                 row.model_dump(mode="python")
             ]
         for index in snapshot.index_rows:
@@ -406,6 +411,21 @@ def test_historical_links_resolve_outside_list_window(
     assert client.get("/api/v1/runs/run-1/executions/execution-1").status_code == 200
     assert client.get("/api/v1/runs/run-1/trials/missing").status_code == 404
     assert len([path for path in reader.read_calls if "/windows/" not in path]) == 7
+
+
+def test_source_publication_lookup_resolves_outside_list_window(
+    snapshot: ResultSnapshot,
+) -> None:
+    reader = FakeReader(snapshot)
+    repository = ResultRepository(
+        PresentationConfig("org/index", max_publications=1), reader
+    )
+    repository.load()
+    source = snapshot.audit_catalog_rows[-1]
+
+    resolved = repository.find_catalog_publication(source.publication_id)
+
+    assert resolved == source
 
 
 def test_catalog_uses_valid_nonstandard_reward_names() -> None:

@@ -29,6 +29,7 @@ from harbor_hf.results import (
     ResultTables,
     RunRow,
     build_catalog_lookup_file,
+    build_catalog_publication_lookup_file,
     build_global_index_row,
     build_index_file,
     build_result_publication,
@@ -254,6 +255,8 @@ def test_serializes_result_and_index_with_parent_checked_leases(
     assert catalog[0].score == 0.0
     lookup = build_catalog_lookup_file(catalog[0])
     assert read_catalog_file(api.files["org/index"][lookup.path]) == catalog
+    publication_lookup = build_catalog_publication_lookup_file(catalog[0])
+    assert read_catalog_file(api.files["org/index"][publication_lookup.path]) == catalog
     assert catalog[0].projection_path.startswith("projections/schema=v1/")
     assert catalog[0].harbor_bundle_count == 1
 
