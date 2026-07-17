@@ -4,6 +4,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -272,8 +273,8 @@ def test_profile_ladder_skips_repetition_used_by_health_retry(
 
     _run_ladder(
         resolved,
-        None,  # type: ignore[arg-type]
-        None,  # type: ignore[arg-type]
+        cast(Any, None),
+        cast(Any, None),
         tmp_path,
         "token",
         tmp_path,
