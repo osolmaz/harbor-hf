@@ -2,8 +2,8 @@
 
 ## Canonical V1 Cutover
 
-- Source revision: `e740020e96ad7d3beaa9e4d722f7b3427d7d4397`
-- Space revision: `51e33984c41567cfc000b674d9492d5d3b7918b1`
+- Source revision: `add8aab285544cdc96cd155a87b7e279cb470ab3`
+- Space revision: `dd27179b1c8b76a7391ea243e9faf8e245d4fbab`
 - Active catalog revision: `b5fbf189b64ee63c0deaf2bb9f997e27d9378b22`
 - Active ShellBench result revision: `bb97497b1e63405d4e460892cf40a44eb4400d40`
 
@@ -70,7 +70,7 @@ It provides filtered and paginated run and campaign lists, stable detail URLs,
 task-level comparison, deterministic server-side result sorting, ETags,
 structured errors, an OpenAPI snapshot, and fail-closed private artifact and
 trajectory routes. The responsive filter toolbar fits phone, tablet,
-narrow-laptop, and desktop widths.
+narrow-laptop, and desktop widths. Run lists default to decreasing score.
 
 The visual implementation was informed by Harbor's Apache-2.0 viewer at commit
 `3914ab318b2dfc8d6f7e73e3587d5be401a79d89`. No Harbor source file was copied.
