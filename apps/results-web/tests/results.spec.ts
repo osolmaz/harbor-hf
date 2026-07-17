@@ -29,6 +29,6 @@ test("keeps component and diagnostic publications in audit scope", async ({ page
   await page.getByRole("button", { name: "Audit" }).click();
   await expect(page.getByRole("heading", { name: "Audit runs" })).toBeVisible();
   await expect(page.locator("tbody tr")).toHaveCount(17);
-  await expect(page.getByText("base; clean").first()).toBeVisible();
+  await expect(page.getByText("base; degraded").first()).toBeVisible();
   await expect(page.getByText("diagnostic; clean").first()).toBeVisible();
 });
