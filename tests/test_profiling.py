@@ -371,6 +371,65 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
     assert str(report.estimated_cost_usd) == "5.0"
 
 
+def test_managed_endpoint_preflight_uses_remote_namespace(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0].model_copy(update={"endpoint": None})
+    assert isinstance(deployment, DeploymentProfile)
+    model = remote_spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
+    spec = profiled_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"models": [model], "deployments": [deployment]}
+                )
+            }
+        )
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="5.00",
+        profile_timeout_seconds=3600,
+    )
+    response = {
+        "vendors": [
+            {
+                "regions": [
+                    {
+                        "name": deployment.region,
+                        "computes": [
+                            {
+                                "instanceType": deployment.hardware,
+                                "numAccelerators": deployment.accelerator_count,
+                                "status": "available",
+                                "pricePerHour": 5.0,
+                                "quota": {
+                                    "maxAccelerators": 2,
+                                    "usedAccelerators": 0,
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response)
+        )
+    )
+
+    report = preflight_profile_plan(
+        resolved, api=FakeApi(), client=client, token="hf_test"
+    )
+
+    assert report.target_kind == "inference-endpoint"
+    assert report.available_accelerators == 2
+
+
 def test_provider_preflight_requires_bounded_full_profile_estimate(
     remote_spec: ExperimentSpec,
 ) -> None:

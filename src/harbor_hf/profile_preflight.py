@@ -8,7 +8,7 @@ import httpx
 from huggingface_hub import HfApi, get_token
 from pydantic import BaseModel, ConfigDict, Field
 
-from harbor_hf.models import DeploymentProfile
+from harbor_hf.models import DeploymentProfile, ExperimentSpec
 from harbor_hf.profiling import ProfilePlan
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.submission import BucketApi, require_private_bucket
@@ -105,9 +105,16 @@ def _preflight_endpoint(
 ) -> PreflightReport:
     target = plan.deployment
     assert isinstance(target, DeploymentProfile)
-    namespace = target.endpoint.namespace if target.endpoint else None
+    spec = ExperimentSpec.model_validate(plan.experiment)
+    namespace = (
+        target.endpoint.namespace
+        if target.endpoint is not None
+        else spec.remote.job.namespace
+        if spec.remote is not None
+        else None
+    )
     if namespace is None:
-        raise ValueError("endpoint profile requires a pre-existing endpoint binding")
+        raise ValueError("endpoint profile requires a remote namespace")
     owned_client = client is None
     http = client or httpx.Client(timeout=30)
     try:
