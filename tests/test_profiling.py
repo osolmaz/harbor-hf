@@ -23,6 +23,7 @@ from harbor_hf.profile_worker import (
 from harbor_hf.profiling import (
     ProfilePlan,
     ProfilePoint,
+    bind_profile_target,
     build_profile_plan,
     canonical_digest,
     new_unselected_profile,
@@ -98,6 +99,26 @@ def failed_repetition(concurrency: int, repetition: int) -> ProfilePoint:
     )
 
 
+def run_expected_profile(
+    plan_path: Path,
+    output_root: Path,
+    *,
+    smoke_fails: bool,
+) -> None:
+    if smoke_fails:
+        with pytest.raises(ProfileWorkerError, match="smoke failed"):
+            run_profile_worker(plan_path, output_root)
+        destination = output_root / "serving-profiles/profile-one"
+        assert (destination / "_FAILED").is_file()
+        checksums = json.loads((destination / "checksums.json").read_text())
+        assert set(checksums) == {"failure.json", "plan.json"}
+        return
+    destination = run_profile_worker(plan_path, output_root)
+    assert (destination / "_SELECTED").is_file()
+    checksums = json.loads((destination / "checksums.json").read_text())
+    assert set(checksums) == {"plan.json", "profile.json"}
+
+
 def test_profile_plan_is_deterministic(remote_spec: ExperimentSpec) -> None:
     first = plan(remote_spec)
     second = plan(remote_spec)
@@ -168,13 +189,10 @@ def test_profile_selection_disqualifies_failed_boundary_repetition(
 
 def test_point_throughput_uses_complete_wall_time() -> None:
     observations = [
-        _TaskObservation(True, 1000, 10, 20, f"task-{index}")
-        for index in range(8)
+        _TaskObservation(True, 1000, 10, 20, f"task-{index}") for index in range(8)
     ]
 
-    result = _summarize_point(
-        1, observations, elapsed_ms=8000, repetition=1
-    )
+    result = _summarize_point(1, observations, elapsed_ms=8000, repetition=1)
 
     assert result.tasks_per_hour == 3600
     assert result.aggregate_output_tokens_per_second == 20
@@ -197,9 +215,7 @@ def test_endpoint_smoke_does_not_forward_endpoint_settings(
         return httpx.Response(
             200,
             json={
-                "choices": [
-                    {"message": {"content": "OK"}, "finish_reason": "stop"}
-                ],
+                "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 4, "completion_tokens": 1},
             },
             request=httpx.Request("POST", "https://endpoint.test"),
@@ -251,6 +267,35 @@ def test_profile_submit_command_is_remote_only(remote_spec: ExperimentSpec) -> N
     assert "profile-worker" in command
     assert "/input/plan.json" in command
     assert not any("llama-server" in argument for argument in command)
+
+
+def test_profile_without_endpoint_gets_deterministic_managed_binding(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0].model_copy(update={"endpoint": None})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [deployment]}
+            )
+        }
+    )
+    resolved = plan(spec)
+
+    first, desired = bind_profile_target(resolved)
+    second, repeated = bind_profile_target(resolved)
+
+    assert desired is not None
+    assert desired == repeated
+    assert first == second
+    bound = first.matrix.deployments[0]
+    assert isinstance(bound, DeploymentProfile)
+    assert bound.endpoint is not None
+    assert bound.endpoint.name == desired.identity.name
+    command = build_profile_submit_command(
+        resolved, input_dir="hf://buckets/input", bucket="osolmaz/results"
+    )
+    assert "harbor-hf-endpoint=" in " ".join(command)
 
 
 class FakeApi:
@@ -335,6 +380,7 @@ def test_provider_preflight_requires_bounded_full_profile_estimate(
         id="provider",
         model=model.repo,
         routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(max_concurrent_requests=2),
     )
     spec = spec.model_copy(
         update={
@@ -365,6 +411,7 @@ def test_provider_preflight_enforces_profile_spend_cap(
         model=model.repo,
         routing=ExplicitProviderRoute(provider="fireworks-ai"),
         limits=ProviderLimits(
+            max_concurrent_requests=2,
             max_spend_usd=Decimal("10"),
             estimated_wave_cost_usd=Decimal("6"),
         ),
@@ -426,7 +473,15 @@ def test_profile_worker_always_pauses_owned_endpoint(
     monkeypatch: pytest.MonkeyPatch,
     smoke_fails: bool,
 ) -> None:
-    resolved = plan(remote_spec)
+    deployment = remote_spec.matrix.deployments[0].model_copy(update={"endpoint": None})
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [deployment]}
+            )
+        }
+    )
+    resolved = plan(spec)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(resolved.model_dump_json(), encoding="utf-8")
     calls: list[str] = []
@@ -448,6 +503,19 @@ def test_profile_worker_always_pauses_owned_endpoint(
         "harbor_hf.profile_worker.prepare_locked_source",
         lambda *_args, **_kwargs: calls.append("source"),
     )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.HuggingFaceEndpointAdapter",
+        lambda **_kwargs: object(),
+    )
+
+    class Provisioner:
+        def __init__(self, _adapter: object) -> None:
+            calls.append("provisioner")
+
+        def create_or_adopt(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("provision")
+
+    monkeypatch.setattr("harbor_hf.profile_worker.EndpointProvisioner", Provisioner)
     monkeypatch.setattr("harbor_hf.profile_worker.EndpointManager", Manager)
     monkeypatch.setattr(
         "harbor_hf.profile_worker.validate_endpoint_model",
@@ -477,14 +545,13 @@ def test_profile_worker_always_pauses_owned_endpoint(
         lambda *_args, **_kwargs: [point(1, 10.0)],
     )
 
-    if smoke_fails:
-        with pytest.raises(ProfileWorkerError, match="smoke failed"):
-            run_profile_worker(plan_path, tmp_path / "output")
-    else:
-        destination = run_profile_worker(plan_path, tmp_path / "output")
-        assert (destination / "_SELECTED").is_file()
-        checksums = json.loads((destination / "checksums.json").read_text())
-        assert set(checksums) == {"_SELECTED", "plan.json", "profile.json"}
+    run_expected_profile(
+        plan_path,
+        tmp_path / "output",
+        smoke_fails=smoke_fails,
+    )
 
     assert calls.index("watchdog") < calls.index("resume")
+    assert calls.index("watchdog") < calls.index("provision")
+    assert calls.index("provision") < calls.index("resume")
     assert calls[-1] == "pause"

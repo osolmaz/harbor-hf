@@ -11,11 +11,15 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from harbor_hf.endpoints import deployment_digest, managed_endpoint_identity
+from harbor_hf.endpoints import (
+    bind_endpoint,
+    deployment_digest,
+    managed_endpoint_identity,
+    served_model_name,
+)
 from harbor_hf.models import (
     AgentProfile,
     ComponentKind,
-    DeploymentProfile,
     DeploymentTarget,
     EndpointRef,
     EvaluationId,
@@ -679,7 +683,7 @@ def managed_wave_endpoint(
     return EndpointRef(
         namespace=identity.namespace,
         name=identity.name,
-        served_model_name=_served_model_name(profile, model),
+        served_model_name=served_model_name(profile, model),
     )
 
 
@@ -709,44 +713,11 @@ def _bound_wave_spec(
     )
     if resolved_endpoint not in (profile.endpoint, managed_endpoint):
         raise ValueError("deployment wave endpoint identity is not allowed")
-    return _bind_endpoint(
+    return bind_endpoint(
         spec,
         deployment_id=run.deployment,
         endpoint=resolved_endpoint,
     )
-
-
-def _bind_endpoint(
-    spec: ExperimentSpec,
-    *,
-    deployment_id: str,
-    endpoint: EndpointRef,
-) -> ExperimentSpec:
-    deployments: list[DeploymentTarget] = []
-    for profile in spec.matrix.deployments:
-        if profile.id != deployment_id:
-            deployments.append(profile)
-            continue
-        if isinstance(profile, ProviderTarget):
-            raise ValueError("inference provider deployments cannot bind endpoints")
-        deployments.append(profile.model_copy(update={"endpoint": endpoint}))
-    matrix = spec.matrix.model_copy(update={"deployments": deployments})
-    return spec.model_copy(update={"matrix": matrix})
-
-
-def _served_model_name(
-    deployment: DeploymentProfile,
-    model: ModelProfile,
-) -> str:
-    arguments = deployment.engine.arguments
-    for option in ("--served-model-name", "--model"):
-        try:
-            index = arguments.index(option)
-        except ValueError:
-            continue
-        if index + 1 < len(arguments) and arguments[index + 1]:
-            return arguments[index + 1]
-    return model.repo
 
 
 def deterministic_wave_id(action_key: str) -> str:

@@ -3,11 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from harbor_hf.endpoints import (
+    DesiredEndpoint,
+    bind_endpoint,
+    build_desired_endpoint,
+    endpoint_ref_for,
+)
 from harbor_hf.models import (
     AgentProfile,
     DeploymentTarget,
@@ -15,6 +22,7 @@ from harbor_hf.models import (
     ModelProfile,
 )
 from harbor_hf.planner import RunCell, resolved_cells
+from harbor_hf.provider_models import ProviderTarget
 
 Sha256Digest = str
 ObjectiveKind = Literal[
@@ -162,6 +170,39 @@ class ProfilePlan(FrozenModel):
     profile_timeout_seconds: int = Field(ge=1)
     reasoning_required: bool
 
+    @model_validator(mode="after")
+    def candidate_ladder_is_valid(self) -> ProfilePlan:
+        _validate_candidate_ladder(self.candidate_concurrency)
+        return self
+
+
+def bind_profile_target(
+    plan: ProfilePlan,
+) -> tuple[ExperimentSpec, DesiredEndpoint | None]:
+    spec = ExperimentSpec.model_validate(plan.experiment)
+    deployment = plan.deployment
+    if isinstance(deployment, ProviderTarget):
+        return spec, None
+    if deployment.endpoint is not None:
+        return spec, None
+    if spec.remote is None:
+        raise ValueError("managed profile endpoints require remote execution")
+    desired = build_desired_endpoint(
+        namespace=spec.remote.job.namespace,
+        campaign_id=f"profile-{plan.profile_id}",
+        model=plan.model,
+        deployment=deployment,
+    )
+    endpoint = endpoint_ref_for(desired, deployment, plan.model)
+    return (
+        bind_endpoint(
+            spec,
+            deployment_id=plan.cell.deployment,
+            endpoint=endpoint,
+        ),
+        desired,
+    )
+
 
 def canonical_digest(value: object) -> str:
     if isinstance(value, BaseModel):
@@ -183,11 +224,21 @@ def build_profile_plan(
     objective: ProfileObjective | None = None,
 ) -> ProfilePlan:
     cells = resolved_cells(spec)
-    if len(cells) != 1:
-        raise ValueError("profile planning requires exactly one resolved matrix cell")
-    if not max_spend_usd or float(max_spend_usd) <= 0:
-        raise ValueError("profile planning requires a positive spend cap")
+    spend_cap = _validate_plan_inputs(
+        spec,
+        cells,
+        candidate_concurrency,
+        max_spend_usd,
+        profile_timeout_seconds,
+    )
     model, deployment, agent = _resolve_profiles(spec, cells[0])
+    if isinstance(deployment, ProviderTarget) and max(candidate_concurrency) > (
+        deployment.limits.max_concurrent_requests
+    ):
+        raise ValueError(
+            "profile concurrency exceeds the provider request concurrency limit"
+        )
+    max_spend_usd = str(spend_cap)
     context = spec.execution.server_context_tokens
     output = spec.execution.max_output_tokens
     if context is None or output is None:
@@ -241,6 +292,31 @@ def build_profile_plan(
             **core,
         }
     )
+
+
+def _validate_plan_inputs(
+    spec: ExperimentSpec,
+    cells: list[RunCell],
+    candidate_concurrency: list[int],
+    max_spend_usd: str,
+    profile_timeout_seconds: int,
+) -> Decimal:
+    if len(cells) != 1:
+        raise ValueError("profile planning requires exactly one resolved matrix cell")
+    try:
+        spend_cap = Decimal(max_spend_usd)
+    except InvalidOperation as error:
+        raise ValueError("profile planning requires a finite spend cap") from error
+    if not spend_cap.is_finite() or spend_cap <= 0:
+        raise ValueError("profile planning requires a positive spend cap")
+    _validate_candidate_ladder(candidate_concurrency)
+    if spec.remote is None:
+        raise ValueError("profile planning requires remote execution settings")
+    if profile_timeout_seconds + 600 > spec.remote.job.timeout_seconds:
+        raise ValueError(
+            "profile timeout must leave 600 seconds of remote Job lifecycle headroom"
+        )
+    return spend_cap
 
 
 def select_profile(profile: ServingProfile) -> ServingProfile:
@@ -306,6 +382,15 @@ def _resolve_profiles(
     deployments = {profile.id: profile for profile in spec.matrix.deployments}
     agents = {profile.id: profile for profile in spec.matrix.agents}
     return models[cell.model], deployments[cell.deployment], agents[cell.agent]
+
+
+def _validate_candidate_ladder(values: list[int]) -> None:
+    if not values:
+        raise ValueError("profile candidate concurrency must not be empty")
+    if values != sorted(set(values)):
+        raise ValueError("profile candidate concurrency must be sorted and unique")
+    if any(value < 1 or value & (value - 1) for value in values):
+        raise ValueError("profile candidate concurrency must use powers of two")
 
 
 def _eligible(profile: ServingProfile, point: ProfilePoint) -> bool:

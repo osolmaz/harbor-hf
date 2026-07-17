@@ -447,26 +447,32 @@ def _validate_serving_profile_binding(spec: ExperimentSpec) -> None:
         raise ValueError(
             "execution concurrent_trials must match the selected serving profile"
         )
-    if any(
-        len(profiles) != 1
-        for profiles in (
-            spec.matrix.models,
-            spec.matrix.deployments,
-            spec.matrix.agents,
-        )
-    ):
+    from harbor_hf.planner import resolved_cells
+
+    cells = resolved_cells(spec)
+    if len(cells) != 1:
         raise ValueError("serving profile binding requires one resolved matrix cell")
-    _validate_binding_identity(spec, binding)
+    cell = cells[0]
+    model = next(profile for profile in spec.matrix.models if profile.id == cell.model)
+    deployment = next(
+        profile for profile in spec.matrix.deployments if profile.id == cell.deployment
+    )
+    agent = next(profile for profile in spec.matrix.agents if profile.id == cell.agent)
+    _validate_binding_identity(spec, binding, model, deployment, agent)
     _validate_binding_token_limits(spec, binding)
 
 
 def _validate_binding_identity(
-    spec: ExperimentSpec, binding: ServingProfileBinding
+    spec: ExperimentSpec,
+    binding: ServingProfileBinding,
+    model: ModelProfile,
+    deployment: DeploymentTarget,
+    agent: AgentProfile,
 ) -> None:
     expected = {
-        "model_sha256": _canonical_profile_digest(spec.matrix.models[0]),
-        "deployment_sha256": _canonical_profile_digest(spec.matrix.deployments[0]),
-        "agent_sha256": _canonical_profile_digest(spec.matrix.agents[0]),
+        "model_sha256": _canonical_profile_digest(model),
+        "deployment_sha256": _canonical_profile_digest(deployment),
+        "agent_sha256": _canonical_profile_digest(agent),
         "benchmark_sha256": _canonical_profile_digest(
             spec.benchmark.model_dump(mode="json", exclude_none=True)
         ),

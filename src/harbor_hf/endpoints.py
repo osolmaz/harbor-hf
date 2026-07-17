@@ -15,7 +15,13 @@ from pydantic import (
     model_validator,
 )
 
-from harbor_hf.models import DeploymentProfile, DeploymentTarget, ModelProfile
+from harbor_hf.models import (
+    DeploymentProfile,
+    DeploymentTarget,
+    EndpointRef,
+    ExperimentSpec,
+    ModelProfile,
+)
 
 DeploymentDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 EndpointName = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
@@ -357,6 +363,51 @@ def build_desired_endpoint(
         tags=sorted([*settings.tags, *identity.tags]),
     )
     return DesiredEndpoint(identity=identity, configuration=configuration)
+
+
+def endpoint_ref_for(
+    desired: DesiredEndpoint,
+    deployment: DeploymentProfile,
+    model: ModelProfile,
+) -> EndpointRef:
+    return EndpointRef(
+        namespace=desired.identity.namespace,
+        name=desired.identity.name,
+        served_model_name=served_model_name(deployment, model),
+    )
+
+
+def bind_endpoint(
+    spec: ExperimentSpec,
+    *,
+    deployment_id: str,
+    endpoint: EndpointRef,
+) -> ExperimentSpec:
+    deployments: list[DeploymentTarget] = []
+    for profile in spec.matrix.deployments:
+        if profile.id != deployment_id:
+            deployments.append(profile)
+            continue
+        if not isinstance(profile, DeploymentProfile):
+            raise ValueError("inference provider deployments cannot bind endpoints")
+        deployments.append(profile.model_copy(update={"endpoint": endpoint}))
+    matrix = spec.matrix.model_copy(update={"deployments": deployments})
+    return spec.model_copy(update={"matrix": matrix})
+
+
+def served_model_name(
+    deployment: DeploymentProfile,
+    model: ModelProfile,
+) -> str:
+    arguments = deployment.engine.arguments
+    for option in ("--served-model-name", "--model"):
+        try:
+            index = arguments.index(option)
+        except ValueError:
+            continue
+        if index + 1 < len(arguments) and arguments[index + 1]:
+            return arguments[index + 1]
+    return model.repo
 
 
 def effective_configuration_mismatches(

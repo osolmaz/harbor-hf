@@ -109,7 +109,13 @@ def archive_directory(source: Path, destination: Path) -> None:
 
 
 def write_checksums(root: Path) -> dict[str, str]:
-    excluded = {"checksums.json", "_SUCCESS", "_FAILED", "_CANCELLED"}
+    excluded = {
+        "checksums.json",
+        "_SUCCESS",
+        "_FAILED",
+        "_CANCELLED",
+        "_SELECTED",
+    }
     checksums = {
         str(path.relative_to(root)): _sha256(path)
         for path in _evidence_paths(root)
@@ -138,7 +144,13 @@ def verify_checksums(root: Path) -> dict[str, str]:
         for path in _evidence_paths(root)
         if path.is_file()
         and str(path.relative_to(root))
-        not in {"checksums.json", "_SUCCESS", "_FAILED", "_CANCELLED"}
+        not in {
+            "checksums.json",
+            "_SUCCESS",
+            "_FAILED",
+            "_CANCELLED",
+            "_SELECTED",
+        }
     }
     if set(value) != expected_paths:
         raise RuntimeError("evidence checksum manifest does not cover exact contents")

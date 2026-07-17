@@ -14,7 +14,9 @@ from pathlib import Path
 import httpx
 from pydantic import JsonValue
 
+from harbor_hf.endpoints import DesiredEndpoint, EndpointProvisioner
 from harbor_hf.evidence import (
+    assert_secret_absent,
     scrub_secret,
     scrub_secret_paths,
     write_checksums,
@@ -23,19 +25,26 @@ from harbor_hf.evidence import (
 from harbor_hf.harbor_adapter import FilesystemHarborExecutionAdapter
 from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
 from harbor_hf.harbor_adapter.validation import load_compatibility_bundle
+from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.process import SubprocessRunner, run_streaming
 from harbor_hf.profile_worker_transport import ProfileTransport
 from harbor_hf.profiling import (
     ProfilePlan,
     ProfilePoint,
+    bind_profile_target,
     build_profile_plan,
     canonical_digest,
     new_unselected_profile,
     select_profile,
 )
 from harbor_hf.provider_models import ProviderTarget
-from harbor_hf.runs import RunLock, build_run_lock, harbor_process_environment
+from harbor_hf.runs import (
+    RunLock,
+    build_run_lock,
+    harbor_process_environment,
+    run_secret_values,
+)
 from harbor_hf.worker import (
     EndpointManager,
     launch_cleanup_watchdog,
@@ -102,43 +111,64 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
         raise ProfileWorkerError("profile artifact prefix already exists")
     destination.mkdir(parents=True)
     write_json(destination / "plan.json", plan.model_dump(mode="json"))
-    profile = new_unselected_profile(plan)
-    run_lock = build_run_lock(
-        spec,
-        model_id=plan.cell.model,
-        deployment_id=plan.cell.deployment,
-        agent_id=plan.cell.agent,
-        run_id=f"profile-{plan.profile_id}",
-        allow_provider=True,
-    )
-    deadline = time.monotonic() + plan.profile_timeout_seconds
-    require_executable("git")
-    require_executable("uv")
-    with tempfile.TemporaryDirectory(prefix="harbor-hf-profile-") as temporary:
-        harbor_source = Path(temporary) / "harbor"
-        prepare_locked_source(
-            spec.remote.harbor.source, harbor_source, SubprocessRunner()
+    secrets: str | tuple[str, ...] = token
+    try:
+        profile = new_unselected_profile(plan)
+        bound_spec, desired_endpoint = bind_profile_target(plan)
+        run_lock = build_run_lock(
+            bound_spec,
+            model_id=plan.cell.model,
+            deployment_id=plan.cell.deployment,
+            agent_id=plan.cell.agent,
+            run_id=f"profile-{plan.profile_id}",
+            allow_provider=True,
         )
-        with _profile_transport(
-            plan, run_lock, destination, token, deadline
-        ) as transport:
-            _verify_smoke(plan, transport, token, deadline)
-            points = _run_ladder(
+        deadline = time.monotonic() + plan.profile_timeout_seconds
+        require_executable("git")
+        require_executable("uv")
+        secrets = run_secret_values(run_lock, token)
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-profile-") as temporary:
+            harbor_source = Path(temporary) / "harbor"
+            prepare_locked_source(
+                spec.remote.harbor.source, harbor_source, SubprocessRunner()
+            )
+            with _profile_transport(
                 plan,
                 run_lock,
-                transport,
-                harbor_source,
-                token,
                 destination,
+                token,
                 deadline,
-            )
-            profile = profile.model_copy(update={"points": points})
-    selected = select_profile(profile)
-    write_json(destination / "profile.json", selected.model_dump(mode="json"))
-    selected_digest = canonical_digest(selected)
-    (destination / "_SELECTED").write_text(selected_digest + "\n", encoding="utf-8")
-    write_checksums(destination)
-    return destination
+                desired_endpoint=desired_endpoint,
+            ) as transport:
+                _verify_smoke(plan, transport, token, deadline)
+                points = _run_ladder(
+                    plan,
+                    run_lock,
+                    transport,
+                    harbor_source,
+                    token,
+                    destination,
+                    deadline,
+                )
+                profile = profile.model_copy(update={"points": points})
+        selected = select_profile(profile)
+        write_json(destination / "profile.json", selected.model_dump(mode="json"))
+        selected_digest = canonical_digest(selected)
+        _finalize_profile(destination, secrets)
+        (destination / "_SELECTED").write_text(selected_digest + "\n", encoding="utf-8")
+        return destination
+    except Exception as error:
+        failure = {
+            "error_type": type(error).__name__,
+            "message": _redact_message(str(error), secrets),
+        }
+        write_json(
+            destination / "failure.json",
+            failure,
+        )
+        _finalize_profile(destination, secrets)
+        write_json(destination / "_FAILED", failure)
+        raise
 
 
 @contextmanager
@@ -148,6 +178,8 @@ def _profile_transport(
     destination: Path,
     token: str,
     deadline: float,
+    *,
+    desired_endpoint: DesiredEndpoint | None,
 ) -> Iterator[ProfileTransport]:
     if isinstance(plan.deployment, ProviderTarget):
         with ProfileTransport.for_provider(
@@ -158,14 +190,23 @@ def _profile_transport(
         ) as transport:
             yield transport
         return
-    endpoint = plan.deployment.endpoint
+    deployment = run_lock.deployment
+    if isinstance(deployment, ProviderTarget):
+        raise ProfileWorkerError("profile target changed while binding its endpoint")
+    endpoint = deployment.endpoint
     if endpoint is None:
         raise ProfileWorkerError("profile endpoint binding is missing")
+    launch_cleanup_watchdog(run_lock, endpoint, token)
+    if desired_endpoint is not None:
+        provisioner = EndpointProvisioner(HuggingFaceEndpointAdapter(token=token))
+        provisioner.create_or_adopt(
+            desired_endpoint,
+            timeout_seconds=min(900, _remaining(deadline)),
+        )
     manager = EndpointManager(endpoint.namespace, endpoint.name, SubprocessRunner())
     baseline = manager.describe()
     validate_endpoint_model(run_lock, baseline)
     require_paused_endpoint(baseline)
-    launch_cleanup_watchdog(run_lock, endpoint, token)
     try:
         base_url = resume_and_probe_endpoint(
             destination,
@@ -252,6 +293,28 @@ def _run_ladder(
         points.append(point)
         _write_point(destination, point, result.observations, result.elapsed_ms)
         if not _point_passes_objective(plan, point):
+            _verify_smoke(plan, transport, token, deadline)
+            retry = _run_point(
+                plan,
+                run_lock,
+                transport,
+                harbor_source,
+                token,
+                concurrency,
+                repetition=2,
+                destination=destination,
+                deadline=deadline,
+            )
+            retried_point = _summarize_point(
+                concurrency,
+                retry.observations,
+                elapsed_ms=retry.elapsed_ms,
+                repetition=2,
+            )
+            points.append(retried_point)
+            _write_point(
+                destination, retried_point, retry.observations, retry.elapsed_ms
+            )
             break
         rate = point.tasks_per_hour or 0
         previous_rates.append(rate)
@@ -261,9 +324,7 @@ def _run_ladder(
         ):
             break
     boundary = [
-        point.concurrency
-        for point in points
-        if _point_passes_objective(plan, point)
+        point.concurrency for point in points if _point_passes_objective(plan, point)
     ][-2:]
     for concurrency in boundary:
         for repetition in range(2, plan.workload.boundary_repetitions + 1):
@@ -644,9 +705,7 @@ def _sample_tasks(plan: ProfilePlan) -> dict[str, str]:
         raise ProfileWorkerError("profile benchmark has no resolved task digests")
     selected = sorted(digests)[: plan.workload.sample_task_count]
     tasks = {
-        task: digest
-        for task in selected
-        if isinstance(digest := digests[task], str)
+        task: digest for task in selected if isinstance(digest := digests[task], str)
     }
     if len(tasks) != plan.workload.sample_task_count:
         raise ProfileWorkerError("profile benchmark task digests are malformed")
@@ -671,6 +730,20 @@ def _scrub_capability(root: Path, capability: str | None) -> None:
         return
     scrub_secret_paths(root, capability)
     scrub_secret(root, capability)
+
+
+def _finalize_profile(root: Path, secrets: str | tuple[str, ...]) -> None:
+    scrub_secret_paths(root, secrets)
+    scrub_secret(root, secrets)
+    assert_secret_absent(root, secrets)
+    write_checksums(root)
+
+
+def _redact_message(value: str, secrets: str | tuple[str, ...]) -> str:
+    candidates = (secrets,) if isinstance(secrets, str) else secrets
+    for secret in candidates:
+        value = value.replace(secret, "[REDACTED]")
+    return value
 
 
 def _timestamp(value: object) -> datetime | None:

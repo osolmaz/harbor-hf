@@ -78,6 +78,7 @@ class ProfileTransport:
         finally:
             self.proxy.revoke_scope(capability)
 
+
 def _wait_ready(base_url: str, token: str, deadline: float) -> None:
     ready_deadline = min(deadline, time.monotonic() + 120)
     last_failure = "no response"

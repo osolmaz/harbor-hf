@@ -10,9 +10,9 @@ from typing import Protocol, cast
 from huggingface_hub import HfApi
 from pydantic import BaseModel, ConfigDict
 
-from harbor_hf.models import DeploymentProfile, ExperimentSpec
+from harbor_hf.models import DeploymentProfile
 from harbor_hf.process import SubprocessRunner
-from harbor_hf.profiling import ProfilePlan
+from harbor_hf.profiling import ProfilePlan, bind_profile_target
 from harbor_hf.runs import build_run_lock
 from harbor_hf.submission import (
     BucketApi,
@@ -45,7 +45,7 @@ class ProfileSubmission(BaseModel):
 def build_profile_submit_command(
     plan: ProfilePlan, *, input_dir: str, bucket: str
 ) -> list[str]:
-    spec = ExperimentSpec.model_validate(plan.experiment)
+    spec, _desired = bind_profile_target(plan)
     if spec.remote is None:
         raise ValueError("profile run requires remote configuration")
     lock = build_run_lock(
@@ -56,7 +56,7 @@ def build_profile_submit_command(
         run_id=f"profile-{plan.profile_id}",
         allow_provider=True,
     )
-    target = plan.deployment
+    target = lock.deployment
     labels = ["--label", f"harbor-hf-profile={plan.profile_id}"]
     if isinstance(target, DeploymentProfile):
         if target.endpoint is None:
@@ -118,7 +118,7 @@ def submit_profile(
     runner: TextRunner | None = None,
     bucket_api: BucketApi | None = None,
 ) -> ProfileSubmission:
-    spec = ExperimentSpec.model_validate(plan.experiment)
+    spec, _desired = bind_profile_target(plan)
     if spec.remote is None:
         raise ValueError("profile run requires remote configuration")
     lock = build_run_lock(
