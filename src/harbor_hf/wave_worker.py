@@ -1190,7 +1190,7 @@ def _sandbox_result_exception(
         if len(raw) > _MAX_SANDBOX_RESULT_BYTES:
             return None
         result = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     if not isinstance(result, dict):
         return None

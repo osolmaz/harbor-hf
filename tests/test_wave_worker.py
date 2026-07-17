@@ -250,6 +250,14 @@ def test_wrapped_harbor_exit_ignores_excessively_nested_result(tmp_path: Path) -
     assert _sandbox_failure_category(tmp_path) is None
 
 
+def test_wrapped_harbor_exit_ignores_overlong_integer_result(tmp_path: Path) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text('{"value":' + "1" * 5000 + "}", encoding="utf-8")
+
+    assert _sandbox_failure_category(tmp_path) is None
+
+
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
     tmp_path: Path,
 ) -> None:
