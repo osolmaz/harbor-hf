@@ -39,6 +39,11 @@
           "title": "Deployment Sha256",
           "type": "string"
         },
+        "harbor_runtime_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Harbor Runtime Sha256",
+          "type": "string"
+        },
         "max_output_tokens": {
           "minimum": 1,
           "title": "Max Output Tokens",
@@ -47,6 +52,20 @@
         "model_sha256": {
           "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Model Sha256",
+          "type": "string"
+        },
+        "reasoning_required": {
+          "title": "Reasoning Required",
+          "type": "boolean"
+        },
+        "sample_task_count": {
+          "minimum": 1,
+          "title": "Sample Task Count",
+          "type": "integer"
+        },
+        "sample_tasks_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sample Tasks Sha256",
           "type": "string"
         },
         "server_context_tokens": {
@@ -60,8 +79,12 @@
         "deployment_sha256",
         "agent_sha256",
         "benchmark_sha256",
+        "harbor_runtime_sha256",
         "server_context_tokens",
-        "max_output_tokens"
+        "max_output_tokens",
+        "reasoning_required",
+        "sample_task_count",
+        "sample_tasks_sha256"
       ],
       "title": "ProfileIdentity",
       "type": "object"
@@ -546,8 +569,6 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/osolmaz/harbor-hf/schemas/serving-profile-v1.schema.json",
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
     "artifacts": {

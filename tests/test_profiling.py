@@ -478,6 +478,62 @@ def test_serving_profile_binding_fails_closed_on_concurrency(
         )
 
 
+def test_serving_profile_binding_fails_closed_on_workload_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = profiled_spec(remote_spec)
+    resolved = plan(remote_spec)
+    binding = ServingProfileBinding(
+        profile_id=resolved.profile_id,
+        profile_sha256="sha256:" + "9" * 64,
+        artifact_uri="hf://buckets/osolmaz/benchmark-runs/serving-profiles/profile-one/profile.json",
+        concurrency=spec.execution.concurrent_trials,
+        **resolved.identity.model_dump(mode="python"),
+    )
+
+    reasoning_execution = spec.execution.model_copy(
+        update={
+            "reasoning_required": False,
+            "serving_profile": binding,
+        }
+    )
+    with pytest.raises(ValueError, match="reasoning mode"):
+        ExperimentSpec.model_validate(
+            spec.model_copy(update={"execution": reasoning_execution}).model_dump(
+                mode="python"
+            )
+        )
+
+    assert spec.remote is not None
+    changed_remote = spec.remote.model_copy(
+        update={
+            "harbor": spec.remote.harbor.model_copy(
+                update={"sandbox_flavor": "cpu-performance"}
+            )
+        }
+    )
+    runtime_execution = spec.execution.model_copy(update={"serving_profile": binding})
+    with pytest.raises(ValueError, match="harbor_runtime_sha256"):
+        ExperimentSpec.model_validate(
+            spec.model_copy(
+                update={"execution": runtime_execution, "remote": changed_remote}
+            ).model_dump(mode="python")
+        )
+
+    changed_binding = binding.model_copy(
+        update={"sample_tasks_sha256": "sha256:" + "8" * 64}
+    )
+    workload_execution = spec.execution.model_copy(
+        update={"serving_profile": changed_binding}
+    )
+    with pytest.raises(ValueError, match="sampled workload"):
+        ExperimentSpec.model_validate(
+            spec.model_copy(update={"execution": workload_execution}).model_dump(
+                mode="python"
+            )
+        )
+
+
 def test_managed_endpoint_binding_preserves_profile_identity(
     remote_spec: ExperimentSpec,
 ) -> None:

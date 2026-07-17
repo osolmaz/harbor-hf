@@ -43,8 +43,12 @@ class ProfileIdentity(FrozenModel):
     deployment_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     agent_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     benchmark_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    harbor_runtime_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     server_context_tokens: int = Field(ge=1)
     max_output_tokens: int = Field(ge=1)
+    reasoning_required: bool
+    sample_task_count: int = Field(ge=1)
+    sample_tasks_sha256: Sha256Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class ProfileObjective(FrozenModel):
@@ -269,19 +273,25 @@ def build_profile_plan(
         raise ValueError("profile planning requires resolved benchmark task digests")
     sampled = tasks[: min(sample_task_count, len(tasks))]
     benchmark = spec.benchmark.model_dump(mode="json", exclude_none=True)
+    assert spec.remote is not None
+    sample_tasks_sha256 = canonical_digest(
+        {task: spec.benchmark.task_digests[task] for task in sampled}
+    )
     identity = ProfileIdentity(
         model_sha256=canonical_digest(model),
         deployment_sha256=profile_deployment_digest(deployment),
         agent_sha256=canonical_digest(agent),
         benchmark_sha256=canonical_digest(benchmark),
+        harbor_runtime_sha256=canonical_digest(spec.remote.harbor),
         server_context_tokens=context,
         max_output_tokens=output,
+        reasoning_required=spec.execution.reasoning_required,
+        sample_task_count=len(sampled),
+        sample_tasks_sha256=sample_tasks_sha256,
     )
     workload = ProfileWorkload(
         sample_task_count=len(sampled),
-        sample_tasks_sha256=canonical_digest(
-            {task: spec.benchmark.task_digests[task] for task in sampled}
-        ),
+        sample_tasks_sha256=sample_tasks_sha256,
     )
     artifacts = ProfileArtifacts(
         bucket=spec.artifacts.bucket,

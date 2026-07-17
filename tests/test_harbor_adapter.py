@@ -461,8 +461,8 @@ def test_adapter_export_uses_only_remaining_shared_deadline(
             return 0
         return 1
 
-    times = iter([100.0, 104.25])
-    with pytest.raises(WorkerError, match="exporter exited"):
+    times = iter([100.0, 104.25, 104.25, 105.25, 105.25, 107.25])
+    with pytest.raises(WorkerError, match="after 3 attempts"):
         adapter.execute(
             prepared,
             tmp_path / "harbor",
@@ -472,10 +472,68 @@ def test_adapter_export_uses_only_remaining_shared_deadline(
             timeout_seconds=10,
             stream_runner=run,
             monotonic=lambda: next(times),
+            sleep=lambda _seconds: None,
             deadline=110.0,
         )
 
-    assert timeouts == [10, 6]
+    assert timeouts == [10, 6, 5, 3]
+
+
+def test_adapter_retries_transient_export_failure(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(_command: object, log_path: Path, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 0
+        if calls == 2:
+            log_path.write_text(
+                "transient bucket visibility failure\n", encoding="utf-8"
+            )
+            return 1
+        prepared.request_path.with_name("harbor-compatibility.json").write_text(
+            _bundle(prepared.request).model_dump_json() + "\n", encoding="utf-8"
+        )
+        return 0
+
+    outcome = adapter.execute(
+        prepared,
+        tmp_path / "harbor",
+        jobs_dir,
+        tmp_path / "harbor.log",
+        environment={},
+        timeout_seconds=30,
+        stream_runner=run,
+        sleep=lambda _seconds: None,
+    )
+
+    assert calls == 3
+    assert outcome.verification is not None
+    assert outcome.verification.trial_count == 1
+    assert (
+        "transient bucket visibility failure"
+        in (tmp_path / "harbor-export.log").read_text()
+    )
 
 
 def test_adapter_revalidates_inputs_after_failed_export(

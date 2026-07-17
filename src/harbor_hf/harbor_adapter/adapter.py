@@ -72,6 +72,7 @@ class HarborExecutionAdapter(Protocol):
         timeout_seconds: int,
         stream_runner: Callable[..., int],
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
         deadline: float | None = None,
     ) -> HarborExecutionOutcome: ...
 
@@ -121,6 +122,7 @@ class FilesystemHarborExecutionAdapter:
         timeout_seconds: int,
         stream_runner: Callable[..., int],
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
         deadline: float | None = None,
     ) -> HarborExecutionOutcome:
         shared_deadline = _shared_deadline(timeout_seconds, deadline, monotonic)
@@ -137,7 +139,6 @@ class FilesystemHarborExecutionAdapter:
         has_results = any(jobs_dir.glob("*/*/result.json"))
         if exit_code != 0 and not has_results:
             return HarborExecutionOutcome(exit_code, None, None)
-        export_timeout = _remaining_export_timeout(shared_deadline, monotonic)
         compatibility_path = prepared.request_path.with_name(
             "harbor-compatibility.json"
         )
@@ -153,9 +154,11 @@ class FilesystemHarborExecutionAdapter:
             export_log,
             request_digest,
             environment,
-            export_timeout,
+            shared_deadline,
             exit_code,
             stream_runner,
+            monotonic,
+            sleep,
         )
         if not exported:
             return HarborExecutionOutcome(exit_code, None, None)
@@ -179,36 +182,59 @@ class FilesystemHarborExecutionAdapter:
         export_log: Path,
         request_digest: str,
         environment: dict[str, str],
-        export_timeout: int,
+        deadline: float,
         harbor_exit: int,
         stream_runner: Callable[..., int],
+        monotonic: Callable[[], float],
+        sleep: Callable[[float], None],
     ) -> bool:
-        try:
-            exporter_exit = stream_runner(
-                render_export_command(
-                    harbor_source,
-                    jobs_dir,
-                    compatibility_path,
-                    prepared.request.harbor_revision,
-                    request_digest,
-                ),
-                export_log,
-                environment=environment,
-                timeout_seconds=export_timeout,
-            )
-        except (OSError, RuntimeError):
+        attempts = 3 if harbor_exit == 0 else 1
+        export_log.unlink(missing_ok=True)
+        last_error: OSError | RuntimeError | None = None
+        exporter_exit: int | None = None
+        for attempt in range(1, attempts + 1):
             self._validate_inputs(prepared)
-            if harbor_exit != 0:
-                return False
-            raise
-        self._validate_inputs(prepared)
-        if exporter_exit != 0:
-            if harbor_exit != 0:
-                return False
-            raise WorkerError(
-                f"Harbor compatibility exporter exited with status {exporter_exit}"
+            compatibility_path.unlink(missing_ok=True)
+            attempt_log = export_log.with_name(
+                f"{export_log.stem}.attempt-{attempt}{export_log.suffix}"
             )
-        return True
+            attempt_log.unlink(missing_ok=True)
+            export_timeout = _remaining_export_timeout(deadline, monotonic)
+            try:
+                exporter_exit = stream_runner(
+                    render_export_command(
+                        harbor_source,
+                        jobs_dir,
+                        compatibility_path,
+                        prepared.request.harbor_revision,
+                        request_digest,
+                    ),
+                    attempt_log,
+                    environment=environment,
+                    timeout_seconds=export_timeout,
+                )
+                last_error = None
+            except (OSError, RuntimeError) as error:
+                last_error = error
+                exporter_exit = None
+            finally:
+                _append_export_attempt_log(export_log, attempt_log, attempt)
+                attempt_log.unlink(missing_ok=True)
+                self._validate_inputs(prepared)
+            if exporter_exit == 0:
+                return True
+            if harbor_exit != 0:
+                return False
+            if attempt < attempts:
+                _sleep_before_export_retry(deadline, monotonic, sleep, attempt)
+        if last_error is not None:
+            raise WorkerError(
+                f"Harbor compatibility exporter failed after {attempts} attempts"
+            ) from last_error
+        raise WorkerError(
+            "Harbor compatibility exporter exited with status "
+            f"{exporter_exit} after {attempts} attempts"
+        )
 
     @staticmethod
     def _validate_inputs(prepared: PreparedHarborExecution) -> None:
@@ -237,6 +263,29 @@ def _remaining_export_timeout(deadline: float, monotonic: Callable[[], float]) -
     if remaining <= 0:
         raise WorkerError("Harbor execution deadline was reached before export")
     return min(max(1, math.ceil(remaining)), 300)
+
+
+def _sleep_before_export_retry(
+    deadline: float,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    attempt: int,
+) -> None:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise WorkerError("Harbor execution deadline was reached during export retry")
+    sleep(min(float(attempt), remaining))
+
+
+def _append_export_attempt_log(
+    export_log: Path, attempt_log: Path, attempt: int
+) -> None:
+    content = attempt_log.read_bytes() if attempt_log.is_file() else b""
+    with export_log.open("ab") as stream:
+        stream.write(f"== exporter attempt {attempt} ==\n".encode())
+        stream.write(content)
+        if content and not content.endswith(b"\n"):
+            stream.write(b"\n")
 
 
 def build_execution_request(

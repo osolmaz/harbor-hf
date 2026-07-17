@@ -330,8 +330,12 @@ class ServingProfileBinding(StrictModel):
     deployment_sha256: ContentDigest
     agent_sha256: ContentDigest
     benchmark_sha256: ContentDigest
+    harbor_runtime_sha256: ContentDigest
     server_context_tokens: int = Field(ge=1)
     max_output_tokens: int = Field(ge=1)
+    reasoning_required: bool
+    sample_task_count: int = Field(ge=1)
+    sample_tasks_sha256: ContentDigest
 
 
 class ExecutionSpec(StrictModel):
@@ -443,6 +447,8 @@ def _validate_serving_profile_binding(spec: ExperimentSpec) -> None:
     binding = spec.execution.serving_profile
     if binding is None:
         return
+    if spec.remote is None:
+        raise ValueError("serving profile binding requires remote execution settings")
     if spec.execution.concurrent_trials != binding.concurrency:
         raise ValueError(
             "execution concurrent_trials must match the selected serving profile"
@@ -469,6 +475,9 @@ def _validate_binding_identity(
     deployment: DeploymentTarget,
     agent: AgentProfile,
 ) -> None:
+    remote = spec.remote
+    if remote is None:
+        raise ValueError("serving profile binding requires remote execution settings")
     expected = {
         "model_sha256": _canonical_profile_digest(model),
         "deployment_sha256": profile_deployment_digest(deployment),
@@ -476,10 +485,21 @@ def _validate_binding_identity(
         "benchmark_sha256": _canonical_profile_digest(
             spec.benchmark.model_dump(mode="json", exclude_none=True)
         ),
+        "harbor_runtime_sha256": _canonical_profile_digest(remote.harbor),
     }
     for field, value in expected.items():
         if getattr(binding, field) != value:
             raise ValueError(f"serving profile {field} does not match the experiment")
+    if binding.reasoning_required != spec.execution.reasoning_required:
+        raise ValueError("serving profile reasoning mode does not match execution")
+    sampled_tasks = sorted(spec.benchmark.task_digests)[: binding.sample_task_count]
+    if len(sampled_tasks) != binding.sample_task_count:
+        raise ValueError("serving profile sample count exceeds benchmark tasks")
+    sample_digest = _canonical_profile_digest(
+        {task: spec.benchmark.task_digests[task] for task in sampled_tasks}
+    )
+    if binding.sample_tasks_sha256 != sample_digest:
+        raise ValueError("serving profile sampled workload does not match benchmark")
 
 
 def _validate_binding_token_limits(

@@ -63,9 +63,12 @@ The bundle contains:
 - no exception tracebacks, environment variables, agent config, task content,
   or secret values.
 
-The exporter log is retained as `harbor-export.log`. The normal evidence
-redaction, secret scan, checksums, and terminal-marker rules apply to the input,
-bundle, log, and raw Harbor artifacts together.
+The exporter retries a transient failure up to three times within the shared
+execution deadline. Each attempt is retained in `harbor-export.log`; stale
+partial bundles are removed before a retry. Persistent export failures remain
+terminal. The normal evidence redaction, secret scan, checksums, and
+terminal-marker rules apply to the input, bundle, log, and raw Harbor artifacts
+together.
 
 The controller writes `private-artifacts.json` for every direct Harbor trial and
 for each complete campaign physical execution. Entries are sorted,
