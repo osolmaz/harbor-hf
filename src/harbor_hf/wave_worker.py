@@ -1166,15 +1166,18 @@ def _sandbox_failure_category(evidence_root: Path | None) -> RetryCategory | Non
         if not _safe_evidence_file(exception_path, resolved_root):
             continue
         try:
-            with exception_path.open(encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    lowered = line.lower()
-                    saw_sandbox_error = saw_sandbox_error or "sandboxerror" in lowered
-                    category = _sandbox_exception_line_category(lowered)
-                    if category is not None:
-                        return category
+            lowered = exception_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).lower()
         except OSError:
             continue
+        if "sandboxerror" not in lowered:
+            continue
+        saw_sandbox_error = True
+        for line in lowered.splitlines():
+            category = _sandbox_exception_line_category(line)
+            if category is not None:
+                return category
     return "benchmark" if saw_sandbox_error else None
 
 

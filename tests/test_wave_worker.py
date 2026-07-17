@@ -53,6 +53,7 @@ from harbor_hf.wave_worker import (
     _finalize_execution,
     _launch_wave_watchdog,
     _remaining_seconds,
+    _sandbox_failure_category,
     _valid_terminal_trial,
     _wave_model_name,
     run_wave_worker,
@@ -204,6 +205,19 @@ def test_wrapped_harbor_exit_uses_sandbox_exception_evidence(
         )
         == expected
     )
+
+
+def test_wrapped_harbor_exit_ignores_sandbox_markers_without_sandbox_error(
+    tmp_path: Path,
+) -> None:
+    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
+    exception.parent.mkdir(parents=True)
+    exception.write_text(
+        "RuntimeError: expected Sandbox API error (503) handling",
+        encoding="utf-8",
+    )
+
+    assert _sandbox_failure_category(tmp_path) is None
 
 
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
