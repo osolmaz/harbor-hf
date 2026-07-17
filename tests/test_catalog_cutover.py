@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,6 +193,7 @@ def _plan() -> CatalogCutoverPlan:
                 publication_id="publication-one",
                 evaluation_id="evaluation-one",
                 role="final",
+                execution_profile_sha256="sha256:" + "7" * 64,
             )
         ],
     )
@@ -242,6 +245,91 @@ def test_cutover_rewrites_v1_and_switches_scoped_catalogs(tmp_path: Path) -> Non
     assert primary[0].publication_role == "final"
     assert catalog_publication_lookup_path("publication-one") in index_files
     assert publisher_lease_path("org/results") not in leases.held
+
+
+def test_cutover_repairs_source_projection_without_execution_profile(
+    tmp_path: Path,
+) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    path = "projections/schema=v1/publication-one.json"
+    projection = json.loads(api.snapshots[("org/results", RESULT_HEAD)][path])
+    del projection["execution_profile_sha256"]
+    api.snapshots[("org/results", RESULT_HEAD)][path] = (
+        json.dumps(projection, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+
+    result = HubCatalogCutover(
+        publisher_id="cutover-one", leases=FakeLeases(), api=api
+    ).apply(_plan())
+
+    assert result.primary_publications == 1
+
+
+def test_cutover_derives_missing_unsupported_count(tmp_path: Path) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    projection_path = "projections/schema=v1/publication-one.json"
+    projection = json.loads(
+        api.snapshots[("org/results", RESULT_HEAD)][projection_path]
+    )
+    runs = projection["tables"]["runs"]
+    table = pq.read_table(
+        pa.BufferReader(api.snapshots[("org/results", RESULT_HEAD)][runs["path"]])
+    )
+    values = table.to_pylist()
+    del values[0]["unsupported_count"]
+    sink = pa.BufferOutputStream()
+    pq.write_table(pa.Table.from_pylist(values), sink)
+    content = sink.getvalue().to_pybytes()
+    api.snapshots[("org/results", RESULT_HEAD)][runs["path"]] = content
+    runs["sha256"] = "sha256:" + hashlib.sha256(content).hexdigest()
+    api.snapshots[("org/results", RESULT_HEAD)][projection_path] = (
+        json.dumps(projection, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+
+    result = HubCatalogCutover(
+        publisher_id="cutover-one", leases=FakeLeases(), api=api
+    ).apply(_plan())
+
+    assert result.primary_publications == 1
+
+
+def test_cutover_rejects_execution_profile_conflict(tmp_path: Path) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    plan = _plan().model_copy(
+        update={
+            "classifications": [
+                _plan()
+                .classifications[0]
+                .model_copy(update={"execution_profile_sha256": "sha256:" + "a" * 64})
+            ]
+        }
+    )
+
+    with pytest.raises(
+        CatalogCutoverError,
+        match="source projection execution profile conflicts with classification",
+    ):
+        HubCatalogCutover(
+            publisher_id="cutover-one", leases=FakeLeases(), api=api
+        ).apply(plan)
+
+
+def test_cutover_rejects_non_scalar_execution_profile(tmp_path: Path) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    path = "projections/schema=v1/publication-one.json"
+    projection = json.loads(api.snapshots[("org/results", RESULT_HEAD)][path])
+    projection["execution_profile_sha256"] = ["invalid"]
+    api.snapshots[("org/results", RESULT_HEAD)][path] = (
+        json.dumps(projection, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+
+    with pytest.raises(
+        CatalogCutoverError,
+        match="source projection execution profile conflicts with classification",
+    ):
+        HubCatalogCutover(
+            publisher_id="cutover-one", leases=FakeLeases(), api=api
+        ).apply(_plan())
 
 
 def test_cutover_recovers_after_result_commit_and_is_idempotent(

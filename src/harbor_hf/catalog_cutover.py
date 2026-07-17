@@ -23,6 +23,7 @@ from harbor_hf.results import (
     ArtifactRow,
     CatalogRow,
     DatasetFile,
+    Digest,
     ExecutionRow,
     GlobalIndexRow,
     MetricRow,
@@ -64,6 +65,7 @@ class CatalogClassification(FrozenModel):
     publication_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     evaluation_id: EvaluationId
     role: PublicationRole
+    execution_profile_sha256: Digest
     component_kind: ComponentKind | None = None
     source_publication_ids: list[str] = Field(default_factory=list)
 
@@ -367,9 +369,26 @@ class HubCatalogCutover:
         dataset = plan.result_dataset
         revision = plan.expected_result_head
         projection_path = f"projections/schema=v1/{classification.publication_id}.json"
-        projection = ResultProjection.model_validate_json(
-            self._read(dataset, projection_path, revision)
+        try:
+            projection_value = json.loads(
+                self._read(dataset, projection_path, revision)
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise CatalogCutoverError("source projection is invalid") from error
+        if not isinstance(projection_value, dict):
+            raise CatalogCutoverError("source projection is invalid")
+        observed_profile = projection_value.get("execution_profile_sha256")
+        if (
+            observed_profile is not None
+            and observed_profile != classification.execution_profile_sha256
+        ):
+            raise CatalogCutoverError(
+                "source projection execution profile conflicts with classification"
+            )
+        projection_value["execution_profile_sha256"] = (
+            classification.execution_profile_sha256
         )
+        projection = ResultProjection.model_validate(projection_value)
         if projection.publication_id != classification.publication_id:
             raise CatalogCutoverError("source projection publication conflicts")
         rows = {
@@ -384,6 +403,10 @@ class HubCatalogCutover:
                 "component_kind": classification.component_kind,
                 "source_publication_ids": classification.source_publication_ids,
             }
+        )
+        run_value.setdefault(
+            "unsupported_count",
+            sum(value.get("outcome") == "unsupported" for value in rows["trials"]),
         )
         tables = ResultTables(
             publication_id=classification.publication_id,
