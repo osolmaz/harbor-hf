@@ -73,12 +73,26 @@ def _preflight_provider(
         raise ValueError(f"requested Inference Provider is unavailable: {requested}")
     if not providers:
         raise ValueError("model has no live Hugging Face Inference Provider route")
+    limits = target.limits
+    estimate = limits.estimated_wave_cost_usd
+    target_cap = limits.max_spend_usd
+    if estimate is None or target_cap is None:
+        raise ValueError(
+            "provider profile requires a bounded full-profile cost estimate"
+        )
+    if estimate > target_cap:
+        raise ValueError("provider profile estimate exceeds the provider spend cap")
+    if estimate > cap:
+        raise ValueError(
+            f"profile estimate ${estimate:.2f} exceeds spend cap ${cap:.2f}"
+        )
     return PreflightReport(
         profile_id=plan.profile_id,
         target_kind="inference-provider",
         model_revision_verified=True,
         private_bucket_verified=True,
         provider_route_verified=True,
+        estimated_cost_usd=estimate,
         spend_cap_usd=cap,
     )
 
@@ -151,8 +165,14 @@ def _find_compute(value: object, target: DeploymentProfile) -> dict[str, object]
             if region.get("name") != target.region:
                 continue
             for compute in _dictionary_list(region, "computes"):
+                instance_type = compute.get("instanceType")
+                normalized_hardware = (
+                    instance_type.removeprefix("nvidia-")
+                    if isinstance(instance_type, str)
+                    else None
+                )
                 if (
-                    compute.get("instanceType") == hardware
+                    normalized_hardware == hardware
                     and compute.get("numAccelerators") == target.accelerator_count
                     and compute.get("status") == "available"
                 ):

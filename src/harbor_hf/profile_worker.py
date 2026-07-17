@@ -3,17 +3,29 @@ from __future__ import annotations
 import math
 import os
 import statistics
+import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 from pydantic import JsonValue
 
-from harbor_hf.evidence import write_json
-from harbor_hf.models import DeploymentProfile, ExperimentSpec
-from harbor_hf.process import SubprocessRunner
+from harbor_hf.evidence import (
+    scrub_secret,
+    scrub_secret_paths,
+    write_checksums,
+    write_json,
+)
+from harbor_hf.harbor_adapter import FilesystemHarborExecutionAdapter
+from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
+from harbor_hf.harbor_adapter.validation import load_compatibility_bundle
+from harbor_hf.models import ExperimentSpec
+from harbor_hf.process import SubprocessRunner, run_streaming
+from harbor_hf.profile_worker_transport import ProfileTransport
 from harbor_hf.profiling import (
     ProfilePlan,
     ProfilePoint,
@@ -22,17 +34,17 @@ from harbor_hf.profiling import (
     new_unselected_profile,
     select_profile,
 )
-from harbor_hf.providers import routed_provider_model
-from harbor_hf.runs import build_run_lock
+from harbor_hf.provider_models import ProviderTarget
+from harbor_hf.runs import RunLock, build_run_lock, harbor_process_environment
 from harbor_hf.worker import (
     EndpointManager,
     launch_cleanup_watchdog,
+    prepare_locked_source,
+    require_executable,
     require_paused_endpoint,
     resume_and_probe_endpoint,
     validate_endpoint_model,
 )
-
-_CONTROL_PARAMETERS: set[str] = set()
 
 
 class ProfileWorkerError(RuntimeError):
@@ -40,16 +52,30 @@ class ProfileWorkerError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _Observation:
+class _SmokeObservation:
     success: bool
-    latency_ms: float
     input_tokens: int
     output_tokens: int
-    finish_reason: str | None
     saw_content: bool
     saw_reasoning: bool
     saw_tool_call: bool
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class _TaskObservation:
+    success: bool
+    latency_ms: float
+    input_tokens: int
+    output_tokens: int
+    task_name: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _PointResult:
+    observations: list[_TaskObservation]
+    elapsed_ms: float
 
 
 def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
@@ -69,6 +95,8 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
     token = os.environ.get("HF_TOKEN", "")
     if not token:
         raise ProfileWorkerError("profile worker requires HF_TOKEN")
+    if spec.remote is None:
+        raise ProfileWorkerError("profile worker requires remote execution settings")
     destination = output_root / plan.artifacts.prefix
     if destination.exists():
         raise ProfileWorkerError("profile artifact prefix already exists")
@@ -83,83 +111,115 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
         run_id=f"profile-{plan.profile_id}",
         allow_provider=True,
     )
-    endpoint_manager: EndpointManager | None = None
     deadline = time.monotonic() + plan.profile_timeout_seconds
-    try:
-        if isinstance(plan.deployment, DeploymentProfile):
-            endpoint = plan.deployment.endpoint
-            if endpoint is None:
-                raise ProfileWorkerError("profile endpoint binding is missing")
-            endpoint_manager = EndpointManager(
-                endpoint.namespace, endpoint.name, SubprocessRunner()
-            )
-            baseline = endpoint_manager.describe()
-            validate_endpoint_model(run_lock, baseline)
-            require_paused_endpoint(baseline)
-            launch_cleanup_watchdog(run_lock, endpoint, token)
-            base_url = resume_and_probe_endpoint(
-                destination,
-                destination / "events.jsonl",
+    require_executable("git")
+    require_executable("uv")
+    with tempfile.TemporaryDirectory(prefix="harbor-hf-profile-") as temporary:
+        harbor_source = Path(temporary) / "harbor"
+        prepare_locked_source(
+            spec.remote.harbor.source, harbor_source, SubprocessRunner()
+        )
+        with _profile_transport(
+            plan, run_lock, destination, token, deadline
+        ) as transport:
+            _verify_smoke(plan, transport, token, deadline)
+            points = _run_ladder(
+                plan,
                 run_lock,
-                endpoint_manager,
+                transport,
+                harbor_source,
                 token,
-                readiness_timeout_seconds=min(3600, _remaining(deadline)),
+                destination,
+                deadline,
             )
-            model_name = endpoint.served_model_name
-        else:
-            base_url = "https://router.huggingface.co"
-            model_name = routed_provider_model(plan.deployment)
-        _verify_smoke(plan, base_url, model_name, token, deadline)
-        points = _run_ladder(plan, base_url, model_name, token, destination, deadline)
-        profile = profile.model_copy(update={"points": points})
-    finally:
-        if endpoint_manager is not None:
-            endpoint_manager.pause_and_verify()
+            profile = profile.model_copy(update={"points": points})
     selected = select_profile(profile)
     write_json(destination / "profile.json", selected.model_dump(mode="json"))
-    checksum = canonical_digest(selected)
-    write_json(destination / "checksums.json", {"profile.json": checksum})
-    (destination / "_SELECTED").write_text(checksum + "\n", encoding="utf-8")
+    selected_digest = canonical_digest(selected)
+    (destination / "_SELECTED").write_text(selected_digest + "\n", encoding="utf-8")
+    write_checksums(destination)
     return destination
+
+
+@contextmanager
+def _profile_transport(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    destination: Path,
+    token: str,
+    deadline: float,
+) -> Iterator[ProfileTransport]:
+    if isinstance(plan.deployment, ProviderTarget):
+        with ProfileTransport.for_provider(
+            plan.deployment,
+            token=token,
+            evidence_path=destination / "provider-requests.jsonl",
+            deadline=deadline,
+        ) as transport:
+            yield transport
+        return
+    endpoint = plan.deployment.endpoint
+    if endpoint is None:
+        raise ProfileWorkerError("profile endpoint binding is missing")
+    manager = EndpointManager(endpoint.namespace, endpoint.name, SubprocessRunner())
+    baseline = manager.describe()
+    validate_endpoint_model(run_lock, baseline)
+    require_paused_endpoint(baseline)
+    launch_cleanup_watchdog(run_lock, endpoint, token)
+    try:
+        base_url = resume_and_probe_endpoint(
+            destination,
+            destination / "events.jsonl",
+            run_lock,
+            manager,
+            token,
+            readiness_timeout_seconds=min(3600, _remaining(deadline)),
+        )
+        yield ProfileTransport.for_endpoint(base_url, endpoint.served_model_name)
+    finally:
+        manager.pause_and_verify()
 
 
 def _verify_smoke(
     plan: ProfilePlan,
-    base_url: str,
-    model_name: str,
+    transport: ProfileTransport,
     token: str,
     deadline: float,
 ) -> None:
-    chat = _request(
-        plan,
-        base_url,
-        model_name,
-        token,
-        "Reply with exactly OK.",
-        tools=False,
-        timeout=_remaining(deadline),
-    )
-    if not chat.success or not (chat.saw_content or chat.saw_reasoning):
-        raise ProfileWorkerError(f"chat smoke failed: {chat.error or 'empty output'}")
-    if plan.reasoning_required and not chat.saw_reasoning:
-        raise ProfileWorkerError("reasoning smoke produced no reasoning channel")
-    tool = _request(
-        plan,
-        base_url,
-        model_name,
-        token,
-        "Use the lookup tool to look up the value for key alpha.",
-        tools=True,
-        timeout=_remaining(deadline),
-    )
-    if not tool.success or not tool.saw_tool_call:
-        raise ProfileWorkerError(f"tool smoke failed: {tool.error or 'no tool call'}")
+    with transport.scope("smoke") as (base_url, model_name, capability):
+        chat = _request(
+            plan,
+            base_url,
+            model_name,
+            token,
+            "Reply with exactly OK.",
+            tools=False,
+            timeout=_remaining(deadline),
+        )
+        if not chat.success or not (chat.saw_content or chat.saw_reasoning):
+            detail = chat.error or "empty output"
+            raise ProfileWorkerError(f"chat smoke failed: {detail}")
+        if plan.reasoning_required and not chat.saw_reasoning:
+            raise ProfileWorkerError("reasoning smoke produced no reasoning channel")
+        tool = _request(
+            plan,
+            base_url,
+            model_name,
+            token,
+            "Use the lookup tool to look up the value for key alpha.",
+            tools=True,
+            timeout=_remaining(deadline),
+        )
+        if not tool.success or not tool.saw_tool_call:
+            detail = tool.error or "no tool call"
+            raise ProfileWorkerError(f"tool smoke failed: {detail}")
 
 
 def _run_ladder(
     plan: ProfilePlan,
-    base_url: str,
-    model_name: str,
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    harbor_source: Path,
     token: str,
     destination: Path,
     deadline: float,
@@ -168,120 +228,202 @@ def _run_ladder(
     previous_rates: list[float] = []
     for concurrency in plan.candidate_concurrency:
         if time.monotonic() >= deadline:
-            points.append(_skipped_point(concurrency, "profile time budget exhausted"))
+            point = _skipped_point(concurrency, "profile time budget exhausted")
+            points.append(point)
+            _write_point(destination, point, [], 0)
             break
-        planned = max(
-            plan.workload.minimum_observations_per_point,
-            2 * concurrency,
-        )
-        observations = _run_point(
+        result = _run_point(
             plan,
-            base_url,
-            model_name,
+            run_lock,
+            transport,
+            harbor_source,
             token,
             concurrency,
-            planned,
-            deadline,
+            repetition=1,
+            destination=destination,
+            deadline=deadline,
         )
-        point = _summarize_point(concurrency, observations, repetition=1)
+        point = _summarize_point(
+            concurrency,
+            result.observations,
+            elapsed_ms=result.elapsed_ms,
+            repetition=1,
+        )
         points.append(point)
-        _write_point(destination, point, observations)
-        if (
-            point.status != "completed"
-            or point.error_rate > plan.objective.maximum_error_rate
-        ):
+        _write_point(destination, point, result.observations, result.elapsed_ms)
+        if not _point_passes_objective(plan, point):
             break
-        rate = point.aggregate_output_tokens_per_second or 0
+        rate = point.tasks_per_hour or 0
         previous_rates.append(rate)
         if (
             len(previous_rates) >= 3
             and previous_rates[-1] <= previous_rates[-2] <= previous_rates[-3]
         ):
             break
-    boundary = [point.concurrency for point in points if point.status == "completed"][
-        -2:
-    ]
+    boundary = [
+        point.concurrency
+        for point in points
+        if _point_passes_objective(plan, point)
+    ][-2:]
     for concurrency in boundary:
         for repetition in range(2, plan.workload.boundary_repetitions + 1):
             if time.monotonic() >= deadline:
+                point = _skipped_point(
+                    concurrency,
+                    "profile time budget exhausted during boundary repetition",
+                    repetition=repetition,
+                )
+                points.append(point)
+                _write_point(destination, point, [], 0)
                 break
-            planned = max(
-                plan.workload.minimum_observations_per_point,
-                2 * concurrency,
-            )
-            observations = _run_point(
+            result = _run_point(
                 plan,
-                base_url,
-                model_name,
+                run_lock,
+                transport,
+                harbor_source,
                 token,
                 concurrency,
-                planned,
-                deadline,
+                repetition=repetition,
+                destination=destination,
+                deadline=deadline,
             )
-            point = _summarize_point(concurrency, observations, repetition=repetition)
+            point = _summarize_point(
+                concurrency,
+                result.observations,
+                elapsed_ms=result.elapsed_ms,
+                repetition=repetition,
+            )
             points.append(point)
-            _write_point(destination, point, observations)
+            _write_point(destination, point, result.observations, result.elapsed_ms)
     return points
-
-
-def _write_point(
-    destination: Path,
-    point: ProfilePoint,
-    observations: list[_Observation],
-) -> None:
-    point_dir = destination / "points" / str(point.concurrency)
-    point_dir.mkdir(parents=True, exist_ok=True)
-    write_json(
-        point_dir / f"{point.repetition}.json",
-        {
-            "point": point.model_dump(mode="json", exclude_none=True),
-            "observations": [observation.__dict__ for observation in observations],
-        },
-    )
 
 
 def _run_point(
     plan: ProfilePlan,
-    base_url: str,
-    model_name: str,
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    harbor_source: Path,
     token: str,
     concurrency: int,
-    planned: int,
+    *,
+    repetition: int,
+    destination: Path,
     deadline: float,
-) -> list[_Observation]:
-    observations: list[_Observation] = []
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [
-            pool.submit(
-                _request,
-                plan,
-                base_url,
-                model_name,
-                token,
-                "Reply with exactly OK.",
-                tools=False,
-                timeout=_remaining(deadline),
-            )
-            for _ in range(planned)
-        ]
-        for future in as_completed(futures):
-            try:
-                observations.append(future.result())
-            except Exception as error:
-                observations.append(
-                    _Observation(
+) -> _PointResult:
+    tasks = _sample_tasks(plan)
+    minimum = max(plan.workload.minimum_observations_per_point, 2 * concurrency)
+    attempts = math.ceil(minimum / len(tasks))
+    point_root = destination / "points" / str(concurrency) / str(repetition)
+    jobs_dir = point_root / "harbor-jobs"
+    execution_root = point_root / "harbor-execution"
+    jobs_dir.mkdir(parents=True)
+    execution_root.mkdir()
+    adapter = FilesystemHarborExecutionAdapter()
+    scope = f"c{concurrency}-r{repetition}"
+    with transport.scope(scope) as (base_url, _model_name, capability):
+        prepared = adapter.prepare(
+            run_lock,
+            execution_root,
+            jobs_dir,
+            base_url,
+            harbor_source,
+            task_names=list(tasks),
+            attempts=attempts,
+            concurrency=concurrency,
+            expected_task_digests=tasks,
+        )
+        timeout = _remaining(deadline)
+        started = time.monotonic()
+        try:
+            with harbor_process_environment(
+                run_lock,
+                token=token,
+                inference_base_url=base_url,
+                redaction_secrets=(capability,) if capability else (),
+            ) as environment:
+                outcome = adapter.execute(
+                    prepared,
+                    harbor_source,
+                    jobs_dir,
+                    execution_root / "harbor.log",
+                    environment=environment,
+                    timeout_seconds=timeout,
+                    stream_runner=run_streaming,
+                    deadline=deadline,
+                )
+        except Exception as error:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            _scrub_capability(point_root, capability)
+            return _PointResult(
+                observations=[
+                    _TaskObservation(
                         False,
+                        elapsed_ms,
                         0,
                         0,
-                        0,
-                        None,
-                        False,
-                        False,
-                        False,
+                        task_name,
                         type(error).__name__,
                     )
+                    for task_name in tasks
+                    for _ in range(attempts)
+                ],
+                elapsed_ms=elapsed_ms,
+            )
+        elapsed_ms = (time.monotonic() - started) * 1000
+        _scrub_capability(point_root, capability)
+    if outcome.exit_code != 0 or outcome.verification is None:
+        return _PointResult(
+            observations=[
+                _TaskObservation(
+                    False,
+                    elapsed_ms,
+                    0,
+                    0,
+                    task_name,
+                    f"Harbor exited with status {outcome.exit_code}",
                 )
-    return observations
+                for task_name in tasks
+                for _ in range(attempts)
+            ],
+            elapsed_ms=elapsed_ms,
+        )
+    assert outcome.compatibility_path is not None
+    bundle = load_compatibility_bundle(outcome.compatibility_path, prepared.request)
+    observations = [_task_observation(trial) for trial in bundle.trials]
+    return _PointResult(observations=observations, elapsed_ms=elapsed_ms)
+
+
+def _task_observation(trial: HarborCompatibilityTrial) -> _TaskObservation:
+    task_name = trial.task_name
+    usage = trial.usage
+    timing = trial.timing.trial
+    started = _timestamp(timing.started_at)
+    finished = _timestamp(timing.finished_at)
+    input_tokens = usage.input_tokens
+    output_tokens = usage.output_tokens
+    valid_usage = (
+        isinstance(input_tokens, int)
+        and not isinstance(input_tokens, bool)
+        and input_tokens > 0
+        and isinstance(output_tokens, int)
+        and not isinstance(output_tokens, bool)
+        and output_tokens > 0
+    )
+    valid_timing = started is not None and finished is not None and finished >= started
+    latency_ms = (
+        (finished - started).total_seconds() * 1000
+        if valid_timing and started is not None and finished is not None
+        else 0
+    )
+    success = valid_usage and valid_timing
+    return _TaskObservation(
+        success,
+        latency_ms,
+        input_tokens if isinstance(input_tokens, int) else 0,
+        output_tokens if isinstance(output_tokens, int) else 0,
+        task_name,
+        None if success else "missing positive token usage or complete timing",
+    )
 
 
 def _request(
@@ -293,17 +435,17 @@ def _request(
     *,
     tools: bool,
     timeout: int,
-) -> _Observation:
-    parameters = {
-        key: value
-        for key, value in plan.deployment.parameters.items()
-        if key not in _CONTROL_PARAMETERS
-    }
+) -> _SmokeObservation:
+    parameters = (
+        dict(plan.deployment.parameters)
+        if isinstance(plan.deployment, ProviderTarget)
+        else {}
+    )
     payload: dict[str, JsonValue] = {
         **parameters,
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": plan.identity.max_output_tokens,
+        "max_tokens": min(plan.identity.max_output_tokens, 512),
         "stream": False,
     }
     if tools:
@@ -322,7 +464,6 @@ def _request(
             }
         ]
         payload["tool_choice"] = "required"
-    started = time.perf_counter()
     try:
         response = httpx.post(
             f"{base_url.rstrip('/')}/v1/chat/completions",
@@ -330,7 +471,6 @@ def _request(
             json=payload,
             timeout=max(1, timeout),
         )
-        latency = (time.perf_counter() - started) * 1000
         response.raise_for_status()
         body = response.json()
         choice = body["choices"][0]
@@ -339,53 +479,51 @@ def _request(
         content = message.get("content")
         reasoning = message.get("reasoning_content") or message.get("reasoning")
         tool_calls = message.get("tool_calls") or []
-        return _Observation(
-            True,
-            latency,
-            _integer(usage.get("prompt_tokens")),
-            _integer(usage.get("completion_tokens")),
-            choice.get("finish_reason"),
-            isinstance(content, str) and bool(content.strip()),
-            isinstance(reasoning, str) and bool(reasoning.strip()),
-            isinstance(tool_calls, list) and bool(tool_calls),
+        input_tokens = _integer(usage.get("prompt_tokens"))
+        output_tokens = _integer(usage.get("completion_tokens"))
+        saw_content = isinstance(content, str) and bool(content.strip())
+        saw_reasoning = isinstance(reasoning, str) and bool(reasoning.strip())
+        saw_tool_call = isinstance(tool_calls, list) and bool(tool_calls)
+        finish_reason = choice.get("finish_reason")
+        semantic = (
+            input_tokens > 0
+            and output_tokens > 0
+            and finish_reason in {"stop", "tool_calls"}
+            and (saw_content or saw_reasoning or saw_tool_call)
+        )
+        return _SmokeObservation(
+            semantic,
+            input_tokens,
+            output_tokens,
+            saw_content,
+            saw_reasoning,
+            saw_tool_call,
+            None if semantic else "response failed semantic validation",
         )
     except Exception as error:
-        return _Observation(
-            False,
-            (time.perf_counter() - started) * 1000,
-            0,
-            0,
-            None,
-            False,
-            False,
-            False,
-            type(error).__name__,
-        )
+        return _SmokeObservation(False, 0, 0, False, False, False, type(error).__name__)
 
 
 def _summarize_point(
     concurrency: int,
-    observations: list[_Observation],
+    observations: list[_TaskObservation],
     *,
+    elapsed_ms: float,
     repetition: int,
 ) -> ProfilePoint:
     successful = [observation for observation in observations if observation.success]
     failed = len(observations) - len(successful)
-    if not successful:
+    if not observations or not successful or elapsed_ms <= 0:
         return _failed_point(
             concurrency,
             len(observations),
-            "all requests failed",
+            "no semantically valid benchmark trials",
             repetition=repetition,
         )
-    elapsed_seconds = max(observation.latency_ms for observation in observations) / 1000
+    elapsed_seconds = elapsed_ms / 1000
     latencies = [observation.latency_ms for observation in successful]
     inputs = [observation.input_tokens for observation in successful]
     outputs = [observation.output_tokens for observation in successful]
-    tpot = [
-        observation.latency_ms / max(1, observation.output_tokens)
-        for observation in successful
-    ]
     error_rate = failed / len(observations)
     payload: dict[str, object] = {
         "concurrency": concurrency,
@@ -396,20 +534,13 @@ def _summarize_point(
         "failed_count": failed,
         "error_rate": error_rate,
         "goodput_rate": 1 - error_rate,
-        "aggregate_input_tokens_per_second": sum(inputs) / max(elapsed_seconds, 0.001),
-        "aggregate_output_tokens_per_second": sum(outputs)
-        / max(elapsed_seconds, 0.001),
-        "tasks_per_hour": len(successful) * 3600 / max(elapsed_seconds, 0.001),
+        "aggregate_input_tokens_per_second": sum(inputs) / elapsed_seconds,
+        "aggregate_output_tokens_per_second": sum(outputs) / elapsed_seconds,
+        "tasks_per_hour": len(successful) * 3600 / elapsed_seconds,
         "session_output_tokens_per_second": statistics.median(
             observation.output_tokens / max(observation.latency_ms / 1000, 0.001)
             for observation in successful
         ),
-        "ttft_ms_p50": _percentile(latencies, 50),
-        "ttft_ms_p95": _percentile(latencies, 95),
-        "ttft_ms_p99": _percentile(latencies, 99),
-        "tpot_ms_p50": _percentile(tpot, 50),
-        "tpot_ms_p95": _percentile(tpot, 95),
-        "tpot_ms_p99": _percentile(tpot, 99),
         "latency_ms_p50": _percentile(latencies, 50),
         "latency_ms_p95": _percentile(latencies, 95),
         "latency_ms_p99": _percentile(latencies, 99),
@@ -419,10 +550,56 @@ def _summarize_point(
         "output_tokens_p50": _percentile(outputs, 50),
         "output_tokens_p95": _percentile(outputs, 95),
         "output_tokens_max": max(outputs),
-        "artifact_prefix": f"points/{concurrency}/{repetition}.json",
+        "artifact_prefix": f"points/{concurrency}/{repetition}/evidence.json",
     }
     payload["point_sha256"] = canonical_digest(payload)
     return ProfilePoint.model_validate(payload)
+
+
+def _write_point(
+    destination: Path,
+    point: ProfilePoint,
+    observations: list[_TaskObservation],
+    elapsed_ms: float,
+) -> None:
+    write_json(
+        destination / point.artifact_prefix,
+        {
+            "point": point.model_dump(mode="json", exclude_none=True),
+            "elapsed_ms": elapsed_ms,
+            "observations": [observation.__dict__ for observation in observations],
+        },
+    )
+
+
+def _point_passes_objective(plan: ProfilePlan, point: ProfilePoint) -> bool:
+    objective = plan.objective
+    return (
+        point.status == "completed"
+        and point.error_rate <= objective.maximum_error_rate
+        and (
+            objective.maximum_ttft_ms_p95 is None
+            or (
+                point.ttft_ms_p95 is not None
+                and point.ttft_ms_p95 <= objective.maximum_ttft_ms_p95
+            )
+        )
+        and (
+            objective.maximum_tpot_ms_p95 is None
+            or (
+                point.tpot_ms_p95 is not None
+                and point.tpot_ms_p95 <= objective.maximum_tpot_ms_p95
+            )
+        )
+        and (
+            objective.minimum_session_output_tokens_per_second is None
+            or (
+                point.session_output_tokens_per_second is not None
+                and point.session_output_tokens_per_second
+                >= objective.minimum_session_output_tokens_per_second
+            )
+        )
+    )
 
 
 def _failed_point(
@@ -437,30 +614,49 @@ def _failed_point(
         "failed_count": planned,
         "error_rate": 1.0,
         "goodput_rate": 0.0,
-        "artifact_prefix": f"points/{concurrency}/{repetition}.json",
+        "artifact_prefix": f"points/{concurrency}/{repetition}/evidence.json",
         "failure_reason": reason,
     }
     return ProfilePoint(point_sha256=canonical_digest(payload), **payload)
 
 
-def _skipped_point(concurrency: int, reason: str) -> ProfilePoint:
+def _skipped_point(
+    concurrency: int, reason: str, *, repetition: int = 1
+) -> ProfilePoint:
     payload = {
         "concurrency": concurrency,
-        "repetition": 1,
+        "repetition": repetition,
         "status": "skipped",
         "planned_count": 0,
         "completed_count": 0,
         "failed_count": 0,
         "error_rate": 0.0,
         "goodput_rate": 0.0,
-        "artifact_prefix": f"points/{concurrency}/1.json",
+        "artifact_prefix": f"points/{concurrency}/{repetition}/evidence.json",
         "failure_reason": reason,
     }
     return ProfilePoint(point_sha256=canonical_digest(payload), **payload)
 
 
+def _sample_tasks(plan: ProfilePlan) -> dict[str, str]:
+    digests = plan.benchmark.get("task_digests")
+    if not isinstance(digests, dict):
+        raise ProfileWorkerError("profile benchmark has no resolved task digests")
+    selected = sorted(digests)[: plan.workload.sample_task_count]
+    tasks = {
+        task: digest
+        for task in selected
+        if isinstance(digest := digests[task], str)
+    }
+    if len(tasks) != plan.workload.sample_task_count:
+        raise ProfileWorkerError("profile benchmark task digests are malformed")
+    if canonical_digest(tasks) != plan.workload.sample_tasks_sha256:
+        raise ProfileWorkerError("profile benchmark sample does not match its digest")
+    return tasks
+
+
 def _remaining(deadline: float) -> int:
-    remaining = math.ceil(deadline - time.monotonic())
+    remaining = math.floor(deadline - time.monotonic())
     if remaining < 1:
         raise ProfileWorkerError("profile time budget exhausted")
     return remaining
@@ -468,6 +664,22 @@ def _remaining(deadline: float) -> int:
 
 def _integer(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _scrub_capability(root: Path, capability: str | None) -> None:
+    if capability is None:
+        return
+    scrub_secret_paths(root, capability)
+    scrub_secret(root, capability)
+
+
+def _timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _percentile(values: list[int] | list[float], percentile: int) -> float:

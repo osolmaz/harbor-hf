@@ -102,13 +102,13 @@ request exercised the configured context limit.
 
 ## Measurements
 
-Each completed point records:
+Each completed benchmark point records:
 
 - planned, completed, and failed request or task counts;
 - aggregate input and output tokens per second;
 - task completions per hour when profiling benchmark work;
 - per-session output tokens per second;
-- p50, p95, and p99 time to first token, time per output token, and latency;
+- p50, p95, and p99 trial latency;
 - error and goodput rates;
 - peak device memory when observable;
 - the raw artifact prefix and checksum.
@@ -116,9 +116,13 @@ Each completed point records:
 It also records observed p50, p95, and maximum prompt and output tokens. These
 measure active workload shape and must not be replaced with configured limits.
 
-Successful HTTP responses are insufficient. Verify nonempty output, finish
-reasons, token accounting, tool-call parsing, task completion, endpoint logs,
-agent exits, truncation, timeouts, and hidden 4xx or 5xx responses.
+TTFT and TPOT are reported only when a streaming recorder measures them. A
+non-streaming full-response duration must never be labeled TTFT or TPOT.
+
+Successful HTTP responses are insufficient. The ladder runs the pinned Harbor
+task sample through the declared agent and sandbox, then verifies token
+accounting, task completion, endpoint logs, agent exits, truncation, timeouts,
+and hidden 4xx or 5xx responses.
 
 ## Stopping Rules
 
@@ -160,7 +164,8 @@ Store profiles under one private Bucket prefix:
 ```text
 serving-profiles/<profile-id>/
   plan.json
-  points/<concurrency>/<repetition>.json
+  points/<concurrency>/<repetition>/evidence.json
+  points/<concurrency>/<repetition>/harbor-execution/
   profile.json
   checksums.json
   _SELECTED | _FAILED
@@ -192,7 +197,8 @@ remote work. The plan embeds the immutable experiment, so the remote worker
 does not depend on mutable local state. `preflight` verifies the model revision,
 private Bucket, provider route or endpoint compute, current accelerator quota,
 hourly price, worst-case profile cost, and declared spend cap. Unknown endpoint
-quota fails closed.
+quota fails closed. Provider profiles require an explicit estimate for the full
+profile and reject it when it exceeds either the provider or profile spend cap.
 
 `run` submits one Hugging Face Job. For an Inference Endpoint, the worker
 requires a paused baseline, starts the cleanup watchdog before resume, keeps
@@ -200,7 +206,8 @@ one endpoint lease across the whole ladder, and pauses and verifies zero ready
 replicas on every exit path. It first verifies ordinary chat, the reasoning
 channel when required, and a forced tool call. It then records content-free
 request observations for the endpoint or Inference Provider, tests ascending
-powers of two, and repeats the last two viable boundary points three times.
+powers of two by running the sampled benchmark tasks through Harbor and the
+declared agent, and repeats the last two viable boundary points three times.
 The operator machine never loads model weights or performs inference.
 
 `select` recomputes every point digest before choosing the winner. A campaign

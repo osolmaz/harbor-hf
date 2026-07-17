@@ -68,6 +68,7 @@ from harbor_hf.profile_submission import (
     submit_profile,
 )
 from harbor_hf.profile_worker import ProfileWorkerError, run_profile_worker
+from harbor_hf.profile_worker_transport import ProfileTransportError
 from harbor_hf.profiling import (
     ProfilePlan,
     build_profile_plan,
@@ -120,6 +121,7 @@ _OPERATION_ERRORS = (
     ResultPublicationError,
     CatalogCutoverError,
     ProfileWorkerError,
+    ProfileTransportError,
 )
 
 
@@ -747,7 +749,7 @@ def profile_worker(
     """Run one serving profile from inside a Hugging Face Job."""
     try:
         destination = run_profile_worker(plan, output_root)
-    except (OSError, ValueError, ProfileWorkerError) as error:
+    except (OSError, ValueError, ProfileWorkerError, ProfileTransportError) as error:
         _exit_operation(error)
     typer.echo(str(destination))
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +13,13 @@ from harbor_hf.cli import app
 from harbor_hf.models import DeploymentProfile, ExperimentSpec, ServingProfileBinding
 from harbor_hf.profile_preflight import preflight_profile_plan
 from harbor_hf.profile_submission import build_profile_submit_command
-from harbor_hf.profile_worker import ProfileWorkerError, run_profile_worker
+from harbor_hf.profile_worker import (
+    ProfileWorkerError,
+    _request,
+    _summarize_point,
+    _TaskObservation,
+    run_profile_worker,
+)
 from harbor_hf.profiling import (
     ProfilePlan,
     ProfilePoint,
@@ -20,6 +27,11 @@ from harbor_hf.profiling import (
     canonical_digest,
     new_unselected_profile,
     select_profile,
+)
+from harbor_hf.provider_models import (
+    ExplicitProviderRoute,
+    ProviderLimits,
+    ProviderTarget,
 )
 
 runner = CliRunner()
@@ -68,6 +80,24 @@ def point(concurrency: int, throughput: float) -> ProfilePoint:
     )
 
 
+def failed_repetition(concurrency: int, repetition: int) -> ProfilePoint:
+    payload = {
+        "concurrency": concurrency,
+        "repetition": repetition,
+        "status": "failed",
+        "planned_count": 8,
+        "completed_count": 0,
+        "failed_count": 8,
+        "error_rate": 1.0,
+        "goodput_rate": 0.0,
+        "artifact_prefix": f"points/{concurrency}/{repetition}/evidence.json",
+        "failure_reason": "failed",
+    }
+    return ProfilePoint.model_validate(
+        {"point_sha256": canonical_digest(payload), **payload}
+    )
+
+
 def test_profile_plan_is_deterministic(remote_spec: ExperimentSpec) -> None:
     first = plan(remote_spec)
     second = plan(remote_spec)
@@ -104,6 +134,92 @@ def test_profile_selection_rejects_tampered_point(remote_spec: ExperimentSpec) -
 
     with pytest.raises(ValueError, match="point digest"):
         select_profile(profile)
+
+
+def test_profile_selection_disqualifies_failed_boundary_repetition(
+    remote_spec: ExperimentSpec,
+) -> None:
+    first = point(1, 10)
+    second = point(2, 20)
+    repeated = second.model_copy(
+        update={
+            "repetition": 2,
+            "point_sha256": canonical_digest(
+                second.model_dump(
+                    mode="json",
+                    exclude={"point_sha256"},
+                    exclude_none=True,
+                )
+                | {"repetition": 2}
+            ),
+        }
+    )
+    profile = new_unselected_profile(plan(remote_spec)).model_copy(
+        update={
+            "points": [first, second, repeated, failed_repetition(2, 3)],
+        }
+    )
+
+    selected = select_profile(profile)
+
+    assert selected.selection is not None
+    assert selected.selection.concurrency == 1
+
+
+def test_point_throughput_uses_complete_wall_time() -> None:
+    observations = [
+        _TaskObservation(True, 1000, 10, 20, f"task-{index}")
+        for index in range(8)
+    ]
+
+    result = _summarize_point(
+        1, observations, elapsed_ms=8000, repetition=1
+    )
+
+    assert result.tasks_per_hour == 3600
+    assert result.aggregate_output_tokens_per_second == 20
+    assert result.ttft_ms_p95 is None
+    assert result.tpot_ms_p95 is None
+
+
+def test_endpoint_smoke_does_not_forward_endpoint_settings(
+    remote_spec: ExperimentSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = plan(remote_spec)
+    captured: dict[str, object] = {}
+
+    def post(*_args: object, **kwargs: object) -> httpx.Response:
+        payload = kwargs["json"]
+        assert isinstance(payload, dict)
+        for key, value in payload.items():
+            assert isinstance(key, str)
+            captured[key] = value
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "OK"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+            },
+            request=httpx.Request("POST", "https://endpoint.test"),
+        )
+
+    monkeypatch.setattr("harbor_hf.profile_worker.httpx.post", post)
+
+    observation = _request(
+        resolved,
+        "https://endpoint.test",
+        "model",
+        "token",
+        "OK",
+        tools=False,
+        timeout=10,
+    )
+
+    assert observation.success
+    assert "min_replicas" not in captured
+    assert "health_route" not in captured
 
 
 def test_serving_profile_binding_fails_closed_on_concurrency(
@@ -145,6 +261,15 @@ class FakeApi:
     def bucket_info(self, bucket_id: str) -> object:
         del bucket_id
         return SimpleNamespace(private=True)
+
+
+class FakeProviderApi(FakeApi):
+    def model_info(self, repo: str, **kwargs: object) -> object:
+        del repo, kwargs
+        return SimpleNamespace(
+            sha="a" * 40,
+            inference_provider_mapping={"fireworks-ai": {}},
+        )
 
 
 def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) -> None:
@@ -199,6 +324,68 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
 
     assert report.available_accelerators == 2
     assert str(report.estimated_cost_usd) == "5.0"
+
+
+def test_provider_preflight_requires_bounded_full_profile_estimate(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = profiled_spec(remote_spec)
+    model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+    )
+    spec = spec.model_copy(
+        update={
+            "matrix": spec.matrix.model_copy(
+                update={"models": [model], "deployments": [provider]}
+            )
+        }
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="5.00",
+        profile_timeout_seconds=3600,
+    )
+
+    with pytest.raises(ValueError, match="bounded full-profile cost estimate"):
+        preflight_profile_plan(resolved, api=FakeProviderApi(), token="hf_test")
+
+
+def test_provider_preflight_enforces_profile_spend_cap(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = profiled_spec(remote_spec)
+    model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(
+            max_spend_usd=Decimal("10"),
+            estimated_wave_cost_usd=Decimal("6"),
+        ),
+    )
+    spec = spec.model_copy(
+        update={
+            "matrix": spec.matrix.model_copy(
+                update={"models": [model], "deployments": [provider]}
+            )
+        }
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="5.00",
+        profile_timeout_seconds=3600,
+    )
+
+    with pytest.raises(ValueError, match="exceeds spend cap"):
+        preflight_profile_plan(resolved, api=FakeProviderApi(), token="hf_test")
 
 
 def test_profile_plan_cli_writes_local_plan(
@@ -257,6 +444,10 @@ def test_profile_worker_always_pauses_owned_endpoint(
             return {}
 
     monkeypatch.setenv("HF_TOKEN", "hf_test")
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.prepare_locked_source",
+        lambda *_args, **_kwargs: calls.append("source"),
+    )
     monkeypatch.setattr("harbor_hf.profile_worker.EndpointManager", Manager)
     monkeypatch.setattr(
         "harbor_hf.profile_worker.validate_endpoint_model",
@@ -292,6 +483,8 @@ def test_profile_worker_always_pauses_owned_endpoint(
     else:
         destination = run_profile_worker(plan_path, tmp_path / "output")
         assert (destination / "_SELECTED").is_file()
+        checksums = json.loads((destination / "checksums.json").read_text())
+        assert set(checksums) == {"_SELECTED", "plan.json", "profile.json"}
 
     assert calls.index("watchdog") < calls.index("resume")
     assert calls[-1] == "pause"

@@ -252,12 +252,16 @@ def select_profile(profile: ServingProfile) -> ServingProfile:
         )
         if canonical_digest(payload) != point.point_sha256:
             raise ValueError("profile point digest does not match its evidence")
-    eligible = [point for point in profile.points if _eligible(profile, point)]
-    if not eligible:
+    all_points: dict[int, list[ProfilePoint]] = {}
+    for point in profile.points:
+        all_points.setdefault(point.concurrency, []).append(point)
+    grouped = {
+        concurrency: points
+        for concurrency, points in all_points.items()
+        if _eligible_repetition_group(profile, points)
+    }
+    if not grouped:
         raise ValueError("profile has no eligible completed points")
-    grouped: dict[int, list[ProfilePoint]] = {}
-    for point in eligible:
-        grouped.setdefault(point.concurrency, []).append(point)
     if profile.objective.kind == "maximum_stable_concurrency":
         winner = max(grouped)
     else:
@@ -332,6 +336,19 @@ def _eligible(profile: ServingProfile, point: ProfilePoint) -> bool:
             )
         )
     )
+
+
+def _eligible_repetition_group(
+    profile: ServingProfile, points: list[ProfilePoint]
+) -> bool:
+    repetitions = [point.repetition for point in points]
+    if len(repetitions) != len(set(repetitions)) or 1 not in repetitions:
+        return False
+    if len(points) > 1 and set(repetitions) != set(
+        range(1, profile.workload.boundary_repetitions + 1)
+    ):
+        return False
+    return all(_eligible(profile, point) for point in points)
 
 
 def _score(kind: ObjectiveKind, points: list[ProfilePoint]) -> float:
