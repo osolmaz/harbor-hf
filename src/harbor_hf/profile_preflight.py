@@ -8,6 +8,7 @@ import httpx
 from huggingface_hub import HfApi, get_token
 from pydantic import BaseModel, ConfigDict, Field
 
+from harbor_hf.endpoints import ENDPOINT_PAUSE_TIMEOUT_SECONDS
 from harbor_hf.models import DeploymentProfile, ExperimentSpec
 from harbor_hf.profiling import ProfilePlan
 from harbor_hf.provider_models import ProviderTarget
@@ -154,7 +155,7 @@ def _preflight_endpoint(
             f"{required} required"
         )
     price = Decimal(str(compute.get("pricePerHour")))
-    duration = plan.profile_timeout_seconds
+    duration = plan.profile_timeout_seconds + ENDPOINT_PAUSE_TIMEOUT_SECONDS
     estimated = price * Decimal(maximum_replicas) * Decimal(duration) / Decimal(3600)
     if estimated > cap:
         raise ValueError(

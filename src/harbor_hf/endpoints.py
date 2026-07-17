@@ -25,6 +25,7 @@ from harbor_hf.models import (
 
 DeploymentDigest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 EndpointName = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+ENDPOINT_PAUSE_TIMEOUT_SECONDS = 300
 _MANAGED_TAG = "harbor-hf-managed"
 
 
@@ -533,7 +534,7 @@ class EndpointProvisioner:
         self,
         desired: DesiredEndpoint,
         *,
-        timeout_seconds: float = 300,
+        timeout_seconds: float = ENDPOINT_PAUSE_TIMEOUT_SECONDS,
         poll_seconds: float = 5,
     ) -> EndpointSnapshot:
         current = self.inspect(desired)

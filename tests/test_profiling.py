@@ -737,7 +737,7 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
         spec,
         profile_id="profile-one",
         candidate_concurrency=[1, 2],
-        max_spend_usd="5.00",
+        max_spend_usd="6.00",
         profile_timeout_seconds=3600,
     )
     deployment = resolved.deployment
@@ -777,7 +777,17 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
     )
 
     assert report.available_accelerators == 2
-    assert str(report.estimated_cost_usd) == "5.0"
+    assert report.estimated_cost_usd == Decimal(65) / Decimal(12)
+
+    rejected = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="5.00",
+        profile_timeout_seconds=3600,
+    )
+    with pytest.raises(ValueError, match="exceeds spend cap"):
+        preflight_profile_plan(rejected, api=FakeApi(), client=client, token="hf_test")
 
 
 def test_endpoint_preflight_accounts_for_maximum_replicas(
@@ -801,7 +811,7 @@ def test_endpoint_preflight_accounts_for_maximum_replicas(
         spec,
         profile_id="profile-one",
         candidate_concurrency=[1, 2],
-        max_spend_usd="10.00",
+        max_spend_usd="11.00",
         profile_timeout_seconds=3600,
     )
     response = {
@@ -839,7 +849,7 @@ def test_endpoint_preflight_accounts_for_maximum_replicas(
     )
 
     assert report.required_accelerators == 2
-    assert report.estimated_cost_usd == Decimal("10.0")
+    assert report.estimated_cost_usd == Decimal(65) / Decimal(6)
 
 
 def test_managed_endpoint_preflight_uses_remote_namespace(
@@ -861,7 +871,7 @@ def test_managed_endpoint_preflight_uses_remote_namespace(
         spec,
         profile_id="profile-one",
         candidate_concurrency=[1, 2],
-        max_spend_usd="5.00",
+        max_spend_usd="6.00",
         profile_timeout_seconds=3600,
     )
     response = {
