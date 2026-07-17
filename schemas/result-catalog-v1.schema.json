@@ -46,6 +46,21 @@
       "title": "Completed At",
       "type": "string"
     },
+    "component_kind": {
+      "anyOf": [
+        {
+          "enum": [
+            "base",
+            "correction"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Component Kind"
+    },
     "control_commit": {
       "pattern": "^[0-9a-f]{40,64}$",
       "title": "Control Commit",
@@ -64,6 +79,11 @@
     "envelope_sha256": {
       "pattern": "^sha256:[0-9a-f]{64}$",
       "title": "Envelope Sha256",
+      "type": "string"
+    },
+    "evaluation_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "title": "Evaluation Id",
       "type": "string"
     },
     "execution_count": {
@@ -136,6 +156,15 @@
       "title": "Publication Id",
       "type": "string"
     },
+    "publication_role": {
+      "enum": [
+        "final",
+        "component",
+        "diagnostic"
+      ],
+      "title": "Publication Role",
+      "type": "string"
+    },
     "quality": {
       "enum": [
         "clean",
@@ -192,6 +221,14 @@
       "title": "Source Checksum",
       "type": "string"
     },
+    "source_publication_ids": {
+      "items": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        "type": "string"
+      },
+      "title": "Source Publication Ids",
+      "type": "array"
+    },
     "unsupported_count": {
       "minimum": 0,
       "title": "Unsupported Count",
@@ -202,6 +239,10 @@
     "publication_id",
     "run_id",
     "campaign_id",
+    "evaluation_id",
+    "publication_role",
+    "component_kind",
+    "source_publication_ids",
     "benchmark",
     "benchmark_revision",
     "result_kind",

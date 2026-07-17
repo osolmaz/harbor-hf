@@ -205,6 +205,9 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
             "run_id": run.run_id,
             "campaign_id": snapshot.lock.campaign_id,
             "experiment": "experiment",
+            "evaluation_id": snapshot.lock.evaluation_id,
+            "publication_role": snapshot.lock.publication_role,
+            "component_kind": snapshot.lock.component_kind,
             "benchmark": "shellbench",
             "benchmark_revision": "sha256:" + "1" * 64,
             "result_kind": "ordinary",
@@ -264,6 +267,9 @@ def _evidence(snapshot: CampaignSnapshot) -> MemoryEvidence:
         "run.lock.json": json.dumps(
             {
                 "run_id": run.run_id,
+                "evaluation_id": snapshot.lock.evaluation_id,
+                "publication_role": snapshot.lock.publication_role,
+                "component_kind": snapshot.lock.component_kind,
                 "attempts": 1,
                 "model": {
                     "id": "model-one",

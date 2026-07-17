@@ -30,9 +30,11 @@ competing watchdog fails before its controller can resume or pause the endpoint.
 ## Browse Results
 
 The public [Harbor Results Space](https://huggingface.co/spaces/osolmaz/harbor-results)
-compares published benchmark runs and exposes stable campaign, run, trial, and
-execution URLs. Its versioned API reads one bounded catalog snapshot for list
-pages and loads revision-pinned run details on demand. The public deployment has
+compares final benchmark evaluations and exposes stable campaign, run, trial,
+and execution URLs. Its audit view keeps component and diagnostic publications
+available without mixing them into leaderboard scores. Its versioned API reads
+one bounded catalog snapshot for list pages and loads revision-pinned run
+details on demand. The public deployment has
 no credential and exposes only sanitized normalized tables and artifact
 metadata; complete sessions and canonical evidence remain in the private HF
 Bucket.

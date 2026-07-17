@@ -68,6 +68,20 @@
         "parameters": [
           {
             "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "primary",
+              "enum": [
+                "primary",
+                "audit"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "cursor",
             "required": false,
             "schema": {
@@ -127,6 +141,20 @@
             "required": true,
             "schema": {
               "title": "Campaign Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "primary",
+              "enum": [
+                "primary",
+                "audit"
+              ],
+              "title": "Scope",
               "type": "string"
             }
           }
@@ -309,6 +337,20 @@
               "default": "",
               "maxLength": 200,
               "title": "Hardware",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "primary",
+              "enum": [
+                "primary",
+                "audit"
+              ],
+              "title": "Scope",
               "type": "string"
             }
           },

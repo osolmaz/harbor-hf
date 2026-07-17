@@ -30,11 +30,6 @@
   },
   "additionalProperties": false,
   "properties": {
-    "execution_profile_sha256": {
-      "pattern": "^sha256:[0-9a-f]{64}$",
-      "title": "Execution Profile Sha256",
-      "type": "string"
-    },
     "control_commit": {
       "pattern": "^[0-9a-f]{40,64}$",
       "title": "Control Commit",
@@ -48,6 +43,11 @@
     "envelope_sha256": {
       "pattern": "^sha256:[0-9a-f]{64}$",
       "title": "Envelope Sha256",
+      "type": "string"
+    },
+    "execution_profile_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Execution Profile Sha256",
       "type": "string"
     },
     "harbor_archive_sha256s": {

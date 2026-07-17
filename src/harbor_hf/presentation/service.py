@@ -9,6 +9,7 @@ from harbor_hf.presentation.repository import ResultRepository, ResultSnapshot
 from harbor_hf.results import (
     ArtifactRow,
     CatalogRow,
+    CatalogScope,
     ExecutionRow,
     MetricRow,
     RunRow,
@@ -35,6 +36,9 @@ class ResultService:
     _historical_catalogs: dict[str, CatalogRow] = field(
         default_factory=dict, init=False, compare=False, repr=False
     )
+    _source_catalogs: dict[str, CatalogRow] = field(
+        default_factory=dict, init=False, compare=False, repr=False
+    )
 
     def health(self) -> dict[str, Any]:
         return {
@@ -43,6 +47,7 @@ class ResultService:
             "index_dataset": self.snapshot.index_dataset,
             "index_revision": self.snapshot.index_revision,
             "run_count": len(self._catalog_rows()),
+            "audit_run_count": len(self._catalog_rows("audit")),
         }
 
     def capabilities(self) -> dict[str, Any]:
@@ -62,8 +67,9 @@ class ResultService:
         benchmark: str = "",
         model: str = "",
         hardware: str = "",
+        scope: CatalogScope = "primary",
     ) -> dict[str, Any]:
-        items = [self._summary(run) for run in self._catalog_rows()]
+        items = [self._summary(run) for run in self._catalog_rows(scope)]
         facets = {
             "benchmarks": sorted({item["benchmark"] for item in items}),
             "models": sorted({item["model_repo"] for item in items}),
@@ -96,9 +102,9 @@ class ResultService:
         items.sort(key=lambda item: item["completed_at"], reverse=True)
         return {"items": items, "total": len(items), "facets": facets}
 
-    def list_campaigns(self) -> dict[str, Any]:
+    def list_campaigns(self, *, scope: CatalogScope = "primary") -> dict[str, Any]:
         grouped: dict[str, list[RunCatalog]] = defaultdict(list)
-        for run in self._catalog_rows():
+        for run in self._catalog_rows(scope):
             grouped[run.campaign_id].append(run)
         items = []
         for campaign_id, runs in grouped.items():
@@ -118,8 +124,12 @@ class ResultService:
         items.sort(key=lambda item: item["completed_at"], reverse=True)
         return {"items": items, "total": len(items)}
 
-    def campaign(self, campaign_id: str) -> dict[str, Any]:
-        runs = [run for run in self._catalog_rows() if run.campaign_id == campaign_id]
+    def campaign(
+        self, campaign_id: str, *, scope: CatalogScope = "primary"
+    ) -> dict[str, Any]:
+        runs = [
+            run for run in self._catalog_rows(scope) if run.campaign_id == campaign_id
+        ]
         if not runs:
             raise ResultNotFound(campaign_id)
         return {
@@ -132,6 +142,7 @@ class ResultService:
         run = detail._run(run_id)
         return {
             "summary": self._summary(self._catalog(run_id)),
+            "sources": [self._summary(source) for source in self._sources(run)],
             "configuration": _public_row(run),
             "trials": [
                 detail._trial_summary(row)
@@ -155,6 +166,30 @@ class ResultService:
             ],
             "provenance": detail._provenance(run),
         }
+
+    def _sources(self, run: RunRow) -> list[RunCatalog]:
+        if not run.source_publication_ids:
+            return []
+        by_publication = {
+            row.publication_id: row for row in self._catalog_rows("audit")
+        }
+        missing = [
+            publication_id
+            for publication_id in run.source_publication_ids
+            if publication_id not in by_publication
+        ]
+        for publication_id in missing:
+            source = self._source_catalogs.get(publication_id)
+            if source is None:
+                if self.repository is None:
+                    raise ResultNotFound(publication_id)
+                try:
+                    source = self.repository.find_catalog_publication(publication_id)
+                except KeyError as error:
+                    raise ResultNotFound(publication_id) from error
+                self._source_catalogs[publication_id] = source
+            by_publication[publication_id] = source
+        return [by_publication[item] for item in run.source_publication_ids]
 
     def compare(self, run_id: str, other_run_id: str) -> dict[str, Any]:
         left_catalog = self._catalog(run_id)
@@ -253,6 +288,10 @@ class ResultService:
             "run_id": run.run_id,
             "publication_id": run.publication_id,
             "campaign_id": run.campaign_id,
+            "evaluation_id": run.evaluation_id,
+            "publication_role": run.publication_role,
+            "component_kind": run.component_kind,
+            "source_publication_ids": run.source_publication_ids,
             "benchmark": run.benchmark,
             "benchmark_revision": run.benchmark_revision,
             "model_repo": run.model_repo,
@@ -315,7 +354,7 @@ class ResultService:
         return self._find(self.snapshot.runs, "run_id", run_id)
 
     def _catalog(self, run_id: str) -> RunCatalog:
-        for row in self._catalog_rows():
+        for row in self._catalog_rows("audit"):
             if row.run_id == run_id:
                 return row
         historical = self._historical_catalogs.get(run_id)
@@ -330,9 +369,14 @@ class ResultService:
         self._historical_catalogs[run_id] = historical
         return historical
 
-    def _catalog_rows(self) -> tuple[RunCatalog, ...]:
-        if self.snapshot.catalog_rows:
-            return self.snapshot.catalog_rows
+    def _catalog_rows(self, scope: CatalogScope = "primary") -> tuple[RunCatalog, ...]:
+        rows = (
+            self.snapshot.catalog_rows
+            if scope == "primary"
+            else self.snapshot.audit_catalog_rows
+        )
+        if rows:
+            return rows
         return self.snapshot.runs
 
     def _catalog_score(self, run: RunCatalog) -> float:

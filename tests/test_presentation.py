@@ -32,6 +32,7 @@ from harbor_hf.results import (
     RunRow,
     TrialRow,
     build_catalog_lookup_file,
+    build_catalog_publication_lookup_file,
     build_catalog_row,
     build_result_publication,
 )
@@ -84,8 +85,10 @@ class FakeReader:
         self.rows: dict[tuple[str, str, str], list[dict[str, object]]] = {}
         self.bytes: dict[tuple[str, str, str], bytes] = {}
         self.files = [
-            "data/catalog/schema=v1/windows/0004.parquet",
-            "data/catalog/schema=v1/windows/0008.parquet",
+            "data/catalog/schema=v1/primary/windows/0004.parquet",
+            "data/catalog/schema=v1/primary/windows/0008.parquet",
+            "data/catalog/schema=v1/audit/windows/0004.parquet",
+            "data/catalog/schema=v1/audit/windows/0008.parquet",
             "data/index/schema=v1/windows/0004.parquet",
             "data/index/schema=v1/windows/0008.parquet",
             *[
@@ -94,17 +97,27 @@ class FakeReader:
             ],
         ]
         for size in (4, 8):
-            catalog_path = f"data/catalog/schema=v1/windows/{size:04d}.parquet"
-            self.rows[("org/index", INDEX_REVISION, catalog_path)] = [
-                row.model_dump(mode="python") for row in snapshot.catalog_rows
-            ]
+            for scope, rows in (
+                ("primary", snapshot.catalog_rows),
+                ("audit", snapshot.audit_catalog_rows),
+            ):
+                catalog_path = (
+                    f"data/catalog/schema=v1/{scope}/windows/{size:04d}.parquet"
+                )
+                self.rows[("org/index", INDEX_REVISION, catalog_path)] = [
+                    row.model_dump(mode="python") for row in rows
+                ]
             index_path = f"data/index/schema=v1/windows/{size:04d}.parquet"
             self.rows[("org/index", INDEX_REVISION, index_path)] = [
                 row.model_dump(mode="python") for row in snapshot.index_rows
             ]
-        for row in snapshot.catalog_rows:
+        for row in snapshot.audit_catalog_rows:
             lookup = build_catalog_lookup_file(row)
             self.rows[("org/index", INDEX_REVISION, lookup.path)] = [
+                row.model_dump(mode="python")
+            ]
+            publication_lookup = build_catalog_publication_lookup_file(row)
+            self.rows[("org/index", INDEX_REVISION, publication_lookup.path)] = [
                 row.model_dump(mode="python")
             ]
         for index in snapshot.index_rows:
@@ -215,6 +228,7 @@ def snapshot() -> ResultSnapshot:
         executions=tuple(row[3] for row in rows),
         metrics=tuple(row[4] for row in rows),
         artifacts=tuple(row[5] for row in rows),
+        audit_catalog_rows=tuple(catalogs),
     )
 
 
@@ -399,6 +413,21 @@ def test_historical_links_resolve_outside_list_window(
     assert len([path for path in reader.read_calls if "/windows/" not in path]) == 7
 
 
+def test_source_publication_lookup_resolves_outside_list_window(
+    snapshot: ResultSnapshot,
+) -> None:
+    reader = FakeReader(snapshot)
+    repository = ResultRepository(
+        PresentationConfig("org/index", max_publications=1), reader
+    )
+    repository.load()
+    source = snapshot.audit_catalog_rows[-1]
+
+    resolved = repository.find_catalog_publication(source.publication_id)
+
+    assert resolved == source
+
+
 def test_catalog_uses_valid_nonstandard_reward_names() -> None:
     index, run, trial, execution, metric, artifact = _publication(1, 1.0)
     del index
@@ -450,7 +479,9 @@ def test_detail_and_comparison_use_nonstandard_reward_names(
         else metric
         for metric in snapshot.metrics
     )
-    service = ResultService(replace(snapshot, catalog_rows=(), metrics=metrics))
+    service = ResultService(
+        replace(snapshot, catalog_rows=(), audit_catalog_rows=(), metrics=metrics)
+    )
 
     detail = service.run("run-1")
     comparison = service.compare("run-1", "run-2")
@@ -549,6 +580,47 @@ def test_etag_changes_with_response_representation(snapshot: ResultSnapshot) -> 
     assert first.headers["etag"] != second.headers["etag"]
 
 
+def test_primary_scope_excludes_audit_only_publications(
+    snapshot: ResultSnapshot,
+) -> None:
+    scoped = replace(snapshot, catalog_rows=(snapshot.catalog_rows[0],))
+    client = TestClient(create_app(ResultService(scoped)))
+
+    primary = client.get("/api/v1/runs").json()
+    audit = client.get("/api/v1/runs?scope=audit").json()
+
+    assert [item["run_id"] for item in primary["items"]] == ["run-1"]
+    assert {item["run_id"] for item in audit["items"]} == {"run-1", "run-2"}
+    assert client.get("/api/v1/health").json()["audit_run_count"] == 2
+
+
+def test_composed_run_links_to_source_publications(snapshot: ResultSnapshot) -> None:
+    source_publication_id = snapshot.runs[1].publication_id
+    composed_run = snapshot.runs[0].model_copy(
+        update={
+            "result_kind": "composed",
+            "source_publication_ids": [source_publication_id],
+        }
+    )
+    composed_tables = _tables_for(
+        replace(snapshot, runs=(composed_run, snapshot.runs[1])),
+        snapshot.index_rows[0],
+    )
+    composed_catalog = _catalog_for_tables(composed_tables)
+    linked = replace(
+        snapshot,
+        runs=(composed_run, snapshot.runs[1]),
+        catalog_rows=(composed_catalog, snapshot.catalog_rows[1]),
+        audit_catalog_rows=(composed_catalog, snapshot.catalog_rows[1]),
+    )
+
+    detail = ResultService(linked).run(composed_run.run_id)
+
+    assert [source["publication_id"] for source in detail["sources"]] == [
+        source_publication_id
+    ]
+
+
 def test_comparison_keeps_logical_attempts_and_checks_benchmark_revision(
     snapshot: ResultSnapshot,
 ) -> None:
@@ -640,6 +712,9 @@ def _publication(
         publication_id=trace["publication_id"],
         run_id=trace["run_id"],
         campaign_id=f"campaign-{number}",
+        evaluation_id=f"evaluation-{number}",
+        publication_role="final",
+        component_kind=None,
         benchmark="shellbench",
         result_kind="ordinary",
         outcome="complete",
@@ -658,6 +733,10 @@ def _publication(
         **trace,
         campaign_id=f"campaign-{number}",
         experiment="viewer-test",
+        evaluation_id=f"evaluation-{number}",
+        publication_role="final",
+        component_kind=None,
+        source_publication_ids=[],
         benchmark="shellbench",
         benchmark_revision=TASK_DIGEST,
         result_kind="ordinary",

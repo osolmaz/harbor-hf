@@ -44,12 +44,14 @@ Common trace fields:
 | `run_lock_sha256` | string | Verified run-lock object checksum |
 | `control_commit` | string | Immutable control Dataset commit used to publish |
 
-`runs` adds campaign, experiment, benchmark, result classification, completion
+`runs` adds campaign, experiment, evaluation identity, publication role,
+source-publication references, benchmark, result classification, completion
 times, model, deployment, agent, fixed planned-trial denominator, task-outcome
 counts, quality, and aggregate child-count fields. `trials` adds the logical
 trial identity, task name and digest, attempt, selected execution, and one of
-four outcomes: `scored`, `agent_failed`, `benchmark_failed`, or
-`infrastructure_exhausted`. Every non-scored trial has a zero reward metric and
+five outcomes: `scored`, `agent_failed`, `benchmark_failed`,
+`infrastructure_exhausted`, or `unsupported`. Every non-scored trial has a zero
+reward metric and
 selects its final failed execution. `executions` adds the physical execution
 identity, trial identity, attempt, runtime kind, `succeeded`, `failed`, or
 `cancelled` status, typed failure category, timestamps, retry reason, and
@@ -98,6 +100,32 @@ consolidated power-of-two windows containing the newest 1, 2, 4, and so on up
 to 2,048 rows in the same parent-checked commit. Readers choose the smallest
 window covering their configured limit, so public refresh I/O stays bounded
 without deleting the per-publication archive.
+
+The index Dataset carries two catalog projections. `primary` contains only
+logical benchmark evaluations whose immutable publication role is `final`.
+`audit` contains final, component, and diagnostic publications. List APIs and
+the hosted viewer use `primary` unless an operator explicitly requests audit
+scope. Run-keyed lookups remain available for every role. Publication-keyed
+lookups keep composed-result provenance resolvable after a source leaves the
+bounded audit windows, and composed final rows record the exact base and
+correction publication IDs shown on their detail pages.
+
+Catalog visibility can be changed without deleting or relabeling evidence:
+
+```bash
+harbor-hf results catalog PUBLICATION_ID \
+  --action withdraw \
+  --reason "superseded evaluation" \
+  --actor operator@example.com \
+  --index-dataset organization/benchmark-run-index \
+  --namespace organization
+```
+
+Each promotion or withdrawal is an immutable event with an actor, reason, and
+timestamp. The latest decision is a projection pointer. Withdrawal removes a
+final publication from `primary` only; the audit catalog, normalized result
+tables, receipts, Bucket evidence, sessions, and trajectories remain intact.
+Only a publication already classified as `final` can be promoted.
 
 The schema review intentionally keeps a few domain-qualified names and repeated
 fields. `logical_attempt` and `physical_attempt` preserve the campaign model's
@@ -170,3 +198,19 @@ The active pre-release contract is cut over in place under `v1`; superseded
 shapes are not supported by production readers. Historical immutable
 publications are never rewritten. They must be rebuilt from canonical evidence
 or rerun before they can enter the active catalog.
+
+An explicit cutover manifest pins the source catalog revision and both current
+Dataset heads, classifies every active publication, and names any source
+publications missing from the old list projection. Apply it with:
+
+```bash
+harbor-hf results cutover-catalog cutover.json --namespace organization
+```
+
+The command holds both publisher leases, rewrites active normalized V1 files in
+one result commit, then switches the scoped catalog and index in one
+parent-checked commit. It validates both the historical source catalog and the
+catalog at the expected index head. If the process stops after the result
+commit, retrying verifies and adopts that commit before finishing the index
+switch. A moved Dataset aborts the operation. Historical Hub revisions,
+composition manifests, and private Bucket evidence are never changed.

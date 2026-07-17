@@ -14,11 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from harbor_hf.endpoints import deployment_digest, managed_endpoint_identity
 from harbor_hf.models import (
     AgentProfile,
+    ComponentKind,
     DeploymentProfile,
     DeploymentTarget,
     EndpointRef,
+    EvaluationId,
     ExperimentSpec,
     ModelProfile,
+    PublicationRole,
     RemoteExecutionSpec,
 )
 from harbor_hf.planner import RunCell, experiment_digest, resolved_cells
@@ -94,6 +97,9 @@ class CampaignPlan(FrozenModel):
         "harbor-hf/campaign-plan/v1alpha1"
     )
     experiment: str
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
     manifest_digest: str
     plan_digest: str
     run_count: int
@@ -105,6 +111,8 @@ class CampaignPlan(FrozenModel):
 
     @model_validator(mode="after")
     def counts_match_contents(self) -> CampaignPlan:
+        if (self.publication_role == "component") != (self.component_kind is not None):
+            raise ValueError("component kind conflicts with publication role")
         shard_count = sum(len(run.shards) for run in self.runs)
         trial_count = sum(
             len(shard.trials) for run in self.runs for shard in run.shards
@@ -144,12 +152,21 @@ class CampaignLock(FrozenModel):
     campaign_id: str
     created_at: datetime
     experiment: str
+    evaluation_id: EvaluationId
+    publication_role: PublicationRole
+    component_kind: ComponentKind | None
     manifest_digest: str
     plan_digest: str
     artifact_prefix: str
     max_shards_per_wave: int
     recovery_policy: CampaignRecoveryPolicy
     runs: list[CampaignRunLock]
+
+    @model_validator(mode="after")
+    def publication_role_is_consistent(self) -> CampaignLock:
+        if (self.publication_role == "component") != (self.component_kind is not None):
+            raise ValueError("component kind conflicts with publication role")
+        return self
 
 
 class SubmitWaveAction(Protocol):
@@ -332,6 +349,9 @@ def build_campaign_plan(
         plan_payload["benchmark_judge"] = spec.benchmark.judge.model_dump(mode="json")
     return CampaignPlan(
         experiment=spec.metadata.name,
+        evaluation_id=spec.publishing.evaluation_id,
+        publication_role=spec.publishing.role,
+        component_kind=spec.publishing.component_kind,
         manifest_digest=experiment_digest(spec),
         plan_digest=_digest(plan_payload),
         run_count=len(runs),
@@ -504,6 +524,9 @@ def build_campaign_lock(
         campaign_id=campaign_id,
         created_at=clock().astimezone(UTC),
         experiment=plan.experiment,
+        evaluation_id=plan.evaluation_id,
+        publication_role=plan.publication_role,
+        component_kind=plan.component_kind,
         manifest_digest=plan.manifest_digest,
         plan_digest=plan.plan_digest,
         artifact_prefix=f"campaigns/{campaign_id}",

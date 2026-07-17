@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, Never, cast
+from uuid import uuid4
 
 import typer
 from httpx import HTTPError
@@ -33,6 +35,12 @@ from harbor_hf.campaigns import (
     campaign_json_schemas,
     new_campaign_id,
 )
+from harbor_hf.catalog_cutover import (
+    CatalogCutoverError,
+    CatalogCutoverPlan,
+    CutoverDatasetApi,
+    HubCatalogCutover,
+)
 from harbor_hf.control import (
     CampaignSubmittedPayload,
     ControlError,
@@ -60,7 +68,7 @@ from harbor_hf.result_publisher import (
     DatasetPublicationError,
     HubDatasetPublisher,
 )
-from harbor_hf.results import ResultPublicationError
+from harbor_hf.results import CatalogDecision, ResultPublicationError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
@@ -95,6 +103,7 @@ _OPERATION_ERRORS = (
     CoordinationError,
     DatasetPublicationError,
     ResultPublicationError,
+    CatalogCutoverError,
 )
 
 
@@ -411,6 +420,65 @@ def results_publish(
                     ),
                     repositories=cast(DatasetRepositoryApi, api),
                 ).publish(campaign_id)
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@results_app.command("catalog")
+def results_catalog(
+    publication_id: Annotated[str, typer.Argument()],
+    action: Annotated[Literal["promote", "withdraw"], typer.Option("--action")],
+    reason: Annotated[str, typer.Option("--reason")],
+    actor: Annotated[str, typer.Option("--actor")],
+    index_dataset: Annotated[str, typer.Option("--index-dataset")],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Record an append-only primary catalog decision."""
+    del output_format
+    try:
+        token = get_token()
+        if token is None:
+            raise ValueError("catalog decisions require HF authentication")
+        decision = CatalogDecision(
+            decision_id=f"decision-{uuid4().hex}",
+            publication_id=publication_id,
+            action=action,
+            actor=actor,
+            reason=reason,
+            created_at=datetime.now(UTC),
+        )
+        result = HubDatasetPublisher(
+            publisher_id=f"cli-{decision.decision_id}",
+            leases=HubClaimStore(namespace, token),
+            api=cast(DatasetApi, HfApi()),
+        ).decide_catalog(decision, index_dataset=index_dataset)
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@results_app.command("cutover-catalog")
+def results_cutover_catalog(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Apply an explicit, parent-checked V1 catalog cutover."""
+    del output_format
+    try:
+        plan = CatalogCutoverPlan.model_validate_json(
+            manifest.read_text(encoding="utf-8")
+        )
+        token = get_token()
+        if token is None:
+            raise ValueError("catalog cutover requires HF authentication")
+        result = HubCatalogCutover(
+            publisher_id=f"cli-{plan.cutover_id}",
+            leases=HubClaimStore(namespace, token),
+            api=cast(CutoverDatasetApi, HfApi()),
+        ).apply(plan)
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
     _echo_json(result.model_dump(mode="json"))

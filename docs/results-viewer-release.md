@@ -42,18 +42,28 @@ artifact bytes were not copied into the public datasets or Space repository.
 
 ## Architecture
 
-The result publisher now writes two bounded projections into the global index
-Dataset:
+The result publisher writes a discovery index and two bounded catalog scopes
+into the global index Dataset. The primary scope contains only final logical
+evaluations; the audit scope also contains base, correction, and diagnostic
+publications. Composed result pages link directly to their source publications.
+Append-only promotion and withdrawal decisions change only the primary
+projection.
 
+The published projections are:
+
+- primary catalog windows used by default for scores and comparisons;
+- audit catalog windows selected explicitly by operators;
 - discovery index windows with immutable result Dataset references;
-- compact catalog windows with aggregate score and run metadata.
+- run- and publication-keyed lookup rows with aggregate score, role, and
+  provenance metadata.
 
 Both use deterministic power-of-two sizes from 1 through 2,048 rows. A catalog
 request downloads one bounded Parquet snapshot. Opening a run then downloads
 one immutable run-keyed lookup and only that publication's revision-pinned run,
-trial, execution, metric, and artifact tables. The lookup keeps direct links
-stable after list-window compaction. Catalog aggregates are recomputed and
-compared with detail tables before a detail response is returned.
+trial, execution, metric, and artifact tables. Publication-keyed lookups keep
+composed-result source links stable after list-window compaction. Catalog
+aggregates are recomputed and compared with detail tables before a detail
+response is returned.
 
 The Docker Space serves a versioned FastAPI contract and one React application.
 It provides filtered and paginated run and campaign lists, stable detail URLs,

@@ -2,6 +2,10 @@ export interface RunSummary {
   run_id: string;
   publication_id: string;
   campaign_id: string;
+  evaluation_id: string;
+  publication_role: "final" | "component" | "diagnostic";
+  component_kind: "base" | "correction" | null;
+  source_publication_ids: string[];
   benchmark: string;
   benchmark_revision: string;
   model_repo: string;
@@ -43,6 +47,7 @@ export interface RunsResponse {
 
 export interface RunDetail {
   summary: RunSummary;
+  sources: RunSummary[];
   configuration: Record<string, unknown>;
   trials: Array<Record<string, unknown> & {
     trial_id: string;

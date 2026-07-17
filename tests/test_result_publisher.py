@@ -18,14 +18,19 @@ from harbor_hf.result_publisher import (
     HubDatasetPublisher,
     PublicationConflict,
     _regular_blob,
+    catalog_decision_event_path,
+    catalog_decision_latest_path,
     publisher_lease_path,
 )
 from harbor_hf.results import (
+    CatalogDecision,
     PublicationProvenance,
     ResultPublication,
     ResultTables,
     RunRow,
     build_catalog_lookup_file,
+    build_catalog_publication_lookup_file,
+    build_catalog_window_file,
     build_global_index_row,
     build_index_file,
     build_result_publication,
@@ -146,6 +151,10 @@ def publication() -> ResultPublication:
             **trace,
             "campaign_id": "campaign-one",
             "experiment": "experiment-one",
+            "evaluation_id": "evaluation-one",
+            "publication_role": "final",
+            "component_kind": None,
+            "source_publication_ids": [],
             "benchmark": "shellbench",
             "benchmark_revision": "sha256:" + "5" * 64,
             "result_kind": "ordinary",
@@ -241,12 +250,14 @@ def test_serializes_result_and_index_with_parent_checked_leases(
         row.publication_id
         for row in read_index_file(api.files["org/index"][windows[-1]])
     ] == [publication.tables.publication_id]
-    catalog_path = "data/catalog/schema=v1/windows/2048.parquet"
+    catalog_path = "data/catalog/schema=v1/primary/windows/2048.parquet"
     catalog = read_catalog_file(api.files["org/index"][catalog_path])
     assert catalog[0].run_id == publication.tables.runs[0].run_id
     assert catalog[0].score == 0.0
     lookup = build_catalog_lookup_file(catalog[0])
     assert read_catalog_file(api.files["org/index"][lookup.path]) == catalog
+    publication_lookup = build_catalog_publication_lookup_file(catalog[0])
+    assert read_catalog_file(api.files["org/index"][publication_lookup.path]) == catalog
     assert catalog[0].projection_path.startswith("projections/schema=v1/")
     assert catalog[0].harbor_bundle_count == 1
 
@@ -276,10 +287,123 @@ def test_publishes_canonical_projection_and_catalog(
         "artifacts",
     }
     catalog = read_catalog_file(
-        api.files["org/index"]["data/catalog/schema=v1/windows/2048.parquet"]
+        api.files["org/index"]["data/catalog/schema=v1/primary/windows/2048.parquet"]
     )[0]
     assert catalog.projection_path == projection_path
     assert catalog.harbor_bundle_count == 1
+
+
+@pytest.mark.parametrize(
+    ("role", "component_kind"),
+    [("component", "base"), ("diagnostic", None)],
+)
+def test_nonfinal_publications_only_enter_audit_catalog(
+    publication: ResultPublication,
+    tmp_path: Path,
+    role: str,
+    component_kind: str | None,
+) -> None:
+    run = publication.tables.runs[0].model_copy(
+        update={"publication_role": role, "component_kind": component_kind}
+    )
+    candidate = build_result_publication(
+        publication.tables.model_copy(update={"runs": [run]})
+    )
+    api = FakeDatasetApi(tmp_path)
+
+    HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    ).publish(candidate, result_dataset="org/results", index_dataset="org/index")
+
+    primary = read_catalog_file(
+        api.files["org/index"]["data/catalog/schema=v1/primary/windows/2048.parquet"]
+    )
+    audit = read_catalog_file(
+        api.files["org/index"]["data/catalog/schema=v1/audit/windows/2048.parquet"]
+    )
+    assert primary == []
+    assert [row.publication_id for row in audit] == [candidate.tables.publication_id]
+
+
+def test_catalog_decisions_withdraw_and_restore_final_publication(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    publisher.publish(
+        publication, result_dataset="org/results", index_dataset="org/index"
+    )
+    publication_id = publication.tables.publication_id
+    withdraw = CatalogDecision(
+        decision_id="decision-withdraw",
+        publication_id=publication_id,
+        action="withdraw",
+        actor="operator@example.com",
+        reason="superseded evaluation",
+        created_at=NOW + timedelta(minutes=2),
+    )
+
+    withdrawn = publisher.decide_catalog(withdraw, index_dataset="org/index")
+
+    primary_path = "data/catalog/schema=v1/primary/windows/2048.parquet"
+    audit_path = "data/catalog/schema=v1/audit/windows/2048.parquet"
+    assert read_catalog_file(api.files["org/index"][primary_path]) == []
+    assert len(read_catalog_file(api.files["org/index"][audit_path])) == 1
+    assert withdrawn.index_revision == api.head("org/index")
+    assert catalog_decision_event_path(withdraw.decision_id) in api.files["org/index"]
+    assert catalog_decision_latest_path(publication_id) in api.files["org/index"]
+
+    for power in range(12):
+        empty_audit = build_catalog_window_file([], 2**power, scope="audit")
+        api.files["org/index"][empty_audit.path] = empty_audit.content
+
+    promote = withdraw.model_copy(
+        update={
+            "decision_id": "decision-promote",
+            "action": "promote",
+            "reason": "approved evaluation",
+            "created_at": NOW + timedelta(minutes=3),
+        }
+    )
+    publisher.decide_catalog(promote, index_dataset="org/index")
+
+    assert [
+        row.publication_id
+        for row in read_catalog_file(api.files["org/index"][primary_path])
+    ] == [publication_id]
+    duplicate = publisher.decide_catalog(promote, index_dataset="org/index")
+    assert duplicate.index_revision == api.head("org/index")
+
+
+def test_catalog_decision_rejects_component_promotion(
+    publication: ResultPublication, tmp_path: Path
+) -> None:
+    run = publication.tables.runs[0].model_copy(
+        update={"publication_role": "component", "component_kind": "base"}
+    )
+    component = build_result_publication(
+        publication.tables.model_copy(update={"runs": [run]})
+    )
+    api = FakeDatasetApi(tmp_path)
+    publisher = HubDatasetPublisher(
+        publisher_id="publisher-one", leases=FakeLeases(), api=api
+    )
+    publisher.publish(
+        component, result_dataset="org/results", index_dataset="org/index"
+    )
+    decision = CatalogDecision(
+        decision_id="decision-promote-component",
+        publication_id=component.tables.publication_id,
+        action="promote",
+        actor="operator@example.com",
+        reason="invalid request",
+        created_at=NOW + timedelta(minutes=2),
+    )
+
+    with pytest.raises(DatasetPublicationError, match="only final"):
+        publisher.decide_catalog(decision, index_dataset="org/index")
 
 
 def test_duplicate_publication_is_a_no_op(

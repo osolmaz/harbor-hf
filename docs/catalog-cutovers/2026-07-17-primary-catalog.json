@@ -1,0 +1,127 @@
+{
+  "schema_version": "harbor-hf/catalog-cutover/v1",
+  "cutover_id": "primary-catalog-20260717",
+  "result_dataset": "osolmaz/shellbench-results",
+  "index_dataset": "osolmaz/benchmark-run-index",
+  "source_catalog_revision": "0faf2230fb14f26fb1b0717a5ba07c6cb6147456",
+  "source_catalog_path": "data/catalog/schema=v1/windows/2048.parquet",
+  "expected_result_head": "98f681bd1240b8c1f4e8680452574da0a8c621de",
+  "expected_index_head": "bbc7c8b678f7b6fddf75b1159dbe756b13e165d1",
+  "classifications": [
+    {
+      "publication_id": "pub-69a4d8621a555f1cafe2610aece2b0e2",
+      "evaluation_id": "shellbench-glm52-fireworks-public115-20260717",
+      "role": "final",
+      "source_publication_ids": [
+        "pub-42874788652132ae28e81343f0ff4a6f",
+        "pub-da2cfbe995d7b2d745df342a6fef1bc6"
+      ]
+    },
+    {
+      "publication_id": "pub-42874788652132ae28e81343f0ff4a6f",
+      "evaluation_id": "shellbench-glm52-fireworks-public115-20260717",
+      "role": "component",
+      "component_kind": "base"
+    },
+    {
+      "publication_id": "pub-da2cfbe995d7b2d745df342a6fef1bc6",
+      "evaluation_id": "shellbench-glm52-fireworks-public115-20260717",
+      "role": "component",
+      "component_kind": "correction"
+    },
+    {
+      "publication_id": "pub-bbd33d77e509b39bd90c3ebd1295c491",
+      "evaluation_id": "shellbench-qwen36-27b-q8-h200-public115-20260717",
+      "role": "final",
+      "source_publication_ids": [
+        "pub-c161123c752629f6d33a3bce31285930",
+        "pub-7f131aede04760968a060fd6cfb7677d"
+      ]
+    },
+    {
+      "publication_id": "pub-c161123c752629f6d33a3bce31285930",
+      "evaluation_id": "shellbench-qwen36-27b-q8-h200-public115-20260717",
+      "role": "component",
+      "component_kind": "base"
+    },
+    {
+      "publication_id": "pub-7f131aede04760968a060fd6cfb7677d",
+      "evaluation_id": "shellbench-qwen36-27b-q8-h200-public115-20260717",
+      "role": "component",
+      "component_kind": "correction"
+    },
+    {
+      "publication_id": "pub-b84b523e4c94285888f3e34f69995409",
+      "evaluation_id": "shellbench-qwen36-35b-q8-h200-public115-20260716",
+      "role": "final",
+      "source_publication_ids": [
+        "pub-7ac3594516bb7a5ba6c2a9b8da397f55",
+        "pub-1d4c9dfaa42b6b04eaea50ab2a0c4d6e"
+      ]
+    },
+    {
+      "publication_id": "pub-7ac3594516bb7a5ba6c2a9b8da397f55",
+      "evaluation_id": "shellbench-qwen36-35b-q8-h200-public115-20260716",
+      "role": "component",
+      "component_kind": "base"
+    },
+    {
+      "publication_id": "pub-1d4c9dfaa42b6b04eaea50ab2a0c4d6e",
+      "evaluation_id": "shellbench-qwen36-35b-q8-h200-public115-20260716",
+      "role": "component",
+      "component_kind": "correction"
+    },
+    {
+      "publication_id": "pub-f9708b073effc307ff48be6c5fb0bf24",
+      "evaluation_id": "shellbench-gemma4-26b-q8-h200-public115-20260717",
+      "role": "final",
+      "source_publication_ids": [
+        "pub-ae7b95f87c06d0c0f7e01837bbf2079e",
+        "pub-958956ec96c8ccc63e72f55ed664537e"
+      ]
+    },
+    {
+      "publication_id": "pub-ae7b95f87c06d0c0f7e01837bbf2079e",
+      "evaluation_id": "shellbench-gemma4-26b-q8-h200-public115-20260717",
+      "role": "component",
+      "component_kind": "base"
+    },
+    {
+      "publication_id": "pub-958956ec96c8ccc63e72f55ed664537e",
+      "evaluation_id": "shellbench-gemma4-26b-q8-h200-public115-20260717",
+      "role": "component",
+      "component_kind": "correction"
+    },
+    {
+      "publication_id": "pub-59b6682214ad451d499838784a5e87cd",
+      "evaluation_id": "shellbench-gemma4-31b-q8-h200-public115-20260717",
+      "role": "final",
+      "source_publication_ids": [
+        "pub-1d5dfa0311d94b0f0f1218dea9508590",
+        "pub-abd0819ef3d31461466f06f4795e3e0e"
+      ]
+    },
+    {
+      "publication_id": "pub-1d5dfa0311d94b0f0f1218dea9508590",
+      "evaluation_id": "shellbench-gemma4-31b-q8-h200-public115-20260717",
+      "role": "component",
+      "component_kind": "base"
+    },
+    {
+      "publication_id": "pub-abd0819ef3d31461466f06f4795e3e0e",
+      "evaluation_id": "shellbench-gemma4-31b-q8-h200-public115-20260717",
+      "role": "component",
+      "component_kind": "correction"
+    },
+    {
+      "publication_id": "pub-b44fc0571adbadd2b8c091cc52f2020e",
+      "evaluation_id": "shellbench-glm52-fireworks-smoke-20260716-a",
+      "role": "diagnostic"
+    },
+    {
+      "publication_id": "pub-de3758be089170ea7890c621bff9bf5c",
+      "evaluation_id": "shellbench-glm52-fireworks-smoke-20260716-b",
+      "role": "diagnostic"
+    }
+  ]
+}
