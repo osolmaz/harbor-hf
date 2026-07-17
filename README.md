@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/harbor-hf-logo-dark.svg">
-    <img alt="harbor-hf" src="assets/harbor-hf-logo.svg" width="400">
+    <img alt="harbor-hf" src="assets/harbor-hf-logo.svg" width="440">
   </picture>
 </p>
 
