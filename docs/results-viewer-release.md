@@ -2,8 +2,8 @@
 
 ## Canonical V1 Cutover
 
-- Source revision: `f4c7a888859d95115a512be30406a6d88bc01fc8`
-- Space revision: `08a42a26b72fa8d051101216a599164142470319`
+- Source revision: `e740020e96ad7d3beaa9e4d722f7b3427d7d4397`
+- Space revision: `51e33984c41567cfc000b674d9492d5d3b7918b1`
 - Active catalog revision: `b5fbf189b64ee63c0deaf2bb9f997e27d9378b22`
 - Active ShellBench result revision: `bb97497b1e63405d4e460892cf40a44eb4400d40`
 
@@ -67,8 +67,10 @@ response is returned.
 
 The Docker Space serves a versioned FastAPI contract and one React application.
 It provides filtered and paginated run and campaign lists, stable detail URLs,
-task-level comparison, ETags, structured errors, an OpenAPI snapshot, and
-fail-closed private artifact and trajectory routes.
+task-level comparison, deterministic server-side result sorting, ETags,
+structured errors, an OpenAPI snapshot, and fail-closed private artifact and
+trajectory routes. The responsive filter toolbar fits phone, tablet,
+narrow-laptop, and desktop widths.
 
 The visual implementation was informed by Harbor's Apache-2.0 viewer at commit
 `3914ab318b2dfc8d6f7e73e3587d5be401a79d89`. No Harbor source file was copied.
@@ -78,12 +80,13 @@ leaderboard and comparison patterns only.
 
 ## Verification
 
-- Python: 1,516 tests.
+- Python: 1,517 tests with 91.10% coverage.
 - Frontend: TypeScript and Vite production build.
 - Hosted API: health, catalog, run detail, comparison, restricted content, and
   permanent-route smoke requests.
-- Hosted browser: six Playwright tests passed on desktop Chrome and iPhone 13
-  profiles.
+- Hosted browser: eight Playwright tests passed on desktop Chrome and iPhone 13
+  profiles, including toolbar overflow checks from 320px through 1,280px and
+  score sorting in both directions.
 - Runtime: Space reached `RUNNING`; application startup completed cleanly.
 - Privacy: Space variables are public configuration only and the secret list is
   empty.
