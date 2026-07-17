@@ -69,14 +69,14 @@
      stroke="#38BDF8"
      stroke-width="4.5"
      stroke-linecap="round"
-     d="M8 104q13-9 26 0t26 0t26 0t26 0"
+     d="M8 105c8.67-9 17.33-9 26 0s17.33 9 26 0 17.33-9 26 0 17.33 9 26 0"
      id="path24" />
   <path
      stroke="#38BDF8"
      stroke-width="4.5"
      stroke-linecap="round"
      opacity=".45"
-     d="M21 116q13-9 26 0t26 0t26 0"
+     d="M21 118c8.67-7 17.33-7 26 0s17.33 7 26 0 17.33-7 26 0"
      id="path26" />
   <!-- wordmark -->
   <g
