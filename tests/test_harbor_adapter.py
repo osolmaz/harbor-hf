@@ -15,13 +15,120 @@ from harbor_hf.harbor_adapter import (
     WorkerError,
     build_execution_request,
 )
-from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
+from harbor_hf.harbor_adapter.exporter import (
+    _openclaw_session_usage,
+    _usage_with_openclaw_fallback,
+    refresh_bundle_artifacts,
+)
 from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle, sha256_digest
 from harbor_hf.harbor_adapter.validation import validate_compatibility_bundle
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.runs import RunLock, build_run_lock
 
 GOLDEN_CONTRACT = Path(__file__).parent / "golden" / "harbor-adapter-contract-v1.json"
+
+
+def _session_record(
+    *,
+    role: str = "assistant",
+    input_tokens: object = 10,
+    cache_read: object = 4,
+    cache_write: object = 2,
+    output_tokens: object = 3,
+    cost: object = 0.25,
+) -> str:
+    return json.dumps(
+        {
+            "message": {
+                "role": role,
+                "usage": {
+                    "input": input_tokens,
+                    "cacheRead": cache_read,
+                    "cacheWrite": cache_write,
+                    "output": output_tokens,
+                    "cost": {"total": cost},
+                },
+            }
+        }
+    )
+
+
+def test_openclaw_session_usage_aggregates_raw_assistant_messages(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(
+        _session_record() + "\n" + _session_record(input_tokens=5, cost=0.5) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (27, 12, 6, 0.75)
+
+
+def test_openclaw_session_usage_ignores_invalid_and_trajectory_records(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(
+        _session_record()
+        + "\nnot-json\n"
+        + _session_record(role="user")
+        + "\n"
+        + _session_record(input_tokens=True)
+        + "\n"
+        + _session_record(cache_write=-1)
+        + "\n"
+        + _session_record(cost="unknown")
+        + "\n",
+        encoding="utf-8",
+    )
+    (sessions / "one.trajectory.jsonl").write_text(
+        _session_record(input_tokens=1000) + "\n", encoding="utf-8"
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (32, 12, 6, None)
+
+
+def test_openclaw_session_usage_does_not_duplicate_legacy_session(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(_session_record() + "\n", encoding="utf-8")
+    (tmp_path / "agent" / "openclaw.session.jsonl").write_text(
+        _session_record(input_tokens=1000) + "\n", encoding="utf-8"
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (16, 6, 3, 0.25)
+
+
+def test_openclaw_session_usage_uses_legacy_session_as_fallback(
+    tmp_path: Path,
+) -> None:
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "openclaw.session.jsonl").write_text(
+        _session_record() + "\n", encoding="utf-8"
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (16, 6, 3, 0.25)
+
+
+def test_openclaw_session_usage_only_fills_missing_native_totals(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(_session_record() + "\n", encoding="utf-8")
+
+    assert _usage_with_openclaw_fallback((20, None, 8, None), tmp_path) == (
+        20,
+        6,
+        8,
+        0.25,
+    )
 
 
 def _request(
