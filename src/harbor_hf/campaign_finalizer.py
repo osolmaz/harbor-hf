@@ -887,7 +887,21 @@ def _validate_run_identity(
         expected.deployment,
         expected.agent,
     )
-    if identity != locked or observed.created_at != campaign.created_at:
+    classification = (
+        observed.evaluation_id,
+        observed.publication_role,
+        observed.component_kind,
+    )
+    campaign_classification = (
+        campaign.evaluation_id,
+        campaign.publication_role,
+        campaign.component_kind,
+    )
+    if (
+        identity != locked
+        or classification != campaign_classification
+        or observed.created_at != campaign.created_at
+    ):
         raise CampaignFinalizationError("run evidence does not match campaign lock")
 
 

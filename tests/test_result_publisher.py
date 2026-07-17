@@ -30,6 +30,7 @@ from harbor_hf.results import (
     RunRow,
     build_catalog_lookup_file,
     build_catalog_publication_lookup_file,
+    build_catalog_window_file,
     build_global_index_row,
     build_index_file,
     build_result_publication,
@@ -353,6 +354,10 @@ def test_catalog_decisions_withdraw_and_restore_final_publication(
     assert withdrawn.index_revision == api.head("org/index")
     assert catalog_decision_event_path(withdraw.decision_id) in api.files["org/index"]
     assert catalog_decision_latest_path(publication_id) in api.files["org/index"]
+
+    for power in range(12):
+        empty_audit = build_catalog_window_file([], 2**power, scope="audit")
+        api.files["org/index"][empty_audit.path] = empty_audit.content
 
     promote = withdraw.model_copy(
         update={

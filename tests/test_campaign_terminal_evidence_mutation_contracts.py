@@ -661,6 +661,9 @@ def _mutate(files: dict[str, bytes], lock: CampaignLock, case: str) -> dict[str,
     two = f"{trial_prefix}/executions/execution-two"
     tampered_run = json.loads(files[f"{base}/run.lock.json"])
     tampered_run["run_id"] = "run-imposter"
+    tampered_classification = json.loads(files[f"{base}/run.lock.json"])
+    tampered_classification["publication_role"] = "diagnostic"
+    tampered_classification["component_kind"] = None
     removals: dict[str, list[str]] = {
         "missing-trial-marker": [f"{trial_prefix}/_SUCCESS"],
         "selected-failed": [f"{two}/_SUCCESS"],
@@ -730,6 +733,9 @@ def _mutate(files: dict[str, bytes], lock: CampaignLock, case: str) -> dict[str,
         "identity-mismatch": {
             f"{base}/run.lock.json": json.dumps(tampered_run).encode()
         },
+        "classification-mismatch": {
+            f"{base}/run.lock.json": json.dumps(tampered_classification).encode()
+        },
     }
     mutated = dict(files)
     for path in removals.get(case, []):
@@ -763,6 +769,7 @@ def _mutate(files: dict[str, bytes], lock: CampaignLock, case: str) -> dict[str,
         ("manifest-conflict", "child checksums conflict"),
         ("manifest-extra-entry", "run checksums do not cover exact evidence"),
         ("identity-mismatch", "run evidence does not match campaign lock"),
+        ("classification-mismatch", "run evidence does not match campaign lock"),
     ],
 )
 def test_finalize_rejection_matrix_has_exact_errors(

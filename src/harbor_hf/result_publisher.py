@@ -26,6 +26,7 @@ from harbor_hf.results import (
     build_global_index_row,
     build_index_file,
     build_index_window_file,
+    catalog_publication_lookup_path,
     read_catalog_file,
     read_index_file,
 )
@@ -446,13 +447,9 @@ class HubDatasetPublisher:
     def _catalog_decision_windows(
         self, dataset: str, revision: str, decision: CatalogDecision
     ) -> list[DatasetFile]:
-        audit = self._read_catalog_window(dataset, revision, scope="audit")
-        target = next(
-            (row for row in audit if row.publication_id == decision.publication_id),
-            None,
+        target = self._read_catalog_publication(
+            dataset, revision, decision.publication_id
         )
-        if target is None:
-            raise DatasetPublicationError("catalog decision publication is unknown")
         if decision.action == "promote" and target.publication_role != "final":
             raise DatasetPublicationError("only final publications can be promoted")
         primary = {
@@ -476,6 +473,17 @@ class HubDatasetPublisher:
             build_catalog_window_file(ordered, size, scope="primary")
             for size in _INDEX_WINDOW_SIZES
         ]
+
+    def _read_catalog_publication(
+        self, dataset: str, revision: str, publication_id: str
+    ) -> CatalogRow:
+        path = catalog_publication_lookup_path(publication_id)
+        if not self._exists(dataset, path, revision):
+            raise DatasetPublicationError("catalog decision publication is unknown")
+        rows = read_catalog_file(self._read(dataset, path, revision))
+        if len(rows) != 1 or rows[0].publication_id != publication_id:
+            raise DatasetPublicationError("catalog publication lookup is inconsistent")
+        return rows[0]
 
     def _read_catalog_window(
         self, dataset: str, revision: str, *, scope: CatalogScope
