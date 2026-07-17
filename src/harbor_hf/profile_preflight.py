@@ -45,6 +45,7 @@ def preflight_profile_plan(
     info = hub.model_info(plan.model.repo, revision=plan.model.revision)
     if getattr(info, "sha", None) != plan.model.revision:
         raise ValueError("model repository did not resolve to the pinned revision")
+    _verify_repository_artifacts(plan, hub)
     require_private_bucket(plan.artifacts.bucket, api=cast(BucketApi, hub))
     cap = Decimal(plan.max_spend_usd)
     if isinstance(plan.deployment, ProviderTarget):
@@ -188,6 +189,33 @@ def _find_compute(value: object, target: DeploymentProfile) -> dict[str, object]
         "endpoint compute is unavailable: "
         f"{target.region}/{hardware}x{target.accelerator_count}"
     )
+
+
+def _verify_repository_artifacts(plan: ProfilePlan, hub: HfApi) -> None:
+    target = plan.deployment
+    if not isinstance(target, DeploymentProfile):
+        return
+    repository_prefix = "/repository/"
+    referenced = {
+        argument.removeprefix(repository_prefix)
+        for argument in target.engine.arguments
+        if argument.startswith(repository_prefix)
+    }
+    if not referenced:
+        return
+    files = set(
+        hub.list_repo_files(
+            plan.model.repo,
+            revision=plan.model.revision,
+            repo_type="model",
+        )
+    )
+    missing = referenced - files
+    if missing:
+        raise ValueError(
+            "deployment references missing model artifacts: "
+            + ", ".join(sorted(missing))
+        )
 
 
 def _dictionary_list(value: Mapping[str, object], key: str) -> list[dict[str, object]]:

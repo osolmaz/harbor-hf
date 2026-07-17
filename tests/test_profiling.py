@@ -307,6 +307,9 @@ class FakeApi:
         del bucket_id
         return SimpleNamespace(private=True)
 
+    def list_repo_files(self, *_args: object, **_kwargs: object) -> list[str]:
+        return []
+
 
 class FakeProviderApi(FakeApi):
     def model_info(self, repo: str, **kwargs: object) -> object:
@@ -428,6 +431,40 @@ def test_managed_endpoint_preflight_uses_remote_namespace(
 
     assert report.target_kind == "inference-endpoint"
     assert report.available_accelerators == 2
+
+
+def test_endpoint_preflight_rejects_missing_repository_artifact(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(
+        update={
+            "engine": deployment.engine.model_copy(
+                update={"arguments": ["-m", "/repository/missing.gguf"]}
+            )
+        }
+    )
+    model = remote_spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
+    spec = profiled_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"models": [model], "deployments": [deployment]}
+                )
+            }
+        )
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="5.00",
+        profile_timeout_seconds=3600,
+    )
+
+    with pytest.raises(ValueError, match="missing model artifacts: missing.gguf"):
+        preflight_profile_plan(resolved, api=FakeApi(), token="hf_test")
 
 
 def test_provider_preflight_requires_bounded_full_profile_estimate(
