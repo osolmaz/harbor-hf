@@ -269,6 +269,41 @@ def test_profile_submit_command_is_remote_only(remote_spec: ExperimentSpec) -> N
     assert not any("llama-server" in argument for argument in command)
 
 
+def test_provider_profile_submit_command_exposes_recorder(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(max_concurrent_requests=2),
+    )
+    spec = profiled_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"deployments": [provider]}
+                )
+            }
+        )
+    )
+    command = build_profile_submit_command(
+        build_profile_plan(
+            spec,
+            profile_id="provider-profile",
+            candidate_concurrency=[1, 2],
+            max_spend_usd="10.00",
+            profile_timeout_seconds=3600,
+        ),
+        input_dir="hf://buckets/input",
+        bucket="osolmaz/results",
+    )
+
+    expose = command.index("--expose")
+    assert command[expose : expose + 2] == ["--expose", "8000"]
+
+
 def test_profile_without_endpoint_gets_deterministic_managed_binding(
     remote_spec: ExperimentSpec,
 ) -> None:

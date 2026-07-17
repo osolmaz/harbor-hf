@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 from harbor_hf.models import DeploymentProfile
 from harbor_hf.process import SubprocessRunner
 from harbor_hf.profiling import ProfilePlan, bind_profile_target
+from harbor_hf.provider_proxy import PROVIDER_RECORDER_PORT
 from harbor_hf.runs import build_run_lock
 from harbor_hf.submission import (
     BucketApi,
@@ -58,6 +59,7 @@ def build_profile_submit_command(
     )
     target = lock.deployment
     labels = ["--label", f"harbor-hf-profile={plan.profile_id}"]
+    exposed_port: list[str] = []
     if isinstance(target, DeploymentProfile):
         if target.endpoint is None:
             raise ValueError("profile endpoint binding is missing")
@@ -71,6 +73,7 @@ def build_profile_submit_command(
             ]
         )
     else:
+        exposed_port = ["--expose", str(PROVIDER_RECORDER_PORT)]
         labels.extend(
             [
                 "--label",
@@ -93,6 +96,7 @@ def build_profile_submit_command(
         job.flavor,
         "--timeout",
         f"{job.timeout_seconds}s",
+        *exposed_port,
         *secret_args,
         *labels,
         "--volume",
