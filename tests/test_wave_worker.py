@@ -242,6 +242,14 @@ def test_wrapped_harbor_exit_ignores_non_utf8_result(tmp_path: Path) -> None:
     assert _sandbox_failure_category(tmp_path) is None
 
 
+def test_wrapped_harbor_exit_ignores_excessively_nested_result(tmp_path: Path) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+
+    assert _sandbox_failure_category(tmp_path) is None
+
+
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
     tmp_path: Path,
 ) -> None:
