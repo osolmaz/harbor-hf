@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import httpx
 from pydantic import JsonValue
@@ -941,9 +942,10 @@ def _skipped_point(
 
 
 def _sample_tasks(plan: ProfilePlan) -> dict[str, str]:
-    digests = plan.benchmark.get("task_digests")
-    if not isinstance(digests, dict):
+    raw_digests = plan.benchmark.get("task_digests")
+    if not isinstance(raw_digests, dict):
         raise ProfileWorkerError("profile benchmark has no resolved task digests")
+    digests = cast(dict[str, object], raw_digests)
     selected = plan.workload.sample_task_names
     tasks = {
         task: digest for task in selected if isinstance(digest := digests[task], str)

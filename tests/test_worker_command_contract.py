@@ -449,9 +449,15 @@ def test_endpoint_command_aligns_openclaw_model_with_llama_cpp_alias(
         expected_task_digests={task_name: lock.benchmark_task_digests[task_name]},
     )
 
-    configured_agent = request.harbor_config["agents"][0]
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    configured_agent = agents[0]
+    assert isinstance(configured_agent, dict)
     assert configured_agent["model_name"] == "openai//repository"
-    config = configured_agent["kwargs"]["openclaw_config"]
+    kwargs = configured_agent["kwargs"]
+    assert isinstance(kwargs, dict)
+    config = kwargs["openclaw_config"]
+    assert isinstance(config, dict)
     assert config["agents"]["defaults"]["model"]["primary"] == "openai//repository"
     assert config["agents"]["defaults"]["pdfModel"]["primary"] == "openai//repository"
     assert config["models"]["providers"]["openai"] == {
