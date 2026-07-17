@@ -269,6 +269,68 @@ def _verify_smoke(
         if not tool.success or not tool.saw_tool_call:
             detail = tool.error or "no tool call"
             raise ProfileWorkerError(f"tool smoke failed: {detail}")
+        _verify_token_limits(plan, base_url, model_name, token, deadline)
+
+
+def _verify_token_limits(
+    plan: ProfilePlan,
+    base_url: str,
+    model_name: str,
+    token: str,
+    deadline: float,
+) -> None:
+    available_input = (
+        plan.identity.server_context_tokens - plan.identity.max_output_tokens
+    )
+    if available_input < 1:
+        raise ProfileWorkerError("output limit leaves no input context")
+    samples: list[tuple[int, int]] = []
+    for repeats in (256, 1024):
+        observation = _request(
+            plan,
+            base_url,
+            model_name,
+            token,
+            _capacity_prompt(repeats),
+            tools=False,
+            timeout=_remaining(deadline),
+            max_tokens=1,
+            allow_length=True,
+        )
+        if not observation.success:
+            detail = observation.error or "calibration request failed"
+            raise ProfileWorkerError(f"context calibration failed: {detail}")
+        samples.append((repeats, observation.input_tokens))
+    repeat_delta = samples[1][0] - samples[0][0]
+    token_delta = samples[1][1] - samples[0][1]
+    if token_delta <= 0:
+        raise ProfileWorkerError("context calibration did not increase token usage")
+    tokens_per_repeat = token_delta / repeat_delta
+    fixed_tokens = samples[0][1] - samples[0][0] * tokens_per_repeat
+    target_input = max(1, available_input - 256)
+    repeats = max(1, math.floor((target_input - fixed_tokens) / tokens_per_repeat))
+    capacity = _request(
+        plan,
+        base_url,
+        model_name,
+        token,
+        _capacity_prompt(repeats),
+        tools=False,
+        timeout=_remaining(deadline),
+        max_tokens=plan.identity.max_output_tokens,
+        allow_length=True,
+    )
+    if not capacity.success:
+        detail = capacity.error or "capacity request failed"
+        raise ProfileWorkerError(f"token limit smoke failed: {detail}")
+    if capacity.input_tokens + plan.identity.max_output_tokens < (
+        plan.identity.server_context_tokens - 512
+    ):
+        raise ProfileWorkerError("token limit smoke did not reach declared context")
+
+
+def _capacity_prompt(repeats: int) -> str:
+    return "Read all tokens, then reply with exactly OK.\n" + "x " * repeats
 
 
 def _run_ladder(
@@ -330,7 +392,9 @@ def _run_ladder(
             _write_point(
                 destination, retried_point, retry.observations, retry.elapsed_ms
             )
-            break
+            if not _point_passes_objective(plan, retried_point):
+                break
+            point = retried_point
         rate = _point_ladder_rate(plan, point)
         if rate is not None:
             previous_rates.append(rate)
@@ -431,9 +495,18 @@ def _run_point(
     destination: Path,
     deadline: float,
 ) -> _PointResult:
-    tasks = _sample_tasks(plan)
+    sampled_tasks = _sample_tasks(plan)
     minimum = max(plan.workload.minimum_observations_per_point, 2 * concurrency)
-    attempts = math.ceil(minimum / len(tasks))
+    if isinstance(plan.deployment, ProviderTarget):
+        tasks = dict(list(sampled_tasks.items())[:minimum])
+        if len(tasks) < minimum:
+            raise ProfileWorkerError(
+                "provider profile lacks distinct tasks for this concurrency"
+            )
+        attempts = 1
+    else:
+        tasks = sampled_tasks
+        attempts = math.ceil(minimum / len(tasks))
     point_root = destination / "points" / str(concurrency) / str(repetition)
     jobs_dir = point_root / "harbor-jobs"
     execution_root = point_root / "harbor-execution"
@@ -584,6 +657,8 @@ def _request(
     *,
     tools: bool,
     timeout: int,
+    max_tokens: int | None = None,
+    allow_length: bool = False,
 ) -> _SmokeObservation:
     parameters = (
         dict(plan.deployment.parameters)
@@ -594,7 +669,11 @@ def _request(
         **parameters,
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": min(plan.identity.max_output_tokens, 512),
+        "max_tokens": (
+            max_tokens
+            if max_tokens is not None
+            else min(plan.identity.max_output_tokens, 512)
+        ),
         "stream": False,
     }
     if tools:
@@ -637,7 +716,10 @@ def _request(
         semantic = (
             input_tokens > 0
             and output_tokens > 0
-            and finish_reason in {"stop", "tool_calls"}
+            and (
+                finish_reason in {"stop", "tool_calls"}
+                or (allow_length and finish_reason == "length")
+            )
             and (saw_content or saw_reasoning or saw_tool_call)
         )
         return _SmokeObservation(

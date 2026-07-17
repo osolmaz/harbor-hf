@@ -257,6 +257,8 @@ def build_profile_plan(
         raise ValueError(
             "profile concurrency exceeds the provider request concurrency limit"
         )
+    if isinstance(deployment, ProviderTarget):
+        sample_task_count = max(sample_task_count, 2 * max(candidate_concurrency))
     max_spend_usd = str(spend_cap)
     profile_cost_estimate = _profile_cost_estimate(
         deployment,
@@ -272,6 +274,10 @@ def build_profile_plan(
     if not tasks:
         raise ValueError("profile planning requires resolved benchmark task digests")
     sampled = tasks[: min(sample_task_count, len(tasks))]
+    if isinstance(deployment, ProviderTarget) and len(sampled) < sample_task_count:
+        raise ValueError(
+            "provider profiling requires enough distinct tasks for maximum concurrency"
+        )
     benchmark = spec.benchmark.model_dump(mode="json", exclude_none=True)
     assert spec.remote is not None
     sample_tasks_sha256 = canonical_digest(
@@ -298,6 +304,14 @@ def build_profile_plan(
         prefix=f"serving-profiles/{profile_id}",
     )
     resolved_objective = objective or ProfileObjective()
+    if (
+        resolved_objective.maximum_ttft_ms_p95 is not None
+        or resolved_objective.maximum_tpot_ms_p95 is not None
+    ):
+        raise ValueError(
+            "latency objectives require streaming measurements "
+            "not collected by profiling"
+        )
     core = {
         "profile_id": profile_id,
         "experiment": spec.model_dump(mode="json", exclude_none=True),
@@ -482,7 +496,10 @@ def _eligible_repetition_group(
     repetitions = [point.repetition for point in points]
     if len(repetitions) != len(set(repetitions)) or 1 not in repetitions:
         return False
-    if len(points) > 1 and set(repetitions) != set(
+    repetitions_required = (
+        profile.objective.kind == "maximum_stable_concurrency" or len(points) > 1
+    )
+    if repetitions_required and set(repetitions) != set(
         range(1, profile.workload.boundary_repetitions + 1)
     ):
         return False
@@ -492,8 +509,8 @@ def _eligible_repetition_group(
 def _score(kind: ObjectiveKind, points: list[ProfilePoint]) -> float:
     if kind == "maximum_throughput":
         values = [point.aggregate_output_tokens_per_second or 0 for point in points]
-    elif kind == "maximum_goodput":
+    elif kind in {"maximum_goodput", "interactive"}:
         values = [point.tasks_per_hour or 0 for point in points]
     else:
-        values = [(point.tasks_per_hour or 0) * point.goodput_rate for point in points]
+        values = [point.tasks_per_hour or 0 for point in points]
     return sum(values) / len(values)

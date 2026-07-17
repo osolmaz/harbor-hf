@@ -99,6 +99,12 @@ minimum is only a floor. Repeat boundary candidates at least three times. Keep
 client request concurrency, server sequence capacity, Harbor trial concurrency,
 active shards, and replica count separate in the evidence.
 
+Provider profiles use distinct benchmark tasks for every observation at a point
+so independent trials retain independent recorder retry budgets. Before the
+ladder starts, calibrated requests approach the declared context boundary while
+submitting the full declared output limit; a profile fails if either limit is
+not accepted.
+
 ## Workload
 
 Profile against the workload the full campaign will run. For benchmark-speed

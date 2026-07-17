@@ -31,11 +31,14 @@ from harbor_hf.profile_worker import (
     _request,
     _run_ladder,
     _run_point,
+    _SmokeObservation,
     _summarize_point,
     _TaskObservation,
+    _verify_smoke,
     run_profile_worker,
 )
 from harbor_hf.profiling import (
+    ProfileObjective,
     ProfilePlan,
     ProfilePoint,
     bind_profile_target,
@@ -61,6 +64,23 @@ def profiled_spec(spec: ExperimentSpec) -> ExperimentSpec:
                     "server_context_tokens": 65_536,
                     "max_output_tokens": 8192,
                     "reasoning_required": True,
+                }
+            )
+        }
+    )
+
+
+def profiled_provider_spec(spec: ExperimentSpec) -> ExperimentSpec:
+    profiled = profiled_spec(spec)
+    task_digests = {
+        f"provider-task-{index:02d}": "sha256:" + f"{index:064x}" for index in range(32)
+    }
+    return profiled.model_copy(
+        update={
+            "benchmark": profiled.benchmark.model_copy(
+                update={
+                    "task_names": sorted(task_digests),
+                    "task_digests": task_digests,
                 }
             )
         }
@@ -394,6 +414,49 @@ def test_profile_ladder_skips_repetition_used_by_health_retry(
     assert repetitions == [1, 2, 3]
 
 
+def test_profile_ladder_continues_after_successful_health_retry(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec).model_copy(update={"candidate_concurrency": [1, 2]})
+    calls: list[tuple[int, int]] = []
+
+    def run_point(
+        *args: object,
+        repetition: int,
+        **_kwargs: object,
+    ) -> _PointResult:
+        concurrency = cast(int, args[5])
+        calls.append((concurrency, repetition))
+        success = (concurrency, repetition) != (1, 1)
+        observations = [
+            _TaskObservation(success, 1000, 10, 20, f"task-{index}")
+            for index in range(8)
+        ]
+        return _PointResult(observations, 8000)
+
+    monkeypatch.setattr("harbor_hf.profile_worker._run_point", run_point)
+    monkeypatch.setattr("harbor_hf.profile_worker._verify_smoke", lambda *_args: None)
+    monkeypatch.setattr("harbor_hf.profile_worker._write_point", lambda *_args: None)
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker._run_boundary_repetitions",
+        lambda *_args, **_kwargs: [],
+    )
+
+    _run_ladder(
+        resolved,
+        cast(Any, None),
+        cast(Any, None),
+        tmp_path,
+        "token",
+        tmp_path,
+        10**12,
+    )
+
+    assert calls == [(1, 1), (1, 2), (2, 1)]
+
+
 def test_profile_ladder_uses_selected_objective_metric(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -418,6 +481,20 @@ def test_profile_ladder_uses_selected_objective_metric(
         }
     )
     assert _point_ladder_rate(stable, measured) is None
+
+
+def test_profile_plan_rejects_unmeasured_latency_objectives(
+    remote_spec: ExperimentSpec,
+) -> None:
+    with pytest.raises(ValueError, match="streaming measurements"):
+        build_profile_plan(
+            profiled_spec(remote_spec),
+            profile_id="latency-profile",
+            candidate_concurrency=[1],
+            max_spend_usd="10",
+            profile_timeout_seconds=3600,
+            objective=ProfileObjective(maximum_ttft_ms_p95=1000),
+        )
 
 
 def test_endpoint_smoke_does_not_forward_endpoint_settings(
@@ -456,6 +533,47 @@ def test_endpoint_smoke_does_not_forward_endpoint_settings(
     assert observation.success
     assert "min_replicas" not in captured
     assert "health_route" not in captured
+
+
+def test_smoke_verifies_declared_context_and_output_limits(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec)
+    calls: list[tuple[int | None, int]] = []
+
+    def request(
+        _plan: ProfilePlan,
+        _base_url: str,
+        _model_name: str,
+        _token: str,
+        prompt: str,
+        *,
+        tools: bool,
+        timeout: int,
+        max_tokens: int | None = None,
+        allow_length: bool = False,
+    ) -> _SmokeObservation:
+        del timeout, allow_length
+        repeats = prompt.count("x ")
+        calls.append((max_tokens, repeats))
+        if tools:
+            return _SmokeObservation(True, 20, 2, False, True, True)
+        if repeats:
+            return _SmokeObservation(True, repeats + 20, 1, True, False, False)
+        return _SmokeObservation(True, 20, 2, True, True, False)
+
+    class Transport:
+        @contextmanager
+        def scope(self, _scope: str) -> Iterator[tuple[str, str, None]]:
+            yield "https://endpoint.test", "model", None
+
+    monkeypatch.setattr("harbor_hf.profile_worker._request", request)
+
+    _verify_smoke(resolved, cast(Any, Transport()), "token", 10**12)
+
+    assert calls[-1][0] == 8192
+    assert calls[-1][1] + 20 + 8192 >= 65_536 - 512
 
 
 def test_serving_profile_binding_fails_closed_on_concurrency(
@@ -608,7 +726,7 @@ def test_provider_profile_submit_command_exposes_recorder(
         routing=ExplicitProviderRoute(provider="fireworks-ai"),
         limits=ProviderLimits(max_concurrent_requests=2),
     )
-    spec = profiled_spec(
+    spec = profiled_provider_spec(
         remote_spec.model_copy(
             update={
                 "matrix": remote_spec.matrix.model_copy(
@@ -631,6 +749,37 @@ def test_provider_profile_submit_command_exposes_recorder(
 
     expose = command.index("--expose")
     assert command[expose : expose + 2] == ["--expose", "8000"]
+
+
+def test_provider_profile_uses_distinct_tasks_at_maximum_concurrency(
+    remote_spec: ExperimentSpec,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(max_concurrent_requests=16),
+    )
+    spec = profiled_provider_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"deployments": [provider]}
+                )
+            }
+        )
+    )
+
+    resolved = build_profile_plan(
+        spec,
+        profile_id="provider-profile",
+        candidate_concurrency=[1, 2, 4, 8, 16],
+        max_spend_usd="25",
+        profile_timeout_seconds=5400,
+    )
+
+    assert resolved.workload.sample_task_count == 32
 
 
 def test_profile_without_endpoint_gets_deterministic_managed_binding(
@@ -949,7 +1098,7 @@ def test_endpoint_preflight_rejects_missing_repository_artifact(
 def test_provider_preflight_requires_bounded_full_profile_estimate(
     remote_spec: ExperimentSpec,
 ) -> None:
-    spec = profiled_spec(remote_spec)
+    spec = profiled_provider_spec(remote_spec)
     model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
     provider = ProviderTarget(
         id="provider",
@@ -979,7 +1128,7 @@ def test_provider_preflight_requires_bounded_full_profile_estimate(
 def test_provider_preflight_enforces_profile_spend_cap(
     remote_spec: ExperimentSpec,
 ) -> None:
-    spec = profiled_spec(remote_spec)
+    spec = profiled_provider_spec(remote_spec)
     model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
     provider = ProviderTarget(
         id="provider",
@@ -1014,7 +1163,7 @@ def test_provider_preflight_enforces_profile_spend_cap(
 def test_provider_preflight_uses_full_profile_not_wave_estimate(
     remote_spec: ExperimentSpec,
 ) -> None:
-    spec = profiled_spec(remote_spec)
+    spec = profiled_provider_spec(remote_spec)
     model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
     provider = ProviderTarget(
         id="provider",
@@ -1063,7 +1212,7 @@ def test_profile_worker_rebuilds_provider_cost_estimate(
             estimated_wave_cost_usd=Decimal("1"),
         ),
     )
-    spec = profiled_spec(
+    spec = profiled_provider_spec(
         remote_spec.model_copy(
             update={
                 "matrix": remote_spec.matrix.model_copy(
