@@ -15,7 +15,10 @@ from harbor_hf.profile_preflight import preflight_profile_plan
 from harbor_hf.profile_submission import build_profile_submit_command
 from harbor_hf.profile_worker import (
     ProfileWorkerError,
+    _point_ladder_rate,
+    _PointResult,
     _request,
+    _run_ladder,
     _summarize_point,
     _TaskObservation,
     run_profile_worker,
@@ -157,6 +160,52 @@ def test_profile_selection_rejects_tampered_point(remote_spec: ExperimentSpec) -
         select_profile(profile)
 
 
+def test_serving_profile_rejects_point_outside_candidate_ladder(
+    remote_spec: ExperimentSpec,
+) -> None:
+    profile = new_unselected_profile(plan(remote_spec))
+
+    with pytest.raises(ValueError, match="points must be in the candidate ladder"):
+        type(profile).model_validate(
+            profile.model_copy(update={"points": [point(16, 20)]}).model_dump()
+        )
+
+
+def test_maximum_goodput_does_not_discount_failed_tasks_twice(
+    remote_spec: ExperimentSpec,
+) -> None:
+    resolved = new_unselected_profile(plan(remote_spec))
+
+    def measured(
+        concurrency: int, tasks_per_hour: float, goodput: float
+    ) -> ProfilePoint:
+        payload = point(concurrency, tasks_per_hour).model_dump(
+            mode="json", exclude={"point_sha256"}, exclude_none=True
+        )
+        payload.update(
+            error_rate=1 - goodput,
+            goodput_rate=goodput,
+            tasks_per_hour=float(tasks_per_hour),
+        )
+        return ProfilePoint.model_validate(
+            {"point_sha256": canonical_digest(payload), **payload}
+        )
+
+    profile = resolved.model_copy(
+        update={
+            "objective": resolved.objective.model_copy(
+                update={"maximum_error_rate": 0.5}
+            ),
+            "points": [measured(1, 80, 1.0), measured(2, 100, 0.5)],
+        }
+    )
+
+    selected = select_profile(profile)
+
+    assert selected.selection is not None
+    assert selected.selection.concurrency == 2
+
+
 def test_profile_selection_disqualifies_failed_boundary_repetition(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -198,6 +247,66 @@ def test_point_throughput_uses_complete_wall_time() -> None:
     assert result.aggregate_output_tokens_per_second == 20
     assert result.ttft_ms_p95 is None
     assert result.tpot_ms_p95 is None
+
+
+def test_profile_ladder_skips_repetition_used_by_health_retry(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec).model_copy(update={"candidate_concurrency": [1]})
+    repetitions: list[int] = []
+
+    def run_point(*_args: object, repetition: int, **_kwargs: object) -> _PointResult:
+        repetitions.append(repetition)
+        success = repetition != 1
+        observations = [
+            _TaskObservation(success, 1000, 10, 20, f"task-{index}")
+            for index in range(8)
+        ]
+        return _PointResult(observations, 8000)
+
+    monkeypatch.setattr("harbor_hf.profile_worker._run_point", run_point)
+    monkeypatch.setattr("harbor_hf.profile_worker._verify_smoke", lambda *_args: None)
+    monkeypatch.setattr("harbor_hf.profile_worker._write_point", lambda *_args: None)
+
+    _run_ladder(
+        resolved,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        tmp_path,
+        "token",
+        tmp_path,
+        float("inf"),
+    )
+
+    assert repetitions == [1, 2, 3]
+
+
+def test_profile_ladder_uses_selected_objective_metric(
+    remote_spec: ExperimentSpec,
+) -> None:
+    resolved = plan(remote_spec)
+    throughput = resolved.model_copy(
+        update={
+            "objective": resolved.objective.model_copy(
+                update={"kind": "maximum_throughput"}
+            )
+        }
+    )
+    measured = point(1, 100).model_copy(
+        update={"aggregate_output_tokens_per_second": 200.0}
+    )
+
+    assert _point_ladder_rate(throughput, measured) == 200.0
+    stable = resolved.model_copy(
+        update={
+            "objective": resolved.objective.model_copy(
+                update={"kind": "maximum_stable_concurrency"}
+            )
+        }
+    )
+    assert _point_ladder_rate(stable, measured) is None
 
 
 def test_endpoint_smoke_does_not_forward_endpoint_settings(

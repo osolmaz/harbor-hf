@@ -142,6 +142,10 @@ class ServingProfile(FrozenModel):
             value < 1 or value & (value - 1) for value in self.candidate_concurrency
         ):
             raise ValueError("candidate concurrency must use powers of two")
+        if any(
+            point.concurrency not in self.candidate_concurrency for point in self.points
+        ):
+            raise ValueError("profile points must be in the candidate ladder")
         if self.selection is not None and (
             self.selection.concurrency not in self.candidate_concurrency
         ):
@@ -439,6 +443,8 @@ def _eligible_repetition_group(
 def _score(kind: ObjectiveKind, points: list[ProfilePoint]) -> float:
     if kind == "maximum_throughput":
         values = [point.aggregate_output_tokens_per_second or 0 for point in points]
+    elif kind == "maximum_goodput":
+        values = [point.tasks_per_hour or 0 for point in points]
     else:
         values = [(point.tasks_per_hour or 0) * point.goodput_rate for point in points]
     return sum(values) / len(values)

@@ -316,18 +316,55 @@ def _run_ladder(
                 destination, retried_point, retry.observations, retry.elapsed_ms
             )
             break
-        rate = point.tasks_per_hour or 0
-        previous_rates.append(rate)
+        rate = _point_ladder_rate(plan, point)
+        if rate is not None:
+            previous_rates.append(rate)
         if (
-            len(previous_rates) >= 3
+            rate is not None
+            and len(previous_rates) >= 3
             and previous_rates[-1] <= previous_rates[-2] <= previous_rates[-3]
         ):
             break
     boundary = [
         point.concurrency for point in points if _point_passes_objective(plan, point)
     ][-2:]
+    points.extend(
+        _run_boundary_repetitions(
+            plan,
+            run_lock,
+            transport,
+            harbor_source,
+            token,
+            destination,
+            deadline,
+            boundary,
+            points,
+        )
+    )
+    return points
+
+
+def _run_boundary_repetitions(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    harbor_source: Path,
+    token: str,
+    destination: Path,
+    deadline: float,
+    boundary: list[int],
+    existing_points: list[ProfilePoint],
+) -> list[ProfilePoint]:
+    points: list[ProfilePoint] = []
     for concurrency in boundary:
+        completed_repetitions = {
+            point.repetition
+            for point in existing_points
+            if point.concurrency == concurrency
+        }
         for repetition in range(2, plan.workload.boundary_repetitions + 1):
+            if repetition in completed_repetitions:
+                continue
             if time.monotonic() >= deadline:
                 point = _skipped_point(
                     concurrency,
@@ -357,6 +394,14 @@ def _run_ladder(
             points.append(point)
             _write_point(destination, point, result.observations, result.elapsed_ms)
     return points
+
+
+def _point_ladder_rate(plan: ProfilePlan, point: ProfilePoint) -> float | None:
+    if plan.objective.kind == "maximum_stable_concurrency":
+        return None
+    if plan.objective.kind == "maximum_throughput":
+        return point.aggregate_output_tokens_per_second or 0
+    return point.tasks_per_hour or 0
 
 
 def _run_point(
