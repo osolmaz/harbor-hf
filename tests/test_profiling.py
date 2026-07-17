@@ -23,7 +23,7 @@ from harbor_hf.models import (
     ServingProfileBinding,
 )
 from harbor_hf.profile_preflight import preflight_profile_plan
-from harbor_hf.profile_submission import build_profile_submit_command
+from harbor_hf.profile_submission import build_profile_submit_command, submit_profile
 from harbor_hf.profile_worker import (
     ProfileWorkerError,
     _point_ladder_rate,
@@ -604,6 +604,45 @@ def test_profile_without_endpoint_gets_deterministic_managed_binding(
         resolved, input_dir="hf://buckets/input", bucket="osolmaz/results"
     )
     assert "harbor-hf-endpoint=" in " ".join(command)
+
+
+def test_profile_submission_initializes_coordination_storage(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class Runner:
+        def run_text(self, command: list[str]) -> str:
+            del command
+            return "6a5a937cbee6ee1cf4ecded4"
+
+    monkeypatch.setenv("GITHUB_TOKEN", "github-test")
+    monkeypatch.setattr(
+        "harbor_hf.profile_submission.ensure_private_coordination_repository",
+        lambda *_args, **_kwargs: calls.append("coordination") or "coordination",
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_submission.ensure_private_job_input_bucket",
+        lambda *_args, **_kwargs: calls.append("input") or "osolmaz/jobs-artifacts",
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_submission.require_private_bucket",
+        lambda *_args, **_kwargs: calls.append("output"),
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_submission.stage_job_input",
+        lambda *_args, **_kwargs: "hf://buckets/osolmaz/jobs-artifacts/input",
+    )
+
+    submission = submit_profile(
+        plan(remote_spec),
+        runner=Runner(),
+        bucket_api=cast(Any, object()),
+    )
+
+    assert submission.job_id == "6a5a937cbee6ee1cf4ecded4"
+    assert calls == ["coordination", "input", "output"]
 
 
 class FakeApi:

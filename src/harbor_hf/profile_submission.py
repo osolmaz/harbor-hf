@@ -19,6 +19,7 @@ from harbor_hf.submission import (
     BucketApi,
     bucket_uri,
     endpoint_lease_label_for,
+    ensure_private_coordination_repository,
     ensure_private_job_input_bucket,
     job_secret_names,
     locked_source_command,
@@ -135,6 +136,7 @@ def submit_profile(
     )
     require_source_secrets(lock)
     api = bucket_api or cast(BucketApi, HfApi())
+    ensure_private_coordination_repository(spec.remote.job.namespace, api=api)
     input_bucket = ensure_private_job_input_bucket(spec.remote.job.namespace, api=api)
     require_private_bucket(plan.artifacts.bucket, api=api)
     with tempfile.TemporaryDirectory(prefix="harbor-hf-profile-") as directory:
