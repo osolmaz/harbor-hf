@@ -536,6 +536,60 @@ def test_adapter_retries_transient_export_failure(
     )
 
 
+def test_adapter_retries_successful_but_incomplete_export(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(_command: object, _log_path: Path, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 0
+        bundle = _bundle(prepared.request)
+        if calls == 2:
+            bundle = bundle.model_copy(update={"trials": []})
+        prepared.request_path.with_name("harbor-compatibility.json").write_text(
+            bundle.model_dump_json() + "\n", encoding="utf-8"
+        )
+        return 0
+
+    outcome = adapter.execute(
+        prepared,
+        tmp_path / "harbor",
+        jobs_dir,
+        tmp_path / "harbor.log",
+        environment={},
+        timeout_seconds=30,
+        stream_runner=run,
+        sleep=lambda _seconds: None,
+    )
+
+    assert calls == 3
+    assert outcome.verification is not None
+    assert outcome.verification.trial_count == 1
+    export_log = (tmp_path / "harbor-export.log").read_text()
+    assert "== exporter attempt 1 ==" in export_log
+    assert "== exporter attempt 2 ==" in export_log
+
+
 def test_adapter_revalidates_inputs_after_failed_export(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

@@ -7,12 +7,15 @@ from copy import deepcopy
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Protocol
+from typing import Never, Protocol
 from urllib.parse import urlparse
 
 from pydantic import JsonValue
 
-from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
+from harbor_hf.harbor_adapter.errors import (
+    HarborVerificationFailure,
+    WorkerError,
+)
 from harbor_hf.harbor_adapter.models import (
     HarborExecutionRequest,
     HarborVerificationPolicy,
@@ -150,7 +153,7 @@ class FilesystemHarborExecutionAdapter:
         request_digest = sha256_digest(
             canonical_json_bytes(prepared.request.model_dump(mode="json"))
         )
-        exported = self._export_compatibility(
+        verification = self._export_compatibility(
             prepared,
             harbor_source,
             jobs_dir,
@@ -164,17 +167,8 @@ class FilesystemHarborExecutionAdapter:
             monotonic,
             sleep,
         )
-        if not exported:
+        if verification is None:
             return HarborExecutionOutcome(exit_code, None, None)
-        try:
-            bundle = load_compatibility_bundle(compatibility_path, prepared.request)
-            verification = validate_compatibility_bundle(bundle, prepared.request)
-        except HarborTrialFailure:
-            raise
-        except (OSError, ValueError, RuntimeError):
-            if exit_code != 0:
-                return HarborExecutionOutcome(exit_code, None, None)
-            raise
         return HarborExecutionOutcome(exit_code, verification, compatibility_path)
 
     def _export_compatibility(
@@ -191,7 +185,7 @@ class FilesystemHarborExecutionAdapter:
         stream_runner: Callable[..., int],
         monotonic: Callable[[], float],
         sleep: Callable[[float], None],
-    ) -> bool:
+    ) -> HarborVerificationResult | None:
         attempts = 3 if harbor_exit == 0 else 1
         export_log.unlink(missing_ok=True)
         last_error: OSError | RuntimeError | None = None
@@ -226,19 +220,18 @@ class FilesystemHarborExecutionAdapter:
                 attempt_log.unlink(missing_ok=True)
                 self._validate_inputs(prepared)
             if exporter_exit == 0:
-                return True
+                try:
+                    bundle = load_compatibility_bundle(
+                        compatibility_path, prepared.request
+                    )
+                    return validate_compatibility_bundle(bundle, prepared.request)
+                except HarborVerificationFailure as error:
+                    last_error = error
             if harbor_exit != 0:
-                return False
+                return None
             if attempt < attempts:
                 _sleep_before_export_retry(deadline, monotonic, sleep, attempt)
-        if last_error is not None:
-            raise WorkerError(
-                f"Harbor compatibility exporter failed after {attempts} attempts"
-            ) from last_error
-        raise WorkerError(
-            "Harbor compatibility exporter exited with status "
-            f"{exporter_exit} after {attempts} attempts"
-        )
+        _raise_export_failure(last_error, exporter_exit, attempts)
 
     @staticmethod
     def _validate_inputs(prepared: PreparedHarborExecution) -> None:
@@ -260,6 +253,23 @@ def _shared_deadline(
     if shared_deadline <= started_at:
         raise WorkerError("Harbor execution deadline was already reached")
     return shared_deadline
+
+
+def _raise_export_failure(
+    last_error: OSError | RuntimeError | None,
+    exporter_exit: int | None,
+    attempts: int,
+) -> Never:
+    if isinstance(last_error, HarborVerificationFailure):
+        raise last_error
+    if last_error is not None:
+        raise WorkerError(
+            f"Harbor compatibility exporter failed after {attempts} attempts"
+        ) from last_error
+    raise WorkerError(
+        "Harbor compatibility exporter exited with status "
+        f"{exporter_exit} after {attempts} attempts"
+    )
 
 
 def _remaining_export_timeout(deadline: float, monotonic: Callable[[], float]) -> int:
