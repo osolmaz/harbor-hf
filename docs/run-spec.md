@@ -215,6 +215,12 @@ implying a particular serving engine.
 
 `attempts` counts independent logical attempts. Infrastructure retries do not
 consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
+for a new deployment, choose it through the
+[deployment profiling contract](deployment-profiling.md), not from GPU name or
+weight size. The selected profile must match the exact model, deployment,
+agent, benchmark workload, context, and output limits. Until the manifest
+contains a first-class profile reference, preserve the profile URI and digest
+with campaign notes and verify the selected concurrency manually.
 `max_trials_per_shard` deterministically bounds the number of task-attempt pairs
 in one campaign shard and defaults to 64. `max_shards_per_wave` bounds compatible
 shards assigned under one endpoint startup and defaults to 8. Provider request

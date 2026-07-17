@@ -1,0 +1,426 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/osolmaz/harbor-hf/schemas/serving-profile-v1.schema.json",
+  "title": "Harbor-HF serving profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "created_at",
+    "identity",
+    "objective",
+    "workload",
+    "candidate_concurrency",
+    "points",
+    "selection",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "harbor-hf/serving-profile/v1"
+    },
+    "profile_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "identity": {
+      "$ref": "#/$defs/identity"
+    },
+    "objective": {
+      "$ref": "#/$defs/objective"
+    },
+    "workload": {
+      "$ref": "#/$defs/workload"
+    },
+    "candidate_concurrency": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "points": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/point"
+      }
+    },
+    "selection": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/selection"
+        }
+      ]
+    },
+    "artifacts": {
+      "$ref": "#/$defs/artifacts"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_sha256",
+        "deployment_sha256",
+        "agent_sha256",
+        "benchmark_sha256",
+        "server_context_tokens",
+        "max_output_tokens"
+      ],
+      "properties": {
+        "model_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "deployment_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "agent_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "benchmark_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "server_context_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "maximum_error_rate"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "maximum_throughput",
+            "maximum_goodput",
+            "maximum_stable_concurrency",
+            "interactive"
+          ]
+        },
+        "maximum_error_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_ttft_ms_p95": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "maximum_tpot_ms_p95": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "minimum_session_output_tokens_per_second": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "sample_task_count",
+        "sample_tasks_sha256",
+        "minimum_observations_per_point",
+        "boundary_repetitions"
+      ],
+      "properties": {
+        "kind": {
+          "const": "benchmark"
+        },
+        "sample_task_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_tasks_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "minimum_observations_per_point": {
+          "type": "integer",
+          "minimum": 8
+        },
+        "boundary_repetitions": {
+          "type": "integer",
+          "minimum": 3
+        }
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point_sha256",
+        "concurrency",
+        "repetition",
+        "status",
+        "planned_count",
+        "completed_count",
+        "failed_count",
+        "error_rate",
+        "goodput_rate",
+        "artifact_prefix"
+      ],
+      "properties": {
+        "point_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "repetition": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "planned_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "aggregate_input_tokens_per_second": {
+          "type": "number",
+          "minimum": 0
+        },
+        "aggregate_output_tokens_per_second": {
+          "type": "number",
+          "minimum": 0
+        },
+        "tasks_per_hour": {
+          "type": "number",
+          "minimum": 0
+        },
+        "session_output_tokens_per_second": {
+          "type": "number",
+          "minimum": 0
+        },
+        "ttft_ms_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "ttft_ms_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "ttft_ms_p99": {
+          "type": "number",
+          "minimum": 0
+        },
+        "tpot_ms_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "tpot_ms_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "tpot_ms_p99": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_ms_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_ms_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_ms_p99": {
+          "type": "number",
+          "minimum": 0
+        },
+        "error_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "goodput_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "peak_device_memory_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "prompt_tokens_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "prompt_tokens_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "prompt_tokens_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output_tokens_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output_tokens_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact_prefix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "failure_reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "completed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "aggregate_input_tokens_per_second",
+              "aggregate_output_tokens_per_second",
+              "tasks_per_hour",
+              "session_output_tokens_per_second",
+              "ttft_ms_p50",
+              "ttft_ms_p95",
+              "ttft_ms_p99",
+              "tpot_ms_p50",
+              "tpot_ms_p95",
+              "tpot_ms_p99",
+              "latency_ms_p50",
+              "latency_ms_p95",
+              "latency_ms_p99",
+              "prompt_tokens_p50",
+              "prompt_tokens_p95",
+              "prompt_tokens_max",
+              "output_tokens_p50",
+              "output_tokens_p95",
+              "output_tokens_max"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "failed",
+                  "skipped"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "failure_reason"
+            ]
+          }
+        }
+      ]
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "concurrency",
+        "criterion",
+        "point_sha256s",
+        "rationale"
+      ],
+      "properties": {
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "criterion": {
+          "enum": [
+            "maximum_throughput",
+            "maximum_goodput",
+            "maximum_stable_concurrency",
+            "interactive"
+          ]
+        },
+        "point_sha256s": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/digest"
+          }
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bucket",
+        "prefix"
+      ],
+      "properties": {
+        "bucket": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "prefix": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        }
+      }
+    }
+  }
+}

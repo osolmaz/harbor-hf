@@ -142,7 +142,10 @@ models serve from Inference Endpoints or Inference Providers, and all
 coordination happens through parent-checked commits to the private
 coordination Dataset — there is no server to keep alive. The
 [endpoint provisioning contract](docs/endpoint-provisioning.md) documents
-deterministic endpoint ownership.
+deterministic endpoint ownership. The
+[deployment profiling contract](docs/deployment-profiling.md) defines the
+powers-of-two concurrency method, immutable profile evidence, stopping rules,
+and selection criteria used before a full campaign.
 
 ## License
 

@@ -348,7 +348,25 @@ Concurrency is enforced at distinct levels:
 Serving concurrency is taken from a measured deployment profile. The scheduler
 does not infer safe concurrency from GPU names or context-window capacity. A
 profile records the workload distribution and goodput criterion used to choose
-its limits.
+its limits. The normative profile format, candidate ladder, stopping rules,
+selection criteria, and Bucket layout are defined in
+[deployment-profiling.md](deployment-profiling.md).
+
+Before automated selection is complete:
+
+- operators run one remote smoke task and a powers-of-two concurrency ladder;
+- all points, failures, retries, and raw measurements use the checked-in
+  `harbor-hf/serving-profile/v1` schema;
+- `execution.concurrent_trials` equals the selected profile concurrency; and
+- campaign notes retain the selected profile's Bucket URI and SHA-256 digest.
+
+The production profiler will add `profile plan`, `profile run`, and
+`profile select`. It must execute the full ladder under one endpoint lease and
+watchdog, pause and verify the endpoint before finalization, select only from
+complete evidence, and write the selected profile digest into the immutable
+campaign input. Automated campaign launch must fail closed when that profile
+identity or selected concurrency does not match. Independent endpoint startups
+for every candidate are explicitly outside the design.
 
 ### Cancellation
 
