@@ -28,6 +28,7 @@ from harbor_hf.publication_envelope import (
     ProfileDigests,
     PublicationEnvelope,
     RuntimeIdentity,
+    canonical_digest,
     canonical_json_bytes,
     object_reference,
     profile_digest,
@@ -58,12 +59,54 @@ _RETRY_CATEGORY = TypeAdapter(RetryCategory)
 _TERMINAL_MARKERS = frozenset({"_SUCCESS", "_FAILED", "_CANCELLED"})
 
 
+@dataclass(frozen=True)
+class _FinalizedRun:
+    manifest_checksum: str
+    source_checksum: str
+
+
 class CampaignFinalizationError(RuntimeError):
     """Raised when terminal campaign evidence cannot be finalized safely."""
 
 
 class ImmutableEvidenceWriter(Protocol):
     def write_immutable(self, *, bucket: str, path: str, content: bytes) -> bool: ...
+
+
+class ValidatingEvidenceWriter:
+    """Validate immutable writes against existing evidence without mutating it."""
+
+    def __init__(self, reader: EvidenceReader, *, bucket: str, prefix: str) -> None:
+        self.reader = reader
+        self.bucket = bucket
+        self.prefix = prefix.rstrip("/")
+        self.paths = set(reader.list_files(bucket=bucket, prefix=self.prefix))
+        self.staged: dict[str, bytes] = {}
+
+    def write_immutable(self, *, bucket: str, path: str, content: bytes) -> bool:
+        root = f"{self.prefix}/"
+        if bucket != self.bucket or not path.startswith(root):
+            raise CampaignFinalizationError("immutable write escaped campaign evidence")
+        relative = path.removeprefix(root)
+        if not relative:
+            raise CampaignFinalizationError("immutable write has no evidence path")
+        staged = self.staged.get(relative)
+        if staged is not None and staged != content:
+            raise CampaignFinalizationError(
+                f"immutable evidence conflicts during validation: {path}"
+            )
+        if relative in self.paths:
+            existing = self.reader.read_bytes(
+                bucket=bucket,
+                prefix=self.prefix,
+                path=relative,
+            )
+            if existing != content:
+                raise CampaignFinalizationError(
+                    f"immutable evidence conflicts during validation: {path}"
+                )
+        self.staged[relative] = content
+        return relative not in self.paths
 
 
 class CampaignFinalizer(Protocol):
@@ -102,8 +145,8 @@ class BucketCampaignFinalizer:
         for run in lock.runs:
             if projection.runs[run.run_id].status != "complete":
                 continue
-            checksum = self._finalize_run(lock, spec, run, paths, projection)
-            run_checksums[run.run_id] = checksum
+            finalized = self._finalize_run(lock, spec, run, paths, projection)
+            run_checksums[run.run_id] = finalized.manifest_checksum
         if decision.status == "completed" and len(run_checksums) != len(lock.runs):
             raise CampaignFinalizationError(
                 "completed campaign does not have complete run evidence"
@@ -129,6 +172,26 @@ class BucketCampaignFinalizer:
             content=b"\n",
         )
 
+    def seal_runs(
+        self,
+        lock: CampaignLock,
+        spec: ExperimentSpec,
+        projection: RecoveryProjection,
+    ) -> dict[str, str]:
+        """Finalize publishable runs without rewriting campaign terminal evidence."""
+        if any(run.status != "complete" for run in projection.runs.values()):
+            raise CampaignFinalizationError("sealed projection has an incomplete run")
+        paths = self.reader.list_files(
+            bucket=spec.artifacts.bucket,
+            prefix=lock.artifact_prefix,
+        )
+        return {
+            run.run_id: self._finalize_run(
+                lock, spec, run, paths, projection
+            ).source_checksum
+            for run in lock.runs
+        }
+
     def _finalize_run(
         self,
         campaign: CampaignLock,
@@ -136,7 +199,7 @@ class BucketCampaignFinalizer:
         run: CampaignRunLock,
         campaign_paths: list[str],
         projection: RecoveryProjection,
-    ) -> str:
+    ) -> _FinalizedRun:
         prefix = f"runs/{run.run_id}"
         run_paths = _under(campaign_paths, prefix)
         run_lock_bytes = self._read(spec, campaign, f"{prefix}/run.lock.json")
@@ -276,7 +339,10 @@ class BucketCampaignFinalizer:
             path=f"{campaign.artifact_prefix}/{prefix}/_SUCCESS",
             content=b"\n",
         )
-        return _sha256(checksum_bytes)
+        return _FinalizedRun(
+            manifest_checksum=_sha256(checksum_bytes),
+            source_checksum=canonical_digest(checksums),
+        )
 
     def _trial_records(
         self,

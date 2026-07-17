@@ -19,6 +19,7 @@ from harbor_hf.automation import (
 from harbor_hf.bucket_evidence import (
     BucketEvidenceError,
     HubBucketEvidenceReader,
+    HubBucketEvidenceWriter,
 )
 from harbor_hf.campaign_apply import (
     CampaignApplyError,
@@ -47,6 +48,7 @@ from harbor_hf.operations import (
     cancel_campaign,
     publish_campaign_results,
     retry_campaign_shard,
+    seal_partial_campaign_runs,
     verify_campaign_artifacts,
 )
 from harbor_hf.planner import build_plan
@@ -322,6 +324,30 @@ def campaign_retry(
             reason=reason,
             dry_run=dry_run,
         )
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@campaign_app.command("seal")
+def campaign_seal(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Seal failed retries in a drained partial campaign as zero-score outcomes."""
+    del output_format
+    try:
+        snapshot = HubCampaignStore(namespace).load_snapshot(campaign_id)
+        with tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-") as cache:
+            result = seal_partial_campaign_runs(
+                snapshot,
+                namespace=namespace,
+                reader=HubBucketEvidenceReader(Path(cache)),
+                writer=None if dry_run else HubBucketEvidenceWriter(),
+                dry_run=dry_run,
+            )
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
     _echo_json(result.model_dump(mode="json"))

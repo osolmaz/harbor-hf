@@ -18,7 +18,9 @@ from harbor_hf.operations import (
     ArtifactVerificationReport,
     CampaignEventResult,
     CampaignPublicationReport,
+    CampaignSealReport,
     PublishedRun,
+    SealedRun,
     VerifiedRun,
 )
 from harbor_hf.process import ProcessError
@@ -295,6 +297,47 @@ def test_campaign_cancel_and_retry_print_json(
     assert retry.exit_code == 0
     assert json.loads(retry.stdout)["dry_run"] is True
     assert calls == [("cancel", "campaign-one"), ("retry", "shard-one")]
+
+
+def test_campaign_seal_prints_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStore:
+        def __init__(self, namespace: str) -> None:
+            assert namespace == "org"
+
+        def load_snapshot(self, campaign_id: str) -> object:
+            assert campaign_id == "campaign-one"
+            return object()
+
+    monkeypatch.setattr("harbor_hf.cli.HubCampaignStore", FakeStore)
+    monkeypatch.setattr(
+        "harbor_hf.cli.seal_partial_campaign_runs",
+        lambda *_args, **_kwargs: CampaignSealReport(
+            campaign_id="campaign-one",
+            artifact_bucket="org/evidence",
+            dry_run=True,
+            runs=[
+                SealedRun(
+                    run_id="run-one",
+                    source_prefix="campaigns/campaign-one/runs/run-one",
+                )
+            ],
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "campaign",
+            "seal",
+            "campaign-one",
+            "--namespace",
+            "org",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["runs"][0]["run_id"] == "run-one"
 
 
 def test_artifacts_verify_and_results_publish_print_json(
