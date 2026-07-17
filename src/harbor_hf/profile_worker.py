@@ -352,6 +352,7 @@ def _verify_token_limits(
             timeout=_remaining(deadline),
             max_tokens=1,
             allow_length=True,
+            require_visible_output=False,
         )
         if not observation.success:
             detail = observation.error or "calibration request failed"
@@ -722,6 +723,7 @@ def _request(
     timeout: int,
     max_tokens: int | None = None,
     allow_length: bool = False,
+    require_visible_output: bool = True,
 ) -> _SmokeObservation:
     parameters = (
         dict(plan.deployment.parameters)
@@ -783,7 +785,12 @@ def _request(
                 finish_reason in {"stop", "tool_calls"}
                 or (allow_length and finish_reason == "length")
             )
-            and (saw_content or saw_reasoning or saw_tool_call)
+            and (
+                not require_visible_output
+                or saw_content
+                or saw_reasoning
+                or saw_tool_call
+            )
         )
         return _SmokeObservation(
             semantic,

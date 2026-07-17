@@ -557,8 +557,9 @@ def test_smoke_verifies_declared_context_and_output_limits(
         timeout: int,
         max_tokens: int | None = None,
         allow_length: bool = False,
+        require_visible_output: bool = True,
     ) -> _SmokeObservation:
-        del timeout, allow_length
+        del timeout, allow_length, require_visible_output
         repeats = prompt.count("x ")
         calls.append((max_tokens, repeats))
         if tools:
@@ -578,6 +579,47 @@ def test_smoke_verifies_declared_context_and_output_limits(
 
     assert calls[-1][0] == 8192
     assert calls[-1][1] + 20 + 8192 >= 65_536 - 512
+
+
+def test_context_calibration_accepts_usage_before_visible_output(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec)
+
+    def post(*_args: object, **_kwargs: object) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": ""},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 282, "completion_tokens": 1},
+            },
+            request=httpx.Request("POST", "https://endpoint.test"),
+        )
+
+    monkeypatch.setattr("harbor_hf.profile_worker.httpx.post", post)
+
+    observation = _request(
+        resolved,
+        "https://endpoint.test",
+        "model",
+        "token",
+        "x " * 256,
+        tools=False,
+        timeout=10,
+        max_tokens=1,
+        allow_length=True,
+        require_visible_output=False,
+    )
+
+    assert observation.success
+    assert observation.input_tokens == 282
+    assert observation.output_tokens == 1
 
 
 def test_serving_profile_binding_fails_closed_on_concurrency(
