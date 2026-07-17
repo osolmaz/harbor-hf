@@ -12,6 +12,7 @@
       "publication_id": "pub-69a4d8621a555f1cafe2610aece2b0e2",
       "evaluation_id": "shellbench-glm52-fireworks-public115-20260717",
       "role": "final",
+      "execution_profile_sha256": "sha256:ea1a7aeee61e3e9abbc91191a8066d6bb213c927809b9b055003a73abf2fa7c5",
       "source_publication_ids": [
         "pub-42874788652132ae28e81343f0ff4a6f",
         "pub-da2cfbe995d7b2d745df342a6fef1bc6"
@@ -21,18 +22,21 @@
       "publication_id": "pub-42874788652132ae28e81343f0ff4a6f",
       "evaluation_id": "shellbench-glm52-fireworks-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:ea1a7aeee61e3e9abbc91191a8066d6bb213c927809b9b055003a73abf2fa7c5",
       "component_kind": "base"
     },
     {
       "publication_id": "pub-da2cfbe995d7b2d745df342a6fef1bc6",
       "evaluation_id": "shellbench-glm52-fireworks-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:ea1a7aeee61e3e9abbc91191a8066d6bb213c927809b9b055003a73abf2fa7c5",
       "component_kind": "correction"
     },
     {
       "publication_id": "pub-bbd33d77e509b39bd90c3ebd1295c491",
       "evaluation_id": "shellbench-qwen36-27b-q8-h200-public115-20260717",
       "role": "final",
+      "execution_profile_sha256": "sha256:debf75a5d8dd929a0a91db925627c6127bf826f1eb5bbf2f1a910a91435d46f6",
       "source_publication_ids": [
         "pub-c161123c752629f6d33a3bce31285930",
         "pub-7f131aede04760968a060fd6cfb7677d"
@@ -42,18 +46,21 @@
       "publication_id": "pub-c161123c752629f6d33a3bce31285930",
       "evaluation_id": "shellbench-qwen36-27b-q8-h200-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:debf75a5d8dd929a0a91db925627c6127bf826f1eb5bbf2f1a910a91435d46f6",
       "component_kind": "base"
     },
     {
       "publication_id": "pub-7f131aede04760968a060fd6cfb7677d",
       "evaluation_id": "shellbench-qwen36-27b-q8-h200-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:debf75a5d8dd929a0a91db925627c6127bf826f1eb5bbf2f1a910a91435d46f6",
       "component_kind": "correction"
     },
     {
       "publication_id": "pub-b84b523e4c94285888f3e34f69995409",
       "evaluation_id": "shellbench-qwen36-35b-q8-h200-public115-20260716",
       "role": "final",
+      "execution_profile_sha256": "sha256:33600c9ed7d5802e210f523be92319eedbcae2f2881251653c454c2045bb20d8",
       "source_publication_ids": [
         "pub-7ac3594516bb7a5ba6c2a9b8da397f55",
         "pub-1d4c9dfaa42b6b04eaea50ab2a0c4d6e"
@@ -63,18 +70,21 @@
       "publication_id": "pub-7ac3594516bb7a5ba6c2a9b8da397f55",
       "evaluation_id": "shellbench-qwen36-35b-q8-h200-public115-20260716",
       "role": "component",
+      "execution_profile_sha256": "sha256:33600c9ed7d5802e210f523be92319eedbcae2f2881251653c454c2045bb20d8",
       "component_kind": "base"
     },
     {
       "publication_id": "pub-1d4c9dfaa42b6b04eaea50ab2a0c4d6e",
       "evaluation_id": "shellbench-qwen36-35b-q8-h200-public115-20260716",
       "role": "component",
+      "execution_profile_sha256": "sha256:33600c9ed7d5802e210f523be92319eedbcae2f2881251653c454c2045bb20d8",
       "component_kind": "correction"
     },
     {
       "publication_id": "pub-f9708b073effc307ff48be6c5fb0bf24",
       "evaluation_id": "shellbench-gemma4-26b-q8-h200-public115-20260717",
       "role": "final",
+      "execution_profile_sha256": "sha256:c8786311801505927934eb10c9bc12981b940b6f8529460474c7122b956604c2",
       "source_publication_ids": [
         "pub-ae7b95f87c06d0c0f7e01837bbf2079e",
         "pub-958956ec96c8ccc63e72f55ed664537e"
@@ -84,18 +94,21 @@
       "publication_id": "pub-ae7b95f87c06d0c0f7e01837bbf2079e",
       "evaluation_id": "shellbench-gemma4-26b-q8-h200-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:c8786311801505927934eb10c9bc12981b940b6f8529460474c7122b956604c2",
       "component_kind": "base"
     },
     {
       "publication_id": "pub-958956ec96c8ccc63e72f55ed664537e",
       "evaluation_id": "shellbench-gemma4-26b-q8-h200-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:c8786311801505927934eb10c9bc12981b940b6f8529460474c7122b956604c2",
       "component_kind": "correction"
     },
     {
       "publication_id": "pub-59b6682214ad451d499838784a5e87cd",
       "evaluation_id": "shellbench-gemma4-31b-q8-h200-public115-20260717",
       "role": "final",
+      "execution_profile_sha256": "sha256:0bd0a483dc34054946658175788c8ab95d953b3d06d2838a01a808aba468eac3",
       "source_publication_ids": [
         "pub-1d5dfa0311d94b0f0f1218dea9508590",
         "pub-abd0819ef3d31461466f06f4795e3e0e"
@@ -105,23 +118,27 @@
       "publication_id": "pub-1d5dfa0311d94b0f0f1218dea9508590",
       "evaluation_id": "shellbench-gemma4-31b-q8-h200-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:0bd0a483dc34054946658175788c8ab95d953b3d06d2838a01a808aba468eac3",
       "component_kind": "base"
     },
     {
       "publication_id": "pub-abd0819ef3d31461466f06f4795e3e0e",
       "evaluation_id": "shellbench-gemma4-31b-q8-h200-public115-20260717",
       "role": "component",
+      "execution_profile_sha256": "sha256:0bd0a483dc34054946658175788c8ab95d953b3d06d2838a01a808aba468eac3",
       "component_kind": "correction"
     },
     {
       "publication_id": "pub-b44fc0571adbadd2b8c091cc52f2020e",
       "evaluation_id": "shellbench-glm52-fireworks-smoke-20260716-a",
-      "role": "diagnostic"
+      "role": "diagnostic",
+      "execution_profile_sha256": "sha256:8bbeda646f5b0b141f9b24c0647dc9586e065caae50f13ecda1c3e7dd475e8a5"
     },
     {
       "publication_id": "pub-de3758be089170ea7890c621bff9bf5c",
       "evaluation_id": "shellbench-glm52-fireworks-smoke-20260716-b",
-      "role": "diagnostic"
+      "role": "diagnostic",
+      "execution_profile_sha256": "sha256:8bbeda646f5b0b141f9b24c0647dc9586e065caae50f13ecda1c3e7dd475e8a5"
     }
   ]
 }
