@@ -234,6 +234,14 @@ def test_wrapped_harbor_exit_ignores_sandbox_markers_without_sandbox_error(
     assert _sandbox_failure_category(tmp_path) is None
 
 
+def test_wrapped_harbor_exit_ignores_non_utf8_result(tmp_path: Path) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_bytes(b"\xff")
+
+    assert _sandbox_failure_category(tmp_path) is None
+
+
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
     tmp_path: Path,
 ) -> None:
