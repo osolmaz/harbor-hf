@@ -213,7 +213,7 @@ def test_wrapped_harbor_exit_ignores_sandbox_markers_without_sandbox_error(
     exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
     exception.parent.mkdir(parents=True)
     exception.write_text(
-        "RuntimeError: expected Sandbox API error (503) handling",
+        "RuntimeError: expected SandboxError: Sandbox API error (503) handling",
         encoding="utf-8",
     )
 

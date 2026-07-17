@@ -1171,10 +1171,14 @@ def _sandbox_failure_category(evidence_root: Path | None) -> RetryCategory | Non
             ).lower()
         except OSError:
             continue
-        if "sandboxerror" not in lowered:
-            continue
-        saw_sandbox_error = True
         for line in lowered.splitlines():
+            exception_type, separator, _ = line.partition(":")
+            if (
+                not separator
+                or exception_type.strip().rsplit(".", 1)[-1] != "sandboxerror"
+            ):
+                continue
+            saw_sandbox_error = True
             category = _sandbox_exception_line_category(line)
             if category is not None:
                 return category
