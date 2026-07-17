@@ -45,6 +45,18 @@ export interface RunsResponse {
   };
 }
 
+export type RunSortField =
+  | "score"
+  | "benchmark"
+  | "model_repo"
+  | "agent_name"
+  | "hardware"
+  | "passed_trials"
+  | "duration_seconds"
+  | "completed_at";
+
+export type SortOrder = "asc" | "desc";
+
 export interface RunDetail {
   summary: RunSummary;
   sources: RunSummary[];

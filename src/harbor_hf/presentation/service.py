@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from harbor_hf.presentation.repository import ResultRepository, ResultSnapshot
 from harbor_hf.results import (
@@ -19,6 +19,17 @@ from harbor_hf.results import (
 
 RunCatalog = RunRow | CatalogRow
 TrialKey = tuple[str, int]
+RunSortField = Literal[
+    "score",
+    "benchmark",
+    "model_repo",
+    "agent_name",
+    "hardware",
+    "passed_trials",
+    "duration_seconds",
+    "completed_at",
+]
+SortOrder = Literal["asc", "desc"]
 
 
 class ResultNotFound(LookupError):
@@ -68,6 +79,8 @@ class ResultService:
         model: str = "",
         hardware: str = "",
         scope: CatalogScope = "primary",
+        sort: RunSortField = "completed_at",
+        order: SortOrder = "desc",
     ) -> dict[str, Any]:
         items = [self._summary(run) for run in self._catalog_rows(scope)]
         facets = {
@@ -99,7 +112,8 @@ class ResultService:
         for field_name, expected in filters.items():
             if expected:
                 items = [item for item in items if item[field_name] == expected]
-        items.sort(key=lambda item: item["completed_at"], reverse=True)
+        items.sort(key=lambda item: str(item["publication_id"]))
+        items.sort(key=lambda item: item[sort], reverse=order == "desc")
         return {"items": items, "total": len(items), "facets": facets}
 
     def list_campaigns(self, *, scope: CatalogScope = "primary") -> dict[str, Any]:
