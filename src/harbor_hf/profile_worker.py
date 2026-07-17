@@ -198,14 +198,27 @@ def _profile_transport(
     endpoint = deployment.endpoint
     if endpoint is None:
         raise ProfileWorkerError("profile endpoint binding is missing")
-    launch_cleanup_watchdog(run_lock, endpoint, token)
+    manager = EndpointManager(endpoint.namespace, endpoint.name, SubprocessRunner())
     if desired_endpoint is not None:
         provisioner = EndpointProvisioner(HuggingFaceEndpointAdapter(token=token))
-        provisioner.create_or_adopt(
-            desired_endpoint,
-            timeout_seconds=min(900, _remaining(deadline)),
-        )
-    manager = EndpointManager(endpoint.namespace, endpoint.name, SubprocessRunner())
+        existing = provisioner.inspect(desired_endpoint)
+        if existing is not None:
+            provisioner.create_or_adopt(
+                desired_endpoint,
+                timeout_seconds=min(900, _remaining(deadline)),
+            )
+            launch_cleanup_watchdog(run_lock, endpoint, token)
+        else:
+            launch_cleanup_watchdog(run_lock, endpoint, token)
+            provisioner.create_or_adopt(
+                desired_endpoint,
+                timeout_seconds=min(900, _remaining(deadline)),
+            )
+    else:
+        baseline = manager.describe()
+        validate_endpoint_model(run_lock, baseline)
+        require_paused_endpoint(baseline)
+        launch_cleanup_watchdog(run_lock, endpoint, token)
     baseline = manager.describe()
     validate_endpoint_model(run_lock, baseline)
     require_paused_endpoint(baseline)

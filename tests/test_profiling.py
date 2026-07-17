@@ -1114,14 +1114,50 @@ def test_profile_plan_cli_writes_local_plan(
     assert json.loads(result.stdout)["remote_work"] is False
 
 
+def _profile_test_deployment(
+    remote_spec: ExperimentSpec, managed_endpoint: bool
+) -> DeploymentProfile:
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    return (
+        deployment.model_copy(update={"endpoint": None})
+        if managed_endpoint
+        else deployment
+    )
+
+
+def _assert_profile_endpoint_order(calls: list[str], managed_endpoint: bool) -> None:
+    assert calls.index("watchdog") < calls.index("resume")
+    if managed_endpoint:
+        assert calls.index("watchdog") < calls.index("provision")
+        assert calls.index("provision") < calls.index("resume")
+    else:
+        assert "provision" not in calls
+        assert calls.index("describe") < calls.index("watchdog")
+        assert calls.index("validated") < calls.index("watchdog")
+        assert calls.index("baseline-paused") < calls.index("watchdog")
+    assert calls[-1] == "pause"
+
+
+def _profile_smoke(calls: list[str], smoke_fails: bool) -> object:
+    def smoke(*_args: object, **_kwargs: object) -> None:
+        calls.append("smoke")
+        if smoke_fails:
+            raise ProfileWorkerError("smoke failed")
+
+    return smoke
+
+
 @pytest.mark.parametrize("smoke_fails", [False, True])
+@pytest.mark.parametrize("managed_endpoint", [False, True])
 def test_profile_worker_always_pauses_owned_endpoint(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     smoke_fails: bool,
+    managed_endpoint: bool,
 ) -> None:
-    deployment = remote_spec.matrix.deployments[0].model_copy(update={"endpoint": None})
+    deployment = _profile_test_deployment(remote_spec, managed_endpoint)
     spec = remote_spec.model_copy(
         update={
             "matrix": remote_spec.matrix.model_copy(
@@ -1160,6 +1196,10 @@ def test_profile_worker_always_pauses_owned_endpoint(
         def __init__(self, _adapter: object) -> None:
             calls.append("provisioner")
 
+        def inspect(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("provision-inspect")
+            return None
+
         def create_or_adopt(self, *_args: object, **_kwargs: object) -> None:
             calls.append("provision")
 
@@ -1182,12 +1222,10 @@ def test_profile_worker_always_pauses_owned_endpoint(
         lambda *_args, **_kwargs: calls.append("resume") or "https://endpoint.test",
     )
 
-    def smoke(*_args: object, **_kwargs: object) -> None:
-        calls.append("smoke")
-        if smoke_fails:
-            raise ProfileWorkerError("smoke failed")
-
-    monkeypatch.setattr("harbor_hf.profile_worker._verify_smoke", smoke)
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker._verify_smoke",
+        _profile_smoke(calls, smoke_fails),
+    )
     monkeypatch.setattr(
         "harbor_hf.profile_worker._run_ladder",
         lambda *_args, **_kwargs: [point(1, 10.0)],
@@ -1199,7 +1237,4 @@ def test_profile_worker_always_pauses_owned_endpoint(
         smoke_fails=smoke_fails,
     )
 
-    assert calls.index("watchdog") < calls.index("resume")
-    assert calls.index("watchdog") < calls.index("provision")
-    assert calls.index("provision") < calls.index("resume")
-    assert calls[-1] == "pause"
+    _assert_profile_endpoint_order(calls, managed_endpoint)
