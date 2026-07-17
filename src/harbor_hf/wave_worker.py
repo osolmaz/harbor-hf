@@ -166,6 +166,7 @@ _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
         ("badrequest", "notfound", "configuration", "status=400", "status=404"),
     ),
 )
+_MAX_SANDBOX_RESULT_BYTES = 1024 * 1024
 
 _TERMINAL_MARKERS = ("_SUCCESS", "_FAILED", "_CANCELLED")
 _HF_JOB_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -1149,6 +1150,10 @@ def _harbor_trial_failure_category(
     if category is not None:
         return category
     if exception_type == "sandboxerror":
+        if error.exception_message is not None:
+            category = _sandbox_exception_line_category(error.exception_message.lower())
+            if category is not None:
+                return category
         return _sandbox_failure_category(evidence_root) or "benchmark"
     if exception_type == "nonzeroagentexitcodeerror":
         return _openclaw_transport_failure_category(evidence_root) or "agent"
@@ -1162,26 +1167,41 @@ def _sandbox_failure_category(evidence_root: Path | None) -> RetryCategory | Non
         return None
     resolved_root = evidence_root.resolve()
     saw_sandbox_error = False
-    for exception_path in sorted(evidence_root.glob("harbor-jobs/*/*/exception.txt")):
-        if not _safe_evidence_file(exception_path, resolved_root):
+    for result_path in sorted(evidence_root.glob("harbor-jobs/*/*/result.json")):
+        exception = _sandbox_result_exception(result_path, resolved_root)
+        if exception is None or exception[0].lower() != "sandboxerror":
             continue
-        try:
-            with exception_path.open(encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    lowered = line.lower()
-                    exception_type, separator, _ = lowered.partition(":")
-                    if (
-                        not separator
-                        or exception_type.strip().rsplit(".", 1)[-1] != "sandboxerror"
-                    ):
-                        continue
-                    saw_sandbox_error = True
-                    category = _sandbox_exception_line_category(lowered)
-                    if category is not None:
-                        return category
-        except OSError:
-            continue
+        saw_sandbox_error = True
+        if exception[1] is not None:
+            category = _sandbox_exception_line_category(exception[1].lower())
+            if category is not None:
+                return category
     return "benchmark" if saw_sandbox_error else None
+
+
+def _sandbox_result_exception(
+    result_path: Path, resolved_root: Path
+) -> tuple[str, str | None] | None:
+    if not _safe_evidence_file(result_path, resolved_root):
+        return None
+    try:
+        with result_path.open("rb") as stream:
+            raw = stream.read(_MAX_SANDBOX_RESULT_BYTES + 1)
+        if len(raw) > _MAX_SANDBOX_RESULT_BYTES:
+            return None
+        result = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(result, dict):
+        return None
+    exception = result.get("exception_info")
+    if not isinstance(exception, dict):
+        return None
+    exception_type = exception.get("exception_type")
+    message = exception.get("exception_message")
+    if not isinstance(exception_type, str) or not isinstance(message, str | None):
+        return None
+    return exception_type, message
 
 
 def _sandbox_exception_line_category(value: str) -> RetryCategory | None:

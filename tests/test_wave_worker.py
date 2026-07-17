@@ -164,10 +164,7 @@ def test_openclaw_structured_transport_timeout_is_retryable(tmp_path: Path) -> N
 def test_sandbox_failure_uses_trusted_exception_evidence(
     tmp_path: Path, detail: str, expected: str
 ) -> None:
-    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
-    exception.parent.mkdir(parents=True)
-    exception.write_text(detail, encoding="utf-8")
-    error = HarborTrialFailure("sandbox failed", "SandboxError")
+    error = HarborTrialFailure("sandbox failed", "SandboxError", detail)
 
     assert (
         _execution_failure_category(error, "execution", evidence_root=tmp_path)
@@ -193,9 +190,19 @@ def test_sandbox_failure_uses_trusted_exception_evidence(
 def test_wrapped_harbor_exit_uses_sandbox_exception_evidence(
     tmp_path: Path, detail: str, expected: str
 ) -> None:
-    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
-    exception.parent.mkdir(parents=True)
-    exception.write_text(detail, encoding="utf-8")
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "exception_info": {
+                    "exception_type": "SandboxError",
+                    "exception_message": detail,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert (
         _execution_failure_category(
@@ -210,10 +217,17 @@ def test_wrapped_harbor_exit_uses_sandbox_exception_evidence(
 def test_wrapped_harbor_exit_ignores_sandbox_markers_without_sandbox_error(
     tmp_path: Path,
 ) -> None:
-    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
-    exception.parent.mkdir(parents=True)
-    exception.write_text(
-        "RuntimeError: expected SandboxError: Sandbox API error (503) handling",
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "exception_info": {
+                    "exception_type": "RuntimeError",
+                    "exception_message": "SandboxError: Sandbox API error (503)",
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
