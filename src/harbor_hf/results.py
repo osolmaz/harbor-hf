@@ -637,7 +637,6 @@ class ResultCompositionManifest(FrozenModel):
     run_id: EntityId
     campaign_id: EntityId
     experiment: str = Field(min_length=1)
-    evaluation_id: EvaluationId
     created_at: AwareDatetime
     completed_at: AwareDatetime
     evidence_bucket: str = Field(min_length=1)
@@ -1171,7 +1170,7 @@ def _build_composed_run(
         **trace,
         campaign_id=manifest.campaign_id,
         experiment=manifest.experiment,
-        evaluation_id=manifest.evaluation_id,
+        evaluation_id=base.evaluation_id,
         publication_role="final",
         component_kind=None,
         source_publication_ids=sorted(
@@ -1299,7 +1298,7 @@ def _validate_composition_compatibility(
         run = sources[reference.publication_id].runs[0]
         if (
             run.result_kind != "ordinary"
-            or run.evaluation_id != manifest.evaluation_id
+            or run.evaluation_id != base.evaluation_id
             or run.publication_role != "component"
             or run.component_kind != reference.role
             or any(getattr(run, field) != getattr(base, field) for field in fields)

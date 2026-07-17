@@ -858,6 +858,8 @@ def test_composition_accepts_different_profile_labels(
     assert composed_run.model_id == base_run.model_id
     assert composed_run.deployment_id == base_run.deployment_id
     assert composed_run.agent_id == base_run.agent_id
+    assert composed_run.evaluation_id == base_run.evaluation_id
+    assert "evaluation_id" not in manifest.model_dump(mode="json")
 
 
 def test_execution_profile_digest_ignores_labels_binding_and_cost_estimates() -> None:
@@ -1129,7 +1131,6 @@ def _composition_inputs(
         run_id="run-composed",
         campaign_id="campaign-composed",
         experiment="experiment-composed",
-        evaluation_id=base_run.evaluation_id,
         created_at=base_run.created_at,
         completed_at=correction_run.completed_at,
         evidence_bucket=source.bucket,

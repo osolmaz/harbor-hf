@@ -152,11 +152,13 @@ class HubCatalogCutover:
 
     def apply(self, plan: CatalogCutoverPlan) -> CatalogCutoverResult:
         datasets = sorted({plan.result_dataset, plan.index_dataset})
-        owners = [self._acquire(dataset) for dataset in datasets]
+        acquired: list[tuple[str, dict[str, str]]] = []
         try:
+            for dataset in datasets:
+                acquired.append((dataset, self._acquire(dataset)))
             return self._apply_locked(plan)
         finally:
-            for dataset, owner in reversed(list(zip(datasets, owners, strict=True))):
+            for dataset, owner in reversed(acquired):
                 self.leases.release(publisher_lease_path(dataset), owner)
 
     def _acquire(self, dataset: str) -> dict[str, str]:
@@ -180,21 +182,23 @@ class HubCatalogCutover:
             self._raise_moved(
                 plan.result_dataset, plan.expected_result_head, result_head
             )
-        legacy = self._legacy_catalog(plan)
+        legacy = self._legacy_catalog(plan, plan.source_catalog_revision)
+        expected_head_catalog = self._legacy_catalog(plan, plan.expected_index_head)
         classified = {item.publication_id: item for item in plan.classifications}
         referenced = {
             source
             for item in plan.classifications
             for source in item.source_publication_ids
         }
-        if not set(legacy).issubset(classified) or set(classified) - set(legacy) != (
-            referenced - set(legacy)
+        discovered = set(legacy) | set(expected_head_catalog)
+        if not discovered.issubset(classified) or set(classified) - discovered != (
+            referenced - discovered
         ):
             raise CatalogCutoverError(
-                "cutover must classify the source catalog and any missing sources"
+                "cutover must classify both catalogs and any missing sources"
             )
         publications = [
-            self._migrate_publication(plan, classification)
+            self._migrate_publication(plan, classification, classified)
             for classification in classified.values()
         ]
         if result_head == plan.expected_result_head:
@@ -332,12 +336,12 @@ class HubCatalogCutover:
         )
 
     def _legacy_catalog(
-        self, plan: CatalogCutoverPlan
+        self, plan: CatalogCutoverPlan, revision: str
     ) -> dict[str, Mapping[str, object]]:
         content = self._read(
             plan.index_dataset,
             plan.source_catalog_path,
-            plan.source_catalog_revision,
+            revision,
         )
         try:
             rows = pq.read_table(pa.BufferReader(content)).to_pylist()
@@ -358,6 +362,7 @@ class HubCatalogCutover:
         self,
         plan: CatalogCutoverPlan,
         classification: CatalogClassification,
+        classifications: Mapping[str, CatalogClassification],
     ) -> ResultPublication:
         dataset = plan.result_dataset
         revision = plan.expected_result_head
@@ -405,19 +410,28 @@ class HubCatalogCutover:
         extras: list[DatasetFile] = []
         if tables.runs[0].result_kind == "composed":
             path = f"compositions/{classification.publication_id}.json"
-            value = json.loads(self._read(dataset, path, revision))
-            value["evaluation_id"] = classification.evaluation_id
-            manifest = ResultCompositionManifest.model_validate(value)
+            manifest_bytes = self._read(dataset, path, revision)
+            manifest = ResultCompositionManifest.model_validate_json(manifest_bytes)
             if sorted(classification.source_publication_ids) != sorted(
                 source.publication_id for source in manifest.sources
             ):
                 raise CatalogCutoverError(
                     "composed source publications conflict with classification"
                 )
+            if any(
+                classifications[source.publication_id].role != "component"
+                or classifications[source.publication_id].component_kind != source.role
+                or classifications[source.publication_id].evaluation_id
+                != classification.evaluation_id
+                for source in manifest.sources
+            ):
+                raise CatalogCutoverError(
+                    "composed source classifications conflict with manifest"
+                )
             extras.append(
                 DatasetFile(
                     path=path,
-                    content=_json_bytes(manifest.model_dump(mode="json")),
+                    content=manifest_bytes,
                 )
             )
         return build_result_publication(tables, extra_files=extras)

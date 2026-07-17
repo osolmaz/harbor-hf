@@ -209,5 +209,8 @@ harbor-hf results cutover-catalog cutover.json --namespace organization
 
 The command holds both publisher leases, rewrites active normalized V1 files in
 one result commit, then switches the scoped catalog and index in one
-parent-checked commit. A moved Dataset aborts the operation. Historical Hub
-revisions and private Bucket evidence are never changed.
+parent-checked commit. It validates both the historical source catalog and the
+catalog at the expected index head. If the process stops after the result
+commit, retrying verifies and adopts that commit before finishing the index
+switch. A moved Dataset aborts the operation. Historical Hub revisions,
+composition manifests, and private Bucket evidence are never changed.

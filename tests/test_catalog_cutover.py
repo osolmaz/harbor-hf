@@ -45,6 +45,13 @@ class FakeLeases:
         self.held.remove(path)
 
 
+class FailingSecondLease(FakeLeases):
+    def acquire(self, path: str, owner: dict[str, str]) -> None:
+        if self.held:
+            raise RuntimeError("simulated lease contention")
+        super().acquire(path, owner)
+
+
 class FakeApi:
     def __init__(self, root: Path, publication_files: dict[str, bytes]) -> None:
         self.root = root
@@ -267,6 +274,42 @@ def test_cutover_refuses_a_moved_dataset(tmp_path: Path) -> None:
         HubCatalogCutover(
             publisher_id="cutover-one", leases=FakeLeases(), api=api
         ).apply(_plan())
+
+
+def test_cutover_refuses_publication_added_at_expected_head(tmp_path: Path) -> None:
+    api = _prepared_api(tmp_path, FakeApi)
+    path = "data/catalog/schema=v1/windows/2048.parquet"
+    original = read_catalog_file(api.snapshots[("org/index", INDEX_HEAD)][path])[0]
+    added = original.model_copy(
+        update={"publication_id": "publication-two", "run_id": "run-two"}
+    )
+    sink = pa.BufferOutputStream()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [original.model_dump(mode="python"), added.model_dump(mode="python")]
+        ),
+        sink,
+    )
+    source_revision = "3" * 40
+    api.snapshots[("org/index", source_revision)] = {
+        path: api.snapshots[("org/index", INDEX_HEAD)][path]
+    }
+    api.snapshots[("org/index", INDEX_HEAD)][path] = sink.getvalue().to_pybytes()
+    plan = _plan().model_copy(update={"source_catalog_revision": source_revision})
+
+    with pytest.raises(CatalogCutoverError, match="classify both catalogs"):
+        HubCatalogCutover(
+            publisher_id="cutover-one", leases=FakeLeases(), api=api
+        ).apply(plan)
+
+
+def test_cutover_releases_first_lease_when_second_is_contended() -> None:
+    leases = FailingSecondLease()
+
+    with pytest.raises(RuntimeError, match="lease contention"):
+        HubCatalogCutover(publisher_id="cutover-one", leases=leases).apply(_plan())
+
+    assert not leases.held
 
 
 def test_production_cutover_manifest_is_complete() -> None:
