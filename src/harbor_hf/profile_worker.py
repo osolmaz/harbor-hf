@@ -97,6 +97,7 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
         candidate_concurrency=plan.candidate_concurrency,
         max_spend_usd=plan.max_spend_usd,
         profile_timeout_seconds=plan.profile_timeout_seconds,
+        estimated_profile_cost_usd=plan.estimated_profile_cost_usd,
         sample_task_count=plan.workload.sample_task_count,
         objective=plan.objective,
     )

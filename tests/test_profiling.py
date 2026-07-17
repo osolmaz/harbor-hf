@@ -942,6 +942,52 @@ def test_provider_preflight_uses_full_profile_not_wave_estimate(
     assert report.estimated_cost_usd == Decimal("6")
 
 
+def test_profile_worker_rebuilds_provider_cost_estimate(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(
+            max_concurrent_requests=2,
+            max_spend_usd=Decimal("10"),
+            estimated_wave_cost_usd=Decimal("1"),
+        ),
+    )
+    spec = profiled_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"deployments": [provider]}
+                )
+            }
+        )
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="10",
+        profile_timeout_seconds=3600,
+        estimated_profile_cost_usd="6",
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(resolved.model_dump_json(), encoding="utf-8")
+
+    def rebuild(*_args: object, **kwargs: object) -> ProfilePlan:
+        assert kwargs["estimated_profile_cost_usd"] == "6"
+        raise RuntimeError("rebuild observed")
+
+    monkeypatch.setattr("harbor_hf.profile_worker.build_profile_plan", rebuild)
+
+    with pytest.raises(RuntimeError, match="rebuild observed"):
+        run_profile_worker(plan_path, tmp_path / "output")
+
+
 def test_profile_plan_cli_writes_local_plan(
     remote_manifest: Path, tmp_path: Path
 ) -> None:
