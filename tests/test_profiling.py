@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ import pytest
 from typer.testing import CliRunner
 
 from harbor_hf.cli import app
+from harbor_hf.harbor_adapter.errors import HarborTrialFailure
+from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
 from harbor_hf.models import DeploymentProfile, ExperimentSpec, ServingProfileBinding
 from harbor_hf.profile_preflight import preflight_profile_plan
 from harbor_hf.profile_submission import build_profile_submit_command
@@ -20,6 +24,7 @@ from harbor_hf.profile_worker import (
     _PointResult,
     _request,
     _run_ladder,
+    _run_point,
     _summarize_point,
     _TaskObservation,
     run_profile_worker,
@@ -248,6 +253,105 @@ def test_point_throughput_uses_complete_wall_time() -> None:
     assert result.aggregate_output_tokens_per_second == 20
     assert result.ttft_ms_p95 is None
     assert result.tpot_ms_p95 is None
+
+
+def compatibility_trial(
+    task_name: str, *, exception_type: str | None = None
+) -> HarborCompatibilityTrial:
+    digest = "sha256:" + "1" * 64
+    return HarborCompatibilityTrial.model_validate(
+        {
+            "path": f"job/{task_name}",
+            "trial_id": task_name,
+            "trial_name": task_name,
+            "lock_digest": digest,
+            "result_digest": digest,
+            "task_name": task_name,
+            "task_digest": digest,
+            "agent_name": "openclaw",
+            "agent_version": "1",
+            "exception_type": exception_type,
+            "step_exceptions": [],
+            "rewards": {"reward": 0},
+            "timing": {
+                "trial": {
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "finished_at": "2026-01-01T00:00:01+00:00",
+                }
+            },
+            "usage": {
+                "input_tokens": 10,
+                "cache_tokens": 0,
+                "output_tokens": 5,
+                "cost_usd": 0,
+            },
+            "artifacts": [],
+        }
+    )
+
+
+def test_profile_point_preserves_individual_harbor_trial_failures(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec)
+    request_path = tmp_path / "execution" / "harbor-request.json"
+    request_path.parent.mkdir()
+    prepared = SimpleNamespace(request_path=request_path, request=object())
+
+    class Adapter:
+        def prepare(self, *_args: object, **_kwargs: object) -> object:
+            return prepared
+
+        def execute(self, *_args: object, **_kwargs: object) -> object:
+            raise HarborTrialFailure("one failed", "SandboxError")
+
+    class Transport:
+        @contextmanager
+        def scope(self, _scope: str) -> Iterator[tuple[str, str, None]]:
+            yield "https://endpoint.test", "model", None
+
+    @contextmanager
+    def process_environment(
+        *_args: object, **_kwargs: object
+    ) -> Iterator[dict[str, str]]:
+        yield {}
+
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.FilesystemHarborExecutionAdapter", Adapter
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.harbor_process_environment", process_environment
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker._sample_tasks",
+        lambda _plan: {"success": "digest", "failure": "digest"},
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.load_compatibility_bundle",
+        lambda *_args: SimpleNamespace(
+            trials=[
+                compatibility_trial("success"),
+                compatibility_trial("failure", exception_type="SandboxError"),
+            ]
+        ),
+    )
+
+    result = _run_point(
+        resolved,
+        cast(Any, object()),
+        cast(Any, Transport()),
+        tmp_path / "harbor",
+        "hf_test",
+        1,
+        repetition=1,
+        destination=tmp_path / "profile",
+        deadline=10**12,
+    )
+
+    assert [observation.success for observation in result.observations] == [True, False]
+    assert result.observations[1].error == "SandboxError"
 
 
 def test_profile_ladder_skips_repetition_used_by_health_retry(
@@ -520,6 +624,68 @@ def test_endpoint_preflight_reports_quota_and_cost(remote_spec: ExperimentSpec) 
 
     assert report.available_accelerators == 2
     assert str(report.estimated_cost_usd) == "5.0"
+
+
+def test_endpoint_preflight_accounts_for_maximum_replicas(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = profiled_spec(remote_spec)
+    model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
+    deployment = spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(
+        update={"parameters": deployment.parameters | {"max_replicas": 2}}
+    )
+    spec = spec.model_copy(
+        update={
+            "matrix": spec.matrix.model_copy(
+                update={"models": [model], "deployments": [deployment]}
+            )
+        }
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="10.00",
+        profile_timeout_seconds=3600,
+    )
+    response = {
+        "vendors": [
+            {
+                "name": "aws",
+                "regions": [
+                    {
+                        "name": deployment.region.removeprefix("aws-"),
+                        "computes": [
+                            {
+                                "instanceType": deployment.hardware,
+                                "numAccelerators": deployment.accelerator_count,
+                                "status": "available",
+                                "pricePerHour": 5.0,
+                                "quota": {
+                                    "maxAccelerators": 2,
+                                    "usedAccelerators": 0,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response)
+        )
+    )
+
+    report = preflight_profile_plan(
+        resolved, api=FakeApi(), client=client, token="hf_test"
+    )
+
+    assert report.required_accelerators == 2
+    assert report.estimated_cost_usd == Decimal("10.0")
 
 
 def test_managed_endpoint_preflight_uses_remote_namespace(

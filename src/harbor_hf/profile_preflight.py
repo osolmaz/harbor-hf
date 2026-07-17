@@ -136,7 +136,14 @@ def _preflight_endpoint(
     if not isinstance(maximum, int) or not isinstance(used, int):
         raise ValueError("endpoint quota is unknown; refusing to guess")
     available = max(0, maximum - used)
-    required = target.accelerator_count
+    maximum_replicas = target.parameters.get("max_replicas", 1)
+    if (
+        not isinstance(maximum_replicas, int)
+        or isinstance(maximum_replicas, bool)
+        or maximum_replicas < 1
+    ):
+        raise ValueError("endpoint max_replicas must be a positive integer")
+    required = target.accelerator_count * maximum_replicas
     if available < required:
         raise ValueError(
             f"endpoint quota has {available} accelerators available; "
@@ -144,7 +151,7 @@ def _preflight_endpoint(
         )
     price = Decimal(str(compute.get("pricePerHour")))
     duration = plan.profile_timeout_seconds
-    estimated = price * Decimal(duration) / Decimal(3600)
+    estimated = price * Decimal(maximum_replicas) * Decimal(duration) / Decimal(3600)
     if estimated > cap:
         raise ValueError(
             f"profile estimate ${estimated:.2f} exceeds spend cap ${cap:.2f}"

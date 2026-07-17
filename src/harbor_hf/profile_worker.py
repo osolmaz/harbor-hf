@@ -23,6 +23,7 @@ from harbor_hf.evidence import (
     write_json,
 )
 from harbor_hf.harbor_adapter import FilesystemHarborExecutionAdapter
+from harbor_hf.harbor_adapter.errors import HarborTrialFailure
 from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
 from harbor_hf.harbor_adapter.validation import load_compatibility_bundle
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
@@ -457,24 +458,24 @@ def _run_point(
                     stream_runner=run_streaming,
                     deadline=deadline,
                 )
+        except HarborTrialFailure:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            _scrub_capability(point_root, capability)
+            compatibility_path = prepared.request_path.with_name(
+                "harbor-compatibility.json"
+            )
+            try:
+                bundle = load_compatibility_bundle(compatibility_path, prepared.request)
+            except Exception as error:
+                return _failed_point_result(tasks, attempts, elapsed_ms, error)
+            return _PointResult(
+                observations=[_task_observation(trial) for trial in bundle.trials],
+                elapsed_ms=elapsed_ms,
+            )
         except Exception as error:
             elapsed_ms = (time.monotonic() - started) * 1000
             _scrub_capability(point_root, capability)
-            return _PointResult(
-                observations=[
-                    _TaskObservation(
-                        False,
-                        elapsed_ms,
-                        0,
-                        0,
-                        task_name,
-                        type(error).__name__,
-                    )
-                    for task_name in tasks
-                    for _ in range(attempts)
-                ],
-                elapsed_ms=elapsed_ms,
-            )
+            return _failed_point_result(tasks, attempts, elapsed_ms, error)
         elapsed_ms = (time.monotonic() - started) * 1000
         _scrub_capability(point_root, capability)
     if outcome.exit_code != 0 or outcome.verification is None:
@@ -521,14 +522,42 @@ def _task_observation(trial: HarborCompatibilityTrial) -> _TaskObservation:
         if valid_timing and started is not None and finished is not None
         else 0
     )
-    success = valid_usage and valid_timing
+    trial_failure = trial.exception_type
+    if trial_failure is None and trial.step_exceptions:
+        step = trial.step_exceptions[0]
+        trial_failure = f"{step.exception_type} in step {step.step_name}"
+    success = trial_failure is None and valid_usage and valid_timing
     return _TaskObservation(
         success,
         latency_ms,
         input_tokens if isinstance(input_tokens, int) else 0,
         output_tokens if isinstance(output_tokens, int) else 0,
         task_name,
-        None if success else "missing positive token usage or complete timing",
+        (
+            None
+            if success
+            else trial_failure or "missing positive token usage or complete timing"
+        ),
+    )
+
+
+def _failed_point_result(
+    tasks: dict[str, str], attempts: int, elapsed_ms: float, error: Exception
+) -> _PointResult:
+    return _PointResult(
+        observations=[
+            _TaskObservation(
+                False,
+                elapsed_ms,
+                0,
+                0,
+                task_name,
+                type(error).__name__,
+            )
+            for task_name in tasks
+            for _ in range(attempts)
+        ],
+        elapsed_ms=elapsed_ms,
     )
 
 
