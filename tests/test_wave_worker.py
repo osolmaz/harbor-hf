@@ -53,6 +53,7 @@ from harbor_hf.wave_worker import (
     _finalize_execution,
     _launch_wave_watchdog,
     _remaining_seconds,
+    _sandbox_failure_category,
     _valid_terminal_trial,
     _wave_model_name,
     run_wave_worker,
@@ -163,15 +164,98 @@ def test_openclaw_structured_transport_timeout_is_retryable(tmp_path: Path) -> N
 def test_sandbox_failure_uses_trusted_exception_evidence(
     tmp_path: Path, detail: str, expected: str
 ) -> None:
-    exception = tmp_path / "harbor-jobs" / "job" / "trial" / "exception.txt"
-    exception.parent.mkdir(parents=True)
-    exception.write_text(detail, encoding="utf-8")
-    error = HarborTrialFailure("sandbox failed", "SandboxError")
+    error = HarborTrialFailure("sandbox failed", "SandboxError", detail)
 
     assert (
         _execution_failure_category(error, "execution", evidence_root=tmp_path)
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox job job-one did not "
+            "become ready within 120s.",
+            "transient",
+        ),
+        (
+            "huggingface_hub.errors.SandboxError: Sandbox API error (400): "
+            "failed to spawn '/bin/bash': No such file or directory",
+            "benchmark",
+        ),
+    ],
+)
+def test_wrapped_harbor_exit_uses_sandbox_exception_evidence(
+    tmp_path: Path, detail: str, expected: str
+) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "exception_info": {
+                    "exception_type": "SandboxError",
+                    "exception_message": detail,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        _execution_failure_category(
+            WorkerError("Harbor exited with status 1"),
+            "execution",
+            evidence_root=tmp_path,
+        )
+        == expected
+    )
+
+
+def test_wrapped_harbor_exit_ignores_sandbox_markers_without_sandbox_error(
+    tmp_path: Path,
+) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "exception_info": {
+                    "exception_type": "RuntimeError",
+                    "exception_message": "SandboxError: Sandbox API error (503)",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _sandbox_failure_category(tmp_path) is None
+
+
+def test_wrapped_harbor_exit_ignores_non_utf8_result(tmp_path: Path) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_bytes(b"\xff")
+
+    assert _sandbox_failure_category(tmp_path) is None
+
+
+def test_wrapped_harbor_exit_ignores_excessively_nested_result(tmp_path: Path) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+
+    assert _sandbox_failure_category(tmp_path) is None
+
+
+def test_wrapped_harbor_exit_ignores_overlong_integer_result(tmp_path: Path) -> None:
+    result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text('{"value":' + "1" * 5000 + "}", encoding="utf-8")
+
+    assert _sandbox_failure_category(tmp_path) is None
 
 
 def test_openclaw_nonterminal_status_log_does_not_reclassify_agent_exit(
