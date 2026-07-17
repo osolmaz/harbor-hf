@@ -16,7 +16,12 @@ from starlette.responses import StreamingResponse
 
 from harbor_hf.presentation.config import PresentationConfig
 from harbor_hf.presentation.repository import PresentationError, ResultRepository
-from harbor_hf.presentation.service import ResultNotFound, ResultService
+from harbor_hf.presentation.service import (
+    ResultNotFound,
+    ResultService,
+    RunSortField,
+    SortOrder,
+)
 
 
 class ServiceHolder:
@@ -175,6 +180,8 @@ def _register_catalog_routes(app: FastAPI, holder: ServiceHolder) -> None:
         model: Annotated[str, Query(max_length=300)] = "",
         hardware: Annotated[str, Query(max_length=200)] = "",
         scope: Annotated[Literal["primary", "audit"], Query()] = "primary",
+        sort: Annotated[RunSortField, Query()] = "completed_at",
+        order: Annotated[SortOrder, Query()] = "desc",
         cursor: Annotated[str, Query(max_length=128)] = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
     ) -> dict[str, Any]:
@@ -184,6 +191,8 @@ def _register_catalog_routes(app: FastAPI, holder: ServiceHolder) -> None:
             model=model,
             hardware=hardware,
             scope=scope,
+            sort=sort,
+            order=order,
         )
         return _paginate(result, cursor=cursor, limit=limit)
 

@@ -32,3 +32,22 @@ test("keeps component and diagnostic publications in audit scope", async ({ page
   await expect(page.getByText("base; degraded").first()).toBeVisible();
   await expect(page.getByText("diagnostic; clean").first()).toBeVisible();
 });
+
+test("sorts evaluations and keeps the scope control within the viewport", async ({ page }) => {
+  for (const width of [320, 560, 768, 1024, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/");
+    const toolbar = page.getByRole("region", { name: "Run filters" });
+    await expect(toolbar).toBeVisible();
+    expect(await toolbar.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  }
+
+  const score = page.getByRole("button", { name: "Score", exact: true });
+  await score.click();
+  await expect(page.locator("tbody tr").first()).toContainText("GLM-5.2");
+  await expect(score.locator("xpath=ancestor::th")).toHaveAttribute("aria-sort", "descending");
+
+  await score.click();
+  await expect(page.locator("tbody tr").first()).toContainText("gemma-4-26B-A4B-it-GGUF");
+  await expect(score.locator("xpath=ancestor::th")).toHaveAttribute("aria-sort", "ascending");
+});

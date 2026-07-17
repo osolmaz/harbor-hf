@@ -1,8 +1,11 @@
 import {
+  ArrowDown,
   ArrowLeftRight,
+  ArrowUp,
   Check,
   ChevronLeft,
   ChevronRight,
+  ChevronsUpDown,
   Database,
   ExternalLink,
   GitCompareArrows,
@@ -22,7 +25,15 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
-import { Comparison, getJson, RunDetail, RunsResponse, RunSummary } from "./api";
+import {
+  Comparison,
+  getJson,
+  RunDetail,
+  RunsResponse,
+  RunSortField,
+  RunSummary,
+  SortOrder,
+} from "./api";
 
 function useData<T>(path: string) {
   const [data, setData] = useState<T | null>(null);
@@ -100,19 +111,21 @@ function RunsPage() {
   const [benchmark, setBenchmark] = useState("");
   const [model, setModel] = useState("");
   const [hardware, setHardware] = useState("");
+  const [sort, setSort] = useState<RunSortField>("completed_at");
+  const [order, setOrder] = useState<SortOrder>("desc");
   const [cursor, setCursor] = useState("");
   const [previousCursors, setPreviousCursors] = useState<string[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const navigate = useNavigate();
   const requestPath = useMemo(() => {
-    const parameters = new URLSearchParams({ limit: "50", scope });
+    const parameters = new URLSearchParams({ limit: "50", scope, sort, order });
     if (search) parameters.set("search", search);
     if (benchmark) parameters.set("benchmark", benchmark);
     if (model) parameters.set("model", model);
     if (hardware) parameters.set("hardware", hardware);
     if (cursor) parameters.set("cursor", cursor);
     return `/api/v1/runs?${parameters}`;
-  }, [search, benchmark, model, hardware, cursor, scope]);
+  }, [search, benchmark, model, hardware, cursor, scope, sort, order]);
   const { data, error } = useData<RunsResponse>(requestPath);
   const updateFilter = <Value extends string,>(
     setter: (value: Value) => void,
@@ -129,6 +142,15 @@ function RunsPage() {
         ? current.filter((value) => value !== runId)
         : [...current.slice(-1), runId],
     );
+  };
+  const updateSort = (field: RunSortField) => {
+    setOrder((current) =>
+      field === sort ? (current === "desc" ? "asc" : "desc") : defaultSortOrder(field),
+    );
+    setSort(field);
+    setCursor("");
+    setPreviousCursors([]);
+    setSelected([]);
   };
   if (error) return <EmptyState message={error} />;
   if (!data) return <Loading />;
@@ -158,7 +180,7 @@ function RunsPage() {
         />
       </section>
       <section className="toolbar" aria-label="Run filters">
-        <div className="segmented-control" aria-label="Catalog scope">
+        <div className="segmented-control" role="group" aria-label="Catalog scope">
           <button
             type="button"
             aria-pressed={scope === "primary"}
@@ -200,7 +222,14 @@ function RunsPage() {
           <GitCompareArrows size={15} /> Compare {selected.length}/2
         </button>
       </section>
-      <RunsTable runs={data.items} selected={selected} onToggle={toggle} />
+      <RunsTable
+        runs={data.items}
+        selected={selected}
+        onToggle={toggle}
+        sort={sort}
+        order={order}
+        onSort={updateSort}
+      />
       <Pagination
         total={data.total}
         count={data.items.length}
@@ -224,16 +253,30 @@ function RunsPage() {
   );
 }
 
-function RunsTable({ runs, selected, onToggle, comparable = true }: {
+function RunsTable({ runs, selected, onToggle, comparable = true, sort, order, onSort }: {
   runs: RunSummary[];
   selected: string[];
   onToggle: (id: string) => void;
   comparable?: boolean;
+  sort?: RunSortField;
+  order?: SortOrder;
+  onSort?: (field: RunSortField) => void;
 }) {
   return (
     <section className="table-wrap">
       <table>
-        <thead><tr>{comparable && <th className="select-cell">Compare</th>}<th>Score</th><th>Benchmark</th><th>Model</th><th>Agent</th><th>Hardware</th><th>Trials</th><th>Duration</th><th>Completed</th><th /></tr></thead>
+        <thead><tr>
+          {comparable && <th className="select-cell">Compare</th>}
+          <SortableHeader label="Score" field="score" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Benchmark" field="benchmark" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Model" field="model_repo" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Agent" field="agent_name" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Hardware" field="hardware" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Trials" field="passed_trials" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Duration" field="duration_seconds" sort={sort} order={order} onSort={onSort} />
+          <SortableHeader label="Completed" field="completed_at" sort={sort} order={order} onSort={onSort} />
+          <th />
+        </tr></thead>
         <tbody>
           {runs.map((run) => (
             <tr key={run.run_id}>
@@ -254,6 +297,36 @@ function RunsTable({ runs, selected, onToggle, comparable = true }: {
       {!runs.length && <EmptyState message="No matching runs" />}
     </section>
   );
+}
+
+function SortableHeader({ label, field, sort, order, onSort }: {
+  label: string;
+  field: RunSortField;
+  sort?: RunSortField;
+  order?: SortOrder;
+  onSort?: (field: RunSortField) => void;
+}) {
+  if (!onSort) return <th>{label}</th>;
+  const active = sort === field;
+  const Icon = active ? (order === "asc" ? ArrowUp : ArrowDown) : ChevronsUpDown;
+  return (
+    <th aria-sort={active ? (order === "asc" ? "ascending" : "descending") : "none"}>
+      <button
+        className="sort-button"
+        type="button"
+        title={`Sort by ${label.toLowerCase()}`}
+        onClick={() => onSort(field)}
+      >
+        {label}<Icon size={13} aria-hidden="true" />
+      </button>
+    </th>
+  );
+}
+
+function defaultSortOrder(field: RunSortField): SortOrder {
+  return ["benchmark", "model_repo", "agent_name", "hardware"].includes(field)
+    ? "asc"
+    : "desc";
 }
 
 function RunPage() {

@@ -56,9 +56,9 @@ main { width: 100%; padding: 0 24px 40px; }
 .summary-stat:first-child { border-left: 1px solid var(--line); }
 .summary-stat span { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .summary-stat strong { font-size: 24px; font-weight: 500; }
-.toolbar { min-height: 60px; display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.toolbar { min-height: 60px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .segmented-control { height: 36px; display: flex; border: 1px solid var(--line); background: var(--surface); }
-.segmented-control button { min-width: 86px; border: 0; border-right: 1px solid var(--line); padding: 0 10px; color: var(--muted); background: transparent; cursor: pointer; }
+.segmented-control button { min-width: 86px; border: 0; border-right: 1px solid var(--line); padding: 0 10px; color: var(--muted); background: transparent; cursor: pointer; white-space: nowrap; }
 .segmented-control button:last-child { border-right: 0; }
 .segmented-control button[aria-pressed="true"] { color: var(--inverse); background: var(--ink); }
 .search-field { min-width: 240px; display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface); }
@@ -77,6 +77,8 @@ main { width: 100%; padding: 0 24px 40px; }
 table { width: 100%; border-collapse: collapse; min-width: 900px; }
 th { height: 38px; color: var(--muted); font-size: 10px; font-weight: 500; text-align: left; text-transform: uppercase; background: var(--faint); }
 th, td { padding: 9px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); vertical-align: middle; }
+.sort-button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0; border: 0; color: inherit; background: transparent; text-transform: inherit; cursor: pointer; white-space: nowrap; }
+.sort-button:hover { color: var(--ink); }
 th:first-child, td:first-child { border-left: 1px solid var(--line); }
 tbody tr { background: var(--surface); }
 tbody tr:hover { background: var(--faint); }
@@ -127,7 +129,6 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--ink); }
   main { padding: 0 14px 32px; }
   .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .summary-stat:nth-child(2) { border-right: 0; }
-  .toolbar { flex-wrap: wrap; }
   .search-field { min-width: 100%; }
   .command-button { margin-left: 0; }
   .pagination { justify-content: space-between; }
@@ -145,6 +146,9 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--ink); }
   .page-header > code { max-width: 100%; text-align: left; }
   .summary-stat { min-height: 78px; padding: 12px; }
   .summary-stat strong { font-size: 19px; }
+  .segmented-control { width: 100%; }
+  .segmented-control button { flex: 1; min-width: 0; }
   .select-field { flex: 1; min-width: 145px; }
   .select-field select { min-width: 0; max-width: 130px; }
+  .command-button { width: 100%; justify-content: center; }
 }

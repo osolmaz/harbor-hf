@@ -516,6 +516,24 @@ def test_api_exposes_comparison_details_and_denies_private_content(
         "run-2": 0.0,
     }
     assert runs["facets"]["models"] == ["org/model-1", "org/model-2"]
+    ascending_score = client.get("/api/v1/runs?sort=score&order=asc&limit=1").json()
+    assert [item["run_id"] for item in ascending_score["items"]] == ["run-2"]
+    assert (
+        client.get(
+            "/api/v1/runs"
+            f"?sort=score&order=asc&limit=1&cursor={ascending_score['next_cursor']}"
+        ).json()["items"][0]["run_id"]
+        == "run-1"
+    )
+    assert [
+        item["run_id"]
+        for item in client.get("/api/v1/runs?sort=model_repo&order=desc").json()[
+            "items"
+        ]
+    ] == ["run-2", "run-1"]
+    invalid_sort = client.get("/api/v1/runs?sort=unknown")
+    assert invalid_sort.status_code == 422
+    assert invalid_sort.json()["error"]["code"] == "invalid_request"
     first_page = client.get("/api/v1/runs?limit=1").json()
     assert len(first_page["items"]) == 1
     assert (
@@ -592,6 +610,22 @@ def test_primary_scope_excludes_audit_only_publications(
     assert [item["run_id"] for item in primary["items"]] == ["run-1"]
     assert {item["run_id"] for item in audit["items"]} == {"run-1", "run-2"}
     assert client.get("/api/v1/health").json()["audit_run_count"] == 2
+
+
+def test_run_sorting_uses_a_stable_publication_tiebreaker(
+    snapshot: ResultSnapshot,
+) -> None:
+    tied = tuple(
+        row.model_copy(update={"score": 1.0}) for row in reversed(snapshot.catalog_rows)
+    )
+    service = ResultService(replace(snapshot, catalog_rows=tied))
+
+    result = service.list_runs(sort="score", order="desc")
+
+    assert [item["publication_id"] for item in result["items"]] == [
+        "publication-1",
+        "publication-2",
+    ]
 
 
 def test_composed_run_links_to_source_publications(snapshot: ResultSnapshot) -> None:
