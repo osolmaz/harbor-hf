@@ -321,12 +321,37 @@ class MatrixSpec(StrictModel):
         return self
 
 
+class ServingProfileBinding(StrictModel):
+    profile_id: ProfileId
+    profile_sha256: ContentDigest
+    artifact_uri: str = Field(pattern=r"^hf://buckets/[^\s]+$")
+    concurrency: int = Field(ge=1)
+    model_sha256: ContentDigest
+    deployment_sha256: ContentDigest
+    agent_sha256: ContentDigest
+    benchmark_sha256: ContentDigest
+    server_context_tokens: int = Field(ge=1)
+    max_output_tokens: int = Field(ge=1)
+
+
 class ExecutionSpec(StrictModel):
     attempts: int = Field(default=1, ge=1)
     concurrent_trials: int = Field(default=1, ge=1)
     max_trials_per_shard: int = Field(default=64, ge=1)
     max_shards_per_wave: int = Field(default=8, ge=1)
     timeout_seconds: int = Field(default=3600, ge=1)
+    server_context_tokens: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    max_output_tokens: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    reasoning_required: bool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+    serving_profile: ServingProfileBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ArtifactStoreSpec(StrictModel):
@@ -394,6 +419,7 @@ class ExperimentSpec(StrictModel):
 
     @model_validator(mode="after")
     def remote_job_has_lifecycle_headroom(self) -> ExperimentSpec:
+        _validate_serving_profile_binding(self)
         if self.remote is None:
             return self
         _validate_remote_input_pins(self)
@@ -411,6 +437,63 @@ class ExperimentSpec(StrictModel):
         ):
             raise ValueError("HF Sandbox timeout must not exceed remote Job timeout")
         return self
+
+
+def _validate_serving_profile_binding(spec: ExperimentSpec) -> None:
+    binding = spec.execution.serving_profile
+    if binding is None:
+        return
+    if spec.execution.concurrent_trials != binding.concurrency:
+        raise ValueError(
+            "execution concurrent_trials must match the selected serving profile"
+        )
+    if any(
+        len(profiles) != 1
+        for profiles in (
+            spec.matrix.models,
+            spec.matrix.deployments,
+            spec.matrix.agents,
+        )
+    ):
+        raise ValueError("serving profile binding requires one resolved matrix cell")
+    _validate_binding_identity(spec, binding)
+    _validate_binding_token_limits(spec, binding)
+
+
+def _validate_binding_identity(
+    spec: ExperimentSpec, binding: ServingProfileBinding
+) -> None:
+    expected = {
+        "model_sha256": _canonical_profile_digest(spec.matrix.models[0]),
+        "deployment_sha256": _canonical_profile_digest(spec.matrix.deployments[0]),
+        "agent_sha256": _canonical_profile_digest(spec.matrix.agents[0]),
+        "benchmark_sha256": _canonical_profile_digest(
+            spec.benchmark.model_dump(mode="json", exclude_none=True)
+        ),
+    }
+    for field, value in expected.items():
+        if getattr(binding, field) != value:
+            raise ValueError(f"serving profile {field} does not match the experiment")
+
+
+def _validate_binding_token_limits(
+    spec: ExperimentSpec, binding: ServingProfileBinding
+) -> None:
+    for key in ("server_context_tokens", "max_output_tokens"):
+        value = getattr(spec.execution, key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"execution {key} must be a positive integer")
+        if getattr(binding, key) != value:
+            raise ValueError(f"serving profile {key} does not match execution")
+
+
+def _canonical_profile_digest(value: object) -> str:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json", exclude_none=True)
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:

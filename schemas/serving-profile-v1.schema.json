@@ -1,79 +1,60 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/osolmaz/harbor-hf/schemas/serving-profile-v1.schema.json",
-  "title": "Harbor-HF serving profile",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "profile_id",
-    "created_at",
-    "identity",
-    "objective",
-    "workload",
-    "candidate_concurrency",
-    "points",
-    "selection",
-    "artifacts"
-  ],
-  "properties": {
-    "schema_version": {
-      "const": "harbor-hf/serving-profile/v1"
-    },
-    "profile_id": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
-    },
-    "created_at": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "identity": {
-      "$ref": "#/$defs/identity"
-    },
-    "objective": {
-      "$ref": "#/$defs/objective"
-    },
-    "workload": {
-      "$ref": "#/$defs/workload"
-    },
-    "candidate_concurrency": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {
-        "type": "integer",
-        "minimum": 1
-      }
-    },
-    "points": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/point"
-      }
-    },
-    "selection": {
-      "oneOf": [
-        {
-          "type": "null"
-        },
-        {
-          "$ref": "#/$defs/selection"
-        }
-      ]
-    },
-    "artifacts": {
-      "$ref": "#/$defs/artifacts"
-    }
-  },
   "$defs": {
-    "digest": {
-      "type": "string",
-      "pattern": "^sha256:[0-9a-f]{64}$"
-    },
-    "identity": {
-      "type": "object",
+    "ProfileArtifacts": {
       "additionalProperties": false,
+      "properties": {
+        "bucket": {
+          "minLength": 1,
+          "title": "Bucket",
+          "type": "string"
+        },
+        "prefix": {
+          "minLength": 1,
+          "title": "Prefix",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bucket",
+        "prefix"
+      ],
+      "title": "ProfileArtifacts",
+      "type": "object"
+    },
+    "ProfileIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Agent Sha256",
+          "type": "string"
+        },
+        "benchmark_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Benchmark Sha256",
+          "type": "string"
+        },
+        "deployment_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Deployment Sha256",
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "minimum": 1,
+          "title": "Max Output Tokens",
+          "type": "integer"
+        },
+        "model_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Model Sha256",
+          "type": "string"
+        },
+        "server_context_tokens": {
+          "minimum": 1,
+          "title": "Server Context Tokens",
+          "type": "integer"
+        }
+      },
       "required": [
         "model_sha256",
         "deployment_sha256",
@@ -82,98 +63,393 @@
         "server_context_tokens",
         "max_output_tokens"
       ],
-      "properties": {
-        "model_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "deployment_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "agent_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "benchmark_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "server_context_tokens": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "max_output_tokens": {
-          "type": "integer",
-          "minimum": 1
-        }
-      }
+      "title": "ProfileIdentity",
+      "type": "object"
     },
-    "objective": {
-      "type": "object",
+    "ProfileObjective": {
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "maximum_error_rate"
-      ],
       "properties": {
         "kind": {
+          "default": "maximum_goodput",
           "enum": [
             "maximum_throughput",
             "maximum_goodput",
             "maximum_stable_concurrency",
             "interactive"
-          ]
+          ],
+          "title": "Kind",
+          "type": "string"
         },
         "maximum_error_rate": {
-          "type": "number",
+          "default": 0.0,
+          "maximum": 1,
           "minimum": 0,
-          "maximum": 1
-        },
-        "maximum_ttft_ms_p95": {
-          "type": "number",
-          "exclusiveMinimum": 0
+          "title": "Maximum Error Rate",
+          "type": "number"
         },
         "maximum_tpot_ms_p95": {
-          "type": "number",
-          "exclusiveMinimum": 0
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maximum Tpot Ms P95"
+        },
+        "maximum_ttft_ms_p95": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maximum Ttft Ms P95"
         },
         "minimum_session_output_tokens_per_second": {
-          "type": "number",
-          "minimum": 0
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Minimum Session Output Tokens Per Second"
         }
-      }
+      },
+      "title": "ProfileObjective",
+      "type": "object"
     },
-    "workload": {
-      "type": "object",
+    "ProfilePoint": {
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "sample_task_count",
-        "sample_tasks_sha256",
-        "minimum_observations_per_point",
-        "boundary_repetitions"
-      ],
       "properties": {
-        "kind": {
-          "const": "benchmark"
+        "aggregate_input_tokens_per_second": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Aggregate Input Tokens Per Second"
         },
-        "sample_task_count": {
-          "type": "integer",
-          "minimum": 1
+        "aggregate_output_tokens_per_second": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Aggregate Output Tokens Per Second"
         },
-        "sample_tasks_sha256": {
-          "$ref": "#/$defs/digest"
+        "artifact_prefix": {
+          "minLength": 1,
+          "title": "Artifact Prefix",
+          "type": "string"
         },
-        "minimum_observations_per_point": {
-          "type": "integer",
-          "minimum": 8
+        "completed_count": {
+          "minimum": 0,
+          "title": "Completed Count",
+          "type": "integer"
         },
-        "boundary_repetitions": {
-          "type": "integer",
-          "minimum": 3
+        "concurrency": {
+          "minimum": 1,
+          "title": "Concurrency",
+          "type": "integer"
+        },
+        "error_rate": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Error Rate",
+          "type": "number"
+        },
+        "failed_count": {
+          "minimum": 0,
+          "title": "Failed Count",
+          "type": "integer"
+        },
+        "failure_reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failure Reason"
+        },
+        "goodput_rate": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Goodput Rate",
+          "type": "number"
+        },
+        "latency_ms_p50": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latency Ms P50"
+        },
+        "latency_ms_p95": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latency Ms P95"
+        },
+        "latency_ms_p99": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latency Ms P99"
+        },
+        "output_tokens_max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Tokens Max"
+        },
+        "output_tokens_p50": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Tokens P50"
+        },
+        "output_tokens_p95": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Tokens P95"
+        },
+        "planned_count": {
+          "minimum": 0,
+          "title": "Planned Count",
+          "type": "integer"
+        },
+        "point_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Point Sha256",
+          "type": "string"
+        },
+        "prompt_tokens_max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Tokens Max"
+        },
+        "prompt_tokens_p50": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Tokens P50"
+        },
+        "prompt_tokens_p95": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Tokens P95"
+        },
+        "repetition": {
+          "minimum": 1,
+          "title": "Repetition",
+          "type": "integer"
+        },
+        "session_output_tokens_per_second": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Output Tokens Per Second"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tasks_per_hour": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tasks Per Hour"
+        },
+        "tpot_ms_p50": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tpot Ms P50"
+        },
+        "tpot_ms_p95": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tpot Ms P95"
+        },
+        "tpot_ms_p99": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tpot Ms P99"
+        },
+        "ttft_ms_p50": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ttft Ms P50"
+        },
+        "ttft_ms_p95": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ttft Ms P95"
+        },
+        "ttft_ms_p99": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ttft Ms P99"
         }
-      }
-    },
-    "point": {
-      "type": "object",
-      "additionalProperties": false,
+      },
       "required": [
         "point_sha256",
         "concurrency",
@@ -186,201 +462,16 @@
         "goodput_rate",
         "artifact_prefix"
       ],
-      "properties": {
-        "point_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "concurrency": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "repetition": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "status": {
-          "enum": [
-            "completed",
-            "failed",
-            "skipped"
-          ]
-        },
-        "planned_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "completed_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "failed_count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "aggregate_input_tokens_per_second": {
-          "type": "number",
-          "minimum": 0
-        },
-        "aggregate_output_tokens_per_second": {
-          "type": "number",
-          "minimum": 0
-        },
-        "tasks_per_hour": {
-          "type": "number",
-          "minimum": 0
-        },
-        "session_output_tokens_per_second": {
-          "type": "number",
-          "minimum": 0
-        },
-        "ttft_ms_p50": {
-          "type": "number",
-          "minimum": 0
-        },
-        "ttft_ms_p95": {
-          "type": "number",
-          "minimum": 0
-        },
-        "ttft_ms_p99": {
-          "type": "number",
-          "minimum": 0
-        },
-        "tpot_ms_p50": {
-          "type": "number",
-          "minimum": 0
-        },
-        "tpot_ms_p95": {
-          "type": "number",
-          "minimum": 0
-        },
-        "tpot_ms_p99": {
-          "type": "number",
-          "minimum": 0
-        },
-        "latency_ms_p50": {
-          "type": "number",
-          "minimum": 0
-        },
-        "latency_ms_p95": {
-          "type": "number",
-          "minimum": 0
-        },
-        "latency_ms_p99": {
-          "type": "number",
-          "minimum": 0
-        },
-        "error_rate": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "goodput_rate": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "peak_device_memory_bytes": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "prompt_tokens_p50": {
-          "type": "number",
-          "minimum": 0
-        },
-        "prompt_tokens_p95": {
-          "type": "number",
-          "minimum": 0
-        },
-        "prompt_tokens_max": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "output_tokens_p50": {
-          "type": "number",
-          "minimum": 0
-        },
-        "output_tokens_p95": {
-          "type": "number",
-          "minimum": 0
-        },
-        "output_tokens_max": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "artifact_prefix": {
-          "type": "string",
-          "minLength": 1
-        },
-        "failure_reason": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "status": {
-                "const": "completed"
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "aggregate_input_tokens_per_second",
-              "aggregate_output_tokens_per_second",
-              "tasks_per_hour",
-              "session_output_tokens_per_second",
-              "ttft_ms_p50",
-              "ttft_ms_p95",
-              "ttft_ms_p99",
-              "tpot_ms_p50",
-              "tpot_ms_p95",
-              "tpot_ms_p99",
-              "latency_ms_p50",
-              "latency_ms_p95",
-              "latency_ms_p99",
-              "prompt_tokens_p50",
-              "prompt_tokens_p95",
-              "prompt_tokens_max",
-              "output_tokens_p50",
-              "output_tokens_p95",
-              "output_tokens_max"
-            ]
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "status": {
-                "enum": [
-                  "failed",
-                  "skipped"
-                ]
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "failure_reason"
-            ]
-          }
-        }
-      ]
+      "title": "ProfilePoint",
+      "type": "object"
     },
-    "selection": {
-      "type": "object",
+    "ProfileSelection": {
       "additionalProperties": false,
-      "required": [
-        "concurrency",
-        "criterion",
-        "point_sha256s",
-        "rationale"
-      ],
       "properties": {
         "concurrency": {
-          "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "title": "Concurrency",
+          "type": "integer"
         },
         "criterion": {
           "enum": [
@@ -388,39 +479,141 @@
             "maximum_goodput",
             "maximum_stable_concurrency",
             "interactive"
-          ]
+          ],
+          "title": "Criterion",
+          "type": "string"
         },
         "point_sha256s": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/digest"
-          }
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Point Sha256S",
+          "type": "array"
         },
         "rationale": {
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
         }
-      }
-    },
-    "artifacts": {
-      "type": "object",
-      "additionalProperties": false,
+      },
       "required": [
-        "bucket",
-        "prefix"
+        "concurrency",
+        "criterion",
+        "point_sha256s",
+        "rationale"
       ],
+      "title": "ProfileSelection",
+      "type": "object"
+    },
+    "ProfileWorkload": {
+      "additionalProperties": false,
       "properties": {
-        "bucket": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+        "boundary_repetitions": {
+          "default": 3,
+          "minimum": 3,
+          "title": "Boundary Repetitions",
+          "type": "integer"
         },
-        "prefix": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        "kind": {
+          "const": "benchmark",
+          "default": "benchmark",
+          "title": "Kind",
+          "type": "string"
+        },
+        "minimum_observations_per_point": {
+          "default": 8,
+          "minimum": 8,
+          "title": "Minimum Observations Per Point",
+          "type": "integer"
+        },
+        "sample_task_count": {
+          "minimum": 1,
+          "title": "Sample Task Count",
+          "type": "integer"
+        },
+        "sample_tasks_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sample Tasks Sha256",
+          "type": "string"
         }
-      }
+      },
+      "required": [
+        "sample_task_count",
+        "sample_tasks_sha256"
+      ],
+      "title": "ProfileWorkload",
+      "type": "object"
     }
-  }
+  },
+  "$id": "https://github.com/osolmaz/harbor-hf/schemas/serving-profile-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "$ref": "#/$defs/ProfileArtifacts"
+    },
+    "candidate_concurrency": {
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 1,
+      "title": "Candidate Concurrency",
+      "type": "array"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "identity": {
+      "$ref": "#/$defs/ProfileIdentity"
+    },
+    "objective": {
+      "$ref": "#/$defs/ProfileObjective"
+    },
+    "points": {
+      "items": {
+        "$ref": "#/$defs/ProfilePoint"
+      },
+      "title": "Points",
+      "type": "array"
+    },
+    "profile_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "title": "Profile Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/serving-profile/v1",
+      "default": "harbor-hf/serving-profile/v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProfileSelection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "workload": {
+      "$ref": "#/$defs/ProfileWorkload"
+    }
+  },
+  "required": [
+    "profile_id",
+    "created_at",
+    "identity",
+    "objective",
+    "workload",
+    "candidate_concurrency",
+    "artifacts"
+  ],
+  "title": "ServingProfile",
+  "type": "object"
 }

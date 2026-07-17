@@ -24,6 +24,7 @@ from harbor_hf.models import (
     ModelProfile,
     PublicationRole,
     RemoteExecutionSpec,
+    ServingProfileBinding,
 )
 from harbor_hf.planner import experiment_digest, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
@@ -76,6 +77,9 @@ class RunLock(BaseModel):
     agent: AgentProfile
     attempts: int
     concurrent_trials: int
+    serving_profile: ServingProfileBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     timeout_seconds: int
     artifact_bucket: str
     artifact_prefix: str
@@ -189,6 +193,7 @@ def build_run_lock(
         agent=agent,
         attempts=spec.execution.attempts,
         concurrent_trials=spec.execution.concurrent_trials,
+        serving_profile=spec.execution.serving_profile,
         timeout_seconds=spec.execution.timeout_seconds,
         artifact_bucket=spec.artifacts.bucket,
         artifact_prefix=f"runs/{spec.metadata.name}/{resolved_id}",

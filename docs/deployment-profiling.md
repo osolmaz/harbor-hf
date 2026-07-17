@@ -171,30 +171,47 @@ endpoint is paused and reports zero ready replicas. The profile points and raw
 logs are immutable. A retry appends a new repetition or creates a new profile;
 it never overwrites prior evidence.
 
-The final campaign evidence records the profile Bucket URI and SHA-256 digest.
-Until that reference is part of the experiment schema, operators must preserve
-it in campaign notes and verify manually that `execution.concurrent_trials`
-matches the selected value.
+The final campaign evidence records the profile Bucket URI and SHA-256 digest
+through `execution.serving_profile`. Manifest validation rejects a mismatched
+selection concurrency or serving identity before campaign planning.
 
-## Planned CLI
+## CLI
 
-The production CLI will expose:
+The production CLI exposes:
 
 ```text
-harbor-hf profile plan EXPERIMENT --output plan.json
+harbor-hf profile plan EXPERIMENT --profile-id ID --max-spend-usd USD \
+  --timeout-seconds 3600 --output plan.json
+harbor-hf profile preflight plan.json
 harbor-hf profile run plan.json
-harbor-hf profile select PROFILE_ID
+harbor-hf profile select profile.json --output selected-profile.json
 ```
 
-`plan` will resolve exact identities and create the candidate ladder without
-remote work. `run` will execute the smoke test and points under one leased
-endpoint lifecycle, publish immutable evidence, and pause the endpoint.
-`select` will validate the evidence, write the selected profile, and prepare a
-campaign manifest whose concurrency and profile digest agree.
+`plan` resolves exact identities and creates the candidate ladder without
+remote work. The plan embeds the immutable experiment, so the remote worker
+does not depend on mutable local state. `preflight` verifies the model revision,
+private Bucket, provider route or endpoint compute, current accelerator quota,
+hourly price, worst-case profile cost, and declared spend cap. Unknown endpoint
+quota fails closed.
 
-Do not implement `profile run` as independent campaigns that each provision an
-endpoint. The profiler must reuse one safely leased endpoint across the ladder
-and retain the existing watchdog and verified-pause guarantees.
+`run` submits one Hugging Face Job. For an Inference Endpoint, the worker
+requires a paused baseline, starts the cleanup watchdog before resume, keeps
+one endpoint lease across the whole ladder, and pauses and verifies zero ready
+replicas on every exit path. It first verifies ordinary chat, the reasoning
+channel when required, and a forced tool call. It then records content-free
+request observations for the endpoint or Inference Provider, tests ascending
+powers of two, and repeats the last two viable boundary points three times.
+The operator machine never loads model weights or performs inference.
+
+`select` recomputes every point digest before choosing the winner. A campaign
+can bind the resulting profile under `execution.serving_profile`; validation
+then requires exact model, deployment, agent, benchmark, context, output, and
+concurrency agreement. The binding is propagated into run locks and campaign
+digests.
+
+Do not split `profile run` into independent Jobs or campaigns per point. The
+profiler reuses one safely leased endpoint across the ladder and retains the
+watchdog and verified-pause guarantees.
 
 ## Not Covered
 
