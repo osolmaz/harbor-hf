@@ -13,6 +13,7 @@ from harbor_hf.private_artifacts import (
     build_private_artifact_manifest,
     openclaw_execution_started,
     sanitize_private_artifact_directory_files,
+    sanitize_private_artifact_special_files,
     sanitize_private_artifact_tree,
     validate_private_artifact_directory_files,
     write_private_artifact_manifest,
@@ -249,6 +250,28 @@ def test_private_artifact_sanitizer_rejects_special_files(tmp_path: Path) -> Non
         (item.path, item.reason) for item in rejected
     }
     assert not fifo.exists()
+
+
+def test_special_file_sanitizer_preserves_regular_profile_evidence(
+    tmp_path: Path,
+) -> None:
+    regular = tmp_path / "session.jsonl"
+    regular.write_text("{}\n", encoding="utf-8")
+    fifo = tmp_path / "runtime.pipe"
+    os.mkfifo(fifo)
+
+    rejected = sanitize_private_artifact_special_files(tmp_path)
+
+    assert [(item.path, item.reason) for item in rejected] == [
+        ("runtime.pipe", "special_file")
+    ]
+    assert regular.read_text(encoding="utf-8") == "{}\n"
+    assert not fifo.exists()
+    assert json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )["rejections"] == [
+        {"path": "runtime.pipe", "reason": "special_file", "size": None}
+    ]
 
 
 def test_private_artifact_sanitizer_records_and_removes_rejected_files(

@@ -29,6 +29,7 @@ from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
 from harbor_hf.harbor_adapter.validation import load_compatibility_bundle
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
 from harbor_hf.models import EndpointRef, ExperimentSpec
+from harbor_hf.private_artifacts import sanitize_private_artifact_special_files
 from harbor_hf.process import SubprocessRunner, run_streaming
 from harbor_hf.profile_worker_transport import ProfileTransport
 from harbor_hf.profiling import (
@@ -971,6 +972,7 @@ def _integer(value: object) -> int:
 def _scrub_capability(root: Path, capability: str | None) -> None:
     if capability is None:
         return
+    sanitize_private_artifact_special_files(root)
     scrub_secret_paths(root, capability)
     scrub_secret(root, capability)
 

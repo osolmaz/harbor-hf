@@ -364,6 +364,22 @@ def sanitize_private_artifact_symlinks(
     )
 
 
+def sanitize_private_artifact_special_files(
+    root: Path,
+) -> list[PrivateArtifactRejection]:
+    """Remove non-file artifact nodes and retain a typed rejection record."""
+    rejected = _remove_special_files(root)
+    existing_rejections, omitted_count = _consume_existing_rejections(
+        root, trust_existing=False
+    )
+    rejected.extend(existing_rejections)
+    return _write_rejections(
+        root,
+        rejected,
+        base_omitted_count=omitted_count,
+    )
+
+
 def validate_private_artifact_directory_files(
     root: Path,
     *,
