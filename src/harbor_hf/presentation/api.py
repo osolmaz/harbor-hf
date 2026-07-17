@@ -180,7 +180,7 @@ def _register_catalog_routes(app: FastAPI, holder: ServiceHolder) -> None:
         model: Annotated[str, Query(max_length=300)] = "",
         hardware: Annotated[str, Query(max_length=200)] = "",
         scope: Annotated[Literal["primary", "audit"], Query()] = "primary",
-        sort: Annotated[RunSortField, Query()] = "completed_at",
+        sort: Annotated[RunSortField, Query()] = "score",
         order: Annotated[SortOrder, Query()] = "desc",
         cursor: Annotated[str, Query(max_length=128)] = "",
         limit: Annotated[int, Query(ge=1, le=100)] = 50,

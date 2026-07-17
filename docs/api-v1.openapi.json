@@ -359,7 +359,7 @@
             "name": "sort",
             "required": false,
             "schema": {
-              "default": "completed_at",
+              "default": "score",
               "enum": [
                 "score",
                 "benchmark",

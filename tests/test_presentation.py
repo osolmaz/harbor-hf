@@ -515,6 +515,7 @@ def test_api_exposes_comparison_details_and_denies_private_content(
         "run-1": 1.0,
         "run-2": 0.0,
     }
+    assert [item["run_id"] for item in runs["items"]] == ["run-1", "run-2"]
     assert runs["facets"]["models"] == ["org/model-1", "org/model-2"]
     ascending_score = client.get("/api/v1/runs?sort=score&order=asc&limit=1").json()
     assert [item["run_id"] for item in ascending_score["items"]] == ["run-2"]

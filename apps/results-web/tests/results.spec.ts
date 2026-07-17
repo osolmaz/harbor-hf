@@ -43,7 +43,6 @@ test("sorts evaluations and keeps the scope control within the viewport", async 
   }
 
   const score = page.getByRole("button", { name: "Score", exact: true });
-  await score.click();
   await expect(page.locator("tbody tr").first()).toContainText("GLM-5.2");
   await expect(score.locator("xpath=ancestor::th")).toHaveAttribute("aria-sort", "descending");
 

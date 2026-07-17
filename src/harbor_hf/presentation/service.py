@@ -79,7 +79,7 @@ class ResultService:
         model: str = "",
         hardware: str = "",
         scope: CatalogScope = "primary",
-        sort: RunSortField = "completed_at",
+        sort: RunSortField = "score",
         order: SortOrder = "desc",
     ) -> dict[str, Any]:
         items = [self._summary(run) for run in self._catalog_rows(scope)]
