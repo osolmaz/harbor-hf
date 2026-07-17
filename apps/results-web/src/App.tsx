@@ -111,7 +111,7 @@ function RunsPage() {
   const [benchmark, setBenchmark] = useState("");
   const [model, setModel] = useState("");
   const [hardware, setHardware] = useState("");
-  const [sort, setSort] = useState<RunSortField>("completed_at");
+  const [sort, setSort] = useState<RunSortField>("score");
   const [order, setOrder] = useState<SortOrder>("desc");
   const [cursor, setCursor] = useState("");
   const [previousCursors, setPreviousCursors] = useState<string[]>([]);
