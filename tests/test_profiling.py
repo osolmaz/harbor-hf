@@ -25,8 +25,10 @@ from harbor_hf.models import (
 from harbor_hf.profile_preflight import preflight_profile_plan
 from harbor_hf.profile_submission import build_profile_submit_command, submit_profile
 from harbor_hf.profile_worker import (
+    ProfileCleanupUnverified,
     ProfileWorkerError,
     _point_ladder_rate,
+    _point_workload,
     _PointResult,
     _request,
     _run_ladder,
@@ -401,7 +403,7 @@ def test_profile_ladder_skips_repetition_used_by_health_retry(
     monkeypatch.setattr("harbor_hf.profile_worker._verify_smoke", lambda *_args: None)
     monkeypatch.setattr("harbor_hf.profile_worker._write_point", lambda *_args: None)
 
-    _run_ladder(
+    points = _run_ladder(
         resolved,
         cast(Any, None),
         cast(Any, None),
@@ -411,7 +413,9 @@ def test_profile_ladder_skips_repetition_used_by_health_retry(
         float("inf"),
     )
 
-    assert repetitions == [1, 2, 3]
+    assert repetitions == [1, 2, 3, 4]
+    profile = new_unselected_profile(resolved).model_copy(update={"points": points})
+    assert select_profile(profile).selection is not None
 
 
 def test_profile_ladder_continues_after_successful_health_retry(
@@ -780,6 +784,11 @@ def test_provider_profile_uses_distinct_tasks_at_maximum_concurrency(
     )
 
     assert resolved.workload.sample_task_count == 32
+    low_tasks, low_attempts = _point_workload(resolved, 1)
+    high_tasks, high_attempts = _point_workload(resolved, 16)
+    assert low_tasks == high_tasks
+    assert len(low_tasks) == 32
+    assert low_attempts == high_attempts == 1
 
 
 def test_profile_without_endpoint_gets_deterministic_managed_binding(
@@ -1307,6 +1316,26 @@ def _profile_smoke(calls: list[str], smoke_fails: bool) -> object:
     return smoke
 
 
+def _run_profile_with_cleanup_expectation(
+    plan_path: Path,
+    output_root: Path,
+    *,
+    smoke_fails: bool,
+    cleanup_fails: bool,
+) -> None:
+    if not cleanup_fails:
+        run_expected_profile(plan_path, output_root, smoke_fails=smoke_fails)
+        return
+    with pytest.raises(ProfileCleanupUnverified, match="remains nonterminal"):
+        run_profile_worker(plan_path, output_root)
+    destination = output_root / "serving-profiles/profile-one"
+    assert (destination / "failure.json").is_file()
+    assert (destination / "checksums.json").is_file()
+    assert not (destination / "_FAILED").exists()
+    assert not (destination / "_SELECTED").exists()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
 @pytest.mark.parametrize("smoke_fails", [False, True])
 @pytest.mark.parametrize("managed_endpoint", [False, True])
 def test_profile_worker_always_pauses_owned_endpoint(
@@ -1315,6 +1344,7 @@ def test_profile_worker_always_pauses_owned_endpoint(
     monkeypatch: pytest.MonkeyPatch,
     smoke_fails: bool,
     managed_endpoint: bool,
+    cleanup_fails: bool,
 ) -> None:
     deployment = _profile_test_deployment(remote_spec, managed_endpoint)
     spec = remote_spec.model_copy(
@@ -1339,6 +1369,8 @@ def test_profile_worker_always_pauses_owned_endpoint(
 
         def pause_and_verify(self) -> dict[str, object]:
             calls.append("pause")
+            if cleanup_fails:
+                raise RuntimeError("pause failed")
             return {}
 
     monkeypatch.setenv("HF_TOKEN", "hf_test")
@@ -1354,13 +1386,15 @@ def test_profile_worker_always_pauses_owned_endpoint(
     class Provisioner:
         def __init__(self, _adapter: object) -> None:
             calls.append("provisioner")
+            self.created = False
 
-        def inspect(self, *_args: object, **_kwargs: object) -> None:
+        def inspect(self, *_args: object, **_kwargs: object) -> object | None:
             calls.append("provision-inspect")
-            return None
+            return {} if self.created else None
 
         def create_or_adopt(self, *_args: object, **_kwargs: object) -> None:
             calls.append("provision")
+            self.created = True
 
     monkeypatch.setattr("harbor_hf.profile_worker.EndpointProvisioner", Provisioner)
     monkeypatch.setattr("harbor_hf.profile_worker.EndpointManager", Manager)
@@ -1390,10 +1424,11 @@ def test_profile_worker_always_pauses_owned_endpoint(
         lambda *_args, **_kwargs: [point(1, 10.0)],
     )
 
-    run_expected_profile(
+    _run_profile_with_cleanup_expectation(
         plan_path,
         tmp_path / "output",
         smoke_fails=smoke_fails,
+        cleanup_fails=cleanup_fails,
     )
 
     _assert_profile_endpoint_order(calls, managed_endpoint)

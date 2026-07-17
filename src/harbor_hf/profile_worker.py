@@ -27,7 +27,7 @@ from harbor_hf.harbor_adapter.errors import HarborTrialFailure
 from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
 from harbor_hf.harbor_adapter.validation import load_compatibility_bundle
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import EndpointRef, ExperimentSpec
 from harbor_hf.process import SubprocessRunner, run_streaming
 from harbor_hf.profile_worker_transport import ProfileTransport
 from harbor_hf.profiling import (
@@ -59,6 +59,10 @@ from harbor_hf.worker import (
 
 class ProfileWorkerError(RuntimeError):
     """Raised when remote serving-profile evidence cannot be produced safely."""
+
+
+class ProfileCleanupUnverified(ProfileWorkerError):
+    """Raised when endpoint shutdown cannot be verified."""
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,14 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
         _finalize_profile(destination, secrets)
         (destination / "_SELECTED").write_text(selected_digest + "\n", encoding="utf-8")
         return destination
+    except ProfileCleanupUnverified as error:
+        failure = {
+            "error_type": type(error).__name__,
+            "message": _redact_message(str(error), secrets),
+        }
+        write_json(destination / "failure.json", failure)
+        _finalize_profile(destination, secrets)
+        raise
     except Exception as error:
         failure = {
             "error_type": type(error).__name__,
@@ -199,30 +211,32 @@ def _profile_transport(
     if endpoint is None:
         raise ProfileWorkerError("profile endpoint binding is missing")
     manager = EndpointManager(endpoint.namespace, endpoint.name, SubprocessRunner())
-    if desired_endpoint is not None:
-        provisioner = EndpointProvisioner(HuggingFaceEndpointAdapter(token=token))
-        existing = provisioner.inspect(desired_endpoint)
-        if existing is not None:
-            provisioner.create_or_adopt(
+    provisioner = (
+        EndpointProvisioner(HuggingFaceEndpointAdapter(token=token))
+        if desired_endpoint is not None
+        else None
+    )
+    cleanup_required = desired_endpoint is not None
+    try:
+        if desired_endpoint is not None:
+            assert provisioner is not None
+            _prepare_managed_profile_endpoint(
+                provisioner,
                 desired_endpoint,
-                timeout_seconds=min(900, _remaining(deadline)),
+                run_lock,
+                endpoint,
+                token,
+                deadline,
             )
-            launch_cleanup_watchdog(run_lock, endpoint, token)
         else:
+            baseline = manager.describe()
+            validate_endpoint_model(run_lock, baseline)
+            require_paused_endpoint(baseline)
+            cleanup_required = True
             launch_cleanup_watchdog(run_lock, endpoint, token)
-            provisioner.create_or_adopt(
-                desired_endpoint,
-                timeout_seconds=min(900, _remaining(deadline)),
-            )
-    else:
         baseline = manager.describe()
         validate_endpoint_model(run_lock, baseline)
         require_paused_endpoint(baseline)
-        launch_cleanup_watchdog(run_lock, endpoint, token)
-    baseline = manager.describe()
-    validate_endpoint_model(run_lock, baseline)
-    require_paused_endpoint(baseline)
-    try:
         base_url = resume_and_probe_endpoint(
             destination,
             destination / "events.jsonl",
@@ -233,7 +247,49 @@ def _profile_transport(
         )
         yield ProfileTransport.for_endpoint(base_url, endpoint.served_model_name)
     finally:
-        manager.pause_and_verify()
+        if cleanup_required:
+            _cleanup_profile_endpoint(manager, provisioner, desired_endpoint)
+
+
+def _prepare_managed_profile_endpoint(
+    provisioner: EndpointProvisioner,
+    desired: DesiredEndpoint,
+    run_lock: RunLock,
+    endpoint: EndpointRef,
+    token: str,
+    deadline: float,
+) -> None:
+    existing = provisioner.inspect(desired)
+    if existing is not None:
+        provisioner.create_or_adopt(
+            desired,
+            timeout_seconds=min(900, _remaining(deadline)),
+        )
+        launch_cleanup_watchdog(run_lock, endpoint, token)
+        return
+    launch_cleanup_watchdog(run_lock, endpoint, token)
+    provisioner.create_or_adopt(
+        desired,
+        timeout_seconds=min(900, _remaining(deadline)),
+    )
+
+
+def _cleanup_profile_endpoint(
+    manager: EndpointManager,
+    provisioner: EndpointProvisioner | None,
+    desired: DesiredEndpoint | None,
+) -> None:
+    try:
+        if (
+            desired is None
+            or provisioner is None
+            or provisioner.inspect(desired) is not None
+        ):
+            manager.pause_and_verify()
+    except Exception as error:
+        raise ProfileCleanupUnverified(
+            "endpoint cleanup is not verified; profile remains nonterminal"
+        ) from error
 
 
 def _verify_smoke(
@@ -436,14 +492,16 @@ def _run_boundary_repetitions(
 ) -> list[ProfilePoint]:
     points: list[ProfilePoint] = []
     for concurrency in boundary:
-        completed_repetitions = {
-            point.repetition
-            for point in existing_points
-            if point.concurrency == concurrency
-        }
-        for repetition in range(2, plan.workload.boundary_repetitions + 1):
-            if repetition in completed_repetitions:
-                continue
+        concurrency_points = [
+            point for point in existing_points if point.concurrency == concurrency
+        ]
+        eligible_count = sum(
+            _point_passes_objective(plan, point) for point in concurrency_points
+        )
+        repetition = (
+            max((point.repetition for point in concurrency_points), default=0) + 1
+        )
+        while eligible_count < plan.workload.boundary_repetitions:
             if time.monotonic() >= deadline:
                 point = _skipped_point(
                     concurrency,
@@ -472,6 +530,10 @@ def _run_boundary_repetitions(
             )
             points.append(point)
             _write_point(destination, point, result.observations, result.elapsed_ms)
+            if not _point_passes_objective(plan, point):
+                break
+            eligible_count += 1
+            repetition += 1
     return points
 
 
@@ -495,18 +557,7 @@ def _run_point(
     destination: Path,
     deadline: float,
 ) -> _PointResult:
-    sampled_tasks = _sample_tasks(plan)
-    minimum = max(plan.workload.minimum_observations_per_point, 2 * concurrency)
-    if isinstance(plan.deployment, ProviderTarget):
-        tasks = dict(list(sampled_tasks.items())[:minimum])
-        if len(tasks) < minimum:
-            raise ProfileWorkerError(
-                "provider profile lacks distinct tasks for this concurrency"
-            )
-        attempts = 1
-    else:
-        tasks = sampled_tasks
-        attempts = math.ceil(minimum / len(tasks))
+    tasks, attempts = _point_workload(plan, concurrency)
     point_root = destination / "points" / str(concurrency) / str(repetition)
     jobs_dir = point_root / "harbor-jobs"
     execution_root = point_root / "harbor-execution"
@@ -585,6 +636,18 @@ def _run_point(
     bundle = load_compatibility_bundle(outcome.compatibility_path, prepared.request)
     observations = [_task_observation(trial) for trial in bundle.trials]
     return _PointResult(observations=observations, elapsed_ms=elapsed_ms)
+
+
+def _point_workload(plan: ProfilePlan, concurrency: int) -> tuple[dict[str, str], int]:
+    tasks = _sample_tasks(plan)
+    minimum = max(plan.workload.minimum_observations_per_point, 2 * concurrency)
+    if isinstance(plan.deployment, ProviderTarget):
+        if len(tasks) < minimum:
+            raise ProfileWorkerError(
+                "provider profile lacks distinct tasks for this concurrency"
+            )
+        return tasks, 1
+    return tasks, math.ceil(minimum / len(tasks))
 
 
 def _task_observation(trial: HarborCompatibilityTrial) -> _TaskObservation:

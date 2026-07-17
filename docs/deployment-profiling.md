@@ -226,8 +226,13 @@ replicas on every exit path. It first verifies ordinary chat, the reasoning
 channel when required, and a forced tool call. It then records content-free
 request observations for the endpoint or Inference Provider, tests ascending
 powers of two by running the sampled benchmark tasks through Harbor and the
-declared agent, and repeats the last two viable boundary points three times.
-The operator machine never loads model weights or performs inference.
+declared agent, and repeats the last two viable boundary points until each has
+three successful measurements. Failed health-check attempts remain in the raw
+evidence but do not replace those measurements. Provider points use the same
+distinct task set at every concurrency so workload composition cannot affect
+selection. Cleanup uncertainty leaves the profile nonterminal for operator or
+watchdog recovery. The operator machine never loads model weights or performs
+inference.
 
 `select` recomputes every point digest before choosing the winner. A campaign
 can bind the resulting profile under `execution.serving_profile`; validation

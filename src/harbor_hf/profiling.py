@@ -398,11 +398,7 @@ def select_profile(profile: ServingProfile) -> ServingProfile:
     all_points: dict[int, list[ProfilePoint]] = {}
     for point in profile.points:
         all_points.setdefault(point.concurrency, []).append(point)
-    grouped = {
-        concurrency: points
-        for concurrency, points in all_points.items()
-        if _eligible_repetition_group(profile, points)
-    }
+    grouped = _eligible_groups(profile, all_points)
     if not grouped:
         raise ValueError("profile has no eligible completed points")
     if profile.objective.kind == "maximum_stable_concurrency":
@@ -492,18 +488,30 @@ def _eligible(profile: ServingProfile, point: ProfilePoint) -> bool:
 
 def _eligible_repetition_group(
     profile: ServingProfile, points: list[ProfilePoint]
-) -> bool:
+) -> list[ProfilePoint] | None:
     repetitions = [point.repetition for point in points]
     if len(repetitions) != len(set(repetitions)) or 1 not in repetitions:
-        return False
+        return None
+    eligible = [point for point in points if _eligible(profile, point)]
+    if not eligible:
+        return None
     repetitions_required = (
         profile.objective.kind == "maximum_stable_concurrency" or len(points) > 1
     )
-    if repetitions_required and set(repetitions) != set(
-        range(1, profile.workload.boundary_repetitions + 1)
-    ):
-        return False
-    return all(_eligible(profile, point) for point in points)
+    if repetitions_required and len(eligible) != profile.workload.boundary_repetitions:
+        return None
+    return eligible
+
+
+def _eligible_groups(
+    profile: ServingProfile, all_points: dict[int, list[ProfilePoint]]
+) -> dict[int, list[ProfilePoint]]:
+    grouped: dict[int, list[ProfilePoint]] = {}
+    for concurrency, points in all_points.items():
+        eligible = _eligible_repetition_group(profile, points)
+        if eligible is not None:
+            grouped[concurrency] = eligible
+    return grouped
 
 
 def _score(kind: ObjectiveKind, points: list[ProfilePoint]) -> float:
