@@ -1,4 +1,9 @@
-# harbor-hf
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/harbor-hf-logo-dark.svg">
+    <img alt="harbor-hf" src="assets/harbor-hf-logo.svg" width="400">
+  </picture>
+</p>
 
 `harbor-hf` is a Harbor companion CLI for reproducible benchmark execution on
 Hugging Face infrastructure. It plans experiment matrices, manages remote
