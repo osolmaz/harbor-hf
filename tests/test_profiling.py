@@ -13,9 +13,15 @@ import pytest
 from typer.testing import CliRunner
 
 from harbor_hf.cli import app
+from harbor_hf.endpoints import bind_endpoint
 from harbor_hf.harbor_adapter.errors import HarborTrialFailure
 from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
-from harbor_hf.models import DeploymentProfile, ExperimentSpec, ServingProfileBinding
+from harbor_hf.models import (
+    DeploymentProfile,
+    EndpointRef,
+    ExperimentSpec,
+    ServingProfileBinding,
+)
 from harbor_hf.profile_preflight import preflight_profile_plan
 from harbor_hf.profile_submission import build_profile_submit_command
 from harbor_hf.profile_worker import (
@@ -472,6 +478,59 @@ def test_serving_profile_binding_fails_closed_on_concurrency(
         )
 
 
+def test_managed_endpoint_binding_preserves_profile_identity(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deployment = remote_spec.matrix.deployments[0].model_copy(update={"endpoint": None})
+    spec = profiled_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"deployments": [deployment]}
+                )
+            }
+        )
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1],
+        max_spend_usd="5.00",
+        profile_timeout_seconds=3600,
+    )
+    binding = ServingProfileBinding(
+        profile_id=resolved.profile_id,
+        profile_sha256="sha256:" + "9" * 64,
+        artifact_uri=(
+            "hf://buckets/osolmaz/benchmark-runs/serving-profiles/"
+            "profile-one/profile.json"
+        ),
+        concurrency=1,
+        **resolved.identity.model_dump(mode="python"),
+    )
+    profiled = ExperimentSpec.model_validate(
+        spec.model_copy(
+            update={
+                "execution": spec.execution.model_copy(
+                    update={"serving_profile": binding}
+                )
+            }
+        ).model_dump(mode="python")
+    )
+
+    bound = bind_endpoint(
+        profiled,
+        deployment_id=deployment.id,
+        endpoint=EndpointRef(
+            namespace="osolmaz",
+            name="managed-profile-endpoint",
+            served_model_name="/repository",
+        ),
+    )
+
+    assert ExperimentSpec.model_validate(bound.model_dump(mode="python")) == bound
+
+
 def test_profile_submit_command_is_remote_only(remote_spec: ExperimentSpec) -> None:
     command = build_profile_submit_command(
         plan(remote_spec), input_dir="hf://buckets/input", bucket="osolmaz/results"
@@ -840,10 +899,47 @@ def test_provider_preflight_enforces_profile_spend_cap(
         candidate_concurrency=[1, 2],
         max_spend_usd="5.00",
         profile_timeout_seconds=3600,
+        estimated_profile_cost_usd="6",
     )
 
     with pytest.raises(ValueError, match="exceeds spend cap"):
         preflight_profile_plan(resolved, api=FakeProviderApi(), token="hf_test")
+
+
+def test_provider_preflight_uses_full_profile_not_wave_estimate(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = profiled_spec(remote_spec)
+    model = spec.matrix.models[0].model_copy(update={"revision": "a" * 40})
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(
+            max_concurrent_requests=2,
+            max_spend_usd=Decimal("10"),
+            estimated_wave_cost_usd=Decimal("1"),
+        ),
+    )
+    spec = spec.model_copy(
+        update={
+            "matrix": spec.matrix.model_copy(
+                update={"models": [model], "deployments": [provider]}
+            )
+        }
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="profile-one",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="10",
+        profile_timeout_seconds=3600,
+        estimated_profile_cost_usd="6",
+    )
+
+    report = preflight_profile_plan(resolved, api=FakeProviderApi(), token="hf_test")
+
+    assert report.estimated_cost_usd == Decimal("6")
 
 
 def test_profile_plan_cli_writes_local_plan(

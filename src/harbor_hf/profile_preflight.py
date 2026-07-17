@@ -75,14 +75,18 @@ def _preflight_provider(
     if not providers:
         raise ValueError("model has no live Hugging Face Inference Provider route")
     limits = target.limits
-    estimate = limits.estimated_wave_cost_usd
+    estimate = (
+        Decimal(plan.estimated_profile_cost_usd)
+        if plan.estimated_profile_cost_usd is not None
+        else None
+    )
     target_cap = limits.max_spend_usd
     if estimate is None or target_cap is None:
         raise ValueError(
             "provider profile requires a bounded full-profile cost estimate"
         )
     if estimate > target_cap:
-        raise ValueError("provider profile estimate exceeds the provider spend cap")
+        raise ValueError("full-profile estimate exceeds the provider spend cap")
     if estimate > cap:
         raise ValueError(
             f"profile estimate ${estimate:.2f} exceeds spend cap ${cap:.2f}"

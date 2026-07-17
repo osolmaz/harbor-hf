@@ -156,6 +156,9 @@ def profile_plan(
     output: Annotated[Path, typer.Option("--output", dir_okay=False)],
     profile_id: Annotated[str, typer.Option("--profile-id")],
     max_spend_usd: Annotated[str, typer.Option("--max-spend-usd")],
+    estimated_profile_cost_usd: Annotated[
+        str | None, typer.Option("--estimated-profile-cost-usd")
+    ] = None,
     timeout_seconds: Annotated[int, typer.Option("--timeout-seconds", min=1)] = 3600,
     concurrency: Annotated[
         list[int] | None, typer.Option("--concurrency", min=1)
@@ -169,6 +172,7 @@ def profile_plan(
             candidate_concurrency=concurrency or [1, 2, 4, 8, 16, 32, 64],
             max_spend_usd=max_spend_usd,
             profile_timeout_seconds=timeout_seconds,
+            estimated_profile_cost_usd=estimated_profile_cost_usd,
         )
         output.write_text(
             json.dumps(resolved.model_dump(mode="json"), indent=2, sort_keys=True)

@@ -471,7 +471,7 @@ def _validate_binding_identity(
 ) -> None:
     expected = {
         "model_sha256": _canonical_profile_digest(model),
-        "deployment_sha256": _canonical_profile_digest(deployment),
+        "deployment_sha256": profile_deployment_digest(deployment),
         "agent_sha256": _canonical_profile_digest(agent),
         "benchmark_sha256": _canonical_profile_digest(
             spec.benchmark.model_dump(mode="json", exclude_none=True)
@@ -500,6 +500,16 @@ def _canonical_profile_digest(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def profile_deployment_digest(deployment: DeploymentTarget) -> str:
+    """Hash serving behavior without a transient endpoint resource identity."""
+    value = deployment.model_dump(
+        mode="json",
+        exclude={"endpoint"},
+        exclude_none=True,
+    )
+    return _canonical_profile_digest(value)
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:

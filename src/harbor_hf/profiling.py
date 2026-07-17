@@ -20,6 +20,7 @@ from harbor_hf.models import (
     DeploymentTarget,
     ExperimentSpec,
     ModelProfile,
+    profile_deployment_digest,
 )
 from harbor_hf.planner import RunCell, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
@@ -171,12 +172,21 @@ class ProfilePlan(FrozenModel):
     candidate_concurrency: list[int]
     artifacts: ProfileArtifacts
     max_spend_usd: str
+    estimated_profile_cost_usd: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     profile_timeout_seconds: int = Field(ge=1)
     reasoning_required: bool
 
     @model_validator(mode="after")
     def candidate_ladder_is_valid(self) -> ProfilePlan:
         _validate_candidate_ladder(self.candidate_concurrency)
+        if self.estimated_profile_cost_usd is not None:
+            if not isinstance(self.deployment, ProviderTarget):
+                raise ValueError(
+                    "full-profile cost estimates apply only to Inference Providers"
+                )
+            _positive_cost_estimate(self.estimated_profile_cost_usd)
         return self
 
 
@@ -224,6 +234,7 @@ def build_profile_plan(
     candidate_concurrency: list[int],
     max_spend_usd: str,
     profile_timeout_seconds: int,
+    estimated_profile_cost_usd: str | None = None,
     sample_task_count: int = 8,
     objective: ProfileObjective | None = None,
 ) -> ProfilePlan:
@@ -243,6 +254,10 @@ def build_profile_plan(
             "profile concurrency exceeds the provider request concurrency limit"
         )
     max_spend_usd = str(spend_cap)
+    profile_cost_estimate = _profile_cost_estimate(
+        deployment,
+        estimated_profile_cost_usd,
+    )
     context = spec.execution.server_context_tokens
     output = spec.execution.max_output_tokens
     if context is None or output is None:
@@ -256,7 +271,7 @@ def build_profile_plan(
     benchmark = spec.benchmark.model_dump(mode="json", exclude_none=True)
     identity = ProfileIdentity(
         model_sha256=canonical_digest(model),
-        deployment_sha256=canonical_digest(deployment),
+        deployment_sha256=profile_deployment_digest(deployment),
         agent_sha256=canonical_digest(agent),
         benchmark_sha256=canonical_digest(benchmark),
         server_context_tokens=context,
@@ -287,6 +302,7 @@ def build_profile_plan(
         "candidate_concurrency": candidate_concurrency,
         "artifacts": artifacts.model_dump(mode="json"),
         "max_spend_usd": max_spend_usd,
+        "estimated_profile_cost_usd": profile_cost_estimate,
         "profile_timeout_seconds": profile_timeout_seconds,
         "reasoning_required": spec.execution.reasoning_required,
     }
@@ -296,6 +312,29 @@ def build_profile_plan(
             **core,
         }
     )
+
+
+def _profile_cost_estimate(
+    deployment: DeploymentTarget,
+    value: str | None,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(deployment, ProviderTarget):
+        raise ValueError(
+            "full-profile cost estimates apply only to Inference Providers"
+        )
+    return str(_positive_cost_estimate(value))
+
+
+def _positive_cost_estimate(value: str) -> Decimal:
+    try:
+        estimate = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError("profile cost estimate must be finite") from error
+    if not estimate.is_finite() or estimate <= 0:
+        raise ValueError("profile cost estimate must be positive and finite")
+    return estimate
 
 
 def _validate_plan_inputs(

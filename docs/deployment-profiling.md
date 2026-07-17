@@ -57,6 +57,9 @@ digests. Together they cover the model repository and revision, weight format
 and quantization, serving engine and image, ordered arguments, hardware,
 replicas, activation and KV precision, context and batching limits, chat
 template, reasoning parser, sampling, caching, and speculative decoding.
+The deployment digest excludes the endpoint resource reference. A managed
+endpoint receives its deterministic name only after planning, and that
+transient address must not change the serving configuration identity.
 
 `benchmark_sha256` covers the benchmark revision, task digests, and the sampled
 workload distribution. It prevents a short synthetic sweep from being treated
@@ -186,6 +189,7 @@ The production CLI exposes:
 
 ```text
 harbor-hf profile plan EXPERIMENT --profile-id ID --max-spend-usd USD \
+  --estimated-profile-cost-usd USD \
   --timeout-seconds 3600 --output plan.json
 harbor-hf profile preflight plan.json
 harbor-hf profile run plan.json
@@ -198,7 +202,9 @@ does not depend on mutable local state. `preflight` verifies the model revision,
 private Bucket, provider route or endpoint compute, current accelerator quota,
 hourly price, worst-case profile cost, and declared spend cap. Unknown endpoint
 quota fails closed. Provider profiles require an explicit estimate for the full
-profile and reject it when it exceeds either the provider or profile spend cap.
+profile through `--estimated-profile-cost-usd`; this is distinct from the
+deployment's campaign-wave estimate. Preflight rejects it when it exceeds
+either the provider or profile spend cap. Endpoint profiles omit this option.
 
 `run` submits one Hugging Face Job. For an Inference Endpoint, the worker
 requires a paused baseline, starts the cleanup watchdog before resume, keeps
