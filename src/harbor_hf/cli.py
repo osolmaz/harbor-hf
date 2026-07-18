@@ -398,6 +398,7 @@ def campaign_reconcile_all(
     namespace: Annotated[str, typer.Option("--namespace")],
     apply: Annotated[bool, typer.Option("--apply")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    campaign_ids: Annotated[list[str] | None, typer.Option("--campaign-id")] = None,
     provider_active_waves: Annotated[
         int | None, typer.Option("--provider-active-waves", min=1)
     ] = None,
@@ -418,14 +419,21 @@ def campaign_reconcile_all(
     try:
         if apply:
             with hugging_face_campaign_reconciler(namespace) as reconciler:
-                results = reconciler.apply_all(context=context)
+                results = reconciler.apply_all(
+                    context=context,
+                    campaign_ids=campaign_ids,
+                )
         else:
             store = HubCampaignStore(namespace)
             results = [
                 plan_reconciliation(*store.load_campaign(campaign_id), context=context)[
                     1
                 ]
-                for campaign_id in store.list_campaigns()
+                for campaign_id in (
+                    list(dict.fromkeys(campaign_ids))
+                    if campaign_ids is not None
+                    else store.list_campaigns()
+                )
             ]
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
@@ -632,6 +640,7 @@ def automation_install(
     provider_active_waves: Annotated[
         int | None, typer.Option("--provider-active-waves", min=1)
     ] = None,
+    campaign_ids: Annotated[list[str] | None, typer.Option("--campaign-id")] = None,
     suspended: Annotated[bool, typer.Option("--suspended")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
@@ -653,6 +662,7 @@ def automation_install(
                 else []
             ),
             provider_active_waves=provider_active_waves,
+            campaign_ids=campaign_ids or [],
             suspended=suspended,
         )
         if dry_run:

@@ -4,7 +4,7 @@ import hashlib
 import json
 import tempfile
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -518,12 +518,17 @@ class CampaignReconciler:
         self,
         *,
         context: ReconcileContext | None = None,
+        campaign_ids: Sequence[str] | None = None,
     ) -> list[CampaignApplyResult | CampaignApplyFailure]:
         results: list[CampaignApplyResult | CampaignApplyFailure] = []
-        campaign_ids = self.store.list_campaigns()
+        selected_campaign_ids = (
+            list(dict.fromkeys(campaign_ids))
+            if campaign_ids is not None
+            else self.store.list_campaigns()
+        )
         observed: dict[str, AdmissionUsage] = {}
         admission_unknown = False
-        for campaign_id in campaign_ids:
+        for campaign_id in selected_campaign_ids:
             try:
                 observed[campaign_id] = self._admission_usage(campaign_id)
             except Exception:
@@ -543,7 +548,7 @@ class CampaignReconciler:
                     )
                 }
             )
-        for campaign_id in campaign_ids:
+        for campaign_id in selected_campaign_ids:
             try:
                 campaign_context = baseline.model_copy(
                     update={
