@@ -82,12 +82,14 @@ without touching remote resources.
 Install the managed automation so reconciliation runs without you:
 
 ```bash
-uv run harbor-hf automation install automation.yaml --schedule "<cron>"
+uv run harbor-hf automation install automation.yaml --schedule "<cron>" \
+  --provider-active-waves 2
 ```
 
 This sets up a scheduled HF Job plus a control webhook, so campaigns make
 progress promptly after every state change and recover when a webhook is
-missed.
+missed. Set `--provider-active-waves` to the live serving quota when several
+campaigns share one inference provider.
 
 Operate a running campaign with:
 

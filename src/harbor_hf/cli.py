@@ -75,7 +75,7 @@ from harbor_hf.profiling import (
     load_serving_profile,
     select_profile,
 )
-from harbor_hf.reconciler import plan_reconciliation
+from harbor_hf.reconciler import AdmissionLimits, ReconcileContext, plan_reconciliation
 from harbor_hf.recovery import project_recovery
 from harbor_hf.result_publisher import (
     DatasetApi,
@@ -398,19 +398,33 @@ def campaign_reconcile_all(
     namespace: Annotated[str, typer.Option("--namespace")],
     apply: Annotated[bool, typer.Option("--apply")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    provider_active_waves: Annotated[
+        int | None, typer.Option("--provider-active-waves", min=1)
+    ] = None,
 ) -> None:
     """Reconcile every campaign in the namespace once."""
     if dry_run == apply:
         typer.echo("Error: choose exactly one of --dry-run or --apply", err=True)
         raise typer.Exit(code=2)
+    context = ReconcileContext(
+        limits=AdmissionLimits(
+            provider_active_waves=(
+                provider_active_waves
+                if provider_active_waves is not None
+                else AdmissionLimits().provider_active_waves
+            )
+        )
+    )
     try:
         if apply:
             with hugging_face_campaign_reconciler(namespace) as reconciler:
-                results = reconciler.apply_all()
+                results = reconciler.apply_all(context=context)
         else:
             store = HubCampaignStore(namespace)
             results = [
-                plan_reconciliation(*store.load_campaign(campaign_id))[1]
+                plan_reconciliation(*store.load_campaign(campaign_id), context=context)[
+                    1
+                ]
                 for campaign_id in store.list_campaigns()
             ]
     except _OPERATION_ERRORS as error:
@@ -615,6 +629,9 @@ def automation_install(
     manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     schedule: Annotated[str, typer.Option("--schedule")],
     namespace: Annotated[str | None, typer.Option("--namespace")] = None,
+    provider_active_waves: Annotated[
+        int | None, typer.Option("--provider-active-waves", min=1)
+    ] = None,
     suspended: Annotated[bool, typer.Option("--suspended")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
@@ -635,6 +652,7 @@ def automation_install(
                 and spec.benchmark.source.credentials is not None
                 else []
             ),
+            provider_active_waves=provider_active_waves,
             suspended=suspended,
         )
         if dry_run:

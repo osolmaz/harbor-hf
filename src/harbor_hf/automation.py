@@ -27,6 +27,7 @@ class AutomationRequest(FrozenModel):
     schedule: str = Field(min_length=1)
     remote: RemoteExecutionSpec
     secret_names: list[str] = Field(default_factory=list)
+    provider_active_waves: int | None = Field(default=None, ge=1)
     suspended: bool = False
 
     @field_validator("secret_names")
@@ -56,6 +57,7 @@ class AutomationPlan(FrozenModel):
     image: str
     command: list[str]
     secret_names: list[str]
+    provider_active_waves: int | None
     control_repository: str
 
 
@@ -70,7 +72,7 @@ class AutomationApi(Protocol):
 
 
 def scheduled_reconciler_command(request: AutomationRequest) -> list[str]:
-    return locked_source_command(
+    command = locked_source_command(
         request.remote.worker,
         "harbor-hf",
         "campaign",
@@ -79,6 +81,9 @@ def scheduled_reconciler_command(request: AutomationRequest) -> list[str]:
         request.namespace,
         "--apply",
     )
+    if request.provider_active_waves is not None:
+        command.extend(["--provider-active-waves", str(request.provider_active_waves)])
+    return command
 
 
 def install_automation(
@@ -187,6 +192,7 @@ def automation_plan(request: AutomationRequest) -> AutomationPlan:
             request.remote.job.token_secret_name,
             *request.secret_names,
         ],
+        provider_active_waves=request.provider_active_waves,
         control_repository=coordination_repository(request.namespace),
     )
 
