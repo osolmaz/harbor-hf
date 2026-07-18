@@ -424,6 +424,10 @@ def test_profile_point_preserves_individual_harbor_trial_failures(
 
     assert [observation.success for observation in result.observations] == [True, False]
     assert result.observations[1].error == "SandboxError"
+    assert (tmp_path / "profile" / "points" / "1" / "1" / "harbor-jobs").is_dir()
+    assert (
+        tmp_path / "profile" / "points" / "1" / "1" / "harbor-execution"
+    ).is_dir()
 
 
 def test_profile_ladder_skips_repetition_used_by_health_retry(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import statistics
 import tempfile
 import time
@@ -601,8 +602,38 @@ def _run_point(
     destination: Path,
     deadline: float,
 ) -> _PointResult:
+    with tempfile.TemporaryDirectory(prefix="harbor-hf-profile-point-") as temporary:
+        point_root = Path(temporary) / "point"
+        result = _run_staged_point(
+            plan,
+            run_lock,
+            transport,
+            harbor_source,
+            token,
+            concurrency,
+            repetition=repetition,
+            point_root=point_root,
+            deadline=deadline,
+        )
+        archived = destination / "points" / str(concurrency) / str(repetition)
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(point_root, archived)
+        return result
+
+
+def _run_staged_point(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    harbor_source: Path,
+    token: str,
+    concurrency: int,
+    *,
+    repetition: int,
+    point_root: Path,
+    deadline: float,
+) -> _PointResult:
     tasks, attempts = _point_workload(plan, concurrency)
-    point_root = destination / "points" / str(concurrency) / str(repetition)
     jobs_dir = point_root / "harbor-jobs"
     execution_root = point_root / "harbor-execution"
     jobs_dir.mkdir(parents=True)
