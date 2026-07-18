@@ -239,6 +239,15 @@ selection. Cleanup uncertainty leaves the profile nonterminal for operator or
 watchdog recovery. The operator machine never loads model weights or performs
 inference.
 
+The worker is restart-safe. It stores an absolute profile deadline before
+remote work, validates the original plan on restart, recomputes saved point
+metrics from their raw task observations, and resumes only missing ladder or
+boundary repetitions. If selection was already written, it verifies the
+selected profile against the plan and requires the endpoint to be paused before
+publishing `_SELECTED`. A conflicting plan, marker, point, or expired deadline
+still fails closed. This preserves the original cost bound across controller
+restarts instead of silently granting a fresh profiling budget.
+
 `select` recomputes every point digest before choosing the winner. A campaign
 can bind the resulting profile under `execution.serving_profile`; validation
 then requires exact model, deployment, agent, benchmark, context, output, and

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -9,7 +10,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -36,6 +37,7 @@ from harbor_hf.profile_worker_transport import ProfileTransport
 from harbor_hf.profiling import (
     ProfilePlan,
     ProfilePoint,
+    ServingProfile,
     bind_profile_target,
     build_profile_plan,
     canonical_digest,
@@ -95,6 +97,12 @@ class _PointResult:
     elapsed_ms: float
 
 
+@dataclass(frozen=True)
+class _ProfileRecovery:
+    existing_points: list[ProfilePoint]
+    selected: ServingProfile | None = None
+
+
 def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
     plan = ProfilePlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
     spec = ExperimentSpec.model_validate(plan.experiment)
@@ -117,10 +125,9 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
     if spec.remote is None:
         raise ProfileWorkerError("profile worker requires remote execution settings")
     destination = output_root / plan.artifacts.prefix
-    if destination.exists():
-        raise ProfileWorkerError("profile artifact prefix already exists")
-    destination.mkdir(parents=True)
-    write_json(destination / "plan.json", plan.model_dump(mode="json"))
+    recovery = _prepare_profile_destination(plan, destination)
+    if recovery is None:
+        return destination
     secrets: str | tuple[str, ...] = token
     try:
         profile = new_unselected_profile(plan)
@@ -133,10 +140,18 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
             run_id=f"profile-{plan.profile_id}",
             allow_provider=True,
         )
-        deadline = time.monotonic() + plan.profile_timeout_seconds
+        deadline = _profile_deadline(destination)
         require_executable("git")
         require_executable("uv")
         secrets = run_secret_values(run_lock, token)
+        if recovery.selected is not None:
+            _require_recovered_profile_cleanup(run_lock)
+            _finalize_profile(destination, secrets)
+            selected_digest = canonical_digest(recovery.selected)
+            (destination / "_SELECTED").write_text(
+                selected_digest + "\n", encoding="utf-8"
+            )
+            return destination
         with tempfile.TemporaryDirectory(prefix="harbor-hf-profile-") as temporary:
             harbor_source = Path(temporary) / "harbor"
             prepare_locked_source(
@@ -159,6 +174,7 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
                     token,
                     destination,
                     deadline,
+                    existing_points=recovery.existing_points,
                 )
                 profile = profile.model_copy(update={"points": points})
         selected = select_profile(profile)
@@ -187,6 +203,111 @@ def run_profile_worker(plan_path: Path, output_root: Path) -> Path:
         _finalize_profile(destination, secrets)
         write_json(destination / "_FAILED", failure)
         raise
+
+
+def _prepare_profile_destination(
+    plan: ProfilePlan, destination: Path
+) -> _ProfileRecovery | None:
+    if destination.exists():
+        return _recover_profile_destination(plan, destination)
+    destination.mkdir(parents=True)
+    write_json(destination / "plan.json", plan.model_dump(mode="json"))
+    started_at = datetime.now(UTC)
+    write_json(
+        destination / "lifecycle.json",
+        {
+            "deadline_at": (
+                started_at + timedelta(seconds=plan.profile_timeout_seconds)
+            ).isoformat(),
+            "plan_sha256": plan.plan_sha256,
+            "started_at": started_at.isoformat(),
+        },
+    )
+    return _ProfileRecovery(existing_points=[])
+
+
+def _recover_profile_destination(
+    plan: ProfilePlan, destination: Path
+) -> _ProfileRecovery | None:
+    stored_plan_path = destination / "plan.json"
+    if not stored_plan_path.is_file():
+        raise ProfileWorkerError("existing profile prefix has no plan")
+    stored_plan = ProfilePlan.model_validate_json(
+        stored_plan_path.read_text(encoding="utf-8")
+    )
+    if stored_plan != plan:
+        raise ProfileWorkerError("existing profile prefix belongs to another plan")
+    markers = [
+        marker for marker in ("_SELECTED", "_FAILED") if (destination / marker).exists()
+    ]
+    if len(markers) > 1:
+        raise ProfileWorkerError("existing profile prefix has conflicting markers")
+    profile_path = destination / "profile.json"
+    if markers == ["_FAILED"]:
+        raise ProfileWorkerError("existing profile prefix is terminally failed")
+    if profile_path.is_file():
+        return _recover_selected_profile(plan, destination, markers)
+    if markers:
+        raise ProfileWorkerError("selected profile marker has no profile")
+    if not (destination / "lifecycle.json").is_file():
+        raise ProfileWorkerError("partial profile prefix predates restart recovery")
+    return _ProfileRecovery(existing_points=_load_recoverable_points(plan, destination))
+
+
+def _recover_selected_profile(
+    plan: ProfilePlan, destination: Path, markers: list[str]
+) -> _ProfileRecovery | None:
+    selected = ServingProfile.model_validate_json(
+        (destination / "profile.json").read_text(encoding="utf-8")
+    )
+    _validate_recovered_selection(plan, selected)
+    if markers == ["_SELECTED"]:
+        marker = (destination / "_SELECTED").read_text(encoding="utf-8").strip()
+        if marker != canonical_digest(selected):
+            raise ProfileWorkerError("selected profile marker digest does not match")
+        return None
+    return _ProfileRecovery(existing_points=selected.points, selected=selected)
+
+
+def _validate_recovered_selection(plan: ProfilePlan, profile: ServingProfile) -> None:
+    unselected = new_unselected_profile(plan).model_copy(
+        update={"created_at": profile.created_at, "points": profile.points}
+    )
+    if select_profile(unselected) != profile:
+        raise ProfileWorkerError("existing selected profile does not match its plan")
+
+
+def _profile_deadline(destination: Path) -> float:
+    lifecycle_path = destination / "lifecycle.json"
+    if not lifecycle_path.is_file():
+        return time.monotonic() + 300
+    lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    deadline_at = datetime.fromisoformat(str(lifecycle["deadline_at"]))
+    remaining = (deadline_at - datetime.now(UTC)).total_seconds()
+    if remaining < 1:
+        raise ProfileWorkerError(
+            "profile time budget exhausted before restart recovery"
+        )
+    return time.monotonic() + remaining
+
+
+def _require_recovered_profile_cleanup(run_lock: RunLock) -> None:
+    deployment = run_lock.deployment
+    if isinstance(deployment, ProviderTarget):
+        return
+    endpoint = deployment.endpoint
+    if endpoint is None:
+        raise ProfileWorkerError("recovered profile endpoint binding is missing")
+    try:
+        baseline = EndpointManager(
+            endpoint.namespace, endpoint.name, SubprocessRunner()
+        ).describe()
+        validate_endpoint_model(run_lock, baseline)
+        require_paused_endpoint(baseline)
+    except Exception as error:
+        raise ProfileCleanupUnverified(
+            "recovered endpoint cleanup is not verified; profile remains nonterminal"
+        ) from error
 
 
 @contextmanager
@@ -442,7 +563,11 @@ def _run_ladder(
     token: str,
     destination: Path,
     deadline: float,
+    *,
+    existing_points: list[ProfilePoint] | None = None,
 ) -> list[ProfilePoint]:
+    recovered = _recovered_point_map(existing_points or [])
+    consumed: set[tuple[int, int]] = set()
     points: list[ProfilePoint] = []
     previous_rates: list[float] = []
     for concurrency in plan.candidate_concurrency:
@@ -451,7 +576,7 @@ def _run_ladder(
             points.append(point)
             _write_point(destination, point, [], 0)
             break
-        result = _run_point(
+        point = _obtain_point(
             plan,
             run_lock,
             transport,
@@ -461,18 +586,13 @@ def _run_ladder(
             repetition=1,
             destination=destination,
             deadline=deadline,
-        )
-        point = _summarize_point(
-            concurrency,
-            result.observations,
-            elapsed_ms=result.elapsed_ms,
-            repetition=1,
+            recovered=recovered,
+            consumed=consumed,
         )
         points.append(point)
-        _write_point(destination, point, result.observations, result.elapsed_ms)
         if not _point_passes_objective(plan, point):
             _verify_smoke(plan, transport, token, deadline)
-            retry = _run_point(
+            retried_point = _obtain_point(
                 plan,
                 run_lock,
                 transport,
@@ -482,17 +602,10 @@ def _run_ladder(
                 repetition=2,
                 destination=destination,
                 deadline=deadline,
-            )
-            retried_point = _summarize_point(
-                concurrency,
-                retry.observations,
-                elapsed_ms=retry.elapsed_ms,
-                repetition=2,
+                recovered=recovered,
+                consumed=consumed,
             )
             points.append(retried_point)
-            _write_point(
-                destination, retried_point, retry.observations, retry.elapsed_ms
-            )
             if not _point_passes_objective(plan, retried_point):
                 break
             point = retried_point
@@ -519,8 +632,85 @@ def _run_ladder(
             deadline,
             boundary,
             points,
+            recovered=recovered,
+            consumed=consumed,
         )
     )
+    _require_all_recovered_points_consumed(recovered, consumed)
+    return points
+
+
+def _recovered_point_map(
+    points: list[ProfilePoint],
+) -> dict[tuple[int, int], ProfilePoint]:
+    recovered = {(point.concurrency, point.repetition): point for point in points}
+    if len(recovered) != len(points):
+        raise ProfileWorkerError("recovered profile contains duplicate points")
+    return recovered
+
+
+def _require_all_recovered_points_consumed(
+    recovered: dict[tuple[int, int], ProfilePoint],
+    consumed: set[tuple[int, int]],
+) -> None:
+    unused = sorted(set(recovered) - consumed)
+    if unused:
+        raise ProfileWorkerError(f"recovered profile has unreachable points: {unused}")
+
+
+def _load_recoverable_points(
+    plan: ProfilePlan, destination: Path
+) -> list[ProfilePoint]:
+    points: list[ProfilePoint] = []
+    for evidence_path in sorted((destination / "points").glob("*/*/evidence.json")):
+        try:
+            concurrency = int(evidence_path.parent.parent.name)
+            repetition = int(evidence_path.parent.name)
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            point = ProfilePoint.model_validate(evidence["point"])
+            observations = [
+                _TaskObservation(**observation)
+                for observation in evidence.get("observations", [])
+            ]
+            elapsed_ms = float(evidence.get("elapsed_ms", 0))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProfileWorkerError(
+                f"recovered point evidence is malformed: {evidence_path}"
+            ) from error
+        expected_prefix = f"points/{concurrency}/{repetition}/evidence.json"
+        if (
+            concurrency not in plan.candidate_concurrency
+            or point.concurrency != concurrency
+            or point.repetition != repetition
+            or point.artifact_prefix != expected_prefix
+        ):
+            raise ProfileWorkerError(
+                f"recovered point identity does not match its path: {evidence_path}"
+            )
+        payload = point.model_dump(
+            mode="json", exclude={"point_sha256"}, exclude_none=True
+        )
+        if canonical_digest(payload) != point.point_sha256:
+            raise ProfileWorkerError(
+                f"recovered point digest does not match: {evidence_path}"
+            )
+        if point.status == "skipped":
+            if observations or elapsed_ms != 0:
+                raise ProfileWorkerError(
+                    f"recovered skipped point has observations: {evidence_path}"
+                )
+        else:
+            summarized = _summarize_point(
+                concurrency,
+                observations,
+                elapsed_ms=elapsed_ms,
+                repetition=repetition,
+            )
+            if summarized != point:
+                raise ProfileWorkerError(
+                    f"recovered point does not match raw observations: {evidence_path}"
+                )
+        points.append(point)
     return points
 
 
@@ -534,7 +724,12 @@ def _run_boundary_repetitions(
     deadline: float,
     boundary: list[int],
     existing_points: list[ProfilePoint],
+    *,
+    recovered: dict[tuple[int, int], ProfilePoint] | None = None,
+    consumed: set[tuple[int, int]] | None = None,
 ) -> list[ProfilePoint]:
+    recovered = recovered or {}
+    consumed = consumed if consumed is not None else set()
     points: list[ProfilePoint] = []
     for concurrency in boundary:
         concurrency_points = [
@@ -556,7 +751,7 @@ def _run_boundary_repetitions(
                 points.append(point)
                 _write_point(destination, point, [], 0)
                 break
-            result = _run_point(
+            point = _obtain_point(
                 plan,
                 run_lock,
                 transport,
@@ -566,20 +761,54 @@ def _run_boundary_repetitions(
                 repetition=repetition,
                 destination=destination,
                 deadline=deadline,
-            )
-            point = _summarize_point(
-                concurrency,
-                result.observations,
-                elapsed_ms=result.elapsed_ms,
-                repetition=repetition,
+                recovered=recovered,
+                consumed=consumed,
             )
             points.append(point)
-            _write_point(destination, point, result.observations, result.elapsed_ms)
             if not _point_passes_objective(plan, point):
                 break
             eligible_count += 1
             repetition += 1
     return points
+
+
+def _obtain_point(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    harbor_source: Path,
+    token: str,
+    concurrency: int,
+    *,
+    repetition: int,
+    destination: Path,
+    deadline: float,
+    recovered: dict[tuple[int, int], ProfilePoint],
+    consumed: set[tuple[int, int]],
+) -> ProfilePoint:
+    key = (concurrency, repetition)
+    if point := recovered.get(key):
+        consumed.add(key)
+        return point
+    result = _run_point(
+        plan,
+        run_lock,
+        transport,
+        harbor_source,
+        token,
+        concurrency,
+        repetition=repetition,
+        destination=destination,
+        deadline=deadline,
+    )
+    point = _summarize_point(
+        concurrency,
+        result.observations,
+        elapsed_ms=result.elapsed_ms,
+        repetition=repetition,
+    )
+    _write_point(destination, point, result.observations, result.elapsed_ms)
+    return point
 
 
 def _point_ladder_rate(plan: ProfilePlan, point: ProfilePoint) -> float | None:

@@ -29,9 +29,11 @@ from harbor_hf.profile_worker import (
     ProfileCleanupUnverified,
     ProfileWorkerError,
     _finalize_profile,
+    _load_recoverable_points,
     _point_ladder_rate,
     _point_workload,
     _PointResult,
+    _prepare_profile_destination,
     _request,
     _run_ladder,
     _run_point,
@@ -39,6 +41,7 @@ from harbor_hf.profile_worker import (
     _summarize_point,
     _TaskObservation,
     _verify_smoke,
+    _write_point,
     run_profile_worker,
 )
 from harbor_hf.profiling import (
@@ -192,12 +195,111 @@ def run_expected_profile(
         destination = output_root / "serving-profiles/profile-one"
         assert (destination / "_FAILED").is_file()
         checksums = json.loads((destination / "checksums.json").read_text())
-        assert set(checksums) == {"failure.json", "plan.json"}
+        assert set(checksums) == {"failure.json", "lifecycle.json", "plan.json"}
         return
     destination = run_profile_worker(plan_path, output_root)
     assert (destination / "_SELECTED").is_file()
     checksums = json.loads((destination / "checksums.json").read_text())
-    assert set(checksums) == {"plan.json", "profile.json"}
+    assert set(checksums) == {"lifecycle.json", "plan.json", "profile.json"}
+
+
+def test_profile_worker_recovers_selected_profile_after_restart(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(resolved.model_dump_json(), encoding="utf-8")
+    output_root = tmp_path / "output"
+    destination = output_root / resolved.artifacts.prefix
+    recovery = _prepare_profile_destination(resolved, destination)
+    assert recovery is not None
+    selected = select_profile(
+        new_unselected_profile(resolved).model_copy(update={"points": [point(1, 10)]})
+    )
+    (destination / "profile.json").write_text(
+        selected.model_dump_json(), encoding="utf-8"
+    )
+
+    class Manager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def describe(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setenv("HF_TOKEN", "hf_test")
+    monkeypatch.setattr("harbor_hf.profile_worker.EndpointManager", Manager)
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.validate_endpoint_model", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.require_paused_endpoint", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker.require_executable", lambda *_args: None
+    )
+
+    recovered = run_profile_worker(plan_path, output_root)
+
+    assert recovered == destination
+    assert (destination / "_SELECTED").read_text(encoding="utf-8").strip() == (
+        canonical_digest(selected)
+    )
+
+
+def test_profile_ladder_reuses_validated_points_after_restart(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = plan(remote_spec).model_copy(update={"candidate_concurrency": [1, 2]})
+    existing = point(1, 10)
+    calls: list[tuple[int, int]] = []
+
+    def run_point(*_args: object, repetition: int, **_kwargs: object) -> _PointResult:
+        calls.append((2, repetition))
+        observations = [
+            _TaskObservation(True, 1000, 10, 20, f"task-{index}") for index in range(8)
+        ]
+        return _PointResult(observations, 8000)
+
+    monkeypatch.setattr("harbor_hf.profile_worker._run_point", run_point)
+    monkeypatch.setattr("harbor_hf.profile_worker._write_point", lambda *_args: None)
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker._run_boundary_repetitions",
+        lambda *_args, **_kwargs: [],
+    )
+
+    points = _run_ladder(
+        resolved,
+        cast(Any, None),
+        cast(Any, None),
+        tmp_path,
+        "token",
+        tmp_path,
+        10**12,
+        existing_points=[existing],
+    )
+
+    assert points[0] == existing
+    assert calls == [(2, 1)]
+
+
+def test_profile_recovery_recomputes_raw_point_evidence(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    resolved = plan(remote_spec)
+    observations = [
+        _TaskObservation(True, 1000, 10, 20, f"task-{index}") for index in range(8)
+    ]
+    measured = _summarize_point(1, observations, elapsed_ms=8000, repetition=1)
+    _write_point(tmp_path, measured, observations, 8000)
+
+    recovered = _load_recoverable_points(resolved, tmp_path)
+
+    assert recovered == [measured]
 
 
 def test_profile_plan_is_deterministic(remote_spec: ExperimentSpec) -> None:
