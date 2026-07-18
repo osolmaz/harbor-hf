@@ -602,6 +602,75 @@ def test_smoke_verifies_declared_context_and_output_limits(
     assert calls[-1][1] + 20 + 8192 >= 65_536 - 512
 
 
+def test_provider_smoke_retries_transient_request_failure(
+    remote_spec: ExperimentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = remote_spec.matrix.models[0]
+    provider = ProviderTarget(
+        id="provider",
+        model=model.repo,
+        routing=ExplicitProviderRoute(provider="fireworks-ai"),
+        limits=ProviderLimits(max_concurrent_requests=2, max_attempts=3),
+    )
+    spec = profiled_provider_spec(
+        remote_spec.model_copy(
+            update={
+                "matrix": remote_spec.matrix.model_copy(
+                    update={"deployments": [provider]}
+                )
+            }
+        )
+    )
+    resolved = build_profile_plan(
+        spec,
+        profile_id="provider-profile",
+        candidate_concurrency=[1, 2],
+        max_spend_usd="10",
+        profile_timeout_seconds=3600,
+    )
+    calls = 0
+
+    def request(
+        _plan: ProfilePlan,
+        _base_url: str,
+        _model_name: str,
+        _token: str,
+        prompt: str,
+        *,
+        tools: bool,
+        timeout: int,
+        max_tokens: int | None = None,
+        allow_length: bool = False,
+        require_visible_output: bool = True,
+    ) -> _SmokeObservation:
+        nonlocal calls
+        del timeout, max_tokens, allow_length, require_visible_output
+        calls += 1
+        if calls == 1:
+            return _SmokeObservation(
+                False, 0, 0, False, False, False, "HTTPStatusError"
+            )
+        repeats = prompt.count("x ")
+        if tools:
+            return _SmokeObservation(True, 20, 2, False, True, True)
+        if repeats:
+            return _SmokeObservation(True, repeats + 20, 1, True, False, False)
+        return _SmokeObservation(True, 20, 2, True, True, False)
+
+    class Transport:
+        @contextmanager
+        def scope(self, _scope: str) -> Iterator[tuple[str, str, None]]:
+            yield "https://provider.test", "model", None
+
+    monkeypatch.setattr("harbor_hf.profile_worker._request", request)
+    monkeypatch.setattr("harbor_hf.profile_worker.time.sleep", lambda _delay: None)
+
+    _verify_smoke(resolved, cast(Any, Transport()), "token", 10**12)
+
+    assert calls == 6
+
+
 def test_context_calibration_accepts_usage_before_visible_output(
     remote_spec: ExperimentSpec,
     monkeypatch: pytest.MonkeyPatch,

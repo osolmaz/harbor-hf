@@ -302,28 +302,28 @@ def _verify_smoke(
     deadline: float,
 ) -> None:
     with transport.scope("smoke") as (base_url, model_name, capability):
-        chat = _request(
+        chat = _smoke_request(
             plan,
             base_url,
             model_name,
             token,
             "Reply with exactly OK.",
             tools=False,
-            timeout=_remaining(deadline),
+            deadline=deadline,
         )
         if not chat.success or not (chat.saw_content or chat.saw_reasoning):
             detail = chat.error or "empty output"
             raise ProfileWorkerError(f"chat smoke failed: {detail}")
         if plan.reasoning_required and not chat.saw_reasoning:
             raise ProfileWorkerError("reasoning smoke produced no reasoning channel")
-        tool = _request(
+        tool = _smoke_request(
             plan,
             base_url,
             model_name,
             token,
             "Use the lookup tool to look up the value for key alpha.",
             tools=True,
-            timeout=_remaining(deadline),
+            deadline=deadline,
         )
         if not tool.success or not tool.saw_tool_call:
             detail = tool.error or "no tool call"
@@ -345,14 +345,14 @@ def _verify_token_limits(
         raise ProfileWorkerError("output limit leaves no input context")
     samples: list[tuple[int, int]] = []
     for repeats in (256, 1024):
-        observation = _request(
+        observation = _smoke_request(
             plan,
             base_url,
             model_name,
             token,
             _capacity_prompt(repeats),
             tools=False,
-            timeout=_remaining(deadline),
+            deadline=deadline,
             max_tokens=1,
             allow_length=True,
             require_visible_output=False,
@@ -369,14 +369,14 @@ def _verify_token_limits(
     fixed_tokens = samples[0][1] - samples[0][0] * tokens_per_repeat
     target_input = max(1, available_input - 256)
     repeats = max(1, math.floor((target_input - fixed_tokens) / tokens_per_repeat))
-    capacity = _request(
+    capacity = _smoke_request(
         plan,
         base_url,
         model_name,
         token,
         _capacity_prompt(repeats),
         tools=False,
-        timeout=_remaining(deadline),
+        deadline=deadline,
         max_tokens=plan.identity.max_output_tokens,
         allow_length=True,
     )
@@ -391,6 +391,46 @@ def _verify_token_limits(
 
 def _capacity_prompt(repeats: int) -> str:
     return "Read all tokens, then reply with exactly OK.\n" + "x " * repeats
+
+
+def _smoke_request(
+    plan: ProfilePlan,
+    base_url: str,
+    model_name: str,
+    token: str,
+    prompt: str,
+    *,
+    tools: bool,
+    deadline: float,
+    max_tokens: int | None = None,
+    allow_length: bool = False,
+    require_visible_output: bool = True,
+) -> _SmokeObservation:
+    attempts = (
+        plan.deployment.limits.max_attempts
+        if isinstance(plan.deployment, ProviderTarget)
+        else 1
+    )
+    for attempt in range(1, attempts + 1):
+        observation = _request(
+            plan,
+            base_url,
+            model_name,
+            token,
+            prompt,
+            tools=tools,
+            timeout=_remaining(deadline),
+            max_tokens=max_tokens,
+            allow_length=allow_length,
+            require_visible_output=require_visible_output,
+        )
+        if observation.success or attempt == attempts:
+            return observation
+        delay = min(2 ** (attempt - 1), 4)
+        if deadline - time.monotonic() <= delay:
+            return observation
+        time.sleep(delay)
+    raise AssertionError("provider smoke attempts must be positive")
 
 
 def _run_ladder(
