@@ -86,6 +86,9 @@ uv run harbor-hf automation install automation.yaml --schedule "<cron>" \
   --provider-active-waves 2
 ```
 
+For a bounded campaign queue, repeat `--campaign-id CAMPAIGN_ID` to keep each
+automation pass scoped to that queue instead of scanning historical campaigns.
+
 This sets up a scheduled HF Job plus a control webhook, so campaigns make
 progress promptly after every state change and recover when a webhook is
 missed. Set `--provider-active-waves` to the live serving quota when several
