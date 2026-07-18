@@ -584,6 +584,7 @@ class HarborStream:
         expected_base_url: str | None = "https://endpoint.example/v1",
         expected_model_name: str = "/repository",
         agent_started: bool = False,
+        failure_exception: tuple[str, str] | None = None,
     ) -> None:
         self.task_digests = task_digests
         self.barrier = threading.Barrier(expected_calls) if synchronize else None
@@ -591,6 +592,7 @@ class HarborStream:
         self.expected_base_url = expected_base_url
         self.expected_model_name = expected_model_name
         self.agent_started = agent_started
+        self.failure_exception = failure_exception
         self.commands: list[list[str]] = []
         self.configs: list[dict[str, Any]] = []
         self.base_urls: list[str] = []
@@ -628,12 +630,25 @@ class HarborStream:
             if self.barrier is not None:
                 self.barrier.wait(timeout=2)
             log_path.write_text("completed test-token\n", encoding="utf-8")
-            if self.exit_code != 0:
-                return self.exit_code
             task_name = config["datasets"][0]["task_names"][0]
             jobs_dir = Path(config["jobs_dir"])
             trial = jobs_dir / "job" / "trial"
             trial.mkdir(parents=True)
+            if self.exit_code != 0:
+                if self.failure_exception is not None:
+                    exception_type, exception_message = self.failure_exception
+                    (trial / "result.json").write_text(
+                        json.dumps(
+                            {
+                                "exception_info": {
+                                    "exception_type": exception_type,
+                                    "exception_message": exception_message,
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return self.exit_code
             (trial / "result.json").write_text(
                 json.dumps(
                     {
@@ -1174,6 +1189,68 @@ def test_wave_failure_still_pauses_and_publishes_failed_execution(
         {"event": "execution_failed", "error_type": "WorkerError"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
     ]
+
+
+def test_task_local_failure_does_not_abort_wave(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", lambda *_args: {"probes": {}})
+    endpoint = EndpointRunner(
+        [
+            endpoint_snapshot("paused", 0),
+            endpoint_snapshot("running", 1),
+            endpoint_snapshot("paused", 0),
+        ]
+    )
+    harbor = HarborStream(
+        spec.benchmark.task_digests,
+        expected_calls=1,
+        exit_code=1,
+        failure_exception=(
+            "SandboxError",
+            "HF Sandbox requires a prebuilt Docker image for this task",
+        ),
+    )
+    output = tmp_path / "output"
+
+    destination = run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=endpoint,
+        stream_runner=harbor,
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+
+    assert (destination / "_SUCCESS").is_file()
+    assert not (destination / "_FAILED").exists()
+    run = wave.runs[0]
+    trial_id = run.shards[0].shard.trials[0].trial_id
+    executions = output / run.artifact_prefix / "trials" / trial_id / "executions"
+    execution = next(executions.iterdir())
+    assert json.loads((execution / "failure.json").read_text()) == {
+        "category": "benchmark",
+        "error_type": "WorkerError",
+        "message": "Harbor exited with status 1",
+    }
+    shard_root = (
+        output
+        / _campaign.artifact_prefix
+        / "runs"
+        / run.configuration.run_id
+        / "shards"
+        / run.shards[0].shard.shard_id
+    )
+    assert not (shard_root / "_SUCCESS").exists()
 
 
 def test_missing_required_session_publishes_terminal_failed_evidence(

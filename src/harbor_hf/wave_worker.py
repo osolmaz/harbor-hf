@@ -818,8 +818,11 @@ def _execute_shard_with_executor(
     append_event(events, "shard_started", shard_id=shard.shard_id)
     trial_checksums: dict[str, str] = {}
     failures: list[tuple[int, Exception]] = []
-    pending: dict[Future[None], tuple[int, CampaignTrialLock, Path]] = {}
+    pending: dict[
+        Future[RetryCategory | None], tuple[int, CampaignTrialLock, Path]
+    ] = {}
     deferred = False
+    task_local_failures = False
     selected_trial_ids = set(wave.trial_ids)
     for trial_index, trial in enumerate(shard.trials):
         destination = _trial_destination(output_root, campaign, run, trial)
@@ -869,23 +872,19 @@ def _execute_shard_with_executor(
         trial_checksums[trial.trial_id] = _file_digest(trial_root / "checksums.json")
     for future in as_completed(pending):
         trial_index, trial, trial_root = pending[future]
-        try:
-            future.result()
-        except Exception as error:
-            failures.append((trial_index, error))
-            append_event(
-                events,
-                "trial_failed",
-                trial_id=trial.trial_id,
-                error_type=type(error).__name__,
-            )
-            continue
-        append_event(events, "trial_completed", trial_id=trial.trial_id)
-        trial_checksums[trial.trial_id] = _file_digest(trial_root / "checksums.json")
+        task_local_failures |= _record_trial_result(
+            future,
+            trial_index,
+            trial,
+            trial_root,
+            events,
+            failures,
+            trial_checksums,
+        )
     if failures:
         append_event(events, "shard_failed", failed_trials=len(failures))
         raise min(failures, key=lambda item: item[0])[1]
-    if deferred:
+    if deferred or task_local_failures:
         append_event(events, "shard_deferred")
         return None
     summary = {
@@ -900,6 +899,39 @@ def _execute_shard_with_executor(
     (shard_root / "_SUCCESS").write_text("\n", encoding="utf-8")
     _publish_unit(shard_root, output_root / locked_shard.artifact_prefix)
     return _file_digest(shard_root / "checksums.json")
+
+
+def _record_trial_result(
+    future: Future[RetryCategory | None],
+    trial_index: int,
+    trial: CampaignTrialLock,
+    trial_root: Path,
+    events: Path,
+    failures: list[tuple[int, Exception]],
+    trial_checksums: dict[str, str],
+) -> bool:
+    try:
+        category = future.result()
+    except Exception as error:
+        failures.append((trial_index, error))
+        append_event(
+            events,
+            "trial_failed",
+            trial_id=trial.trial_id,
+            error_type=type(error).__name__,
+        )
+        return False
+    if category is not None:
+        append_event(
+            events,
+            "trial_failed",
+            trial_id=trial.trial_id,
+            category=category,
+        )
+        return True
+    append_event(events, "trial_completed", trial_id=trial.trial_id)
+    trial_checksums[trial.trial_id] = _file_digest(trial_root / "checksums.json")
+    return False
 
 
 def _execute_trial(
@@ -921,7 +953,7 @@ def _execute_trial(
     monotonic: Callable[[], float],
     *,
     provider_proxy: ProviderEvidenceProxy | None = None,
-) -> None:
+) -> RetryCategory | None:
     trial_root.mkdir(parents=True, exist_ok=True)
     executions = trial_root / "executions"
     executions.mkdir(exist_ok=True)
@@ -1022,12 +1054,14 @@ def _execute_trial(
     finally:
         _revoke_trial_provider_route(provider_proxy, capability, events)
     failure_record: dict[str, object] | None = None
+    failure_category: RetryCategory | None = None
     secrets = _secret_values_with(_wave_secret_values(wave, token), capability)
     if error is not None:
+        failure_category = _execution_failure_category(
+            error, failure_phase, evidence_root=execution_root
+        )
         failure_record = {
-            "category": _execution_failure_category(
-                error, failure_phase, evidence_root=execution_root
-            ),
+            "category": failure_category,
             "error_type": type(error).__name__,
             "message": _redact_secret_values(str(error), secrets),
         }
@@ -1050,6 +1084,8 @@ def _execute_trial(
     )
     _publish_unit(execution_root, destination)
     if error is not None:
+        if failure_category in {"agent", "benchmark"}:
+            return failure_category
         raise error
 
     write_json(trial_root / "trial.lock.json", trial.model_dump(mode="json"))
@@ -1073,6 +1109,7 @@ def _execute_trial(
         / "trials"
         / trial.trial_id,
     )
+    return None
 
 
 def _register_trial_provider_route(
