@@ -37,6 +37,8 @@ from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock
 
+_SUCCESSFUL_EXPORT_ATTEMPTS = 6
+
 
 @dataclass(frozen=True)
 class PreparedHarborExecution:
@@ -186,7 +188,7 @@ class FilesystemHarborExecutionAdapter:
         monotonic: Callable[[], float],
         sleep: Callable[[float], None],
     ) -> HarborVerificationResult | None:
-        attempts = 3 if harbor_exit == 0 else 1
+        attempts = _SUCCESSFUL_EXPORT_ATTEMPTS if harbor_exit == 0 else 1
         export_log.unlink(missing_ok=True)
         last_error: OSError | RuntimeError | None = None
         exporter_exit: int | None = None
@@ -288,7 +290,7 @@ def _sleep_before_export_retry(
     remaining = deadline - monotonic()
     if remaining <= 0:
         raise WorkerError("Harbor execution deadline was reached during export retry")
-    sleep(min(float(attempt), remaining))
+    sleep(min(float(2 ** (attempt - 1)), 16.0, remaining))
 
 
 def _append_export_attempt_log(

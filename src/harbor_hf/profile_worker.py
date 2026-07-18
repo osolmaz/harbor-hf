@@ -1012,17 +1012,33 @@ def _integer(value: object) -> int:
 def _scrub_capability(root: Path, capability: str | None) -> None:
     if capability is None:
         return
-    sanitize_private_artifact_special_files(root)
-    scrub_secret_paths(root, capability)
-    scrub_secret(root, capability)
+    _scrub_mounted_evidence(root, capability, write_manifest=False)
 
 
 def _finalize_profile(root: Path, secrets: str | tuple[str, ...]) -> None:
-    sanitize_private_artifact_special_files(root)
-    scrub_secret_paths(root, secrets)
-    scrub_secret(root, secrets)
-    assert_secret_absent(root, secrets)
-    write_checksums(root)
+    _scrub_mounted_evidence(root, secrets, write_manifest=True)
+
+
+def _scrub_mounted_evidence(
+    root: Path,
+    secrets: str | tuple[str, ...],
+    *,
+    write_manifest: bool,
+) -> None:
+    attempts = 6
+    for attempt in range(1, attempts + 1):
+        try:
+            sanitize_private_artifact_special_files(root)
+            scrub_secret_paths(root, secrets)
+            scrub_secret(root, secrets)
+            assert_secret_absent(root, secrets)
+            if write_manifest:
+                write_checksums(root)
+            return
+        except FileNotFoundError:
+            if attempt == attempts:
+                raise
+            time.sleep(min(2 ** (attempt - 1), 16))
 
 
 def _redact_message(value: str, secrets: str | tuple[str, ...]) -> str:

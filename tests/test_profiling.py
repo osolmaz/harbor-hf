@@ -79,6 +79,29 @@ def test_profile_finalizer_records_special_nodes(tmp_path: Path) -> None:
     assert (tmp_path / "checksums.json").exists()
 
 
+def test_profile_finalizer_retries_transient_bucket_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text('{"status":"complete"}\n', encoding="utf-8")
+    calls = 0
+
+    def scrub(_root: Path, _secrets: object) -> list[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise FileNotFoundError(evidence)
+        return []
+
+    monkeypatch.setattr("harbor_hf.profile_worker.scrub_secret", scrub)
+    monkeypatch.setattr("harbor_hf.profile_worker.time.sleep", lambda _delay: None)
+
+    _finalize_profile(tmp_path, "hf_test_secret")
+
+    assert calls == 2
+    assert (tmp_path / "checksums.json").exists()
+
+
 def profiled_spec(spec: ExperimentSpec) -> ExperimentSpec:
     return spec.model_copy(
         update={

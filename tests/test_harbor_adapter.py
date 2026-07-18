@@ -455,14 +455,22 @@ def test_adapter_export_uses_only_remaining_shared_deadline(
         assert isinstance(timeout, int)
         timeouts.append(timeout)
         if len(timeouts) == 1:
+            now[0] += 4.25
             result = jobs_dir / "job" / "trial" / "result.json"
             result.parent.mkdir(parents=True)
             result.write_text("{}\n", encoding="utf-8")
             return 0
         return 1
 
-    times = iter([100.0, 104.25, 104.25, 105.25, 105.25, 107.25])
-    with pytest.raises(WorkerError, match="after 3 attempts"):
+    now = [100.0]
+
+    def monotonic() -> float:
+        return now[0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(WorkerError, match="deadline was reached"):
         adapter.execute(
             prepared,
             tmp_path / "harbor",
@@ -471,8 +479,8 @@ def test_adapter_export_uses_only_remaining_shared_deadline(
             environment={},
             timeout_seconds=10,
             stream_runner=run,
-            monotonic=lambda: next(times),
-            sleep=lambda _seconds: None,
+            monotonic=monotonic,
+            sleep=sleep,
             deadline=110.0,
         )
 
