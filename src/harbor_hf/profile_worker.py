@@ -978,6 +978,7 @@ def _scrub_capability(root: Path, capability: str | None) -> None:
 
 
 def _finalize_profile(root: Path, secrets: str | tuple[str, ...]) -> None:
+    sanitize_private_artifact_special_files(root)
     scrub_secret_paths(root, secrets)
     scrub_secret(root, secrets)
     assert_secret_absent(root, secrets)

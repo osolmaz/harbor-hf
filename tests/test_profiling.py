@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -27,6 +28,7 @@ from harbor_hf.profile_submission import build_profile_submit_command, submit_pr
 from harbor_hf.profile_worker import (
     ProfileCleanupUnverified,
     ProfileWorkerError,
+    _finalize_profile,
     _point_ladder_rate,
     _point_workload,
     _PointResult,
@@ -56,6 +58,25 @@ from harbor_hf.provider_models import (
 )
 
 runner = CliRunner()
+
+
+def test_profile_finalizer_records_special_nodes(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text('{"status":"complete"}\n', encoding="utf-8")
+    fifo = tmp_path / "runtime.pipe"
+    os.mkfifo(fifo)
+
+    _finalize_profile(tmp_path, "hf_test_secret")
+
+    assert evidence.exists()
+    assert not fifo.exists()
+    rejection = json.loads(
+        (tmp_path / "private-artifact-rejections.json").read_text(encoding="utf-8")
+    )
+    assert rejection["rejections"] == [
+        {"path": "runtime.pipe", "reason": "special_file", "size": None}
+    ]
+    assert (tmp_path / "checksums.json").exists()
 
 
 def profiled_spec(spec: ExperimentSpec) -> ExperimentSpec:
