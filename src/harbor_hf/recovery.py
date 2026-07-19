@@ -623,6 +623,8 @@ def _finish_execution(
     if execution is None:
         raise ValueError(f"execution outcome has no start: {event.subject_id}")
     if execution.status != "active":
+        if _is_reconciler_lost_sentinel(event):
+            return 0
         raise ValueError(f"execution has multiple outcomes: {event.subject_id}")
     payload = cast(ExecutionOutcomePayload, event.payload)
     if (
@@ -646,6 +648,18 @@ def _finish_execution(
         }
     )
     return payload.spend_microusd
+
+
+def _is_reconciler_lost_sentinel(event: CampaignEvent) -> bool:
+    if event.producer != "reconciler" or event.kind != "execution.failed":
+        return False
+    payload = cast(ExecutionOutcomePayload, event.payload)
+    return (
+        payload.category == "lost"
+        and payload.message is not None
+        and payload.message.startswith("HF Job ")
+        and payload.message.endswith(" without terminal execution evidence")
+    )
 
 
 def _record_wave_status(
