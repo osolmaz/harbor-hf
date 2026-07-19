@@ -1779,6 +1779,64 @@ def test_execution_outcome_faults_are_rejected(remote_spec: ExperimentSpec) -> N
     assert str(captured.value) == "execution has multiple outcomes: execution-one"
 
 
+def test_late_execution_evidence_overrides_reconciler_lost_sentinel(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    shard = lock.runs[0].shards[0]
+    trial = shard.trials[0]
+    start = _event(
+        lock,
+        2,
+        "execution",
+        "execution-one",
+        "execution.started",
+        ExecutionStartedPayload(
+            trial_id=trial.trial_id,
+            shard_id=shard.shard_id,
+            physical_attempt=1,
+        ),
+    )
+    actual = _event(
+        lock,
+        3,
+        "execution",
+        "execution-one",
+        "execution.failed",
+        ExecutionOutcomePayload(
+            trial_id=trial.trial_id,
+            physical_attempt=1,
+            category="transient",
+            message="command timed out",
+            spend_microusd=17,
+        ),
+    ).model_copy(update={"producer": "wave-controller"})
+    lost = _event(
+        lock,
+        4,
+        "execution",
+        "execution-one",
+        "execution.failed",
+        ExecutionOutcomePayload(
+            trial_id=trial.trial_id,
+            physical_attempt=1,
+            category="lost",
+            message=(
+                "HF Job job-one reached ERROR without terminal execution evidence"
+            ),
+            spend_microusd=0,
+        ),
+    )
+
+    projection = project_recovery(lock, [submitted, start, actual, lost])
+    execution = projection.executions["execution-one"]
+
+    assert execution.status == "failed"
+    assert execution.category == "transient"
+    assert execution.message == "command timed out"
+    assert projection.spend_microusd == 17
+
+
 @pytest.mark.parametrize(
     ("scope", "reason"),
     [
