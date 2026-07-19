@@ -1209,7 +1209,7 @@ def test_spend_cap_exhausts_retryable_trials_without_another_wave(
     assert plan.blocked == []
 
 
-def test_provisional_admission_does_not_exhaust_another_retry(
+def test_grouped_retries_share_one_provisional_admission(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock, submitted = _campaign(
@@ -1253,7 +1253,8 @@ def test_provisional_admission_does_not_exhaust_another_retry(
     )
 
     assert [action.kind for action in plan.actions] == ["retry-shard"]
-    assert [blocked.reason for blocked in plan.blocked] == ["spend-cap"]
+    assert len(plan.actions[0].shard_ids) == 2
+    assert plan.blocked == []
 
 
 def test_mutable_estimate_cannot_irreversibly_exhaust_a_retry(

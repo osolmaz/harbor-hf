@@ -399,23 +399,34 @@ def _retry_candidates(
             continue
         target = ready if retry_is_ready(trial, now) else waiting
         target[trial.shard_id].append(trial.trial_id)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for shard_id in sorted(ready):
+        deployment = _deployment_for_shards(lock, [shard_id])
+        groups[deployment].append(shard_id)
     candidates = []
     blocked = []
-    for shard_id, trial_ids in sorted(ready.items()):
-        deployment = _deployment_for_shards(lock, [shard_id])
+    for deployment in sorted(groups):
         admission = _deployment(lock, context, deployment)
-        candidates.append(
-            _Candidate(
-                kind="retry-shard",
-                deployment_digest=deployment,
-                provider=_admission_provider(admission),
-                shard_ids=[shard_id],
-                trial_ids=sorted(trial_ids),
-                target_ids=sorted(trial_ids),
-                estimated_cost_microusd=admission.estimated_wave_cost_microusd,
-                spend_cap_microusd=_run_admission(lock, deployment).spend_cap_microusd,
+        shard_ids = groups[deployment]
+        for offset in range(0, len(shard_ids), lock.max_shards_per_wave):
+            chunk = shard_ids[offset : offset + lock.max_shards_per_wave]
+            trial_ids = sorted(
+                trial_id for shard_id in chunk for trial_id in ready[shard_id]
             )
-        )
+            candidates.append(
+                _Candidate(
+                    kind="retry-shard",
+                    deployment_digest=deployment,
+                    provider=_admission_provider(admission),
+                    shard_ids=chunk,
+                    trial_ids=trial_ids,
+                    target_ids=trial_ids,
+                    estimated_cost_microusd=admission.estimated_wave_cost_microusd,
+                    spend_cap_microusd=_run_admission(
+                        lock, deployment
+                    ).spend_cap_microusd,
+                )
+            )
     for shard_id in sorted(waiting):
         deployment = _deployment_for_shards(lock, [shard_id])
         blocked.append(
