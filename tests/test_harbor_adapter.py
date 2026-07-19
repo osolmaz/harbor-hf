@@ -15,13 +15,120 @@ from harbor_hf.harbor_adapter import (
     WorkerError,
     build_execution_request,
 )
-from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
+from harbor_hf.harbor_adapter.exporter import (
+    _openclaw_session_usage,
+    _usage_with_openclaw_fallback,
+    refresh_bundle_artifacts,
+)
 from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle, sha256_digest
 from harbor_hf.harbor_adapter.validation import validate_compatibility_bundle
 from harbor_hf.models import ExperimentSpec
 from harbor_hf.runs import RunLock, build_run_lock
 
 GOLDEN_CONTRACT = Path(__file__).parent / "golden" / "harbor-adapter-contract-v1.json"
+
+
+def _session_record(
+    *,
+    role: str = "assistant",
+    input_tokens: object = 10,
+    cache_read: object = 4,
+    cache_write: object = 2,
+    output_tokens: object = 3,
+    cost: object = 0.25,
+) -> str:
+    return json.dumps(
+        {
+            "message": {
+                "role": role,
+                "usage": {
+                    "input": input_tokens,
+                    "cacheRead": cache_read,
+                    "cacheWrite": cache_write,
+                    "output": output_tokens,
+                    "cost": {"total": cost},
+                },
+            }
+        }
+    )
+
+
+def test_openclaw_session_usage_aggregates_raw_assistant_messages(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(
+        _session_record() + "\n" + _session_record(input_tokens=5, cost=0.5) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (27, 12, 6, 0.75)
+
+
+def test_openclaw_session_usage_ignores_invalid_and_trajectory_records(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(
+        _session_record()
+        + "\nnot-json\n"
+        + _session_record(role="user")
+        + "\n"
+        + _session_record(input_tokens=True)
+        + "\n"
+        + _session_record(cache_write=-1)
+        + "\n"
+        + _session_record(cost="unknown")
+        + "\n",
+        encoding="utf-8",
+    )
+    (sessions / "one.trajectory.jsonl").write_text(
+        _session_record(input_tokens=1000) + "\n", encoding="utf-8"
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (32, 12, 6, None)
+
+
+def test_openclaw_session_usage_does_not_duplicate_legacy_session(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(_session_record() + "\n", encoding="utf-8")
+    (tmp_path / "agent" / "openclaw.session.jsonl").write_text(
+        _session_record(input_tokens=1000) + "\n", encoding="utf-8"
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (16, 6, 3, 0.25)
+
+
+def test_openclaw_session_usage_uses_legacy_session_as_fallback(
+    tmp_path: Path,
+) -> None:
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "openclaw.session.jsonl").write_text(
+        _session_record() + "\n", encoding="utf-8"
+    )
+
+    assert _openclaw_session_usage(tmp_path) == (16, 6, 3, 0.25)
+
+
+def test_openclaw_session_usage_only_fills_missing_native_totals(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "one.jsonl").write_text(_session_record() + "\n", encoding="utf-8")
+
+    assert _usage_with_openclaw_fallback((20, None, 8, None), tmp_path) == (
+        20,
+        6,
+        8,
+        0.25,
+    )
 
 
 def _request(
@@ -348,14 +455,22 @@ def test_adapter_export_uses_only_remaining_shared_deadline(
         assert isinstance(timeout, int)
         timeouts.append(timeout)
         if len(timeouts) == 1:
+            now[0] += 4.25
             result = jobs_dir / "job" / "trial" / "result.json"
             result.parent.mkdir(parents=True)
             result.write_text("{}\n", encoding="utf-8")
             return 0
         return 1
 
-    times = iter([100.0, 104.25])
-    with pytest.raises(WorkerError, match="exporter exited"):
+    now = [100.0]
+
+    def monotonic() -> float:
+        return now[0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(WorkerError, match="deadline was reached"):
         adapter.execute(
             prepared,
             tmp_path / "harbor",
@@ -364,11 +479,123 @@ def test_adapter_export_uses_only_remaining_shared_deadline(
             environment={},
             timeout_seconds=10,
             stream_runner=run,
-            monotonic=lambda: next(times),
+            monotonic=monotonic,
+            sleep=sleep,
             deadline=110.0,
         )
 
-    assert timeouts == [10, 6]
+    assert timeouts == [10, 6, 5, 3]
+
+
+def test_adapter_retries_transient_export_failure(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(_command: object, log_path: Path, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 0
+        if calls == 2:
+            log_path.write_text(
+                "transient bucket visibility failure\n", encoding="utf-8"
+            )
+            return 1
+        prepared.request_path.with_name("harbor-compatibility.json").write_text(
+            _bundle(prepared.request).model_dump_json() + "\n", encoding="utf-8"
+        )
+        return 0
+
+    outcome = adapter.execute(
+        prepared,
+        tmp_path / "harbor",
+        jobs_dir,
+        tmp_path / "harbor.log",
+        environment={},
+        timeout_seconds=30,
+        stream_runner=run,
+        sleep=lambda _seconds: None,
+    )
+
+    assert calls == 3
+    assert outcome.verification is not None
+    assert outcome.verification.trial_count == 1
+    assert (
+        "transient bucket visibility failure"
+        in (tmp_path / "harbor-export.log").read_text()
+    )
+
+
+def test_adapter_retries_successful_but_incomplete_export(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock, _request_value = _request(remote_spec, tmp_path)
+    adapter = FilesystemHarborExecutionAdapter()
+    jobs_dir = tmp_path / "jobs"
+    prepared = adapter.prepare(
+        lock,
+        tmp_path,
+        jobs_dir,
+        "https://endpoint.example",
+        tmp_path / "harbor",
+        task_names=list(lock.benchmark_tasks),
+        attempts=lock.attempts,
+        concurrency=lock.concurrent_trials,
+        expected_task_digests=dict(lock.benchmark_task_digests),
+    )
+    calls = 0
+
+    def run(_command: object, _log_path: Path, **_kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            result = jobs_dir / "job" / "trial" / "result.json"
+            result.parent.mkdir(parents=True)
+            result.write_text("{}\n", encoding="utf-8")
+            return 0
+        bundle = _bundle(prepared.request)
+        if calls == 2:
+            bundle = bundle.model_copy(update={"trials": []})
+        prepared.request_path.with_name("harbor-compatibility.json").write_text(
+            bundle.model_dump_json() + "\n", encoding="utf-8"
+        )
+        return 0
+
+    outcome = adapter.execute(
+        prepared,
+        tmp_path / "harbor",
+        jobs_dir,
+        tmp_path / "harbor.log",
+        environment={},
+        timeout_seconds=30,
+        stream_runner=run,
+        sleep=lambda _seconds: None,
+    )
+
+    assert calls == 3
+    assert outcome.verification is not None
+    assert outcome.verification.trial_count == 1
+    export_log = (tmp_path / "harbor-export.log").read_text()
+    assert "== exporter attempt 1 ==" in export_log
+    assert "== exporter attempt 2 ==" in export_log
 
 
 def test_adapter_revalidates_inputs_after_failed_export(

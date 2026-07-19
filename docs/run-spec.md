@@ -215,6 +215,17 @@ implying a particular serving engine.
 
 `attempts` counts independent logical attempts. Infrastructure retries do not
 consume attempt ordinals. `concurrent_trials` limits Harbor trial concurrency;
+for a new deployment, choose it through the
+[deployment profiling contract](deployment-profiling.md), not from GPU name or
+weight size. `server_context_tokens`, `max_output_tokens`, and
+`reasoning_required` declare the behavior that profiling must verify.
+
+`serving_profile` binds the selected profile ID, Bucket URI, profile digest,
+selection concurrency, model/deployment/agent/benchmark identity, Harbor client
+runtime, reasoning mode, sampled workload, and token limits. When present,
+validation fails unless the manifest has one resolved matrix cell and every
+identity, workload, and concurrency value matches. The binding is copied into
+run locks and participates in campaign and experiment digests.
 `max_trials_per_shard` deterministically bounds the number of task-attempt pairs
 in one campaign shard and defaults to 64. `max_shards_per_wave` bounds compatible
 shards assigned under one endpoint startup and defaults to 8. Provider request

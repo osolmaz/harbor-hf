@@ -61,7 +61,21 @@ from harbor_hf.operations import (
 )
 from harbor_hf.planner import build_plan
 from harbor_hf.process import ProcessError, SubprocessRunner
-from harbor_hf.reconciler import plan_reconciliation
+from harbor_hf.profile_preflight import preflight_profile_plan
+from harbor_hf.profile_submission import (
+    ProfileSubmission,
+    build_profile_submit_command,
+    submit_profile,
+)
+from harbor_hf.profile_worker import ProfileWorkerError, run_profile_worker
+from harbor_hf.profile_worker_transport import ProfileTransportError
+from harbor_hf.profiling import (
+    ProfilePlan,
+    build_profile_plan,
+    load_serving_profile,
+    select_profile,
+)
+from harbor_hf.reconciler import AdmissionLimits, ReconcileContext, plan_reconciliation
 from harbor_hf.recovery import project_recovery
 from harbor_hf.result_publisher import (
     DatasetApi,
@@ -85,10 +99,12 @@ results_app = typer.Typer(no_args_is_help=True, help="Publish campaign results."
 automation_app = typer.Typer(
     no_args_is_help=True, help="Install campaign reconciliation automation."
 )
+profile_app = typer.Typer(no_args_is_help=True, help="Profile serving deployments.")
 app.add_typer(campaign_app, name="campaign")
 app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(results_app, name="results")
 app.add_typer(automation_app, name="automation")
+app.add_typer(profile_app, name="profile")
 
 _OPERATION_ERRORS = (
     HTTPError,
@@ -104,6 +120,8 @@ _OPERATION_ERRORS = (
     DatasetPublicationError,
     ResultPublicationError,
     CatalogCutoverError,
+    ProfileWorkerError,
+    ProfileTransportError,
 )
 
 
@@ -122,6 +140,114 @@ def _load_or_exit(path: Path) -> ExperimentSpec:
     except ManifestError as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=2) from error
+
+
+def _load_profile_plan(path: Path) -> ProfilePlan:
+    try:
+        return ProfilePlan.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+
+
+@profile_app.command("plan")
+def profile_plan(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+    profile_id: Annotated[str, typer.Option("--profile-id")],
+    max_spend_usd: Annotated[str, typer.Option("--max-spend-usd")],
+    estimated_profile_cost_usd: Annotated[
+        str | None, typer.Option("--estimated-profile-cost-usd")
+    ] = None,
+    timeout_seconds: Annotated[int, typer.Option("--timeout-seconds", min=1)] = 3600,
+    concurrency: Annotated[
+        list[int] | None, typer.Option("--concurrency", min=1)
+    ] = None,
+) -> None:
+    """Resolve one deterministic serving profile without remote work."""
+    try:
+        resolved = build_profile_plan(
+            _load_or_exit(manifest),
+            profile_id=profile_id,
+            candidate_concurrency=concurrency or [1, 2, 4, 8, 16, 32, 64],
+            max_spend_usd=max_spend_usd,
+            profile_timeout_seconds=timeout_seconds,
+            estimated_profile_cost_usd=estimated_profile_cost_usd,
+        )
+        output.write_text(
+            json.dumps(resolved.model_dump(mode="json"), indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, ValueError) as error:
+        _exit_operation(error)
+    _echo_json(
+        {
+            "profile_id": resolved.profile_id,
+            "plan_sha256": resolved.plan_sha256,
+            "output": str(output),
+            "remote_work": False,
+        }
+    )
+
+
+@profile_app.command("preflight")
+def profile_preflight(
+    plan: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Verify quota, price, routing, revision, and private storage."""
+    try:
+        report = preflight_profile_plan(_load_profile_plan(plan))
+    except (HTTPError, OSError, ValueError) as error:
+        _exit_operation(error)
+    _echo_json(report.model_dump(mode="json"))
+
+
+@profile_app.command("run")
+def profile_run(
+    plan: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Submit a remote-only serving profile Job."""
+    resolved = _load_profile_plan(plan)
+    try:
+        if dry_run:
+            command = build_profile_submit_command(
+                resolved,
+                input_dir="hf://buckets/NAMESPACE/jobs-artifacts/DRY-RUN",
+                bucket=resolved.artifacts.bucket,
+            )
+            result = ProfileSubmission(
+                profile_id=resolved.profile_id,
+                artifact_prefix=resolved.artifacts.prefix,
+                job_id=None,
+                command=command,
+            )
+        else:
+            preflight_profile_plan(resolved)
+            result = submit_profile(resolved)
+    except (HTTPError, OSError, ProcessError, ValueError) as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@profile_app.command("select")
+def profile_select(
+    profile: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+) -> None:
+    """Validate immutable point evidence and select the winning concurrency."""
+    try:
+        selected = select_profile(load_serving_profile(profile))
+        output.write_text(
+            json.dumps(selected.model_dump(mode="json"), indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, ValueError) as error:
+        _exit_operation(error)
+    assert selected.selection is not None
+    _echo_json(selected.selection.model_dump(mode="json"))
 
 
 @app.command()
@@ -272,20 +398,42 @@ def campaign_reconcile_all(
     namespace: Annotated[str, typer.Option("--namespace")],
     apply: Annotated[bool, typer.Option("--apply")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    campaign_ids: Annotated[list[str] | None, typer.Option("--campaign-id")] = None,
+    provider_active_waves: Annotated[
+        int | None, typer.Option("--provider-active-waves", min=1)
+    ] = None,
 ) -> None:
     """Reconcile every campaign in the namespace once."""
     if dry_run == apply:
         typer.echo("Error: choose exactly one of --dry-run or --apply", err=True)
         raise typer.Exit(code=2)
+    context = ReconcileContext(
+        limits=AdmissionLimits(
+            provider_active_waves=(
+                provider_active_waves
+                if provider_active_waves is not None
+                else AdmissionLimits().provider_active_waves
+            )
+        )
+    )
     try:
         if apply:
             with hugging_face_campaign_reconciler(namespace) as reconciler:
-                results = reconciler.apply_all()
+                results = reconciler.apply_all(
+                    context=context,
+                    campaign_ids=campaign_ids,
+                )
         else:
             store = HubCampaignStore(namespace)
             results = [
-                plan_reconciliation(*store.load_campaign(campaign_id))[1]
-                for campaign_id in store.list_campaigns()
+                plan_reconciliation(*store.load_campaign(campaign_id), context=context)[
+                    1
+                ]
+                for campaign_id in (
+                    list(dict.fromkeys(campaign_ids))
+                    if campaign_ids is not None
+                    else store.list_campaigns()
+                )
             ]
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
@@ -489,6 +637,10 @@ def automation_install(
     manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     schedule: Annotated[str, typer.Option("--schedule")],
     namespace: Annotated[str | None, typer.Option("--namespace")] = None,
+    provider_active_waves: Annotated[
+        int | None, typer.Option("--provider-active-waves", min=1)
+    ] = None,
+    campaign_ids: Annotated[list[str] | None, typer.Option("--campaign-id")] = None,
     suspended: Annotated[bool, typer.Option("--suspended")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
@@ -509,6 +661,8 @@ def automation_install(
                 and spec.benchmark.source.credentials is not None
                 else []
             ),
+            provider_active_waves=provider_active_waves,
+            campaign_ids=campaign_ids or [],
             suspended=suspended,
         )
         if dry_run:
@@ -616,6 +770,19 @@ def wave_worker(
     except (OSError, ValueError, WorkerError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
+    typer.echo(str(destination))
+
+
+@app.command("profile-worker", hidden=True)
+def profile_worker(
+    plan: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output_root: Annotated[Path, typer.Option("--output-root", file_okay=False)],
+) -> None:
+    """Run one serving profile from inside a Hugging Face Job."""
+    try:
+        destination = run_profile_worker(plan, output_root)
+    except (OSError, ValueError, ProfileWorkerError, ProfileTransportError) as error:
+        _exit_operation(error)
     typer.echo(str(destination))
 
 

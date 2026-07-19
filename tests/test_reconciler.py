@@ -321,3 +321,61 @@ def test_reconcile_closed_wave_routes_retryable_evidence_to_retry(
     assert by_kind["retry-shard"].shard_ids == [failed_shard]
     assert plan.blocked[0].reason == "deployment-budget"
     assert plan.blocked[0].shard_ids == [untouched_shard]
+
+
+def test_reconcile_groups_retryable_shards_by_deployment(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _two_shard_campaign(remote_spec)
+    _projection, initial = plan_reconciliation(lock, [submitted], now=NOW)
+    action = initial.actions[0]
+    trial_shards = [
+        (shard.trials[0].trial_id, shard.shard_id)
+        for run in lock.runs
+        for shard in run.shards
+    ]
+    events = [submitted]
+    for index, (trial_id, shard_id) in enumerate(trial_shards, start=1):
+        execution_id = f"exec-{index}"
+        events.extend(
+            [
+                new_event(
+                    subject_type="execution",
+                    subject_id=execution_id,
+                    kind="execution.started",
+                    producer="wave-controller",
+                    payload=ExecutionStartedPayload(
+                        trial_id=trial_id,
+                        shard_id=shard_id,
+                        physical_attempt=1,
+                        wave_id=action.wave_id,
+                    ),
+                    clock=lambda index=index: NOW + timedelta(seconds=10 + index),
+                    identifier=lambda index=index: f"{index + 3:032x}",
+                ),
+                new_event(
+                    subject_type="execution",
+                    subject_id=execution_id,
+                    kind="execution.failed",
+                    producer="wave-controller",
+                    payload=ExecutionOutcomePayload(
+                        trial_id=trial_id,
+                        physical_attempt=1,
+                        category="transient",
+                    ),
+                    clock=lambda index=index: NOW + timedelta(seconds=20 + index),
+                    identifier=lambda index=index: f"{index + 5:032x}",
+                ),
+            ]
+        )
+    events.extend(_submitted_wave_events(lock, action, NOW + timedelta(seconds=60)))
+
+    projection, plan = plan_reconciliation(lock, events, now=NOW + timedelta(hours=1))
+
+    assert all(shard.status == "retry_wait" for shard in projection.shards.values())
+    assert [item.kind for item in plan.actions] == ["retry-shard"]
+    assert plan.actions[0].shard_ids == sorted(action.shard_ids)
+    assert plan.actions[0].trial_ids == sorted(
+        trial_id for trial_id, _shard_id in trial_shards
+    )
+    assert plan.blocked == []

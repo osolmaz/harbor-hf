@@ -38,16 +38,26 @@ def experiment_digest(spec: ExperimentSpec) -> str:
             matrix.pop("exclude")
     execution = payload.get("execution")
     if isinstance(execution, dict):
-        if execution.get("max_trials_per_shard") == 64:
-            execution.pop("max_trials_per_shard")
-        if execution.get("max_shards_per_wave") == 8:
-            execution.pop("max_shards_per_wave")
+        _remove_default_execution_fields(execution)
     canonical = json.dumps(
         payload,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _remove_default_execution_fields(execution: dict[str, object]) -> None:
+    defaults = {
+        "max_trials_per_shard": 64,
+        "max_shards_per_wave": 8,
+        "server_context_tokens": None,
+        "max_output_tokens": None,
+        "reasoning_required": False,
+    }
+    for field, default in defaults.items():
+        if execution.get(field) == default:
+            execution.pop(field, None)
 
 
 def is_task_pattern(task: str) -> bool:

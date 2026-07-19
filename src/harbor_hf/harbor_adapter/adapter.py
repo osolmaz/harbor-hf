@@ -7,12 +7,15 @@ from copy import deepcopy
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Protocol
+from typing import Never, Protocol
 from urllib.parse import urlparse
 
 from pydantic import JsonValue
 
-from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
+from harbor_hf.harbor_adapter.errors import (
+    HarborVerificationFailure,
+    WorkerError,
+)
 from harbor_hf.harbor_adapter.models import (
     HarborExecutionRequest,
     HarborVerificationPolicy,
@@ -25,10 +28,16 @@ from harbor_hf.harbor_adapter.validation import (
     load_compatibility_bundle,
     validate_compatibility_bundle,
 )
-from harbor_hf.models import DeploymentProfile, pinned_harbor_dataset_reference
+from harbor_hf.models import (
+    DeploymentProfile,
+    DeploymentTarget,
+    pinned_harbor_dataset_reference,
+)
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock
+
+_SUCCESSFUL_EXPORT_ATTEMPTS = 6
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,7 @@ class HarborExecutionAdapter(Protocol):
         timeout_seconds: int,
         stream_runner: Callable[..., int],
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
         deadline: float | None = None,
     ) -> HarborExecutionOutcome: ...
 
@@ -121,6 +131,7 @@ class FilesystemHarborExecutionAdapter:
         timeout_seconds: int,
         stream_runner: Callable[..., int],
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
         deadline: float | None = None,
     ) -> HarborExecutionOutcome:
         shared_deadline = _shared_deadline(timeout_seconds, deadline, monotonic)
@@ -137,7 +148,6 @@ class FilesystemHarborExecutionAdapter:
         has_results = any(jobs_dir.glob("*/*/result.json"))
         if exit_code != 0 and not has_results:
             return HarborExecutionOutcome(exit_code, None, None)
-        export_timeout = _remaining_export_timeout(shared_deadline, monotonic)
         compatibility_path = prepared.request_path.with_name(
             "harbor-compatibility.json"
         )
@@ -145,7 +155,7 @@ class FilesystemHarborExecutionAdapter:
         request_digest = sha256_digest(
             canonical_json_bytes(prepared.request.model_dump(mode="json"))
         )
-        exported = self._export_compatibility(
+        verification = self._export_compatibility(
             prepared,
             harbor_source,
             jobs_dir,
@@ -153,21 +163,14 @@ class FilesystemHarborExecutionAdapter:
             export_log,
             request_digest,
             environment,
-            export_timeout,
+            shared_deadline,
             exit_code,
             stream_runner,
+            monotonic,
+            sleep,
         )
-        if not exported:
+        if verification is None:
             return HarborExecutionOutcome(exit_code, None, None)
-        try:
-            bundle = load_compatibility_bundle(compatibility_path, prepared.request)
-            verification = validate_compatibility_bundle(bundle, prepared.request)
-        except HarborTrialFailure:
-            raise
-        except (OSError, ValueError, RuntimeError):
-            if exit_code != 0:
-                return HarborExecutionOutcome(exit_code, None, None)
-            raise
         return HarborExecutionOutcome(exit_code, verification, compatibility_path)
 
     def _export_compatibility(
@@ -179,36 +182,58 @@ class FilesystemHarborExecutionAdapter:
         export_log: Path,
         request_digest: str,
         environment: dict[str, str],
-        export_timeout: int,
+        deadline: float,
         harbor_exit: int,
         stream_runner: Callable[..., int],
-    ) -> bool:
-        try:
-            exporter_exit = stream_runner(
-                render_export_command(
-                    harbor_source,
-                    jobs_dir,
-                    compatibility_path,
-                    prepared.request.harbor_revision,
-                    request_digest,
-                ),
-                export_log,
-                environment=environment,
-                timeout_seconds=export_timeout,
-            )
-        except (OSError, RuntimeError):
+        monotonic: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> HarborVerificationResult | None:
+        attempts = _SUCCESSFUL_EXPORT_ATTEMPTS if harbor_exit == 0 else 1
+        export_log.unlink(missing_ok=True)
+        last_error: OSError | RuntimeError | None = None
+        exporter_exit: int | None = None
+        for attempt in range(1, attempts + 1):
             self._validate_inputs(prepared)
-            if harbor_exit != 0:
-                return False
-            raise
-        self._validate_inputs(prepared)
-        if exporter_exit != 0:
-            if harbor_exit != 0:
-                return False
-            raise WorkerError(
-                f"Harbor compatibility exporter exited with status {exporter_exit}"
+            compatibility_path.unlink(missing_ok=True)
+            attempt_log = export_log.with_name(
+                f"{export_log.stem}.attempt-{attempt}{export_log.suffix}"
             )
-        return True
+            attempt_log.unlink(missing_ok=True)
+            export_timeout = _remaining_export_timeout(deadline, monotonic)
+            try:
+                exporter_exit = stream_runner(
+                    render_export_command(
+                        harbor_source,
+                        jobs_dir,
+                        compatibility_path,
+                        prepared.request.harbor_revision,
+                        request_digest,
+                    ),
+                    attempt_log,
+                    environment=environment,
+                    timeout_seconds=export_timeout,
+                )
+                last_error = None
+            except (OSError, RuntimeError) as error:
+                last_error = error
+                exporter_exit = None
+            finally:
+                _append_export_attempt_log(export_log, attempt_log, attempt)
+                attempt_log.unlink(missing_ok=True)
+                self._validate_inputs(prepared)
+            if exporter_exit == 0:
+                try:
+                    bundle = load_compatibility_bundle(
+                        compatibility_path, prepared.request
+                    )
+                    return validate_compatibility_bundle(bundle, prepared.request)
+                except HarborVerificationFailure as error:
+                    last_error = error
+            if harbor_exit != 0:
+                return None
+            if attempt < attempts:
+                _sleep_before_export_retry(deadline, monotonic, sleep, attempt)
+        _raise_export_failure(last_error, exporter_exit, attempts)
 
     @staticmethod
     def _validate_inputs(prepared: PreparedHarborExecution) -> None:
@@ -232,11 +257,51 @@ def _shared_deadline(
     return shared_deadline
 
 
+def _raise_export_failure(
+    last_error: OSError | RuntimeError | None,
+    exporter_exit: int | None,
+    attempts: int,
+) -> Never:
+    if isinstance(last_error, HarborVerificationFailure):
+        raise last_error
+    if last_error is not None:
+        raise WorkerError(
+            f"Harbor compatibility exporter failed after {attempts} attempts"
+        ) from last_error
+    raise WorkerError(
+        "Harbor compatibility exporter exited with status "
+        f"{exporter_exit} after {attempts} attempts"
+    )
+
+
 def _remaining_export_timeout(deadline: float, monotonic: Callable[[], float]) -> int:
     remaining = deadline - monotonic()
     if remaining <= 0:
         raise WorkerError("Harbor execution deadline was reached before export")
     return min(max(1, math.ceil(remaining)), 300)
+
+
+def _sleep_before_export_retry(
+    deadline: float,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    attempt: int,
+) -> None:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise WorkerError("Harbor execution deadline was reached during export retry")
+    sleep(min(float(2 ** (attempt - 1)), 16.0, remaining))
+
+
+def _append_export_attempt_log(
+    export_log: Path, attempt_log: Path, attempt: int
+) -> None:
+    content = attempt_log.read_bytes() if attempt_log.is_file() else b""
+    with export_log.open("ab") as stream:
+        stream.write(f"== exporter attempt {attempt} ==\n".encode())
+        stream.write(content)
+        if content and not content.endswith(b"\n"):
+            stream.write(b"\n")
 
 
 def build_execution_request(
@@ -399,15 +464,25 @@ def _expected_agent_version(lock: RunLock) -> str:
 def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
     parameters = deepcopy(lock.agent.parameters)
     target = lock.deployment
-    if not isinstance(target, ProviderTarget):
-        return parameters
     if lock.agent.name != "openclaw":
-        raise WorkerError(
-            "Inference Provider request controls require the OpenClaw Harbor agent"
-        )
+        if isinstance(target, ProviderTarget):
+            raise WorkerError(
+                "Inference Provider request controls require the OpenClaw Harbor agent"
+            )
+        return parameters
+    if not isinstance(target, ProviderTarget) and "openclaw_config" not in parameters:
+        return parameters
+    return _effective_openclaw_agent_parameters(lock, parameters, target)
+
+
+def _effective_openclaw_agent_parameters(
+    lock: RunLock,
+    parameters: dict[str, JsonValue],
+    target: DeploymentTarget,
+) -> dict[str, JsonValue]:
     existing = parameters.get("openclaw_config", {})
     if not isinstance(existing, dict):
-        raise WorkerError("OpenClaw provider configuration must be a JSON object")
+        raise WorkerError("OpenClaw configuration must be a JSON object")
     config = deepcopy(existing)
     models = config.setdefault("models", {})
     if not isinstance(models, dict):
@@ -420,10 +495,30 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
         raise WorkerError(
             "OpenClaw OpenAI provider configuration must be a JSON object"
         )
-    routed_model = routed_provider_model(target)
-    model_template = _openclaw_provider_model_template(
-        provider, requested_model=target.model, routed_model=routed_model
+    routed_model = (
+        routed_provider_model(target)
+        if isinstance(target, ProviderTarget)
+        else _served_model_name(lock)
     )
+    model_template = _openclaw_provider_model_template(
+        provider, requested_model=lock.model.repo, routed_model=routed_model
+    )
+    if not isinstance(target, ProviderTarget):
+        provider.update(
+            {
+                "api": "openai-completions",
+                "models": [
+                    {
+                        **model_template,
+                        "id": routed_model,
+                        "name": routed_model,
+                    }
+                ],
+            }
+        )
+        _set_openclaw_primary_model(config, routed_model)
+        parameters["openclaw_config"] = config
+        return parameters
     request_parameters = dict(target.parameters)
     request_parameters.update(
         {
@@ -447,6 +542,21 @@ def effective_agent_parameters(lock: RunLock) -> dict[str, JsonValue]:
     )
     parameters["openclaw_config"] = config
     return parameters
+
+
+def _set_openclaw_primary_model(config: dict[str, JsonValue], model_name: str) -> None:
+    agents = config.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        raise WorkerError("OpenClaw agents configuration must be a JSON object")
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        raise WorkerError("OpenClaw agent defaults must be a JSON object")
+    selected = f"openai/{model_name}"
+    for key in ("model", "pdfModel"):
+        value = defaults.setdefault(key, {})
+        if not isinstance(value, dict):
+            raise WorkerError(f"OpenClaw {key} configuration must be a JSON object")
+        value["primary"] = selected
 
 
 def _openclaw_provider_model_template(

@@ -1,0 +1,45 @@
+{
+  "schema_version": "harbor-hf/serving-profile/v1",
+  "profile_id": "ornith-35b-q4-h200-64k-20260718",
+  "created_at": "2026-07-18T01:00:00Z",
+  "identity": {
+    "model_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "deployment_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "agent_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "benchmark_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "harbor_runtime_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "server_context_tokens": 65536,
+    "max_output_tokens": 8192,
+    "reasoning_required": true,
+    "sample_task_count": 8,
+    "sample_task_names": ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f", "task-g", "task-h"],
+    "sample_tasks_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "objective": {
+    "kind": "maximum_goodput",
+    "maximum_error_rate": 0.0
+  },
+  "workload": {
+    "kind": "benchmark",
+    "sample_task_count": 8,
+    "sample_task_names": ["task-a", "task-b", "task-c", "task-d", "task-e", "task-f", "task-g", "task-h"],
+    "sample_tasks_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "minimum_observations_per_point": 8,
+    "boundary_repetitions": 3
+  },
+  "candidate_concurrency": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "points": [],
+  "selection": null,
+  "artifacts": {
+    "bucket": "organization/benchmark-runs",
+    "prefix": "serving-profiles/ornith-35b-q4-h200-64k-20260718"
+  }
+}

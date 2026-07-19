@@ -28,6 +28,9 @@ class TimingValue(Protocol):
     finished_at: datetime | None
 
 
+UsageTotals = tuple[int | None, int | None, int | None, float | None]
+
+
 def _digest(path: Path) -> str:
     value = hashlib.sha256()
     with path.open("rb") as stream:
@@ -178,6 +181,108 @@ def _optional_timing(value: TimingValue | None) -> dict[str, str | None] | None:
     return _timing(value) if value is not None else None
 
 
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _nonnegative_number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value)
+    return None
+
+
+def _openclaw_session_paths(trial_dir: Path) -> list[Path]:
+    sessions_dir = trial_dir / "agent" / "openclaw-sessions"
+    paths = [
+        path
+        for path in sorted(sessions_dir.glob("*.jsonl"))
+        if "trajectory" not in path.name.lower() and not path.is_symlink()
+    ]
+    if paths:
+        return paths
+    legacy = trial_dir / "agent" / "openclaw.session.jsonl"
+    return [legacy] if legacy.is_file() and not legacy.is_symlink() else []
+
+
+def _openclaw_usage_record(value: object) -> tuple[int, int, int, float | None] | None:
+    if not isinstance(value, dict):
+        return None
+    message = value.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    uncached = _nonnegative_int(usage.get("input"))
+    cache_read = _nonnegative_int(usage.get("cacheRead"))
+    cache_write = _nonnegative_int(usage.get("cacheWrite"))
+    output = _nonnegative_int(usage.get("output"))
+    if None in (uncached, cache_read, cache_write, output):
+        return None
+    assert uncached is not None
+    assert cache_read is not None
+    assert cache_write is not None
+    assert output is not None
+    cached = cache_read + cache_write
+    cost = usage.get("cost")
+    total_cost = (
+        _nonnegative_number(cost.get("total")) if isinstance(cost, dict) else None
+    )
+    return (uncached + cached, cached, output, total_cost)
+
+
+def _openclaw_session_usage(trial_dir: Path) -> UsageTotals:
+    input_tokens = 0
+    cache_tokens = 0
+    output_tokens = 0
+    cost_usd = 0.0
+    records = 0
+    cost_records = 0
+    for path in _openclaw_session_paths(trial_dir):
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        value = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    usage = _openclaw_usage_record(value)
+                    if usage is None:
+                        continue
+                    input_tokens += usage[0]
+                    cache_tokens += usage[1]
+                    output_tokens += usage[2]
+                    records += 1
+                    total_cost = usage[3]
+                    if total_cost is not None:
+                        cost_usd += total_cost
+                        cost_records += 1
+        except (OSError, UnicodeError):
+            continue
+    if records == 0:
+        return (None, None, None, None)
+    return (
+        input_tokens,
+        cache_tokens,
+        output_tokens,
+        cost_usd if cost_records == records else None,
+    )
+
+
+def _usage_with_openclaw_fallback(native: UsageTotals, trial_dir: Path) -> UsageTotals:
+    if all(value is not None for value in native):
+        return native
+    fallback = _openclaw_session_usage(trial_dir)
+    return (
+        native[0] if native[0] is not None else fallback[0],
+        native[1] if native[1] is not None else fallback[1],
+        native[2] if native[2] is not None else fallback[2],
+        native[3] if native[3] is not None else fallback[3],
+    )
+
+
 def export_bundle(
     jobs_dir: Path,
     output: Path,
@@ -216,7 +321,9 @@ def export_bundle(
         result = trial_result_type.model_validate_json(result_path.read_text())
         lock = trial_lock_type.model_validate_json(lock_path.read_text())
         model = result.agent_info.model_info
-        usage = result.compute_token_cost_totals()
+        usage = _usage_with_openclaw_fallback(
+            result.compute_token_cost_totals(), trial_dir
+        )
         step_exceptions = [
             {
                 "step_name": step.step_name,

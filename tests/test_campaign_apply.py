@@ -929,6 +929,20 @@ def test_apply_all_uses_campaign_listing(remote_spec: ExperimentSpec) -> None:
     assert [result.campaign_id for result in results] == [lock.campaign_id]
 
 
+def test_apply_all_uses_explicit_campaign_scope(remote_spec: ExperimentSpec) -> None:
+    lock, request, submitted = _campaign(remote_spec)
+
+    class ScopedStore(FakeStore):
+        def list_campaigns(self) -> list[str]:
+            raise AssertionError("explicit scope must not list historical campaigns")
+
+    results = _reconciler(
+        ScopedStore(lock, request, [submitted]), FakeEndpoints(), FakeJobs()
+    ).apply_all(campaign_ids=[lock.campaign_id, lock.campaign_id])
+
+    assert [result.campaign_id for result in results] == [lock.campaign_id]
+
+
 def test_apply_all_carries_new_admission_into_the_next_campaign(
     remote_spec: ExperimentSpec,
 ) -> None:

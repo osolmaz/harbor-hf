@@ -27,6 +27,8 @@ class AutomationRequest(FrozenModel):
     schedule: str = Field(min_length=1)
     remote: RemoteExecutionSpec
     secret_names: list[str] = Field(default_factory=list)
+    provider_active_waves: int | None = Field(default=None, ge=1)
+    campaign_ids: list[str] = Field(default_factory=list)
     suspended: bool = False
 
     @field_validator("secret_names")
@@ -38,6 +40,15 @@ class AutomationRequest(FrozenModel):
             raise ValueError("automation secret names must be unique")
         if any(not name or name != name.strip() or "=" in name for name in value):
             raise ValueError("automation secret names must be environment variables")
+        return value
+
+    @field_validator("campaign_ids")
+    @classmethod
+    def campaign_scope_is_canonical(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("automation campaign ids must be unique")
+        if any(not item or item != item.strip() for item in value):
+            raise ValueError("automation campaign ids must be non-empty")
         return value
 
 
@@ -56,6 +67,8 @@ class AutomationPlan(FrozenModel):
     image: str
     command: list[str]
     secret_names: list[str]
+    provider_active_waves: int | None
+    campaign_ids: list[str]
     control_repository: str
 
 
@@ -70,7 +83,7 @@ class AutomationApi(Protocol):
 
 
 def scheduled_reconciler_command(request: AutomationRequest) -> list[str]:
-    return locked_source_command(
+    command = locked_source_command(
         request.remote.worker,
         "harbor-hf",
         "campaign",
@@ -79,6 +92,11 @@ def scheduled_reconciler_command(request: AutomationRequest) -> list[str]:
         request.namespace,
         "--apply",
     )
+    if request.provider_active_waves is not None:
+        command.extend(["--provider-active-waves", str(request.provider_active_waves)])
+    for campaign_id in request.campaign_ids:
+        command.extend(["--campaign-id", campaign_id])
+    return command
 
 
 def install_automation(
@@ -187,6 +205,8 @@ def automation_plan(request: AutomationRequest) -> AutomationPlan:
             request.remote.job.token_secret_name,
             *request.secret_names,
         ],
+        provider_active_waves=request.provider_active_waves,
+        campaign_ids=request.campaign_ids,
         control_repository=coordination_repository(request.namespace),
     )
 

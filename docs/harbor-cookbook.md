@@ -82,7 +82,35 @@ Planning performs no inference and creates no remote compute. Preserve the plan
 digest, run IDs, shard IDs, trial IDs, source commits, model revision,
 deployment digest, image digests, and resolved task digests from the output.
 
-## 2. Submit and reconcile
+## 2. Profile a new deployment
+
+Before the first full campaign for an exact model and deployment, run the
+[deployment profiling procedure](deployment-profiling.md). Start with one
+verified smoke task, then test Harbor trial concurrency at powers of two:
+
+```text
+c1, c2, c4, c8, c16, c32, c64, ...
+```
+
+Continue while completed task throughput or declared goodput improves. Retry a
+failed boundary after a health probe, refine between the last-good and first-bad
+powers when useful, and repeat boundary candidates. Do not infer concurrency
+from model size, GPU name, configured context capacity, or a synthetic token
+throughput test.
+
+The profile must use the same model revision, quantization, serving image,
+hardware, context and output limits, KV precision, chat template, reasoning,
+agent, and representative benchmark workload as the full campaign. Store the
+selected profile and raw points in the private artifact Bucket. Set
+`execution.concurrent_trials` to the selected value and retain the profile URI
+and SHA-256 digest with the campaign notes until manifest linkage is
+implemented.
+
+Run the whole ladder under one leased endpoint lifecycle. Pause the endpoint
+and verify zero ready replicas before writing the profile's terminal marker.
+Do not create one endpoint-backed campaign per candidate.
+
+## 3. Submit and reconcile
 
 Preview the control records before writing them:
 
@@ -116,7 +144,7 @@ Do not treat a timed-out create, resume, submit, cancel, or pause request as a
 confirmed failure. The next pass must inspect deterministic remote identities
 and adopt the observed resource or action before retrying.
 
-## 3A. Endpoint-backed execution path
+## 4A. Endpoint-backed execution path
 
 An endpoint deployment digest covers the model revision, engine, image,
 command, ordered arguments, non-secret environment, secret names, provider,
@@ -142,7 +170,7 @@ The watchdog pauses the endpoint when the controller exits or loses ownership.
 Cleanup actions take priority over new billable work. Ordinary completion
 pauses the endpoint; deletion is a separate, explicit retention action.
 
-## 3B. Inference Provider execution path
+## 4B. Inference Provider execution path
 
 A provider-backed wave uses the same campaign, run, shard, logical-trial,
 physical-execution, Harbor, and artifact contracts. It does not create or lease
@@ -183,7 +211,7 @@ or token count. Endpoint-only fields must be `not_applicable` and unreported
 provider fields must be `not_reported`. Compare endpoint and provider runs only
 on fields observed for both.
 
-## 4. Monitor and cancel safely
+## 5. Monitor and cancel safely
 
 Use projections instead of scraping worker logs:
 
@@ -222,7 +250,7 @@ is re-observed before any cancellation outcome or cleanup is synthesized.
 `reconcile-all` reports a malformed campaign as one failure record and
 continues with the remaining campaigns.
 
-## 5. Verify canonical artifacts
+## 6. Verify canonical artifacts
 
 Run verification before publication:
 
@@ -257,7 +285,7 @@ campaigns/<campaign-id>/
     _SUCCESS | _PARTIAL | _FAILED | _CANCELLED
 ```
 
-## 6. Publish derived result tables
+## 7. Publish derived result tables
 
 Publish only after artifact verification succeeds:
 
@@ -304,7 +332,7 @@ Audit or rebuild compares these derived rows with the canonical Bucket evidence.
 Deleting and rebuilding a result Dataset must produce equivalent normalized
 rows and stable publication paths.
 
-## 7. Deploy the optional read-only Space
+## 8. Deploy the optional read-only Space
 
 The repository's Docker Space is staged from [`deploy/space/`](../deploy/space/)
 with `scripts/build_space_release.py`. Build `apps/results-web`, stage the

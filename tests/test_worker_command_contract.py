@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from harbor_hf.harbor_adapter import build_execution_request
-from harbor_hf.models import DeploymentProfile, ExperimentSpec, GitBenchmarkSource
+from harbor_hf.models import (
+    DeploymentProfile,
+    EndpointRef,
+    ExperimentSpec,
+    GitBenchmarkSource,
+)
 from harbor_hf.provider_models import (
     ExplicitProviderRoute,
     ProviderLimits,
@@ -372,6 +377,96 @@ def test_provider_command_applies_locked_openclaw_request_controls(
                     "maxRetries": 2,
                     "timeoutMs": 17250,
                 },
+            }
+        ],
+    }
+
+
+def test_endpoint_command_aligns_openclaw_model_with_llama_cpp_alias(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    model = remote_spec.matrix.models[0]
+    deployment = remote_spec.matrix.deployments[0]
+    assert isinstance(deployment, DeploymentProfile)
+    deployment = deployment.model_copy(
+        update={
+            "endpoint": EndpointRef(
+                namespace="osolmaz",
+                name="llama-endpoint",
+                served_model_name="/repository",
+            ),
+            "engine": deployment.engine.model_copy(
+                update={
+                    "arguments": ["-m", "/repository/model.gguf", "-a", "/repository"]
+                }
+            ),
+        }
+    )
+    agent = remote_spec.matrix.agents[0].model_copy(
+        update={
+            "parameters": {
+                "openclaw_config": {
+                    "agents": {
+                        "defaults": {
+                            "model": {"primary": f"openai/{model.repo}"},
+                            "pdfModel": {"primary": f"openai/{model.repo}"},
+                        }
+                    },
+                    "models": {
+                        "providers": {
+                            "openai": {
+                                "models": [
+                                    {
+                                        "id": model.repo,
+                                        "name": model.repo,
+                                        "compat": {"supportsUsageInStreaming": True},
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    )
+    spec = remote_spec.model_copy(
+        update={
+            "matrix": remote_spec.matrix.model_copy(
+                update={"deployments": [deployment], "agents": [agent]}
+            )
+        }
+    )
+    lock = build_run_lock(spec, run_id="endpoint-model-contract")
+    task_name = next(iter(lock.benchmark_task_digests))
+
+    request = build_execution_request(
+        lock,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        task_names=[task_name],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={task_name: lock.benchmark_task_digests[task_name]},
+    )
+
+    agents = request.harbor_config["agents"]
+    assert isinstance(agents, list)
+    configured_agent = agents[0]
+    assert isinstance(configured_agent, dict)
+    assert configured_agent["model_name"] == "openai//repository"
+    kwargs = configured_agent["kwargs"]
+    assert isinstance(kwargs, dict)
+    config = kwargs["openclaw_config"]
+    assert isinstance(config, dict)
+    assert config["agents"]["defaults"]["model"]["primary"] == "openai//repository"
+    assert config["agents"]["defaults"]["pdfModel"]["primary"] == "openai//repository"
+    assert config["models"]["providers"]["openai"] == {
+        "api": "openai-completions",
+        "models": [
+            {
+                "id": "/repository",
+                "name": "/repository",
+                "compat": {"supportsUsageInStreaming": True},
             }
         ],
     }

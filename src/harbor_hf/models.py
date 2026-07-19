@@ -321,12 +321,42 @@ class MatrixSpec(StrictModel):
         return self
 
 
+class ServingProfileBinding(StrictModel):
+    profile_id: ProfileId
+    profile_sha256: ContentDigest
+    artifact_uri: str = Field(pattern=r"^hf://buckets/[^\s]+$")
+    concurrency: int = Field(ge=1)
+    model_sha256: ContentDigest
+    deployment_sha256: ContentDigest
+    agent_sha256: ContentDigest
+    benchmark_sha256: ContentDigest
+    harbor_runtime_sha256: ContentDigest
+    server_context_tokens: int = Field(ge=1)
+    max_output_tokens: int = Field(ge=1)
+    reasoning_required: bool
+    sample_task_count: int = Field(ge=1)
+    sample_task_names: list[TaskName] = Field(min_length=1)
+    sample_tasks_sha256: ContentDigest
+
+
 class ExecutionSpec(StrictModel):
     attempts: int = Field(default=1, ge=1)
     concurrent_trials: int = Field(default=1, ge=1)
     max_trials_per_shard: int = Field(default=64, ge=1)
     max_shards_per_wave: int = Field(default=8, ge=1)
     timeout_seconds: int = Field(default=3600, ge=1)
+    server_context_tokens: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    max_output_tokens: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    reasoning_required: bool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+    serving_profile: ServingProfileBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ArtifactStoreSpec(StrictModel):
@@ -394,6 +424,7 @@ class ExperimentSpec(StrictModel):
 
     @model_validator(mode="after")
     def remote_job_has_lifecycle_headroom(self) -> ExperimentSpec:
+        _validate_serving_profile_binding(self)
         if self.remote is None:
             return self
         _validate_remote_input_pins(self)
@@ -411,6 +442,105 @@ class ExperimentSpec(StrictModel):
         ):
             raise ValueError("HF Sandbox timeout must not exceed remote Job timeout")
         return self
+
+
+def _validate_serving_profile_binding(spec: ExperimentSpec) -> None:
+    binding = spec.execution.serving_profile
+    if binding is None:
+        return
+    if spec.remote is None:
+        raise ValueError("serving profile binding requires remote execution settings")
+    if spec.execution.concurrent_trials != binding.concurrency:
+        raise ValueError(
+            "execution concurrent_trials must match the selected serving profile"
+        )
+    from harbor_hf.planner import resolved_cells
+
+    cells = resolved_cells(spec)
+    if len(cells) != 1:
+        raise ValueError("serving profile binding requires one resolved matrix cell")
+    cell = cells[0]
+    model = next(profile for profile in spec.matrix.models if profile.id == cell.model)
+    deployment = next(
+        profile for profile in spec.matrix.deployments if profile.id == cell.deployment
+    )
+    agent = next(profile for profile in spec.matrix.agents if profile.id == cell.agent)
+    _validate_binding_identity(spec, binding, model, deployment, agent)
+    _validate_binding_token_limits(spec, binding)
+
+
+def _validate_binding_identity(
+    spec: ExperimentSpec,
+    binding: ServingProfileBinding,
+    model: ModelProfile,
+    deployment: DeploymentTarget,
+    agent: AgentProfile,
+) -> None:
+    remote = spec.remote
+    if remote is None:
+        raise ValueError("serving profile binding requires remote execution settings")
+    expected = {
+        "model_sha256": _canonical_profile_digest(model),
+        "deployment_sha256": profile_deployment_digest(deployment),
+        "agent_sha256": _canonical_profile_digest(agent),
+        "benchmark_sha256": _canonical_profile_digest(
+            spec.benchmark.model_dump(mode="json", exclude_none=True)
+        ),
+        "harbor_runtime_sha256": _canonical_profile_digest(remote.harbor),
+    }
+    for field, value in expected.items():
+        if getattr(binding, field) != value:
+            raise ValueError(f"serving profile {field} does not match the experiment")
+    if binding.reasoning_required != spec.execution.reasoning_required:
+        raise ValueError("serving profile reasoning mode does not match execution")
+    _validate_binding_sample(spec, binding)
+
+
+def _validate_binding_sample(
+    spec: ExperimentSpec, binding: ServingProfileBinding
+) -> None:
+    sampled_tasks = binding.sample_task_names
+    if len(sampled_tasks) != binding.sample_task_count:
+        raise ValueError("serving profile sample count does not match its task names")
+    if len(sampled_tasks) != len(set(sampled_tasks)):
+        raise ValueError("serving profile sampled task names must be unique")
+    if any(task not in spec.benchmark.task_digests for task in sampled_tasks):
+        raise ValueError("serving profile sample contains an unknown benchmark task")
+    sample_digest = _canonical_profile_digest(
+        {task: spec.benchmark.task_digests[task] for task in sampled_tasks}
+    )
+    if binding.sample_tasks_sha256 != sample_digest:
+        raise ValueError("serving profile sampled workload does not match benchmark")
+
+
+def _validate_binding_token_limits(
+    spec: ExperimentSpec, binding: ServingProfileBinding
+) -> None:
+    for key in ("server_context_tokens", "max_output_tokens"):
+        value = getattr(spec.execution, key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"execution {key} must be a positive integer")
+        if getattr(binding, key) != value:
+            raise ValueError(f"serving profile {key} does not match execution")
+
+
+def _canonical_profile_digest(value: object) -> str:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json", exclude_none=True)
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def profile_deployment_digest(deployment: DeploymentTarget) -> str:
+    """Hash serving behavior without a transient endpoint resource identity."""
+    value = deployment.model_dump(
+        mode="json",
+        exclude={"endpoint"},
+        exclude_none=True,
+    )
+    return _canonical_profile_digest(value)
 
 
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:

@@ -118,6 +118,35 @@ def test_builds_digest_pinned_scheduled_reconciler(remote_spec: ExperimentSpec) 
     assert request.remote.worker.revision in command[2]
 
 
+def test_scheduled_reconciler_preserves_provider_wave_limit(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec).model_copy(update={"provider_active_waves": 2})
+
+    command = scheduled_reconciler_command(request)
+
+    assert command[-2:] == ["--provider-active-waves", "2"]
+    assert automation_plan(request).provider_active_waves == 2
+
+
+def test_scheduled_reconciler_preserves_campaign_scope(
+    remote_spec: ExperimentSpec,
+) -> None:
+    request = _request(remote_spec).model_copy(
+        update={"campaign_ids": ["campaign-one", "campaign-two"]}
+    )
+
+    command = scheduled_reconciler_command(request)
+
+    assert command[-4:] == [
+        "--campaign-id",
+        "campaign-one",
+        "--campaign-id",
+        "campaign-two",
+    ]
+    assert automation_plan(request).campaign_ids == ["campaign-one", "campaign-two"]
+
+
 def test_installs_serial_schedule_and_dataset_webhook(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -276,6 +305,8 @@ def test_automation_plan_exposes_the_complete_installation_contract(
         "image": "ghcr.io/astral-sh/uv@sha256:" + "0" * 64,
         "command": scheduled_reconciler_command(request),
         "secret_names": ["HF_TOKEN"],
+        "provider_active_waves": None,
+        "campaign_ids": [],
         "control_repository": "osolmaz/harbor-hf-coordination",
     }
 
