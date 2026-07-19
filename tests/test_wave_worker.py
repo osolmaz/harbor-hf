@@ -234,6 +234,24 @@ def test_wrapped_harbor_exit_ignores_sandbox_markers_without_sandbox_error(
     assert _sandbox_failure_category(tmp_path) is None
 
 
+def test_wrapped_harbor_exit_uses_preflight_harbor_log_evidence(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "harbor.log").write_text(
+        "ValueError: HF Sandbox requires a prebuilt Docker image.\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        _execution_failure_category(
+            WorkerError("Harbor exited with status 1"),
+            "execution",
+            evidence_root=tmp_path,
+        )
+        == "benchmark"
+    )
+
+
 def test_wrapped_harbor_exit_ignores_non_utf8_result(tmp_path: Path) -> None:
     result = tmp_path / "harbor-jobs" / "job" / "trial" / "result.json"
     result.parent.mkdir(parents=True)

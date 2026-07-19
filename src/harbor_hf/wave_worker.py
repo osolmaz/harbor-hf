@@ -167,6 +167,8 @@ _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
     ),
 )
 _MAX_SANDBOX_RESULT_BYTES = 1024 * 1024
+_MAX_HARBOR_LOG_CLASSIFICATION_BYTES = 1024 * 1024
+_MISSING_PREBUILT_IMAGE_MARKER = "hf sandbox requires a prebuilt docker image"
 
 _TERMINAL_MARKERS = ("_SUCCESS", "_FAILED", "_CANCELLED")
 _HF_JOB_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -1213,7 +1215,28 @@ def _sandbox_failure_category(evidence_root: Path | None) -> RetryCategory | Non
             category = _sandbox_exception_line_category(exception[1].lower())
             if category is not None:
                 return category
-    return "benchmark" if saw_sandbox_error else None
+    if saw_sandbox_error:
+        return "benchmark"
+    return _harbor_preflight_failure_category(evidence_root, resolved_root)
+
+
+def _harbor_preflight_failure_category(
+    evidence_root: Path, resolved_root: Path
+) -> RetryCategory | None:
+    log_path = evidence_root / "harbor.log"
+    if not _safe_evidence_file(log_path, resolved_root):
+        return None
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - _MAX_HARBOR_LOG_CLASSIFICATION_BYTES))
+            tail = stream.read(_MAX_HARBOR_LOG_CLASSIFICATION_BYTES)
+    except OSError:
+        return None
+    if _MISSING_PREBUILT_IMAGE_MARKER in tail.decode("utf-8", errors="replace").lower():
+        return "benchmark"
+    return None
 
 
 def _sandbox_result_exception(
