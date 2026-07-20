@@ -284,6 +284,8 @@ def _manual_recovery_requirements(
         for event in ordered_events(events)
         if event.kind == "campaign.manual-intervention-required"
     ]
+    if not required:
+        raise ValueError("manual intervention requirement has not been recorded")
     wave_ids = sorted(
         {
             payload.parent_id
@@ -291,7 +293,7 @@ def _manual_recovery_requirements(
             if (payload := cast(LifecyclePayload, event.payload)).parent_id is not None
         }
     )
-    if required and not wave_ids:
+    if not wave_ids:
         raise ValueError("manual intervention does not reference recoverable cleanup")
     return required, wave_ids
 

@@ -595,9 +595,17 @@ def test_unpaired_cleanup_failure_keeps_campaign_in_manual_intervention(
         )
     )
 
-    assert project_recovery(snapshot.lock, snapshot.events).status == (
-        "manual_intervention"
+    assert (
+        project_recovery(snapshot.lock, snapshot.events).status == "manual_intervention"
     )
+    with pytest.raises(ValueError, match="requirement has not been recorded"):
+        resume_campaign(
+            MemoryStore(snapshot),
+            "campaign-one",
+            reason="verified",
+            cleanup_verified=True,
+            dry_run=False,
+        )
 
 
 def test_resume_accepts_cleanup_wave_already_closed(
