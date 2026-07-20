@@ -17,6 +17,7 @@ from harbor_hf.control import (
     ExecutionOutcomePayload,
     ExecutionStartedPayload,
     LifecyclePayload,
+    ManualInterventionResolutionPayload,
     WaveLifecyclePayload,
     new_event,
 )
@@ -512,6 +513,65 @@ def test_resume_requires_verified_cleanup_and_records_resolution(
     projection = project_recovery(snapshot.lock, snapshot.events)
     assert projection.status == "active"
     assert projection.waves["wave-one"].status == "closed"
+
+
+def test_resume_acknowledges_every_failed_cleanup_wave(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    wave_payload = WaveLifecyclePayload(
+        deployment_digest=snapshot.lock.runs[0].deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+    )
+    for index, wave_id in enumerate(["wave-one", "wave-two"], start=1):
+        snapshot.events.extend(
+            [
+                new_event(
+                    subject_type="wave",
+                    subject_id=wave_id,
+                    kind="wave.cleanup-failed",
+                    producer="watchdog",
+                    payload=wave_payload,
+                    clock=lambda index=index: (
+                        snapshot.lock.created_at + timedelta(seconds=index * 2)
+                    ),
+                    identifier=lambda index=index: f"{index * 2:032x}",
+                ),
+                new_event(
+                    subject_type="campaign",
+                    subject_id=snapshot.lock.campaign_id,
+                    kind="campaign.manual-intervention-required",
+                    producer="reconciler",
+                    payload=LifecyclePayload(parent_id=wave_id),
+                    clock=lambda index=index: (
+                        snapshot.lock.created_at + timedelta(seconds=index * 2 + 1)
+                    ),
+                    identifier=lambda index=index: f"{index * 2 + 1:032x}",
+                ),
+            ]
+        )
+    store = MemoryStore(snapshot)
+
+    result = resume_campaign(
+        store,
+        "campaign-one",
+        reason="all endpoints verified paused",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+
+    resolution = next(
+        event for event in snapshot.events if event.event_id == result.event_id
+    )
+    assert isinstance(resolution.payload, ManualInterventionResolutionPayload)
+    assert resolution.payload.wave_ids == ["wave-one", "wave-two"]
+    projection = project_recovery(snapshot.lock, snapshot.events)
+    assert projection.status == "active"
+    assert {
+        projection.waves[wave_id].status for wave_id in resolution.payload.wave_ids
+    } == {"closed"}
 
 
 def test_resume_accepts_cleanup_wave_already_closed(

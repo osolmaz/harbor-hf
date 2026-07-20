@@ -28,6 +28,7 @@ from harbor_hf.control import (
     EventKind,
     HubCampaignStore,
     LifecyclePayload,
+    ManualInterventionResolutionPayload,
     Producer,
     TerminalPayload,
     new_event,
@@ -795,7 +796,9 @@ def test_manual_intervention_resolution_requires_manual_state(
         subject_id=lock.campaign_id,
         kind="campaign.manual-intervention-resolved",
         producer="cli",
-        payload=LifecyclePayload(message="cleanup verified"),
+        payload=ManualInterventionResolutionPayload(
+            wave_ids=["wave-one"], message="cleanup verified"
+        ),
         clock=lambda: NOW + timedelta(seconds=1),
         identifier=lambda: "f" * 32,
     )
@@ -841,7 +844,9 @@ def test_manual_intervention_resolution_preserves_cancellation(
         subject_id=lock.campaign_id,
         kind="campaign.manual-intervention-resolved",
         producer="cli",
-        payload=LifecyclePayload(parent_id="wave-one", message="cleanup verified"),
+        payload=ManualInterventionResolutionPayload(
+            wave_ids=["wave-one"], message="cleanup verified"
+        ),
         clock=lambda: NOW + timedelta(seconds=3),
         identifier=lambda: "c" * 32,
     )
@@ -880,7 +885,9 @@ def test_cancellation_during_manual_intervention_remains_requested(
         subject_id=lock.campaign_id,
         kind="campaign.manual-intervention-resolved",
         producer="cli",
-        payload=LifecyclePayload(parent_id="wave-one", message="cleanup verified"),
+        payload=ManualInterventionResolutionPayload(
+            wave_ids=["wave-one"], message="cleanup verified"
+        ),
         clock=lambda: NOW + timedelta(seconds=3),
         identifier=lambda: "c" * 32,
     )
@@ -888,6 +895,47 @@ def test_cancellation_during_manual_intervention_remains_requested(
     projection = project_campaign(lock, [submitted, required, cancelled, resolved])
 
     assert projection.status == "cancel_requested"
+
+
+def test_draining_during_manual_intervention_is_applied_after_resolution(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _lock(remote_spec)
+    submitted = _submitted(lock)
+    required = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(parent_id="wave-one"),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "a" * 32,
+    )
+    draining = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.draining",
+        producer="reconciler",
+        payload=LifecyclePayload(message="draining"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "b" * 32,
+    )
+    resolved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-resolved",
+        producer="cli",
+        payload=ManualInterventionResolutionPayload(wave_ids=["wave-one"]),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "c" * 32,
+    )
+
+    assert project_campaign(lock, [submitted, required, draining]).status == (
+        "manual_intervention"
+    )
+    assert project_campaign(lock, [submitted, required, draining, resolved]).status == (
+        "draining"
+    )
 
 
 def test_control_store_commit_corpus_is_stable(

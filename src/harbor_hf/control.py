@@ -150,6 +150,11 @@ class LifecyclePayload(FrozenModel):
     message: str | None = None
 
 
+class ManualInterventionResolutionPayload(FrozenModel):
+    wave_ids: list[str] = Field(min_length=1)
+    message: str | None = None
+
+
 class WaveLifecyclePayload(FrozenModel):
     deployment_digest: str
     provider: str = Field(min_length=1)
@@ -198,6 +203,7 @@ EventPayload = (
     | ShardRetryPayload
     | TerminalPayload
     | LifecyclePayload
+    | ManualInterventionResolutionPayload
     | WaveLifecyclePayload
     | ExecutionStartedPayload
     | ExecutionOutcomePayload
@@ -231,6 +237,7 @@ _EXACT_PAYLOAD_TYPES: dict[str, type[BaseModel]] = {
     "campaign.submitted": CampaignSubmittedPayload,
     "campaign.cancel-requested": CancellationPayload,
     "campaign.shard-retry-requested": ShardRetryPayload,
+    "campaign.manual-intervention-resolved": ManualInterventionResolutionPayload,
     "execution.started": ExecutionStartedPayload,
     "spend.recorded": SpendRecordedPayload,
     "action.reserved": ActionReservedPayload,
@@ -356,6 +363,7 @@ def project_campaign(
 
     status: CampaignStatus = "queued"
     status_before_manual_intervention: CampaignStatus | None = None
+    manual_requirements: set[str] = set()
     actions: dict[str, ActionProjection] = {}
     for event in ordered[1:]:
         if status in {"completed", "partial", "failed", "cancelled"}:
@@ -367,14 +375,16 @@ def project_campaign(
             cast(CampaignStatus, status),
             status_before_manual_intervention,
         )
+        _update_manual_requirements(event, manual_requirements)
         status = _apply_event(
             lock,
             event,
             cast(CampaignStatus, status),
             actions,
             status_before_manual_intervention=status_before_manual_intervention,
+            manual_intervention_remaining=bool(manual_requirements),
         )
-        if event.kind == "campaign.manual-intervention-resolved":
+        if _manual_intervention_fully_resolved(event, manual_requirements):
             status_before_manual_intervention = None
     return CampaignProjection(
         campaign_id=lock.campaign_id,
@@ -384,6 +394,21 @@ def project_campaign(
         last_observed_at=ordered[-1].observed_at,
         actions=actions,
     )
+
+
+def _update_manual_requirements(event: CampaignEvent, requirements: set[str]) -> None:
+    if event.kind == "campaign.manual-intervention-required":
+        payload = cast(LifecyclePayload, event.payload)
+        requirements.add(payload.parent_id or event.event_id)
+    elif event.kind == "campaign.manual-intervention-resolved":
+        payload = cast(ManualInterventionResolutionPayload, event.payload)
+        requirements.difference_update(payload.wave_ids)
+
+
+def _manual_intervention_fully_resolved(
+    event: CampaignEvent, requirements: set[str]
+) -> bool:
+    return event.kind == "campaign.manual-intervention-resolved" and not requirements
 
 
 def _manual_return_status(
@@ -402,6 +427,8 @@ def _manual_return_status(
         and previous != "draining"
     ):
         return "cancel_requested"
+    if event.kind == "campaign.draining" and status == "manual_intervention":
+        return "draining"
     return previous
 
 
@@ -412,6 +439,7 @@ def _apply_event(
     actions: dict[str, ActionProjection],
     *,
     status_before_manual_intervention: CampaignStatus | None,
+    manual_intervention_remaining: bool,
 ) -> CampaignStatus:
     if event.subject_type != "campaign" or event.subject_id != lock.campaign_id:
         raise ControlError("campaign event has the wrong subject")
@@ -422,16 +450,36 @@ def _apply_event(
         "campaign.shard-retry-requested",
     }:
         return _apply_operator_request(event, status)
-    if event.kind == "campaign.draining":
-        return "draining"
-    if event.kind == "campaign.manual-intervention-required":
-        return "manual_intervention"
-    if event.kind == "campaign.manual-intervention-resolved":
-        return _resolve_manual_intervention(status, status_before_manual_intervention)
+    if event.kind in {
+        "campaign.draining",
+        "campaign.manual-intervention-required",
+        "campaign.manual-intervention-resolved",
+    }:
+        return _apply_manual_lifecycle_event(
+            event,
+            status,
+            status_before_manual_intervention,
+            manual_intervention_remaining,
+        )
     if event.kind.startswith("campaign."):
         return cast(CampaignStatus, event.kind.removeprefix("campaign."))
     _apply_action_event(event, actions)
     return "active" if status == "queued" else status
+
+
+def _apply_manual_lifecycle_event(
+    event: CampaignEvent,
+    status: CampaignStatus,
+    previous: CampaignStatus | None,
+    manual_intervention_remaining: bool,
+) -> CampaignStatus:
+    if event.kind == "campaign.draining":
+        return "manual_intervention" if status == "manual_intervention" else "draining"
+    if event.kind == "campaign.manual-intervention-required":
+        return "manual_intervention"
+    if manual_intervention_remaining:
+        return "manual_intervention"
+    return _resolve_manual_intervention(status, previous)
 
 
 def _resolve_manual_intervention(
