@@ -99,12 +99,15 @@ Operate a running campaign with:
 ```bash
 uv run harbor-hf campaign cancel CAMPAIGN_ID --namespace NAMESPACE
 uv run harbor-hf campaign retry CAMPAIGN_ID --shard SHARD_ID --namespace NAMESPACE
+uv run harbor-hf campaign resume CAMPAIGN_ID --namespace NAMESPACE --cleanup-verified
 uv run harbor-hf campaign seal CAMPAIGN_ID --namespace NAMESPACE
 ```
 
 `cancel` records a durable cancellation and drains work; `retry` requests an
-immediate retry for a shard's retryable trials; `seal` closes out a drained
-partial campaign by recording its failed retries as zero-score outcomes. The
+immediate retry for a shard's retryable trials; `resume` records that an
+operator verified endpoint cleanup after a manual-intervention stop; `seal`
+closes out a drained partial campaign by recording its failed retries as
+zero-score outcomes. The
 [Harbor Cookbook](docs/harbor-cookbook.md) walks through full campaign
 operation end to end.
 

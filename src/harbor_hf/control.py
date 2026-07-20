@@ -22,6 +22,7 @@ _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.draining",
     "campaign.manual-intervention-required",
+    "campaign.manual-intervention-resolved",
     "execution.failed",
     "execution.cancelled",
     "trial.invalid",
@@ -51,6 +52,7 @@ EventKind = Literal[
     "campaign.shard-retry-requested",
     "campaign.draining",
     "campaign.manual-intervention-required",
+    "campaign.manual-intervention-resolved",
     "campaign.completed",
     "campaign.partial",
     "campaign.failed",
@@ -353,13 +355,27 @@ def project_campaign(
         raise ControlError("campaign submission event does not match its lock")
 
     status: CampaignStatus = "queued"
+    status_before_manual_intervention: CampaignStatus | None = None
     actions: dict[str, ActionProjection] = {}
     for event in ordered[1:]:
         if status in {"completed", "partial", "failed", "cancelled"}:
             raise ControlError("campaign has events after a terminal transition")
         if event.subject_type != "campaign":
             continue
-        status = _apply_event(lock, event, cast(CampaignStatus, status), actions)
+        status_before_manual_intervention = _manual_return_status(
+            event,
+            cast(CampaignStatus, status),
+            status_before_manual_intervention,
+        )
+        status = _apply_event(
+            lock,
+            event,
+            cast(CampaignStatus, status),
+            actions,
+            status_before_manual_intervention=status_before_manual_intervention,
+        )
+        if event.kind == "campaign.manual-intervention-resolved":
+            status_before_manual_intervention = None
     return CampaignProjection(
         campaign_id=lock.campaign_id,
         plan_digest=lock.plan_digest,
@@ -370,11 +386,32 @@ def project_campaign(
     )
 
 
+def _manual_return_status(
+    event: CampaignEvent,
+    status: CampaignStatus,
+    previous: CampaignStatus | None,
+) -> CampaignStatus | None:
+    if (
+        event.kind == "campaign.manual-intervention-required"
+        and status != "manual_intervention"
+    ):
+        return status
+    if (
+        event.kind == "campaign.cancel-requested"
+        and status == "manual_intervention"
+        and previous != "draining"
+    ):
+        return "cancel_requested"
+    return previous
+
+
 def _apply_event(
     lock: CampaignLock,
     event: CampaignEvent,
     status: CampaignStatus,
     actions: dict[str, ActionProjection],
+    *,
+    status_before_manual_intervention: CampaignStatus | None,
 ) -> CampaignStatus:
     if event.subject_type != "campaign" or event.subject_id != lock.campaign_id:
         raise ControlError("campaign event has the wrong subject")
@@ -389,10 +426,22 @@ def _apply_event(
         return "draining"
     if event.kind == "campaign.manual-intervention-required":
         return "manual_intervention"
+    if event.kind == "campaign.manual-intervention-resolved":
+        return _resolve_manual_intervention(status, status_before_manual_intervention)
     if event.kind.startswith("campaign."):
         return cast(CampaignStatus, event.kind.removeprefix("campaign."))
     _apply_action_event(event, actions)
     return "active" if status == "queued" else status
+
+
+def _resolve_manual_intervention(
+    status: CampaignStatus, previous: CampaignStatus | None
+) -> CampaignStatus:
+    if status != "manual_intervention":
+        raise ControlError("manual intervention can only be resolved while required")
+    if previous in {"cancel_requested", "draining"}:
+        return previous
+    return "active"
 
 
 def _apply_operator_request(

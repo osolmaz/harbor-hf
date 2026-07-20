@@ -785,6 +785,111 @@ def test_campaign_projection_corpus_is_stable(remote_spec: ExperimentSpec) -> No
     )
 
 
+def test_manual_intervention_resolution_requires_manual_state(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _lock(remote_spec)
+    submitted = _submitted(lock)
+    resolved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-resolved",
+        producer="cli",
+        payload=LifecyclePayload(message="cleanup verified"),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "f" * 32,
+    )
+
+    with pytest.raises(
+        ControlError, match="manual intervention can only be resolved while required"
+    ):
+        project_campaign(lock, [submitted, resolved])
+
+
+@pytest.mark.parametrize(
+    "prior_kind", ["campaign.cancel-requested", "campaign.draining"]
+)
+def test_manual_intervention_resolution_preserves_cancellation(
+    remote_spec: ExperimentSpec, prior_kind: str
+) -> None:
+    lock = _lock(remote_spec)
+    submitted = _submitted(lock)
+    prior = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind=cast(EventKind, prior_kind),
+        producer="reconciler" if prior_kind.endswith("draining") else "cli",
+        payload=(
+            LifecyclePayload(message="draining")
+            if prior_kind.endswith("draining")
+            else CancellationPayload(reason="stop")
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "a" * 32,
+    )
+    required = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(parent_id="wave-one", message="cleanup failed"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "b" * 32,
+    )
+    resolved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-resolved",
+        producer="cli",
+        payload=LifecyclePayload(parent_id="wave-one", message="cleanup verified"),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "c" * 32,
+    )
+
+    projection = project_campaign(lock, [submitted, prior, required, resolved])
+
+    expected = "draining" if prior_kind.endswith("draining") else "cancel_requested"
+    assert projection.status == expected
+
+
+def test_cancellation_during_manual_intervention_remains_requested(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = _lock(remote_spec)
+    submitted = _submitted(lock)
+    required = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(parent_id="wave-one", message="cleanup failed"),
+        clock=lambda: NOW + timedelta(seconds=1),
+        identifier=lambda: "a" * 32,
+    )
+    cancelled = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.cancel-requested",
+        producer="cli",
+        payload=CancellationPayload(reason="stop"),
+        clock=lambda: NOW + timedelta(seconds=2),
+        identifier=lambda: "b" * 32,
+    )
+    resolved = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-resolved",
+        producer="cli",
+        payload=LifecyclePayload(parent_id="wave-one", message="cleanup verified"),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "c" * 32,
+    )
+
+    projection = project_campaign(lock, [submitted, required, cancelled, resolved])
+
+    assert projection.status == "cancel_requested"
+
+
 def test_control_store_commit_corpus_is_stable(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

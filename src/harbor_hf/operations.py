@@ -15,6 +15,7 @@ from harbor_hf.control import CampaignEvent, CampaignSnapshot
 from harbor_hf.io import load_experiment_bytes
 from harbor_hf.recovery import (
     durable_cancellation_event,
+    durable_manual_intervention_resolution_event,
     durable_shard_retry_event,
     project_recovery,
     seal_partial_projection,
@@ -239,6 +240,33 @@ def retry_campaign_shard(
     snapshot = store.load_snapshot(campaign_id)
     event, created = durable_shard_retry_event(
         snapshot.lock, snapshot.events, shard_id, reason
+    )
+    recorded = (
+        False if dry_run or not created else store.ensure_event(campaign_id, event)
+    )
+    return CampaignEventResult(
+        campaign_id=campaign_id,
+        event_id=event.event_id,
+        kind=event.kind,
+        recorded=recorded,
+        dry_run=dry_run,
+    )
+
+
+def resume_campaign(
+    store: CampaignEventStore,
+    campaign_id: str,
+    *,
+    reason: str,
+    cleanup_verified: bool,
+    dry_run: bool,
+) -> CampaignEventResult:
+    snapshot = store.load_snapshot(campaign_id)
+    event, created = durable_manual_intervention_resolution_event(
+        snapshot.lock,
+        snapshot.events,
+        reason,
+        cleanup_verified=cleanup_verified,
     )
     recorded = (
         False if dry_run or not created else store.ensure_event(campaign_id, event)
