@@ -574,6 +574,32 @@ def test_resume_acknowledges_every_failed_cleanup_wave(
     } == {"closed"}
 
 
+def test_unpaired_cleanup_failure_keeps_campaign_in_manual_intervention(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    snapshot.events.append(
+        new_event(
+            subject_type="wave",
+            subject_id="wave-unpaired",
+            kind="wave.cleanup-failed",
+            producer="watchdog",
+            payload=WaveLifecyclePayload(
+                deployment_digest=snapshot.lock.runs[0].deployment_digest,
+                provider="hf-inference-endpoints",
+                shard_ids=[shard.shard_id],
+            ),
+            clock=lambda: snapshot.lock.created_at,
+            identifier=lambda: "5" * 32,
+        )
+    )
+
+    assert project_recovery(snapshot.lock, snapshot.events).status == (
+        "manual_intervention"
+    )
+
+
 def test_resume_accepts_cleanup_wave_already_closed(
     remote_spec: ExperimentSpec,
 ) -> None:

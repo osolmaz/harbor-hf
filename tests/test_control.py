@@ -31,6 +31,7 @@ from harbor_hf.control import (
     ManualInterventionResolutionPayload,
     Producer,
     TerminalPayload,
+    WaveLifecyclePayload,
     new_event,
     project_campaign,
 )
@@ -507,6 +508,46 @@ def test_hub_store_ensures_identical_event_once(
     )
     with pytest.raises(CampaignConflict, match="event conflicts"):
         store.ensure_event(lock.campaign_id, conflicting)
+
+
+def test_hub_store_rejects_resolution_missing_a_current_cleanup_failure(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    shard = lock.runs[0].shards[0]
+    wave_payload = WaveLifecyclePayload(
+        deployment_digest=lock.runs[0].deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+    )
+    for index, wave_id in enumerate(["wave-one", "wave-two"], start=1):
+        store.append_event(
+            lock.campaign_id,
+            new_event(
+                subject_type="wave",
+                subject_id=wave_id,
+                kind="wave.cleanup-failed",
+                producer="watchdog",
+                payload=wave_payload,
+                clock=lambda index=index: NOW + timedelta(seconds=index),
+                identifier=lambda index=index: f"{index:032x}",
+            ),
+        )
+    resolution = new_event(
+        subject_type="campaign",
+        subject_id=lock.campaign_id,
+        kind="campaign.manual-intervention-resolved",
+        producer="cli",
+        payload=ManualInterventionResolutionPayload(wave_ids=["wave-one"]),
+        clock=lambda: NOW + timedelta(seconds=3),
+        identifier=lambda: "3" * 32,
+    )
+
+    with pytest.raises(CampaignConflict, match="verify these waves.*wave-two"):
+        store.ensure_event(lock.campaign_id, resolution)
 
 
 def test_hub_store_guarded_events_lose_atomically_to_concurrent_cancellation(

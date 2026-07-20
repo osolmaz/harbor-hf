@@ -664,25 +664,29 @@ class HubCampaignStore:
         head = self._head()
         lock_path = _campaign_lock_path(campaign_id)
         lock = CampaignLock.model_validate(self._read_json(lock_path, head))
-        prefix = f"campaigns/{campaign_id}/events/"
-        paths = sorted(
-            path
-            for path in self.api.list_repo_files(
-                self.repository,
-                repo_type="dataset",
-                revision=head,
-            )
-            if path.startswith(prefix) and path.endswith(".json")
-        )
-        events = [
-            CampaignEvent.model_validate(self._read_json(path, head)) for path in paths
-        ]
+        events = self._load_events_at(campaign_id, head)
         return CampaignSnapshot(
             lock=lock,
             events=events,
             request=self._read_bytes(_campaign_request_path(campaign_id), head),
             control_commit=self._last_commit(lock_path, head),
         )
+
+    def _load_events_at(self, campaign_id: str, revision: str) -> list[CampaignEvent]:
+        prefix = f"campaigns/{campaign_id}/events/"
+        paths = sorted(
+            path
+            for path in self.api.list_repo_files(
+                self.repository,
+                repo_type="dataset",
+                revision=revision,
+            )
+            if path.startswith(prefix) and path.endswith(".json")
+        )
+        return [
+            CampaignEvent.model_validate(self._read_json(path, revision))
+            for path in paths
+        ]
 
     def load_request(self, campaign_id: str) -> bytes:
         head = self._head()
@@ -751,6 +755,8 @@ class HubCampaignStore:
         _validate_event_scope(campaign_id, event)
         if event.kind == "campaign.cancel-requested":
             return self._ensure_cancellation_event(campaign_id, event)
+        if event.kind == "campaign.manual-intervention-resolved":
+            return self._ensure_manual_resolution_event(campaign_id, event)
         path = _event_path(campaign_id, event.event_id)
         expected = event.model_dump(mode="json")
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
@@ -760,6 +766,41 @@ class HubCampaignStore:
                 if not _same_event_request(observed, expected):
                     raise CampaignConflict(f"event conflicts: {event.event_id}")
                 return False
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=path,
+                            path_or_fileobj=_json_bytes(expected),
+                        )
+                    ],
+                    commit_message=f"chore: record {event.kind}",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def _ensure_manual_resolution_event(
+        self, campaign_id: str, event: CampaignEvent
+    ) -> bool:
+        path = _event_path(campaign_id, event.event_id)
+        expected = event.model_dump(mode="json")
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            if self._exists(path, head):
+                observed = self._read_json(path, head)
+                if not _same_event_request(observed, expected):
+                    raise CampaignConflict(f"event conflicts: {event.event_id}")
+                return False
+            _validate_manual_resolution_basis(
+                event, self._load_events_at(campaign_id, head)
+            )
             try:
                 self.api.create_commit(
                     self.repository,
@@ -1016,6 +1057,33 @@ def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> boo
     observed_request.pop("observed_at", None)
     expected_request.pop("observed_at", None)
     return observed_request == expected_request
+
+
+def _validate_manual_resolution_basis(
+    resolution: CampaignEvent, events: list[CampaignEvent]
+) -> None:
+    payload = cast(ManualInterventionResolutionPayload, resolution.payload)
+    missing = _cleanup_failed_wave_ids(events) - set(payload.wave_ids)
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise CampaignConflict(
+            f"cleanup state changed; verify these waves before resuming: {names}"
+        )
+
+
+def _cleanup_failed_wave_ids(events: list[CampaignEvent]) -> set[str]:
+    states: dict[str, str] = {}
+    for event in ordered_events(events):
+        if event.kind.startswith("wave."):
+            states[event.subject_id] = event.kind
+        elif event.kind == "campaign.manual-intervention-resolved":
+            payload = cast(ManualInterventionResolutionPayload, event.payload)
+            for wave_id in payload.wave_ids:
+                if states.get(wave_id) == "wave.cleanup-failed":
+                    states[wave_id] = "wave.closed"
+    return {
+        wave_id for wave_id, status in states.items() if status == "wave.cleanup-failed"
+    }
 
 
 def _campaign_request_path(campaign_id: str) -> str:

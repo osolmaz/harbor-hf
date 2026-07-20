@@ -218,23 +218,46 @@ def durable_manual_intervention_resolution_event(
     """Resume a campaign after an operator has verified failed cleanup."""
     if not cleanup_verified:
         raise ValueError("manual recovery requires verified endpoint cleanup")
-    required, wave_ids = _manual_recovery_requirements(events)
-    identity = f"{lock.campaign_id}:{','.join(event.event_id for event in required)}"
+    ordered = ordered_events(events)
+    projection = project_recovery(lock, events)
+    if projection.campaign.status != "manual_intervention":
+        resolved = next(
+            (
+                event
+                for event in reversed(ordered)
+                if event.kind == "campaign.manual-intervention-resolved"
+            ),
+            None,
+        )
+        if resolved is not None:
+            return resolved, False
+        raise ValueError("campaign does not require manual intervention")
+    required, required_wave_ids = _manual_recovery_requirements(events)
+    wave_ids = sorted(
+        {
+            *required_wave_ids,
+            *(
+                wave.wave_id
+                for wave in projection.waves.values()
+                if wave.status == "cleanup_failed"
+            ),
+        }
+    )
+    identity = (
+        f"{lock.campaign_id}:{','.join(event.event_id for event in required)}:"
+        f"{','.join(wave_ids)}"
+    )
     identifier = hashlib.sha256(f"{identity}:resolved".encode()).hexdigest()[:32]
     event_id = f"evt-{identifier}"
-    for event in ordered_events(events):
+    for event in ordered:
         if event.event_id == event_id:
             if event.kind != "campaign.manual-intervention-resolved":
                 raise ValueError("manual recovery event identity conflicts")
             return event, False
-    projection = project_recovery(lock, events)
-    if projection.campaign.status != "manual_intervention":
-        raise ValueError("campaign does not require manual intervention")
     _validate_manual_recovery_waves(projection, wave_ids)
     observed_at = max(
         clock().astimezone(UTC),
-        max(event.observed_at for event in ordered_events(events))
-        + timedelta(microseconds=1),
+        max(event.observed_at for event in ordered) + timedelta(microseconds=1),
     )
     return (
         new_event(
@@ -261,8 +284,6 @@ def _manual_recovery_requirements(
         for event in ordered_events(events)
         if event.kind == "campaign.manual-intervention-required"
     ]
-    if not required:
-        raise ValueError("campaign does not require manual intervention")
     wave_ids = sorted(
         {
             payload.parent_id
@@ -270,7 +291,7 @@ def _manual_recovery_requirements(
             if (payload := cast(LifecyclePayload, event.payload)).parent_id is not None
         }
     )
-    if not wave_ids:
+    if required and not wave_ids:
         raise ValueError("manual intervention does not reference recoverable cleanup")
     return required, wave_ids
 
@@ -359,6 +380,10 @@ def project_recovery(
     for event in ordered_events(events):
         _apply_campaign_recovery_event(event, waves)
         spend += _apply_recovery_event(event, runs, shards, trials, executions, waves)
+    if campaign.status not in _CAMPAIGN_TERMINAL and any(
+        wave.status == "cleanup_failed" for wave in waves.values()
+    ):
+        campaign = campaign.model_copy(update={"status": "manual_intervention"})
     trials = _derive_trials(lock, trials, executions)
     trials = _apply_retry_requests(lock, events, trials)
     shards = _derive_shards(shards, trials)
