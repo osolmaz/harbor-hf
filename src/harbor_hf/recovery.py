@@ -279,10 +279,17 @@ def durable_manual_intervention_resolution_event(
 def _manual_recovery_requirements(
     events: list[CampaignEvent],
 ) -> tuple[list[CampaignEvent], list[str]]:
+    resolved_wave_ids = {
+        wave_id
+        for event in ordered_events(events)
+        if event.kind == "campaign.manual-intervention-resolved"
+        for wave_id in cast(ManualInterventionResolutionPayload, event.payload).wave_ids
+    }
     required = [
         event
         for event in ordered_events(events)
         if event.kind == "campaign.manual-intervention-required"
+        and cast(LifecyclePayload, event.payload).parent_id not in resolved_wave_ids
     ]
     if not required:
         raise ValueError("manual intervention requirement has not been recorded")

@@ -608,6 +608,71 @@ def test_unpaired_cleanup_failure_keeps_campaign_in_manual_intervention(
         )
 
 
+def test_new_cleanup_failure_requires_a_new_manual_requirement(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    wave_payload = WaveLifecyclePayload(
+        deployment_digest=snapshot.lock.runs[0].deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+    )
+    snapshot.events.extend(
+        [
+            new_event(
+                subject_type="wave",
+                subject_id="wave-one",
+                kind="wave.cleanup-failed",
+                producer="watchdog",
+                payload=wave_payload,
+                clock=lambda: snapshot.lock.created_at,
+                identifier=lambda: "6" * 32,
+            ),
+            new_event(
+                subject_type="campaign",
+                subject_id=snapshot.lock.campaign_id,
+                kind="campaign.manual-intervention-required",
+                producer="reconciler",
+                payload=LifecyclePayload(parent_id="wave-one"),
+                clock=lambda: snapshot.lock.created_at + timedelta(seconds=1),
+                identifier=lambda: "7" * 32,
+            ),
+        ]
+    )
+    store = MemoryStore(snapshot)
+    resume_campaign(
+        store,
+        "campaign-one",
+        reason="verified first wave",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+    snapshot.events.append(
+        new_event(
+            subject_type="wave",
+            subject_id="wave-two",
+            kind="wave.cleanup-failed",
+            producer="watchdog",
+            payload=wave_payload,
+            clock=lambda: snapshot.lock.created_at + timedelta(seconds=2),
+            identifier=lambda: "8" * 32,
+        )
+    )
+
+    assert (
+        project_recovery(snapshot.lock, snapshot.events).status == "manual_intervention"
+    )
+    with pytest.raises(ValueError, match="requirement has not been recorded"):
+        resume_campaign(
+            store,
+            "campaign-one",
+            reason="verified second wave",
+            cleanup_verified=True,
+            dry_run=False,
+        )
+
+
 def test_resume_accepts_cleanup_wave_already_closed(
     remote_spec: ExperimentSpec,
 ) -> None:
