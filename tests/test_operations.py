@@ -16,6 +16,9 @@ from harbor_hf.control import (
     CampaignSubmittedPayload,
     ExecutionOutcomePayload,
     ExecutionStartedPayload,
+    LifecyclePayload,
+    ManualInterventionResolutionPayload,
+    WaveLifecyclePayload,
     new_event,
 )
 from harbor_hf.io import ManifestError
@@ -24,10 +27,15 @@ from harbor_hf.operations import (
     AutomaticCampaignPublisher,
     cancel_campaign,
     publish_campaign_results,
+    resume_campaign,
     retry_campaign_shard,
     verify_campaign_artifacts,
 )
 from harbor_hf.reconciler import plan_reconciliation
+from harbor_hf.recovery import (
+    durable_manual_intervention_resolution_event,
+    project_recovery,
+)
 from harbor_hf.result_publisher import PublicationResult
 from harbor_hf.results import ResultPublication, ResultPublicationError
 
@@ -438,6 +446,343 @@ def test_retry_rejects_nonretryable_shard(remote_spec: ExperimentSpec) -> None:
             reason="retry",
             dry_run=False,
         )
+
+
+def test_resume_requires_verified_cleanup_and_records_resolution(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    snapshot.events.extend(
+        [
+            new_event(
+                subject_type="wave",
+                subject_id="wave-one",
+                kind="wave.cleanup-failed",
+                producer="watchdog",
+                payload=WaveLifecyclePayload(
+                    deployment_digest=snapshot.lock.runs[0].deployment_digest,
+                    provider="hf-inference-endpoints",
+                    shard_ids=[shard.shard_id],
+                ),
+                clock=lambda: snapshot.lock.created_at - timedelta(seconds=1),
+                identifier=lambda: "3" * 32,
+            ),
+            new_event(
+                subject_type="campaign",
+                subject_id=snapshot.lock.campaign_id,
+                kind="campaign.manual-intervention-required",
+                producer="reconciler",
+                payload=LifecyclePayload(
+                    parent_id="wave-one", message="cleanup failed"
+                ),
+                clock=lambda: snapshot.lock.created_at,
+                identifier=lambda: "4" * 32,
+            ),
+        ]
+    )
+    store = MemoryStore(snapshot)
+
+    with pytest.raises(ValueError, match="requires verified endpoint cleanup"):
+        resume_campaign(
+            store,
+            "campaign-one",
+            reason="not checked",
+            cleanup_verified=False,
+            dry_run=False,
+        )
+    result = resume_campaign(
+        store,
+        "campaign-one",
+        reason="verified paused",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+    repeated = resume_campaign(
+        store,
+        "campaign-one",
+        reason="already verified",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+
+    assert result.recorded
+    assert not repeated.recorded
+    assert repeated.event_id == result.event_id
+    assert result.kind == "campaign.manual-intervention-resolved"
+    projection = project_recovery(snapshot.lock, snapshot.events)
+    assert projection.status == "active"
+    assert projection.waves["wave-one"].status == "closed"
+
+
+def test_resume_acknowledges_every_failed_cleanup_wave(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    wave_payload = WaveLifecyclePayload(
+        deployment_digest=snapshot.lock.runs[0].deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+    )
+    for index, wave_id in enumerate(["wave-one", "wave-two"], start=1):
+        snapshot.events.extend(
+            [
+                new_event(
+                    subject_type="wave",
+                    subject_id=wave_id,
+                    kind="wave.cleanup-failed",
+                    producer="watchdog",
+                    payload=wave_payload,
+                    clock=lambda index=index: (
+                        snapshot.lock.created_at + timedelta(seconds=index * 2)
+                    ),
+                    identifier=lambda index=index: f"{index * 2:032x}",
+                ),
+                new_event(
+                    subject_type="campaign",
+                    subject_id=snapshot.lock.campaign_id,
+                    kind="campaign.manual-intervention-required",
+                    producer="reconciler",
+                    payload=LifecyclePayload(parent_id=wave_id),
+                    clock=lambda index=index: (
+                        snapshot.lock.created_at + timedelta(seconds=index * 2 + 1)
+                    ),
+                    identifier=lambda index=index: f"{index * 2 + 1:032x}",
+                ),
+            ]
+        )
+    store = MemoryStore(snapshot)
+
+    result = resume_campaign(
+        store,
+        "campaign-one",
+        reason="all endpoints verified paused",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+
+    resolution = next(
+        event for event in snapshot.events if event.event_id == result.event_id
+    )
+    assert isinstance(resolution.payload, ManualInterventionResolutionPayload)
+    assert resolution.payload.wave_ids == ["wave-one", "wave-two"]
+    projection = project_recovery(snapshot.lock, snapshot.events)
+    assert projection.status == "active"
+    assert {
+        projection.waves[wave_id].status for wave_id in resolution.payload.wave_ids
+    } == {"closed"}
+
+
+def test_unpaired_cleanup_failure_keeps_campaign_in_manual_intervention(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    snapshot.events.append(
+        new_event(
+            subject_type="wave",
+            subject_id="wave-unpaired",
+            kind="wave.cleanup-failed",
+            producer="watchdog",
+            payload=WaveLifecyclePayload(
+                deployment_digest=snapshot.lock.runs[0].deployment_digest,
+                provider="hf-inference-endpoints",
+                shard_ids=[shard.shard_id],
+            ),
+            clock=lambda: snapshot.lock.created_at,
+            identifier=lambda: "5" * 32,
+        )
+    )
+
+    assert (
+        project_recovery(snapshot.lock, snapshot.events).status == "manual_intervention"
+    )
+    with pytest.raises(ValueError, match="requirement has not been recorded"):
+        resume_campaign(
+            MemoryStore(snapshot),
+            "campaign-one",
+            reason="verified",
+            cleanup_verified=True,
+            dry_run=False,
+        )
+
+
+def test_new_cleanup_failure_requires_a_new_manual_requirement(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    wave_payload = WaveLifecyclePayload(
+        deployment_digest=snapshot.lock.runs[0].deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+    )
+    snapshot.events.extend(
+        [
+            new_event(
+                subject_type="wave",
+                subject_id="wave-one",
+                kind="wave.cleanup-failed",
+                producer="watchdog",
+                payload=wave_payload,
+                clock=lambda: snapshot.lock.created_at,
+                identifier=lambda: "6" * 32,
+            ),
+            new_event(
+                subject_type="campaign",
+                subject_id=snapshot.lock.campaign_id,
+                kind="campaign.manual-intervention-required",
+                producer="reconciler",
+                payload=LifecyclePayload(parent_id="wave-one"),
+                clock=lambda: snapshot.lock.created_at + timedelta(seconds=1),
+                identifier=lambda: "7" * 32,
+            ),
+        ]
+    )
+    store = MemoryStore(snapshot)
+    resume_campaign(
+        store,
+        "campaign-one",
+        reason="verified first wave",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+    snapshot.events.append(
+        new_event(
+            subject_type="wave",
+            subject_id="wave-two",
+            kind="wave.cleanup-failed",
+            producer="watchdog",
+            payload=wave_payload,
+            clock=lambda: snapshot.lock.created_at + timedelta(seconds=2),
+            identifier=lambda: "8" * 32,
+        )
+    )
+
+    assert (
+        project_recovery(snapshot.lock, snapshot.events).status == "manual_intervention"
+    )
+    with pytest.raises(ValueError, match="requirement has not been recorded"):
+        resume_campaign(
+            store,
+            "campaign-one",
+            reason="verified second wave",
+            cleanup_verified=True,
+            dry_run=False,
+        )
+
+
+def test_resume_accepts_cleanup_wave_already_closed(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    shard = snapshot.lock.runs[0].shards[0]
+    wave_payload = WaveLifecyclePayload(
+        deployment_digest=snapshot.lock.runs[0].deployment_digest,
+        provider="hf-inference-endpoints",
+        shard_ids=[shard.shard_id],
+    )
+    snapshot.events.extend(
+        [
+            new_event(
+                subject_type="wave",
+                subject_id="wave-one",
+                kind="wave.cleanup-failed",
+                producer="watchdog",
+                payload=wave_payload,
+                clock=lambda: snapshot.lock.created_at - timedelta(seconds=2),
+                identifier=lambda: "2" * 32,
+            ),
+            new_event(
+                subject_type="campaign",
+                subject_id=snapshot.lock.campaign_id,
+                kind="campaign.manual-intervention-required",
+                producer="reconciler",
+                payload=LifecyclePayload(parent_id="wave-one"),
+                clock=lambda: snapshot.lock.created_at - timedelta(seconds=1),
+                identifier=lambda: "3" * 32,
+            ),
+            new_event(
+                subject_type="wave",
+                subject_id="wave-one",
+                kind="wave.closed",
+                producer="watchdog",
+                payload=wave_payload,
+                clock=lambda: snapshot.lock.created_at,
+                identifier=lambda: "4" * 32,
+            ),
+        ]
+    )
+    store = MemoryStore(snapshot)
+
+    result = resume_campaign(
+        store,
+        "campaign-one",
+        reason="verified paused",
+        cleanup_verified=True,
+        dry_run=False,
+    )
+
+    assert result.recorded
+    assert project_recovery(snapshot.lock, snapshot.events).waves[
+        "wave-one"
+    ].status == ("closed")
+
+
+def test_resume_validates_wave_and_orders_after_existing_events(
+    remote_spec: ExperimentSpec,
+) -> None:
+    snapshot = _snapshot(remote_spec)
+    required = new_event(
+        subject_type="campaign",
+        subject_id=snapshot.lock.campaign_id,
+        kind="campaign.manual-intervention-required",
+        producer="reconciler",
+        payload=LifecyclePayload(parent_id="missing-wave"),
+        clock=lambda: snapshot.lock.created_at,
+        identifier=lambda: "2" * 32,
+    )
+
+    with pytest.raises(ValueError, match="does not reference recoverable cleanup"):
+        durable_manual_intervention_resolution_event(
+            snapshot.lock,
+            [*snapshot.events, required],
+            "verified",
+            cleanup_verified=True,
+            clock=lambda: snapshot.lock.created_at - timedelta(days=1),
+        )
+
+    shard = snapshot.lock.runs[0].shards[0]
+    cleanup_failed = new_event(
+        subject_type="wave",
+        subject_id="wave-one",
+        kind="wave.cleanup-failed",
+        producer="watchdog",
+        payload=WaveLifecyclePayload(
+            deployment_digest=snapshot.lock.runs[0].deployment_digest,
+            provider="hf-inference-endpoints",
+            shard_ids=[shard.shard_id],
+        ),
+        clock=lambda: snapshot.lock.created_at,
+        identifier=lambda: "3" * 32,
+    )
+    required = required.model_copy(
+        update={
+            "payload": LifecyclePayload(parent_id="wave-one"),
+            "observed_at": snapshot.lock.created_at + timedelta(seconds=1),
+        }
+    )
+    event, created = durable_manual_intervention_resolution_event(
+        snapshot.lock,
+        [*snapshot.events, cleanup_failed, required],
+        "verified",
+        cleanup_verified=True,
+        clock=lambda: snapshot.lock.created_at - timedelta(days=1),
+    )
+
+    assert created
+    assert event.observed_at == required.observed_at + timedelta(microseconds=1)
 
 
 def test_verifies_and_publishes_campaign_evidence(

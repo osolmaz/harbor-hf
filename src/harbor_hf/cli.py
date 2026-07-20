@@ -55,6 +55,7 @@ from harbor_hf.operations import (
     DatasetRepositoryApi,
     cancel_campaign,
     publish_campaign_results,
+    resume_campaign,
     retry_campaign_shard,
     seal_partial_campaign_runs,
     verify_campaign_artifacts,
@@ -505,6 +506,30 @@ def campaign_seal(
                 writer=None if dry_run else HubBucketEvidenceWriter(),
                 dry_run=dry_run,
             )
+    except _OPERATION_ERRORS as error:
+        _exit_operation(error)
+    _echo_json(result.model_dump(mode="json"))
+
+
+@campaign_app.command("resume")
+def campaign_resume(
+    campaign_id: Annotated[str, typer.Argument()],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    cleanup_verified: Annotated[bool, typer.Option("--cleanup-verified")] = False,
+    reason: Annotated[str, typer.Option("--reason")] = "operator verified cleanup",
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    output_format: Annotated[Literal["json"], typer.Option("--format")] = "json",
+) -> None:
+    """Resume a campaign after manually verifying failed cleanup."""
+    del output_format
+    try:
+        result = resume_campaign(
+            HubCampaignStore(namespace),
+            campaign_id,
+            reason=reason,
+            cleanup_verified=cleanup_verified,
+            dry_run=dry_run,
+        )
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
     _echo_json(result.model_dump(mode="json"))

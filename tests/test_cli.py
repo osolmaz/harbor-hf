@@ -340,6 +340,47 @@ def test_campaign_seal_prints_json(monkeypatch: pytest.MonkeyPatch) -> None:
     assert json.loads(result.stdout)["runs"][0]["run_id"] == "run-one"
 
 
+def test_campaign_resume_requires_cleanup_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr("harbor_hf.cli.HubCampaignStore", lambda _namespace: object())
+
+    def fake_resume(_store: object, _campaign_id: str, **kwargs: object) -> object:
+        calls.append(kwargs)
+        if not kwargs["cleanup_verified"]:
+            raise ValueError("manual recovery requires verified endpoint cleanup")
+        return CampaignEventResult(
+            campaign_id="campaign-one",
+            event_id="evt-" + "1" * 32,
+            kind="campaign.manual-intervention-resolved",
+            recorded=True,
+            dry_run=False,
+        )
+
+    monkeypatch.setattr("harbor_hf.cli.resume_campaign", fake_resume)
+
+    rejected = runner.invoke(
+        app, ["campaign", "resume", "campaign-one", "--namespace", "org"]
+    )
+    accepted = runner.invoke(
+        app,
+        [
+            "campaign",
+            "resume",
+            "campaign-one",
+            "--namespace",
+            "org",
+            "--cleanup-verified",
+        ],
+    )
+
+    assert rejected.exit_code == 1
+    assert accepted.exit_code == 0
+    assert json.loads(accepted.stdout)["recorded"] is True
+    assert [call["cleanup_verified"] for call in calls] == [False, True]
+
+
 def test_artifacts_verify_and_results_publish_print_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

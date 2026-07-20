@@ -170,6 +170,22 @@ The watchdog pauses the endpoint when the controller exits or loses ownership.
 Cleanup actions take priority over new billable work. Ordinary completion
 pauses the endpoint; deletion is a separate, explicit retention action.
 
+If cleanup fails and the campaign enters `manual_intervention`, first verify
+that the owning controller and watchdog Jobs are terminal, pause the endpoint,
+and confirm `status.state=paused` with `readyReplica=0`. Release only the stale
+lease whose exact owner was verified, then record the recovery and resume
+reconciliation:
+
+```bash
+harbor-hf campaign resume CAMPAIGN_ID --namespace NAMESPACE \
+  --cleanup-verified --reason "stale watchdog lease released after verified pause"
+harbor-hf campaign reconcile CAMPAIGN_ID --namespace NAMESPACE --apply
+```
+
+The cleanup acknowledgement is mandatory. `resume` refuses campaigns that are
+not stopped for manual intervention and preserves the recovery as an
+append-only control event.
+
 ## 4B. Inference Provider execution path
 
 A provider-backed wave uses the same campaign, run, shard, logical-trial,

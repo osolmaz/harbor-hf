@@ -15,6 +15,8 @@ from harbor_hf.control import (
     ExecutionOutcomePayload,
     ExecutionStartedPayload,
     IdentifierFactory,
+    LifecyclePayload,
+    ManualInterventionResolutionPayload,
     RetryCategory,
     ShardRetryPayload,
     SpendRecordedPayload,
@@ -205,6 +207,115 @@ def durable_cancellation_event(
     )
 
 
+def durable_manual_intervention_resolution_event(
+    lock: CampaignLock,
+    events: list[CampaignEvent],
+    reason: str,
+    *,
+    cleanup_verified: bool,
+    clock: Clock = lambda: datetime.now(UTC),
+) -> tuple[CampaignEvent, bool]:
+    """Resume a campaign after an operator has verified failed cleanup."""
+    if not cleanup_verified:
+        raise ValueError("manual recovery requires verified endpoint cleanup")
+    ordered = ordered_events(events)
+    projection = project_recovery(lock, events)
+    if projection.campaign.status != "manual_intervention":
+        resolved = next(
+            (
+                event
+                for event in reversed(ordered)
+                if event.kind == "campaign.manual-intervention-resolved"
+            ),
+            None,
+        )
+        if resolved is not None:
+            return resolved, False
+        raise ValueError("campaign does not require manual intervention")
+    required, required_wave_ids = _manual_recovery_requirements(events)
+    wave_ids = sorted(
+        {
+            *required_wave_ids,
+            *(
+                wave.wave_id
+                for wave in projection.waves.values()
+                if wave.status == "cleanup_failed"
+            ),
+        }
+    )
+    identity = (
+        f"{lock.campaign_id}:{','.join(event.event_id for event in required)}:"
+        f"{','.join(wave_ids)}"
+    )
+    identifier = hashlib.sha256(f"{identity}:resolved".encode()).hexdigest()[:32]
+    event_id = f"evt-{identifier}"
+    for event in ordered:
+        if event.event_id == event_id:
+            if event.kind != "campaign.manual-intervention-resolved":
+                raise ValueError("manual recovery event identity conflicts")
+            return event, False
+    _validate_manual_recovery_waves(projection, wave_ids)
+    observed_at = max(
+        clock().astimezone(UTC),
+        max(event.observed_at for event in ordered) + timedelta(microseconds=1),
+    )
+    return (
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="campaign.manual-intervention-resolved",
+            producer="cli",
+            payload=ManualInterventionResolutionPayload(
+                wave_ids=wave_ids,
+                message=reason,
+            ),
+            clock=lambda: observed_at,
+            identifier=lambda: identifier,
+        ),
+        True,
+    )
+
+
+def _manual_recovery_requirements(
+    events: list[CampaignEvent],
+) -> tuple[list[CampaignEvent], list[str]]:
+    resolved_wave_ids = {
+        wave_id
+        for event in ordered_events(events)
+        if event.kind == "campaign.manual-intervention-resolved"
+        for wave_id in cast(ManualInterventionResolutionPayload, event.payload).wave_ids
+    }
+    required = [
+        event
+        for event in ordered_events(events)
+        if event.kind == "campaign.manual-intervention-required"
+        and cast(LifecyclePayload, event.payload).parent_id not in resolved_wave_ids
+    ]
+    if not required:
+        raise ValueError("manual intervention requirement has not been recorded")
+    wave_ids = sorted(
+        {
+            payload.parent_id
+            for event in required
+            if (payload := cast(LifecyclePayload, event.payload)).parent_id is not None
+        }
+    )
+    if not wave_ids:
+        raise ValueError("manual intervention does not reference recoverable cleanup")
+    return required, wave_ids
+
+
+def _validate_manual_recovery_waves(
+    projection: RecoveryProjection, wave_ids: list[str]
+) -> None:
+    for wave_id in wave_ids:
+        wave = projection.waves.get(wave_id)
+        if wave is None or wave.status not in {"cleanup_failed", "closed"}:
+            raise ValueError(
+                "manual intervention does not reference recoverable cleanup"
+            )
+
+
 def _cancellation_identifier(lock: CampaignLock) -> IdentifierFactory:
     return lambda: hashlib.sha256(f"{lock.campaign_id}:cancel".encode()).hexdigest()[
         :32
@@ -276,7 +387,12 @@ def project_recovery(
     waves: dict[str, WaveProjection] = {}
     spend = 0
     for event in ordered_events(events):
+        _apply_campaign_recovery_event(event, waves)
         spend += _apply_recovery_event(event, runs, shards, trials, executions, waves)
+    if campaign.status not in _CAMPAIGN_TERMINAL and any(
+        wave.status == "cleanup_failed" for wave in waves.values()
+    ):
+        campaign = campaign.model_copy(update={"status": "manual_intervention"})
     trials = _derive_trials(lock, trials, executions)
     trials = _apply_retry_requests(lock, events, trials)
     shards = _derive_shards(shards, trials)
@@ -470,6 +586,7 @@ def _legacy_retry_generations(
                 if current.status == "retry_wait":
                     event_generations[trial_id] = len(current.executions)
             generations[event.event_id] = event_generations
+        _apply_campaign_recovery_event(event, waves)
         _apply_recovery_event(event, runs, shards, trials, executions, waves)
         if event.kind == "execution.started":
             payload = cast(ExecutionStartedPayload, event.payload)
@@ -500,6 +617,20 @@ def _apply_recovery_event(
     elif event.kind == "spend.recorded":
         return cast(SpendRecordedPayload, event.payload).amount_microusd
     return 0
+
+
+def _apply_campaign_recovery_event(
+    event: CampaignEvent, waves: dict[str, WaveProjection]
+) -> None:
+    if event.kind != "campaign.manual-intervention-resolved":
+        return
+    payload = cast(ManualInterventionResolutionPayload, event.payload)
+    for wave_id in payload.wave_ids:
+        wave = waves.get(wave_id)
+        if wave is None or wave.status not in {"cleanup_failed", "closed"}:
+            raise ValueError("manual recovery does not reference a failed cleanup wave")
+        if wave.status == "cleanup_failed":
+            waves[wave.wave_id] = wave.model_copy(update={"status": "closed"})
 
 
 def retry_delay_seconds(

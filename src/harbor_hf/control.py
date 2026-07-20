@@ -22,6 +22,7 @@ _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.draining",
     "campaign.manual-intervention-required",
+    "campaign.manual-intervention-resolved",
     "execution.failed",
     "execution.cancelled",
     "trial.invalid",
@@ -51,6 +52,7 @@ EventKind = Literal[
     "campaign.shard-retry-requested",
     "campaign.draining",
     "campaign.manual-intervention-required",
+    "campaign.manual-intervention-resolved",
     "campaign.completed",
     "campaign.partial",
     "campaign.failed",
@@ -148,6 +150,11 @@ class LifecyclePayload(FrozenModel):
     message: str | None = None
 
 
+class ManualInterventionResolutionPayload(FrozenModel):
+    wave_ids: list[str] = Field(min_length=1)
+    message: str | None = None
+
+
 class WaveLifecyclePayload(FrozenModel):
     deployment_digest: str
     provider: str = Field(min_length=1)
@@ -196,6 +203,7 @@ EventPayload = (
     | ShardRetryPayload
     | TerminalPayload
     | LifecyclePayload
+    | ManualInterventionResolutionPayload
     | WaveLifecyclePayload
     | ExecutionStartedPayload
     | ExecutionOutcomePayload
@@ -229,6 +237,7 @@ _EXACT_PAYLOAD_TYPES: dict[str, type[BaseModel]] = {
     "campaign.submitted": CampaignSubmittedPayload,
     "campaign.cancel-requested": CancellationPayload,
     "campaign.shard-retry-requested": ShardRetryPayload,
+    "campaign.manual-intervention-resolved": ManualInterventionResolutionPayload,
     "execution.started": ExecutionStartedPayload,
     "spend.recorded": SpendRecordedPayload,
     "action.reserved": ActionReservedPayload,
@@ -353,13 +362,30 @@ def project_campaign(
         raise ControlError("campaign submission event does not match its lock")
 
     status: CampaignStatus = "queued"
+    status_before_manual_intervention: CampaignStatus | None = None
+    manual_requirements: set[str] = set()
     actions: dict[str, ActionProjection] = {}
     for event in ordered[1:]:
         if status in {"completed", "partial", "failed", "cancelled"}:
             raise ControlError("campaign has events after a terminal transition")
         if event.subject_type != "campaign":
             continue
-        status = _apply_event(lock, event, cast(CampaignStatus, status), actions)
+        status_before_manual_intervention = _manual_return_status(
+            event,
+            cast(CampaignStatus, status),
+            status_before_manual_intervention,
+        )
+        _update_manual_requirements(event, manual_requirements)
+        status = _apply_event(
+            lock,
+            event,
+            cast(CampaignStatus, status),
+            actions,
+            status_before_manual_intervention=status_before_manual_intervention,
+            manual_intervention_remaining=bool(manual_requirements),
+        )
+        if _manual_intervention_fully_resolved(event, manual_requirements):
+            status_before_manual_intervention = None
     return CampaignProjection(
         campaign_id=lock.campaign_id,
         plan_digest=lock.plan_digest,
@@ -370,11 +396,50 @@ def project_campaign(
     )
 
 
+def _update_manual_requirements(event: CampaignEvent, requirements: set[str]) -> None:
+    if event.kind == "campaign.manual-intervention-required":
+        payload = cast(LifecyclePayload, event.payload)
+        requirements.add(payload.parent_id or event.event_id)
+    elif event.kind == "campaign.manual-intervention-resolved":
+        payload = cast(ManualInterventionResolutionPayload, event.payload)
+        requirements.difference_update(payload.wave_ids)
+
+
+def _manual_intervention_fully_resolved(
+    event: CampaignEvent, requirements: set[str]
+) -> bool:
+    return event.kind == "campaign.manual-intervention-resolved" and not requirements
+
+
+def _manual_return_status(
+    event: CampaignEvent,
+    status: CampaignStatus,
+    previous: CampaignStatus | None,
+) -> CampaignStatus | None:
+    if (
+        event.kind == "campaign.manual-intervention-required"
+        and status != "manual_intervention"
+    ):
+        return status
+    if (
+        event.kind == "campaign.cancel-requested"
+        and status == "manual_intervention"
+        and previous != "draining"
+    ):
+        return "cancel_requested"
+    if event.kind == "campaign.draining" and status == "manual_intervention":
+        return "draining"
+    return previous
+
+
 def _apply_event(
     lock: CampaignLock,
     event: CampaignEvent,
     status: CampaignStatus,
     actions: dict[str, ActionProjection],
+    *,
+    status_before_manual_intervention: CampaignStatus | None,
+    manual_intervention_remaining: bool,
 ) -> CampaignStatus:
     if event.subject_type != "campaign" or event.subject_id != lock.campaign_id:
         raise ControlError("campaign event has the wrong subject")
@@ -385,14 +450,46 @@ def _apply_event(
         "campaign.shard-retry-requested",
     }:
         return _apply_operator_request(event, status)
-    if event.kind == "campaign.draining":
-        return "draining"
-    if event.kind == "campaign.manual-intervention-required":
-        return "manual_intervention"
+    if event.kind in {
+        "campaign.draining",
+        "campaign.manual-intervention-required",
+        "campaign.manual-intervention-resolved",
+    }:
+        return _apply_manual_lifecycle_event(
+            event,
+            status,
+            status_before_manual_intervention,
+            manual_intervention_remaining,
+        )
     if event.kind.startswith("campaign."):
         return cast(CampaignStatus, event.kind.removeprefix("campaign."))
     _apply_action_event(event, actions)
     return "active" if status == "queued" else status
+
+
+def _apply_manual_lifecycle_event(
+    event: CampaignEvent,
+    status: CampaignStatus,
+    previous: CampaignStatus | None,
+    manual_intervention_remaining: bool,
+) -> CampaignStatus:
+    if event.kind == "campaign.draining":
+        return "manual_intervention" if status == "manual_intervention" else "draining"
+    if event.kind == "campaign.manual-intervention-required":
+        return "manual_intervention"
+    if manual_intervention_remaining:
+        return "manual_intervention"
+    return _resolve_manual_intervention(status, previous)
+
+
+def _resolve_manual_intervention(
+    status: CampaignStatus, previous: CampaignStatus | None
+) -> CampaignStatus:
+    if status != "manual_intervention":
+        raise ControlError("manual intervention can only be resolved while required")
+    if previous in {"cancel_requested", "draining"}:
+        return previous
+    return "active"
 
 
 def _apply_operator_request(
@@ -567,25 +664,29 @@ class HubCampaignStore:
         head = self._head()
         lock_path = _campaign_lock_path(campaign_id)
         lock = CampaignLock.model_validate(self._read_json(lock_path, head))
-        prefix = f"campaigns/{campaign_id}/events/"
-        paths = sorted(
-            path
-            for path in self.api.list_repo_files(
-                self.repository,
-                repo_type="dataset",
-                revision=head,
-            )
-            if path.startswith(prefix) and path.endswith(".json")
-        )
-        events = [
-            CampaignEvent.model_validate(self._read_json(path, head)) for path in paths
-        ]
+        events = self._load_events_at(campaign_id, head)
         return CampaignSnapshot(
             lock=lock,
             events=events,
             request=self._read_bytes(_campaign_request_path(campaign_id), head),
             control_commit=self._last_commit(lock_path, head),
         )
+
+    def _load_events_at(self, campaign_id: str, revision: str) -> list[CampaignEvent]:
+        prefix = f"campaigns/{campaign_id}/events/"
+        paths = sorted(
+            path
+            for path in self.api.list_repo_files(
+                self.repository,
+                repo_type="dataset",
+                revision=revision,
+            )
+            if path.startswith(prefix) and path.endswith(".json")
+        )
+        return [
+            CampaignEvent.model_validate(self._read_json(path, revision))
+            for path in paths
+        ]
 
     def load_request(self, campaign_id: str) -> bytes:
         head = self._head()
@@ -654,6 +755,8 @@ class HubCampaignStore:
         _validate_event_scope(campaign_id, event)
         if event.kind == "campaign.cancel-requested":
             return self._ensure_cancellation_event(campaign_id, event)
+        if event.kind == "campaign.manual-intervention-resolved":
+            return self._ensure_manual_resolution_event(campaign_id, event)
         path = _event_path(campaign_id, event.event_id)
         expected = event.model_dump(mode="json")
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
@@ -663,6 +766,41 @@ class HubCampaignStore:
                 if not _same_event_request(observed, expected):
                     raise CampaignConflict(f"event conflicts: {event.event_id}")
                 return False
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=path,
+                            path_or_fileobj=_json_bytes(expected),
+                        )
+                    ],
+                    commit_message=f"chore: record {event.kind}",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def _ensure_manual_resolution_event(
+        self, campaign_id: str, event: CampaignEvent
+    ) -> bool:
+        path = _event_path(campaign_id, event.event_id)
+        expected = event.model_dump(mode="json")
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            if self._exists(path, head):
+                observed = self._read_json(path, head)
+                if not _same_event_request(observed, expected):
+                    raise CampaignConflict(f"event conflicts: {event.event_id}")
+                return False
+            _validate_manual_resolution_basis(
+                event, self._load_events_at(campaign_id, head)
+            )
             try:
                 self.api.create_commit(
                     self.repository,
@@ -919,6 +1057,33 @@ def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> boo
     observed_request.pop("observed_at", None)
     expected_request.pop("observed_at", None)
     return observed_request == expected_request
+
+
+def _validate_manual_resolution_basis(
+    resolution: CampaignEvent, events: list[CampaignEvent]
+) -> None:
+    payload = cast(ManualInterventionResolutionPayload, resolution.payload)
+    missing = _cleanup_failed_wave_ids(events) - set(payload.wave_ids)
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise CampaignConflict(
+            f"cleanup state changed; verify these waves before resuming: {names}"
+        )
+
+
+def _cleanup_failed_wave_ids(events: list[CampaignEvent]) -> set[str]:
+    states: dict[str, str] = {}
+    for event in ordered_events(events):
+        if event.kind.startswith("wave."):
+            states[event.subject_id] = event.kind
+        elif event.kind == "campaign.manual-intervention-resolved":
+            payload = cast(ManualInterventionResolutionPayload, event.payload)
+            for wave_id in payload.wave_ids:
+                if states.get(wave_id) == "wave.cleanup-failed":
+                    states[wave_id] = "wave.closed"
+    return {
+        wave_id for wave_id, status in states.items() if status == "wave.cleanup-failed"
+    }
 
 
 def _campaign_request_path(campaign_id: str) -> str:
