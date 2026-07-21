@@ -498,7 +498,7 @@ class JudgeEvidenceRecorder:
                 error_type=type(error).__name__,
                 error_message=_safe_error_message(error),
             )
-        except (JudgeRecorderError, ValueError, OSError):
+        except (JudgeRecorderError, TrialEvidenceError, ValueError, OSError):
             self._send_error(handler, 502, "judge evidence recording failed")
             return
         self._send(handler, 502, error_body, delivered_headers)

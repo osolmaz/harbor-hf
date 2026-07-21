@@ -216,6 +216,48 @@ def test_known_secret_in_prompt_fails_closed(tmp_path: Path) -> None:
     assert summary.rejected_call_count == 1
 
 
+def test_secret_bearing_retained_header_returns_controlled_failure(
+    tmp_path: Path,
+) -> None:
+    recorder = JudgeEvidenceRecorder(
+        token="upstream-token",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=b"{}")
+            )
+        ),
+        capability_factory=lambda: "h" * 32,
+    )
+    base = recorder.start(host="127.0.0.1", port=0)
+    capability = recorder.register_scope(
+        execution_id="exec",
+        trial_id="trial",
+        model="judge",
+        destination=tmp_path / "judge",
+        policy=_policy(),
+    )
+    request = urllib.request.Request(
+        recorder.scoped_url(base, capability),
+        data=b'{"model":"judge","messages":[]}',
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "upstream-token",
+        },
+        method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as captured:
+            urllib.request.urlopen(request, timeout=5)
+    finally:
+        recorder.close()
+
+    assert captured.value.code == 502
+    assert json.loads(captured.value.read()) == {
+        "error": "judge evidence recording failed"
+    }
+    assert not (tmp_path / "judge" / "judge-0001").exists()
+
+
 def test_records_transport_errors_and_delivered_response(tmp_path: Path) -> None:
     def upstream(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("unavailable", request=request)
