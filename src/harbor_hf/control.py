@@ -45,6 +45,7 @@ RetryCategory = Literal[
     "configuration",
     "authentication",
     "cleanup",
+    "evidence",
 ]
 EventKind = Literal[
     "campaign.submitted",

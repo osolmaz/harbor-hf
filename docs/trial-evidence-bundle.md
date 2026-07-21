@@ -509,13 +509,21 @@ set of task names or task digests that require a judge.
 | `secret_detected` | A known credential appeared in a request or response body. |
 
 `not_expected` requires `expected: false` and an empty exchange list.
-`captured` requires one or more exchanges when `expected` is true. Other states
-cannot support a scored execution for a judge-required task.
+`captured` requires one or more exchanges when `expected` is true. `not_called`
+can support a scored execution only when the closed recorder summary reports
+zero calls and the verifier took a locked deterministic branch, such as the
+ShellBench no-submission zero path. It must not contain a judge selection.
+`capture_failed` and `secret_detected` cannot support a scored execution.
 
 ### Judge directory
 
 Each HTTP attempt receives a unique execution-local ID in increasing order:
 `judge-0001`, `judge-0002`, and so on. Retried calls are never overwritten.
+
+A judge directory also contains `recorder.json`. It records the execution ID,
+locked model, final exchange count, and close time. This closed summary proves
+that a zero-exchange execution made no judge call through its only configured
+judge route.
 
 An exchange directory contains:
 
@@ -867,7 +875,7 @@ Any of these conditions is fatal:
 - the workspace archive and index disagree;
 - a workspace node type is unsupported;
 - a symlink is unsafe;
-- an expected judge exchange is absent or incomplete;
+- an observed judge call has no complete exchange, or the closed recorder count does not match the complete exchanges;
 - a scorecard selects an unknown exchange;
 - an identity differs from the locked execution;
 - a known secret is found;

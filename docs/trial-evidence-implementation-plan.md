@@ -1002,7 +1002,9 @@ Publication checks:
 - every file reference is covered by root checksums;
 - task and execution identity match normalized rows;
 - completion is `complete`;
-- judge-required tasks have selected complete exchanges;
+- judge-capable tasks have a closed recorder summary;
+- every observed judge call has a complete exchange and every scored judge call is selected;
+- a zero-call deterministic verifier branch has no judge selection;
 - deterministic tasks declare no judge exchange requirement;
 - raw evidence remains in a private Bucket;
 - public artifact rows contain metadata only.
@@ -1228,7 +1230,9 @@ Cover every component status and invalid field combination. Include:
 - identity mismatch at each level;
 - unsorted session and trajectory references plus exchange and log references
   or requirement lists;
-- judge expected with no exchange;
+- judge expected with no closed recorder summary;
+- closed zero-call judge recorder accepted without a judge selection;
+- recorder exchange count mismatch;
 - deterministic task with judge selection;
 - selected unknown or incomplete exchange;
 - complete status with an unsatisfied requirement;

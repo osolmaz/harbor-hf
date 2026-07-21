@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import urllib.request
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 import yaml
 from conftest import write_fake_compatibility_bundle
@@ -27,7 +29,9 @@ from harbor_hf.campaigns import (
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import assert_secret_absent, verify_checksums, write_checksums
 from harbor_hf.harbor_adapter import HarborTrialFailure, HarborVerificationFailure
+from harbor_hf.judge_recorder import JudgeEvidenceRecorder as RealJudgeEvidenceRecorder
 from harbor_hf.models import (
+    BenchmarkJudgeSpec,
     EndpointRef,
     ExperimentSpec,
     GitBenchmarkSource,
@@ -693,6 +697,22 @@ class HarborStream:
                 json.dumps({"task": {"digest": self.task_digests[task_name]}}),
                 encoding="utf-8",
             )
+            workspace = trial / "artifacts" / "workspace" / "app" / "output"
+            workspace.mkdir(parents=True)
+            (workspace / "answer.txt").write_text("answer\n", encoding="utf-8")
+            agent = trial / "agent"
+            agent.mkdir()
+            (agent / "trajectory.json").write_text("{}\n")
+            if not self.agent_started:
+                sessions = agent / "openclaw-sessions"
+                sessions.mkdir()
+                (sessions / "session.jsonl").write_text('{"role":"assistant"}\n')
+            verifier = trial / "verifier"
+            verifier.mkdir()
+            (verifier / "scorecard.json").write_text('{"passed":true}\n')
+            (verifier / "reward.txt").write_text("1\n")
+            (verifier / "test-stdout.txt").write_text("ok\n")
+            (verifier / "test-stderr.txt").write_text("")
             return 0
         finally:
             with self.lock:
@@ -865,6 +885,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             {"event": "execution_started", "execution_id": execution_root.name},
             {"event": "harbor_started"},
             {"event": "harbor_finished", "exit_code": 0},
+            {"event": "trial_evidence_validated", "trial_id": trial.trial_id},
             {"event": "execution_succeeded"},
             {"event": "secrets_redacted", "files": ["harbor.log"]},
         ]
@@ -917,6 +938,129 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     assert json.loads(
         (output / campaign.artifact_prefix / "campaign.lock.json").read_text()
     ) == campaign.model_dump(mode="json")
+
+
+def test_judged_wave_records_and_selects_exact_exchange(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = BenchmarkJudgeSpec(
+        api_url="https://router.huggingface.co/v1/chat/completions",
+        model="judge/model",
+    )
+    judged_spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        judged_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime",
+        lambda *_args: {"probes": {"health": {"http_status": 200}}},
+    )
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker._job_ingress_base_url",
+        lambda port, _label: f"http://127.0.0.1:{port}",
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://router.huggingface.co/v1/chat/completions"
+        assert json.loads(request.content)["model"] == "judge/model"
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json", "X-Request-ID": "judge-req"},
+            content=b'{"choices":[{"message":{"content":"ok"}}]}',
+        )
+
+    def recorder_factory(*, token: str) -> RealJudgeEvidenceRecorder:
+        return RealJudgeEvidenceRecorder(
+            token=token,
+            client=httpx.Client(transport=httpx.MockTransport(upstream)),
+            capability_factory=lambda: "j" * 32,
+        )
+
+    monkeypatch.setattr("harbor_hf.wave_worker.JudgeEvidenceRecorder", recorder_factory)
+    base_stream = HarborStream(spec.benchmark.task_digests, expected_calls=1)
+
+    def judged_stream(
+        command: list[str],
+        log_path: Path,
+        *,
+        environment: dict[str, str],
+        timeout_seconds: int,
+    ) -> int:
+        if not ("--output" in command and "--request-digest" in command):
+            request_body = json.dumps(
+                {
+                    "model": "wrong/model",
+                    "messages": [{"role": "user", "content": "grade"}],
+                }
+            ).encode()
+            request = urllib.request.Request(
+                environment["AGENT_JUDGE_API_URL"],
+                data=request_body,
+                headers={
+                    "Authorization": "Bearer verifier-placeholder",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert response.status == 200
+                assert response.headers["X-Harbor-Judge-Exchange-ID"] == "judge-0001"
+        return base_stream(
+            command,
+            log_path,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+
+    output = tmp_path / "output"
+    run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=EndpointRunner(
+            [
+                endpoint_snapshot("paused", 0),
+                endpoint_snapshot("running", 1),
+                endpoint_snapshot("paused", 0),
+            ]
+        ),
+        stream_runner=judged_stream,
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+
+    evidence_manifest = next(output.rglob("evidence/manifest.json"))
+    payload = json.loads(evidence_manifest.read_text())
+    assert payload["judge"]["expected"] is True
+    assert len(payload["judge"]["exchanges"]) == 1
+    assert payload["judge"]["recorder_summary"]["path"].endswith(
+        "evidence/judge/recorder.json"
+    )
+    selection_path = evidence_manifest.parent.parent / "verifier/judge-selection.json"
+    assert json.loads(selection_path.read_text())["exchange_id"] == "judge-0001"
+    exchange = evidence_manifest.parent / "judge/judge-0001"
+    assert json.loads((exchange / "request-received.bin").read_bytes())["model"] == (
+        "wrong/model"
+    )
+    assert json.loads((exchange / "request-forwarded.bin").read_bytes())["model"] == (
+        "judge/model"
+    )
+    assert (exchange / "response-upstream.bin").read_bytes() == (
+        exchange / "response-delivered.bin"
+    ).read_bytes()
+    assert (
+        json.loads((evidence_manifest.parent / "judge/recorder.json").read_text())[
+            "exchange_count"
+        ]
+        == 1
+    )
 
 
 def test_provider_wave_runs_shards_without_endpoint_lifecycle(
@@ -1315,9 +1459,9 @@ def test_missing_required_session_publishes_terminal_failed_evidence(
         (execution / "private-artifacts.json").read_text(encoding="utf-8")
     )
     assert failure == {
-        "category": "configuration",
-        "error_type": "PrivateArtifactRequirementError",
-        "message": "successful OpenClaw execution has no session JSONL",
+        "category": "evidence",
+        "error_type": "TrialEvidenceError",
+        "message": "agent execution has no session JSONL",
     }
     assert private["requirements"] == [
         {

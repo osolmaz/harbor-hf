@@ -109,6 +109,18 @@ class BenchmarkJudgeSpec(StrictModel):
     api_url: AnyHttpUrl
     model: str = Field(min_length=1)
     api_key_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
+    task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
+    exclude_task_names: list[TaskName] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def task_selectors_are_unique(self) -> BenchmarkJudgeSpec:
+        for label, values in (
+            ("task_names", self.task_names),
+            ("exclude_task_names", self.exclude_task_names),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"benchmark judge {label} must be unique")
+        return self
 
     @field_validator("api_url")
     @classmethod
@@ -121,10 +133,11 @@ class BenchmarkJudgeSpec(StrictModel):
             or value.fragment is not None
             or value.host != "router.huggingface.co"
             or value.port != 443
+            or value.path != "/v1/chat/completions"
         ):
             raise ValueError(
                 "benchmark judge API URL must be credential-free HTTPS on the "
-                "trusted Hugging Face router"
+                "Hugging Face router chat completions endpoint"
             )
         return value
 
@@ -359,8 +372,31 @@ class ExecutionSpec(StrictModel):
     )
 
 
+class TrialEvidencePolicy(StrictModel):
+    """Locked workspace and judge evidence limits for one remote execution."""
+
+    workspace_root: Literal["/app"]
+    workspace_max_nodes: int = Field(ge=1, le=1_000_000)
+    workspace_max_file_bytes: int = Field(ge=1, le=8 * 1024**3)
+    workspace_max_total_bytes: int = Field(ge=1, le=32 * 1024**3)
+    workspace_max_archive_bytes: int = Field(ge=1, le=32 * 1024**3)
+    workspace_capture_timeout_seconds: int = Field(ge=1, le=3600)
+    judge_max_request_bytes: int = Field(ge=1, le=128 * 1024**2)
+    judge_max_response_bytes: int = Field(ge=1, le=128 * 1024**2)
+    judge_max_calls_per_execution: int = Field(ge=1, le=64)
+
+    @model_validator(mode="after")
+    def limits_are_consistent(self) -> TrialEvidencePolicy:
+        if self.workspace_max_file_bytes > self.workspace_max_total_bytes:
+            raise ValueError("workspace file limit cannot exceed the total byte limit")
+        return self
+
+
 class ArtifactStoreSpec(StrictModel):
     bucket: str = Field(min_length=1)
+    trial_evidence: TrialEvidencePolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class PublishingSpec(StrictModel):
@@ -543,12 +579,49 @@ def profile_deployment_digest(deployment: DeploymentTarget) -> str:
     return _canonical_profile_digest(value)
 
 
+def resolved_judge_required_tasks(benchmark: BenchmarkSpec) -> list[str]:
+    """Resolve the exact sorted judge-required task names for a locked run."""
+    if benchmark.judge is None:
+        return []
+    selected = sorted(benchmark.task_digests)
+    if not selected:
+        raise ValueError("judge task selection requires resolved task digests")
+    judge = benchmark.judge
+    included: set[str] = set()
+    for selector in judge.task_names:
+        matched = {task for task in selected if fnmatch(task, selector)}
+        if not matched:
+            raise ValueError(
+                f"benchmark judge selector matches no selected task: {selector}"
+            )
+        included |= matched
+    for selector in judge.exclude_task_names:
+        matched = {task for task in selected if fnmatch(task, selector)}
+        if not matched:
+            raise ValueError(
+                f"benchmark judge exclusion matches no selected task: {selector}"
+            )
+        outside = matched - included
+        if outside:
+            raise ValueError(
+                "benchmark judge exclusion names a task outside the "
+                f"included judge set: {selector}"
+            )
+        included -= matched
+    return sorted(included)
+
+
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
+    if spec.artifacts.trial_evidence is None:
+        raise ValueError(
+            "remote benchmark runs require an artifacts.trial_evidence policy"
+        )
     if spec.benchmark.source is None:
         pinned_harbor_dataset_reference(
             spec.benchmark.dataset, spec.benchmark.dataset_digest
         )
     _validate_task_pins(spec.benchmark)
+    resolved_judge_required_tasks(spec.benchmark)
     if any(
         re.fullmatch(r"[0-9a-f]{40}", model.revision) is None
         for model in spec.matrix.models

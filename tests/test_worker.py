@@ -3202,6 +3202,19 @@ def _successful_stream(
         json.dumps({"task": {"digest": "sha256:" + "2" * 64}}),
         encoding="utf-8",
     )
+    workspace = trial / "artifacts" / "workspace" / "app" / "output"
+    workspace.mkdir(parents=True)
+    (workspace / "answer.txt").write_text("answer\n")
+    sessions = trial / "agent" / "openclaw-sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "session.jsonl").write_text('{"role":"assistant"}\n')
+    (trial / "agent" / "trajectory.json").write_text("{}\n")
+    verifier = trial / "verifier"
+    verifier.mkdir()
+    (verifier / "scorecard.json").write_text('{"passed":true}\n')
+    (verifier / "reward.txt").write_text("1\n")
+    (verifier / "test-stdout.txt").write_text("ok\n")
+    (verifier / "test-stderr.txt").write_text("")
     log_path.write_text("completed test-token\n", encoding="utf-8")
     return 0
 
@@ -3353,6 +3366,15 @@ def test_worker_publishes_success_after_cleanup(
         "harbor-jobs/job/trial/result.json",
         "harbor-jobs/job/trial/lock.json",
         "harbor-jobs/job/trial/private-artifacts.json",
+        "harbor-jobs/job/trial/agent/openclaw-sessions/session.jsonl",
+        "harbor-jobs/job/trial/agent/trajectory.json",
+        "harbor-jobs/job/trial/evidence/manifest.json",
+        "harbor-jobs/job/trial/evidence/workspace-files.jsonl",
+        "harbor-jobs/job/trial/evidence/workspace.tar.zst",
+        "harbor-jobs/job/trial/verifier/reward.txt",
+        "harbor-jobs/job/trial/verifier/scorecard.json",
+        "harbor-jobs/job/trial/verifier/test-stderr.txt",
+        "harbor-jobs/job/trial/verifier/test-stdout.txt",
         "harbor-native-bundle.json",
         "harbor.log",
         "harbor-request.json",
@@ -3411,6 +3433,7 @@ def test_direct_worker_fails_and_publishes_when_openclaw_session_is_missing(
             result = json.loads(result_path.read_text(encoding="utf-8"))
             result["agent_execution"] = {"started_at": "2026-07-14T00:00:00Z"}
             result_path.write_text(json.dumps(result), encoding="utf-8")
+            shutil.rmtree(result_path.parent / "agent" / "openclaw-sessions")
         return exit_code
 
     runner = EndpointRunner(

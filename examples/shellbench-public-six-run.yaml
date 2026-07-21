@@ -7,6 +7,13 @@ metadata:
 benchmark:
   dataset: harbor/shellbench@1.0
   dataset_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  judge:
+    protocol: openai-compatible
+    api_url: https://router.huggingface.co/v1/chat/completions
+    model: google/gemini-3.5-flash
+    api_key_secret_name: HF_TOKEN
+    task_names:
+      - "*"
   task_names:
     - "*"
   task_digests:
@@ -68,7 +75,7 @@ matrix:
         thinking: "off"
         compaction: true
 execution:
-  attempts: 1
+  attempts: 6
   concurrent_trials: 8
   timeout_seconds: 7200
 artifacts:

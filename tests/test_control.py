@@ -823,7 +823,7 @@ def test_campaign_projection_corpus_is_stable(remote_spec: ExperimentSpec) -> No
     ).encode()
 
     assert hashlib.sha256(encoded).hexdigest() == (
-        "ab3bb6224a06579ab418f7753790d58893c2c5b925a1870e1cd9aa59591feb6d"
+        "7e395dea60138cb17adb91b3197ae975e9d35698fdb60177d6b7a1fc553908e3"
     )
 
 
@@ -1034,7 +1034,7 @@ def test_control_store_commit_corpus_is_stable(
     ).encode()
 
     assert hashlib.sha256(encoded).hexdigest() == (
-        "d89df250af3711c868ecbb7676150eb95878ebb6d249204ec55e3a3d0189780d"
+        "bdc8f1a823ec1a7379a8e2cd07d29143e7454a793f0cd3600cf9e5a68334bb7d"
     )
 
 

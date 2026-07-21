@@ -1,0 +1,70 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "maximum": 4095,
+      "minimum": 0,
+      "title": "Mode",
+      "type": "integer"
+    },
+    "path": {
+      "minLength": 1,
+      "title": "Path",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/workspace-file/v1",
+      "default": "harbor-hf/workspace-file/v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sha256": {
+      "anyOf": [
+        {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sha256"
+    },
+    "size": {
+      "minimum": 0,
+      "title": "Size",
+      "type": "integer"
+    },
+    "target": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Target"
+    },
+    "type": {
+      "enum": [
+        "directory",
+        "file",
+        "symlink",
+        "hardlink"
+      ],
+      "title": "Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path",
+    "type",
+    "mode",
+    "size"
+  ],
+  "title": "WorkspaceFile",
+  "type": "object"
+}

@@ -359,6 +359,12 @@ def build_execution_request(
         "n_attempts": attempts,
         "n_concurrent_trials": concurrency,
         "retry": {"max_retries": 0},
+        "artifacts": [
+            {
+                "source": "/app",
+                "destination": "workspace/app",
+            }
+        ],
         "environment": {
             "type": lock.remote.harbor.environment,
             "kwargs": {

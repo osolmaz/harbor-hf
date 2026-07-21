@@ -1,0 +1,239 @@
+{
+  "$defs": {
+    "BodyReference": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size": {
+          "minimum": 0,
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "size",
+        "sha256"
+      ],
+      "title": "BodyReference",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "attempt": {
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "delivered_http_status": {
+      "maximum": 599,
+      "minimum": 100,
+      "title": "Delivered Http Status",
+      "type": "integer"
+    },
+    "delivered_response_headers": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Delivered Response Headers",
+      "type": "object"
+    },
+    "error_message": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Message"
+    },
+    "error_type": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error Type"
+    },
+    "exchange_id": {
+      "pattern": "^judge-[0-9]{4}$",
+      "title": "Exchange Id",
+      "type": "string"
+    },
+    "execution_id": {
+      "title": "Execution Id",
+      "type": "string"
+    },
+    "finished_at": {
+      "format": "date-time",
+      "title": "Finished At",
+      "type": "string"
+    },
+    "forwarded_model": {
+      "title": "Forwarded Model",
+      "type": "string"
+    },
+    "outcome": {
+      "enum": [
+        "success",
+        "upstream_error",
+        "transport_error",
+        "recorder_error"
+      ],
+      "title": "Outcome",
+      "type": "string"
+    },
+    "provider": {
+      "const": "hf-inference-provider",
+      "default": "hf-inference-provider",
+      "title": "Provider",
+      "type": "string"
+    },
+    "request_forwarded": {
+      "$ref": "#/$defs/BodyReference"
+    },
+    "request_forwarded_headers": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Request Forwarded Headers",
+      "type": "object"
+    },
+    "request_received": {
+      "$ref": "#/$defs/BodyReference"
+    },
+    "request_received_headers": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Request Received Headers",
+      "type": "object"
+    },
+    "requested_model": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Requested Model"
+    },
+    "response_delivered": {
+      "$ref": "#/$defs/BodyReference"
+    },
+    "response_upstream": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BodyReference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "schema_version": {
+      "const": "harbor-hf/judge-exchange/v1",
+      "default": "harbor-hf/judge-exchange/v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    },
+    "total_ms": {
+      "minimum": 0,
+      "title": "Total Ms",
+      "type": "number"
+    },
+    "transformation": {
+      "enum": [
+        "none",
+        "model_enforced"
+      ],
+      "title": "Transformation",
+      "type": "string"
+    },
+    "upstream_http_status": {
+      "anyOf": [
+        {
+          "maximum": 599,
+          "minimum": 100,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Upstream Http Status"
+    },
+    "upstream_request_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Upstream Request Id"
+    },
+    "upstream_response_headers": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Upstream Response Headers",
+      "type": "object"
+    },
+    "upstream_url": {
+      "const": "https://router.huggingface.co/v1/chat/completions",
+      "default": "https://router.huggingface.co/v1/chat/completions",
+      "title": "Upstream Url",
+      "type": "string"
+    }
+  },
+  "required": [
+    "exchange_id",
+    "execution_id",
+    "attempt",
+    "requested_model",
+    "forwarded_model",
+    "transformation",
+    "request_received_headers",
+    "request_forwarded_headers",
+    "request_received",
+    "request_forwarded",
+    "response_upstream",
+    "response_delivered",
+    "delivered_http_status",
+    "upstream_response_headers",
+    "delivered_response_headers",
+    "started_at",
+    "finished_at",
+    "total_ms",
+    "outcome"
+  ],
+  "title": "JudgeExchange",
+  "type": "object"
+}

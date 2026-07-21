@@ -411,7 +411,8 @@ def test_benchmark_failure_retries_then_becomes_scored_invalid(
 
 
 @pytest.mark.parametrize(
-    "category", ["lost", "transient", "quota", "rate-limit", "ambiguous"]
+    "category",
+    ["lost", "transient", "quota", "rate-limit", "ambiguous", "evidence"],
 )
 def test_retry_budget_exhaustion_is_terminal(
     remote_spec: ExperimentSpec, category: RetryCategory
@@ -2179,7 +2180,8 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
 
     retry_lock, retry_submitted = _campaign(remote_spec)
     for offset, category in enumerate(
-        ["lost", "transient", "quota", "rate-limit", "ambiguous"], 40
+        ["lost", "transient", "quota", "rate-limit", "ambiguous", "evidence"],
+        40,
     ):
         events = [
             retry_submitted,
@@ -2239,7 +2241,7 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
         corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "a578b43cad2ee93cabc91a3dce88c017407406dd09d5bff05302088b1a15ccb7"
+        "937c43641a6d9bbb83beab039859f6f451a34598d86e31b4631f944c6c7ae2c3"
     )
 
 

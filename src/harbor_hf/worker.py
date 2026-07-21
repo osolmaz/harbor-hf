@@ -58,6 +58,7 @@ from harbor_hf.harbor_adapter.legacy import (
     validate_task_counts,
     validate_trial_count,
 )
+from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle
 from harbor_hf.harbor_native_bundle import write_harbor_native_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import (
@@ -96,6 +97,7 @@ from harbor_hf.submission import (
     github_repository,
     locked_source_command,
 )
+from harbor_hf.trial_evidence import assemble_trial_evidence
 
 _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
 _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
@@ -717,6 +719,10 @@ def _execute_benchmark(
     stream_runner: Callable[..., int],
     harbor_source: Path,
 ) -> None:
+    if lock.benchmark_judge is not None:
+        raise WorkerError(
+            "judge-required runs must use campaign execution for per-trial evidence"
+        )
     base_url = resume_and_probe_endpoint(root, events, lock, manager, token)
 
     jobs_dir = root / "harbor-jobs"
@@ -760,8 +766,45 @@ def _execute_benchmark(
     if outcome.verification is None:
         raise WorkerError("Harbor produced no validated compatibility bundle")
     write_json(root / "verification.json", outcome.verification.model_dump(mode="json"))
+    _assemble_direct_trial_evidence(
+        root, jobs_dir, lock, outcome.compatibility_path, token
+    )
     _validate_direct_private_artifacts(root, lock)
     append_event(events, "verification_validated")
+
+
+def _assemble_direct_trial_evidence(
+    root: Path,
+    jobs_dir: Path,
+    lock: RunLock,
+    compatibility_path: Path | None,
+    token: str,
+) -> None:
+    policy = lock.trial_evidence
+    if policy is None or compatibility_path is None:
+        raise WorkerError("direct run has no locked trial evidence policy")
+    bundle = HarborCompatibilityBundle.model_validate_json(
+        compatibility_path.read_text(encoding="utf-8")
+    )
+    attempts: dict[str, int] = {}
+    for native in sorted(bundle.trials, key=lambda item: (item.task_name, item.path)):
+        logical_attempt = attempts.get(native.task_name, 0) + 1
+        attempts[native.task_name] = logical_attempt
+        assemble_trial_evidence(
+            jobs_dir / native.path,
+            campaign_id=None,
+            run_id=lock.run_id,
+            execution_id=lock.run_id,
+            trial_id=native.trial_id,
+            task_name=native.task_name,
+            task_digest=native.task_digest,
+            logical_attempt=logical_attempt,
+            physical_attempt=1,
+            judge_expected=False,
+            judge_model=None,
+            policy=policy,
+            known_secrets=(token,),
+        )
 
 
 def resume_and_probe_endpoint(

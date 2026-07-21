@@ -379,7 +379,7 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
         separators=(",", ":"),
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "80ec988f41ff8b1f8dd7e81e338e941cd02ee83767d3d8af529089c282404b5d"
+        "04cfb7fdca69409e051fbf09af1f4be31001db81e0eb52a96e4b2ce0a7de9239"
     )
 
 

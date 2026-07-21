@@ -1,0 +1,39 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "closed_at": {
+      "format": "date-time",
+      "title": "Closed At",
+      "type": "string"
+    },
+    "exchange_count": {
+      "minimum": 0,
+      "title": "Exchange Count",
+      "type": "integer"
+    },
+    "execution_id": {
+      "minLength": 1,
+      "title": "Execution Id",
+      "type": "string"
+    },
+    "model": {
+      "minLength": 1,
+      "title": "Model",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/judge-recorder-summary/v1",
+      "default": "harbor-hf/judge-recorder-summary/v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "execution_id",
+    "model",
+    "exchange_count",
+    "closed_at"
+  ],
+  "title": "JudgeRecorderSummary",
+  "type": "object"
+}

@@ -83,6 +83,7 @@ _RETRYABLE_CATEGORIES = {
     "quota",
     "rate-limit",
     "ambiguous",
+    "evidence",
     "agent",
     "benchmark",
 }
