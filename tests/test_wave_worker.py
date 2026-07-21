@@ -1018,7 +1018,9 @@ def test_judged_wave_records_and_selects_exact_exchange(
         environment: dict[str, str],
         timeout_seconds: int,
     ) -> int:
-        if not ("--output" in command and "--request-digest" in command):
+        is_export = "--output" in command and "--request-digest" in command
+        exchange_id: str | None = None
+        if not is_export:
             request_body = json.dumps(
                 {
                     "model": "wrong/model",
@@ -1037,13 +1039,31 @@ def test_judged_wave_records_and_selects_exact_exchange(
             )
             with urllib.request.urlopen(request, timeout=5) as response:
                 assert response.status == 200
-                assert response.headers["X-Harbor-Judge-Exchange-ID"] == "judge-0001"
-        return base_stream(
+                exchange_id = response.headers["X-Harbor-Judge-Exchange-ID"]
+                assert exchange_id == "judge-0001"
+        result = base_stream(
             command,
             log_path,
             environment=environment,
             timeout_seconds=timeout_seconds,
         )
+        if not is_export:
+            assert exchange_id is not None
+            config_path = Path(command[command.index("--config") + 1])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            selection = (
+                Path(config["jobs_dir"]) / "job/trial/verifier/judge-selection.json"
+            )
+            selection.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "harbor-hf/judge-selection/v1",
+                        "exchange_id": exchange_id,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return result
 
     output = tmp_path / "output"
     run_wave_worker(

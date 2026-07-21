@@ -587,13 +587,6 @@ def _judge_selection_reference(
         if path.exists():
             raise TrialEvidenceError("judge selection exists without an exchange")
         return None, None
-    if not path.exists() and len(exchanges) == 1:
-        _atomic_write_json(
-            path,
-            JudgeSelection(exchange_id=exchanges[0].parent.name).model_dump(
-                mode="json"
-            ),
-        )
     if not path.is_file():
         raise TrialEvidenceError("judge selection is missing")
     selection = JudgeSelection.model_validate_json(path.read_text())

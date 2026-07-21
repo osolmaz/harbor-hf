@@ -321,9 +321,10 @@ def _private_artifact_entry(
     if not candidate.is_file():
         raise RuntimeError(f"private artifact has unsupported file type: {relative}")
     size = candidate.stat().st_size
+    workspace_archive = "evidence/workspace.tar.zst"
     effective_limit = (
         MAX_WORKSPACE_ARCHIVE_BYTES
-        if relative.endswith("/evidence/workspace.tar.zst")
+        if relative == workspace_archive or relative.endswith(f"/{workspace_archive}")
         else max_file_bytes
     )
     if size > effective_limit:
