@@ -228,7 +228,10 @@ def _evidence_paths(root: Path, *, allow_symlinks: bool = False) -> list[Path]:
     paths = sorted(root.rglob("*"))
     if not allow_symlinks and any(path.is_symlink() for path in paths):
         raise RuntimeError("symbolic links are not allowed in run evidence")
-    if any(not path.is_dir() and not path.is_file() for path in paths):
+    if any(
+        not path.is_symlink() and not path.is_dir() and not path.is_file()
+        for path in paths
+    ):
         raise RuntimeError("special files are not allowed in run evidence")
     return paths
 

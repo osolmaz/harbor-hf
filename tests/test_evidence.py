@@ -199,6 +199,10 @@ def test_secret_redaction_can_scan_workspace_tree_with_symlinks(
     assert_secret_absent(root, "secret-value", allow_symlinks=True)
     assert (root / "link").is_symlink()
 
+    dangling = root / "dangling"
+    dangling.symlink_to("missing.txt")
+    assert_secret_absent(root, "secret-value", allow_symlinks=True)
+
     (root / "secret-value-link").symlink_to("target.txt")
     with pytest.raises(RuntimeError, match="secret value found in artifact path"):
         assert_secret_absent(root, "secret-value", allow_symlinks=True)
