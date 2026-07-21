@@ -940,6 +940,33 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     ) == campaign.model_dump(mode="json")
 
 
+def test_wave_rejects_missing_trial_evidence_before_remote_setup(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+) -> None:
+    _, _, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=1, concurrency=1
+    )
+    run = wave.runs[0]
+    legacy_run = run.model_copy(
+        update={
+            "configuration": run.configuration.model_copy(
+                update={"trial_evidence": None}
+            )
+        }
+    )
+    legacy_wave = wave.model_copy(update={"runs": [legacy_run]})
+    wave_path.write_text(legacy_wave.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(WorkerError, match="complete trial evidence policy"):
+        run_wave_worker(
+            manifest,
+            campaign_path,
+            wave_path,
+            tmp_path / "output",
+        )
+
+
 def test_judged_wave_records_and_selects_exact_exchange(
     remote_spec: ExperimentSpec,
     tmp_path: Path,

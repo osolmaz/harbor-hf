@@ -288,6 +288,8 @@ class _EndpointWaveLifecycle:
 def validate_wave_lock(
     spec: ExperimentSpec, campaign: CampaignLock, lock: WaveLock
 ) -> None:
+    if any(run.configuration.trial_evidence is None for run in lock.runs):
+        raise WorkerError("wave run locks require a complete trial evidence policy")
     matching_runs = [
         run for run in campaign.runs if run.deployment_digest == lock.deployment_digest
     ]

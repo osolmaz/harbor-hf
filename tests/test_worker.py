@@ -3984,6 +3984,15 @@ def test_run_lock_validation_reconstructs_selected_matrix_cell(
     validate_run_lock(spec, lock)
 
 
+def test_run_lock_validation_rejects_missing_trial_evidence(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock = build_run_lock(remote_spec).model_copy(update={"trial_evidence": None})
+
+    with pytest.raises(WorkerError, match="complete trial evidence policy"):
+        validate_run_lock(remote_spec, lock)
+
+
 def test_run_lock_validation_reports_digest_and_resolution_errors(
     remote_spec: ExperimentSpec,
 ) -> None:

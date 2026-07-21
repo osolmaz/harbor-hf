@@ -97,6 +97,11 @@ def test_records_exact_bodies_and_enforces_model(tmp_path: Path) -> None:
         path.read_text(errors="ignore") for path in exchange.iterdir()
     )
     assert verify_judge_exchange(exchange).exchange_id == "judge-0001"
+    unexpected = exchange / "unexpected"
+    unexpected.mkdir()
+    with pytest.raises(JudgeRecorderError, match="unsupported entry"):
+        verify_judge_exchange(exchange)
+    unexpected.rmdir()
     (exchange / "response-delivered.bin").write_bytes(b"tampered")
     with pytest.raises(JudgeRecorderError, match="digest mismatch"):
         verify_judge_exchange(exchange)

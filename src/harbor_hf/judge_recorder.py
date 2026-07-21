@@ -680,12 +680,7 @@ def verify_judge_exchange(exchange_dir: Path) -> JudgeExchange:
     if exchange.response_upstream is not None:
         references.append(exchange.response_upstream)
     expected = {"exchange.json", *(reference.path for reference in references)}
-    observed = {
-        path.name
-        for path in exchange_dir.iterdir()
-        if path.is_file() and not path.is_symlink()
-    }
-    if observed != expected:
+    if _judge_exchange_entry_names(exchange_dir) != expected:
         raise JudgeRecorderError("judge exchange file set is incomplete")
     for reference in references:
         path = exchange_dir / reference.path
@@ -738,6 +733,16 @@ def _safe_error_message(error: Exception) -> str:
     if isinstance(error, httpx.HTTPError):
         return "upstream judge transport failed"
     return "judge evidence recorder failed"
+
+
+def _judge_exchange_entry_names(exchange_dir: Path) -> set[str]:
+    try:
+        entries = list(exchange_dir.iterdir())
+    except OSError as error:
+        raise JudgeRecorderError("judge exchange directory is unreadable") from error
+    if any(path.is_symlink() or not path.is_file() for path in entries):
+        raise JudgeRecorderError("judge exchange contains an unsupported entry")
+    return {path.name for path in entries}
 
 
 def _capability(path: str) -> str | None:

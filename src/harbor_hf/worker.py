@@ -600,6 +600,8 @@ def _failure_details(
 
 
 def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
+    if lock.trial_evidence is None:
+        raise WorkerError("run lock requires a complete trial evidence policy")
     if lock.spec_digest != experiment_digest(spec):
         raise WorkerError("manifest digest does not match the run lock")
     try:
