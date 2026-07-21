@@ -146,6 +146,39 @@ def test_rejects_streaming_without_upstream_call(tmp_path: Path) -> None:
     assert calls == 0
 
 
+def test_rejects_untrusted_routing_fields_without_upstream_call(tmp_path: Path) -> None:
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=b"{}")
+
+    recorder = JudgeEvidenceRecorder(
+        token="token",
+        client=httpx.Client(transport=httpx.MockTransport(upstream)),
+        capability_factory=lambda: "r" * 32,
+    )
+    base = recorder.start(host="127.0.0.1", port=0)
+    capability = recorder.register_scope(
+        execution_id="exec",
+        trial_id="trial",
+        model="judge",
+        destination=tmp_path / "judge",
+        policy=_policy(),
+    )
+    try:
+        status, _, _ = _request(
+            recorder.scoped_url(base, capability),
+            {"model": "judge", "messages": [], "provider": "untrusted"},
+        )
+    finally:
+        recorder.close()
+
+    assert status == 502
+    assert calls == 0
+
+
 def test_known_secret_in_prompt_fails_closed(tmp_path: Path) -> None:
     recorder = JudgeEvidenceRecorder(
         token="upstream-token",

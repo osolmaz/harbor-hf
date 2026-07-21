@@ -33,6 +33,9 @@ _ALLOWED_REQUEST_HEADERS = frozenset(
         "user-agent",
     }
 )
+_ALLOWED_REQUEST_FIELDS = frozenset(
+    {"messages", "model", "response_format", "temperature"}
+)
 _ALLOWED_RESPONSE_HEADERS = frozenset(
     {
         "content-encoding",
@@ -368,6 +371,8 @@ class JudgeEvidenceRecorder:
                 raise JudgeRecorderError("judge request must be a JSON object")
             if payload.get("stream") is True:
                 raise JudgeRecorderError("streaming judge requests are forbidden")
+            if not set(payload).issubset(_ALLOWED_REQUEST_FIELDS):
+                raise JudgeRecorderError("judge request contains unsupported fields")
             requested_model = (
                 payload.get("model") if isinstance(payload.get("model"), str) else None
             )
