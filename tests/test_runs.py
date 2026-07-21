@@ -288,7 +288,7 @@ def test_run_lock_preserves_and_renders_hosted_judge(
     assert lock.benchmark_judge == spec.benchmark.judge
     assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
     assert observed_environment == {
-        "AGENT_JUDGE_API_KEY": "harbor-hf-recorder",
+        "AGENT_JUDGE_API_KEY": "secret-token",
         "AGENT_JUDGE_API_URL": judge_url,
         "AGENT_JUDGE_MODEL": "deepseek-ai/DeepSeek-V3.2",
         "HF_TOKEN": "secret-token",

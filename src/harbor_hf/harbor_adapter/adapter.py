@@ -68,6 +68,7 @@ class HarborExecutionAdapter(Protocol):
         attempts: int,
         concurrency: int,
         expected_task_digests: dict[str, str],
+        extra_environment_hosts: tuple[str, ...] = (),
     ) -> PreparedHarborExecution: ...
 
     def execute(
@@ -99,6 +100,7 @@ class FilesystemHarborExecutionAdapter:
         attempts: int,
         concurrency: int,
         expected_task_digests: dict[str, str],
+        extra_environment_hosts: tuple[str, ...] = (),
     ) -> PreparedHarborExecution:
         request = build_execution_request(
             lock,
@@ -108,6 +110,7 @@ class FilesystemHarborExecutionAdapter:
             attempts=attempts,
             concurrency=concurrency,
             expected_task_digests=expected_task_digests,
+            extra_environment_hosts=extra_environment_hosts,
         )
         request_path = execution_root / "harbor-request.json"
         config_path = execution_root / "harbor-job.json"
@@ -313,6 +316,7 @@ def build_execution_request(
     attempts: int,
     concurrency: int,
     expected_task_digests: dict[str, str],
+    extra_environment_hosts: tuple[str, ...] = (),
 ) -> HarborExecutionRequest:
     if attempts < 1 or concurrency < 1:
         raise WorkerError("Harbor attempts and concurrency must be positive")
@@ -354,6 +358,17 @@ def build_execution_request(
     if lock.agent.revision_kind == "package":
         agent_kwargs["version"] = lock.agent.revision
     host = urlparse(base_url).hostname or ""
+    environment: dict[str, JsonValue] = {
+        "type": lock.remote.harbor.environment,
+        "kwargs": {
+            "flavor": lock.remote.harbor.sandbox_flavor,
+            "job_timeout": lock.remote.harbor.sandbox_idle_timeout_seconds,
+        },
+    }
+    if extra_environment_hosts:
+        environment["extra_allowed_hosts"] = list(
+            dict.fromkeys(extra_environment_hosts)
+        )
     config: dict[str, JsonValue] = {
         "jobs_dir": str(jobs_dir),
         "n_attempts": attempts,
@@ -365,13 +380,7 @@ def build_execution_request(
                 "destination": "workspace/app",
             }
         ],
-        "environment": {
-            "type": lock.remote.harbor.environment,
-            "kwargs": {
-                "flavor": lock.remote.harbor.sandbox_flavor,
-                "job_timeout": lock.remote.harbor.sandbox_idle_timeout_seconds,
-            },
-        },
+        "environment": environment,
         "agents": [
             {
                 "name": lock.agent.name,

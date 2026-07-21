@@ -15,6 +15,7 @@ from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -1088,6 +1089,7 @@ def _execute_trial(
             attempts=1,
             concurrency=1,
             expected_task_digests={trial.task_name: trial.task_digest},
+            extra_environment_hosts=_judge_environment_hosts(judge_api_url),
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
@@ -1241,6 +1243,15 @@ def _finish_trial_judge_route(
         )
         return existing_error or revoke_error
     return existing_error
+
+
+def _judge_environment_hosts(judge_api_url: str | None) -> tuple[str, ...]:
+    if judge_api_url is None:
+        return ()
+    host = urlparse(judge_api_url).hostname
+    if not host:
+        raise WorkerError("judge recorder URL has no hostname")
+    return (host,)
 
 
 def _register_trial_judge_route(

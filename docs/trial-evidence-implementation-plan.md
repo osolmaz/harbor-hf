@@ -607,18 +607,22 @@ When a task is judge-required, set:
 ```text
 AGENT_JUDGE_API_URL=<scoped recorder URL>/v1/chat/completions
 AGENT_JUDGE_MODEL=<locked judge model>
-AGENT_JUDGE_API_KEY=harbor-hf-recorder
+AGENT_JUDGE_API_KEY=<HF Job ingress credential>
 ```
 
 The upstream judge API URL remains in the immutable lock and is known only to
 the trusted recorder. The verifier does not receive it.
 
-The ingress credential remains an environment value. It must not be serialized
-into the Harbor request, OpenClaw config, workspace, judge evidence, or process
-command.
+The verifier uses the HF Job ingress credential as its bearer value. The
+credential remains an environment value and is used only to enter the scoped
+recorder route; the recorder still owns the separate upstream judge credential.
+The ingress credential must not be serialized into the Harbor request, OpenClaw
+config, workspace, judge evidence, or process command.
 
 For deterministic tasks, omit all three judge variables. This prevents a task
 outside the resolved judge-required set from making an accidental paid call.
+For judge-required tasks, add the recorder ingress hostname to Harbor's
+run-specific environment host allowlist so the verifier phase can reach it.
 
 ### Request validation
 

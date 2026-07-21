@@ -998,11 +998,12 @@ def test_judged_wave_records_and_selects_exact_exchange(
                     "messages": [{"role": "user", "content": "grade"}],
                 }
             ).encode()
+            assert environment["AGENT_JUDGE_API_KEY"] == "test-token"
             request = urllib.request.Request(
                 environment["AGENT_JUDGE_API_URL"],
                 data=request_body,
                 headers={
-                    "Authorization": "Bearer verifier-placeholder",
+                    "Authorization": (f"Bearer {environment['AGENT_JUDGE_API_KEY']}"),
                     "Content-Type": "application/json",
                 },
                 method="POST",
@@ -1036,6 +1037,8 @@ def test_judged_wave_records_and_selects_exact_exchange(
         identifier=IdentifierSequence(),
     )
 
+    harbor_config = json.loads(next(output.rglob("harbor-job.json")).read_text())
+    assert harbor_config["environment"]["extra_allowed_hosts"] == ["127.0.0.1"]
     evidence_manifest = next(output.rglob("evidence/manifest.json"))
     payload = json.loads(evidence_manifest.read_text())
     assert payload["judge"]["expected"] is True
