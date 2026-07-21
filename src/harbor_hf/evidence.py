@@ -183,11 +183,15 @@ def assert_secret_absent(
                 raise RuntimeError(f"secret value found in artifact {relative}")
 
 
-def scrub_secret_paths(root: Path, secrets: SecretValues) -> int:
+def scrub_secret_paths(
+    root: Path, secrets: SecretValues, *, allow_symlinks: bool = False
+) -> int:
     changed = 0
     for secret in _secret_values(secrets):
         paths = sorted(
-            _evidence_paths(root), key=lambda path: len(path.parts), reverse=True
+            _evidence_paths(root, allow_symlinks=allow_symlinks),
+            key=lambda path: len(path.parts),
+            reverse=True,
         )
         for path in paths:
             if secret not in path.name:

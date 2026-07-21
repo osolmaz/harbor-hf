@@ -1077,13 +1077,11 @@ def _assemble_profile_point_evidence(
     policy = run_lock.trial_evidence
     if policy is None:
         raise ProfileWorkerError("profile trial evidence policy is missing")
+    run_secrets = run_secret_values(run_lock, token)
+    base_secrets = (run_secrets,) if isinstance(run_secrets, str) else run_secrets
     secrets = tuple(
         value
-        for value in (
-            *run_secret_values(run_lock, token),
-            provider_capability,
-            judge_capability,
-        )
+        for value in (*base_secrets, provider_capability, judge_capability)
         if value
     )
     judge_records = _split_profile_judge_records(
@@ -1147,6 +1145,7 @@ def _split_profile_judge_records(
     aggregate = execution_root / "judge-records"
     summary = _profile_judge_summary(aggregate)
     assigned = _profile_judge_assignments(judged, jobs_dir)
+    zero_call_trials = _profile_zero_call_trials(judged, jobs_dir)
     exchange_dirs = {
         path.name: path
         for path in aggregate.glob("judge-*")
@@ -1157,16 +1156,7 @@ def _split_profile_judge_records(
     policy = run_lock.trial_evidence
     if policy is None:
         raise ProfileWorkerError("profile trial evidence policy is missing")
-    assignment_counts: dict[str, int] = {}
-    for native in assigned.values():
-        assignment_counts[native.trial_id] = (
-            assignment_counts.get(native.trial_id, 0) + 1
-        )
-    if any(
-        count > policy.judge_max_calls_per_execution
-        for count in assignment_counts.values()
-    ):
-        raise ProfileWorkerError("profile trial exceeds its judge call limit")
+    _validate_profile_assignment_counts(assigned, policy.judge_max_calls_per_execution)
     grouped: dict[str, list[str]] = {}
     destinations: dict[str, Path] = {}
     for exchange_id, native in assigned.items():
@@ -1183,6 +1173,11 @@ def _split_profile_judge_records(
         shutil.move(str(exchange_dir), destination / exchange_id)
         grouped.setdefault(native.trial_id, []).append(exchange_id)
         destinations[native.trial_id] = destination
+    for native in zero_call_trials:
+        destination = execution_root / "profile-judge-records" / native.trial_id
+        destination.mkdir(parents=True)
+        destinations[native.trial_id] = destination
+        grouped[native.trial_id] = []
     for trial_id, exchange_ids in grouped.items():
         execution_id = f"profile-{plan.profile_id}-{scope}-{trial_id}"
         trial_summary = JudgeRecorderSummary(
@@ -1200,6 +1195,16 @@ def _split_profile_judge_records(
     (aggregate / "recorder.json").unlink()
     aggregate.rmdir()
     return destinations
+
+
+def _validate_profile_assignment_counts(
+    assigned: dict[str, HarborCompatibilityTrial], maximum_calls: int
+) -> None:
+    counts: dict[str, int] = {}
+    for native in assigned.values():
+        counts[native.trial_id] = counts.get(native.trial_id, 0) + 1
+    if any(count > maximum_calls for count in counts.values()):
+        raise ProfileWorkerError("profile trial exceeds its judge call limit")
 
 
 def _profile_judge_summary(aggregate: Path) -> JudgeRecorderSummary:
@@ -1223,11 +1228,14 @@ def _profile_judge_assignments(
             raise ProfileWorkerError("judged profile trial did not complete")
         native_root = resolve_native_trial_root(jobs_dir, native.path)
         verifier = native_root / "verifier"
+        selection_path = verifier / "judge-selection.json"
+        calls_path = verifier / "judge-calls.json"
+        if not selection_path.exists() and not calls_path.exists():
+            continue
         try:
             selection = JudgeSelection.model_validate_json(
                 (verifier / "judge-selection.json").read_text(encoding="utf-8")
             )
-            calls_path = verifier / "judge-calls.json"
             calls = (
                 JudgeCalls.model_validate_json(calls_path.read_text(encoding="utf-8"))
                 if calls_path.is_file()
@@ -1244,6 +1252,25 @@ def _profile_judge_assignments(
                 raise ProfileWorkerError("profile judge exchange was assigned twice")
             assigned[exchange_id] = native
     return assigned
+
+
+def _profile_zero_call_trials(
+    judged: list[HarborCompatibilityTrial], jobs_dir: Path
+) -> list[HarborCompatibilityTrial]:
+    return [
+        native
+        for native in judged
+        if not (
+            resolve_native_trial_root(jobs_dir, native.path)
+            / "verifier"
+            / "judge-selection.json"
+        ).exists()
+        and not (
+            resolve_native_trial_root(jobs_dir, native.path)
+            / "verifier"
+            / "judge-calls.json"
+        ).exists()
+    ]
 
 
 def _point_workload(plan: ProfilePlan, concurrency: int) -> tuple[dict[str, str], int]:
@@ -1576,11 +1603,11 @@ def _integer(value: object) -> int:
 def _scrub_capability(root: Path, capability: str | None) -> None:
     if capability is None:
         return
-    _scrub_mounted_evidence(root, capability, write_manifest=False)
+    _scrub_mounted_evidence(root, capability, write_manifest=False, allow_symlinks=True)
 
 
 def _finalize_profile(root: Path, secrets: str | tuple[str, ...]) -> None:
-    _scrub_mounted_evidence(root, secrets, write_manifest=True)
+    _scrub_mounted_evidence(root, secrets, write_manifest=True, allow_symlinks=False)
 
 
 def _scrub_mounted_evidence(
@@ -1588,14 +1615,15 @@ def _scrub_mounted_evidence(
     secrets: str | tuple[str, ...],
     *,
     write_manifest: bool,
+    allow_symlinks: bool,
 ) -> None:
     attempts = 6
     for attempt in range(1, attempts + 1):
         try:
             sanitize_private_artifact_special_files(root)
-            scrub_secret_paths(root, secrets)
-            scrub_secret(root, secrets)
-            assert_secret_absent(root, secrets)
+            scrub_secret_paths(root, secrets, allow_symlinks=allow_symlinks)
+            scrub_secret(root, secrets, allow_symlinks=allow_symlinks)
+            assert_secret_absent(root, secrets, allow_symlinks=allow_symlinks)
             if write_manifest:
                 write_checksums(root)
             return

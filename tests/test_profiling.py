@@ -90,7 +90,10 @@ def test_profile_finalizer_retries_transient_bucket_visibility(
     evidence.write_text('{"status":"complete"}\n', encoding="utf-8")
     calls = 0
 
-    def scrub(_root: Path, _secrets: object) -> list[str]:
+    def scrub(
+        _root: Path, _secrets: object, *, allow_symlinks: bool = False
+    ) -> list[str]:
+        del allow_symlinks
         nonlocal calls
         calls += 1
         if calls == 1:
