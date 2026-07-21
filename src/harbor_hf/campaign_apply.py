@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -1601,9 +1602,14 @@ def hugging_face_campaign_reconciler(
     from harbor_hf.result_publisher import DatasetApi, HubDatasetPublisher
 
     evidence_api = HfApi()
-    evidence_cache = tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-")
+    evidence_cache = Path(
+        os.environ.get(
+            "HARBOR_HF_EVIDENCE_CACHE",
+            str(Path.home() / ".cache" / "harbor-hf" / "evidence"),
+        )
+    ).expanduser()
     reader = HubBucketEvidenceReader(
-        Path(evidence_cache.name),
+        evidence_cache,
         api=cast(BucketEvidenceApi, evidence_api),
     )
     token = get_token()
@@ -1645,7 +1651,7 @@ def hugging_face_campaign_reconciler(
         observer=BucketCampaignObserver(reader),
         finalizer=BucketCampaignFinalizer(reader, writer),
         result_publisher=result_publisher,
-        cleanup=evidence_cache.cleanup,
+        cleanup=lambda: None,
     )
 
 
