@@ -78,9 +78,44 @@ def test_workspace_package_is_deterministic_and_restorable(tmp_path: Path) -> No
     assert first.evidence.file_index.sha256 == second.evidence.file_index.sha256
     restored = tmp_path / "restored"
     restore_workspace(first_root, first.evidence, restored)
-    assert (restored / "a" / "x.txt").read_text() == "x"
-    assert os.readlink(restored / "link") == "a/x.txt"
+    assert (restored / "app" / "a" / "x.txt").read_text() == "x"
+    assert os.readlink(restored / "app" / "link") == "a/x.txt"
     verify_workspace_package(first_root, first.evidence, deep=True)
+
+
+@pytest.mark.parametrize("target", ["../outside", "missing", "loop"])
+def test_workspace_rejects_unsafe_symlink_targets(tmp_path: Path, target: str) -> None:
+    source = tmp_path / "app"
+    source.mkdir()
+    (tmp_path / "outside").write_text("outside")
+    os.symlink(target, source / "link")
+    if target == "loop":
+        os.unlink(source / "link")
+        os.symlink("link", source / "link")
+    root = tmp_path / "trial"
+    root.mkdir()
+    with pytest.raises(TrialEvidenceError, match="symlink"):
+        package_workspace(source, root / "evidence", policy=_policy())
+
+
+def test_workspace_materializes_hardlinks_as_regular_files(tmp_path: Path) -> None:
+    source = tmp_path / "app"
+    source.mkdir()
+    (source / "first").write_text("value")
+    os.link(source / "first", source / "second")
+    root = tmp_path / "trial"
+    root.mkdir()
+    package = package_workspace(source, root / "evidence", policy=_policy())
+    files = [entry for entry in package.entries if entry.type == "file"]
+    assert [entry.path for entry in files] == ["first", "second"]
+    assert package.evidence.regular_file_bytes == 10
+    restored = tmp_path / "restored"
+    restore_workspace(root, package.evidence, restored)
+    assert (restored / "app" / "first").read_text() == "value"
+    assert (restored / "app" / "second").read_text() == "value"
+    assert (restored / "app" / "first").stat().st_ino != (
+        restored / "app" / "second"
+    ).stat().st_ino
 
 
 def test_workspace_limits_fail_closed(tmp_path: Path) -> None:

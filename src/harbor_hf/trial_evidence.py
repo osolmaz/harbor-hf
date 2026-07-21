@@ -7,6 +7,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+from collections import deque
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -60,7 +61,7 @@ class FileReference(FrozenModel):
 class WorkspaceFile(FrozenModel):
     schema_version: Literal["harbor-hf/workspace-file/v1"] = WORKSPACE_INDEX_SCHEMA
     path: str = Field(min_length=1)
-    type: Literal["directory", "file", "symlink", "hardlink"]
+    type: Literal["directory", "file", "symlink"]
     mode: int = Field(ge=0, le=0o7777)
     size_bytes: int | None = Field(default=None, ge=0)
     sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
@@ -75,9 +76,9 @@ class WorkspaceFile(FrozenModel):
             _safe_relative_path(self.path)
         if self.type == "file" and (self.sha256 is None or self.size_bytes is None):
             raise ValueError("workspace file requires size and sha256")
-        if self.type in {"symlink", "hardlink"} and not self.target:
+        if self.type == "symlink" and not self.target:
             raise ValueError("workspace link requires target")
-        if self.type not in {"symlink", "hardlink"} and self.target is not None:
+        if self.type != "symlink" and self.target is not None:
             raise ValueError("workspace non-link cannot have target")
         if self.type != "file" and (
             self.sha256 is not None or self.size_bytes is not None
@@ -307,6 +308,7 @@ def package_workspace(
     evidence_dir.mkdir(parents=True, exist_ok=True)
     deadline = monotonic() + policy.workspace_capture_timeout_seconds
     entries = list(_workspace_entries(snapshot, policy, deadline=deadline))
+    _validate_workspace_symlink_graph(snapshot, entries)
     index_path = evidence_dir / "workspace-files.jsonl"
     _atomic_write(
         index_path,
@@ -359,7 +361,7 @@ def verify_workspace_package(
     if deep:
         with tempfile.TemporaryDirectory(prefix="harbor-hf-workspace-verify-") as raw:
             restore_workspace(trial_root, evidence, Path(raw))
-            observed = list(_workspace_entries(Path(raw), None))
+            observed = list(_workspace_entries(Path(raw) / "app", None))
             if observed != entries:
                 raise TrialEvidenceError("restored workspace does not match file index")
     return entries
@@ -382,7 +384,20 @@ def restore_workspace(
         raw.flush()
         with tarfile.open(raw.name, mode="r:") as archive:
             _validate_tar_members(archive, evidence)
-            archive.extractall(destination, filter="fully_trusted")
+            with tempfile.TemporaryDirectory(
+                prefix=".harbor-hf-restore-", dir=destination
+            ) as staging_raw:
+                staging = Path(staging_raw)
+                archive.extractall(staging, filter="fully_trusted")
+                restored_app = staging / "app"
+                observed = list(_workspace_entries(restored_app, None))
+                _validate_workspace_symlink_graph(restored_app, observed)
+                expected = _load_workspace_index(trial_root / evidence.file_index.path)
+                if observed != expected:
+                    raise TrialEvidenceError(
+                        "restored workspace does not match file index"
+                    )
+                os.replace(restored_app, destination / "app")
 
 
 def _decompress_workspace_archive(
@@ -897,7 +912,6 @@ def _workspace_entries(
     deadline: float | None = None,
 ) -> Iterator[WorkspaceFile]:
     total = 0
-    inodes: dict[tuple[int, int], str] = {}
     root_metadata = snapshot.lstat()
     root_entry = WorkspaceFile(
         path=".",
@@ -912,17 +926,77 @@ def _workspace_entries(
     )
     for count, path in enumerate(paths, 2):
         _check_workspace_deadline(deadline)
-        entry = _workspace_entry(snapshot, path, inodes, deadline=deadline)
+        entry = _workspace_entry(snapshot, path, deadline=deadline)
         if entry.type == "file":
             total += entry.size_bytes or 0
         _validate_workspace_limits(entry, count, total, policy)
         yield entry
 
 
+def _validate_workspace_symlink_graph(
+    snapshot: Path, entries: list[WorkspaceFile]
+) -> None:
+    graph = _workspace_directory_graph(snapshot, entries)
+    _require_acyclic_directory_graph(graph)
+
+
+def _workspace_directory_graph(
+    snapshot: Path, entries: list[WorkspaceFile]
+) -> dict[str, set[str]]:
+    root = snapshot.resolve(strict=True)
+    directories = {entry.path for entry in entries if entry.type == "directory"}
+    graph = {path: set[str]() for path in directories}
+    for path in directories - {"."}:
+        parent = PurePosixPath(path).parent.as_posix()
+        graph.setdefault(parent, set()).add(path)
+    for entry in entries:
+        if entry.type != "symlink":
+            continue
+        resolved = _safe_workspace_symlink_target(snapshot, root, entry)
+        if resolved.is_dir():
+            parent = PurePosixPath(entry.path).parent.as_posix()
+            graph.setdefault(parent, set()).add(resolved.relative_to(root).as_posix())
+    return graph
+
+
+def _safe_workspace_symlink_target(
+    snapshot: Path, root: Path, entry: WorkspaceFile
+) -> Path:
+    target = entry.target or ""
+    if PurePosixPath(target).is_absolute():
+        raise TrialEvidenceError("workspace symlink target must be relative")
+    try:
+        resolved = (snapshot / entry.path).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise TrialEvidenceError(
+            "workspace symlink target is dangling or cyclic"
+        ) from error
+    if not resolved.is_relative_to(root):
+        raise TrialEvidenceError("workspace symlink target escapes /app")
+    return resolved
+
+
+def _require_acyclic_directory_graph(graph: dict[str, set[str]]) -> None:
+    indegree = {path: 0 for path in graph}
+    for targets in graph.values():
+        for target in targets:
+            indegree[target] = indegree.get(target, 0) + 1
+    pending = deque(path for path, degree in indegree.items() if degree == 0)
+    visited = 0
+    while pending:
+        current = pending.popleft()
+        visited += 1
+        for target in graph.get(current, set()):
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                pending.append(target)
+    if visited != len(indegree):
+        raise TrialEvidenceError("workspace symlink graph contains a cycle")
+
+
 def _workspace_entry(
     snapshot: Path,
     path: Path,
-    inodes: dict[tuple[int, int], str],
     *,
     deadline: float | None,
 ) -> WorkspaceFile:
@@ -941,15 +1015,6 @@ def _workspace_entry(
         raise TrialEvidenceError(
             f"workspace contains unsupported special file: {relative}"
         )
-    inode = (metadata.st_dev, metadata.st_ino)
-    if metadata.st_nlink > 1 and inode in inodes:
-        return WorkspaceFile(
-            path=relative,
-            type="hardlink",
-            mode=mode,
-            target=inodes[inode],
-        )
-    inodes[inode] = relative
     return WorkspaceFile(
         path=relative,
         type="file",
@@ -998,7 +1063,8 @@ def _write_workspace_archive(
             for entry in entries:
                 _check_workspace_deadline(deadline)
                 path = snapshot / entry.path
-                info = tarfile.TarInfo(entry.path)
+                archive_name = "app" if entry.path == "." else f"app/{entry.path}"
+                info = tarfile.TarInfo(archive_name)
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
                 info.mtime = 0
@@ -1008,10 +1074,6 @@ def _write_workspace_archive(
                     archive.addfile(info)
                 elif entry.type == "symlink":
                     info.type = tarfile.SYMTYPE
-                    info.linkname = entry.target or ""
-                    archive.addfile(info)
-                elif entry.type == "hardlink":
-                    info.type = tarfile.LNKTYPE
                     info.linkname = entry.target or ""
                     archive.addfile(info)
                 else:
@@ -1037,18 +1099,19 @@ def _write_workspace_archive(
 def _validate_tar_members(
     archive: tarfile.TarFile, evidence: WorkspaceEvidence
 ) -> None:
-    seen: dict[str, Literal["directory", "file", "symlink", "hardlink"]] = {}
+    seen: dict[str, Literal["directory", "file", "symlink"]] = {}
     symlinks: set[PurePosixPath] = set()
     members = archive.getmembers()
+    if not members or members[0].name != "app" or not members[0].isdir():
+        raise TrialEvidenceError("workspace archive has no top-level app directory")
     for member in members:
-        if member.name != ".":
-            _safe_relative_path(member.name)
-        member_path = PurePosixPath(member.name)
-        if member.name in seen:
+        relative = _archive_relative_path(member.name)
+        member_path = PurePosixPath(relative)
+        if relative in seen:
             raise TrialEvidenceError("workspace archive contains duplicate path")
         if any(parent in symlinks for parent in member_path.parents):
             raise TrialEvidenceError("workspace archive writes through a symlink")
-        seen[member.name] = _tar_member_kind(member, seen, symlinks, member_path)
+        seen[relative] = _tar_member_kind(member, seen, symlinks, member_path)
     if len(members) != evidence.entry_count:
         raise TrialEvidenceError("workspace archive entry count mismatch")
     unpacked = sum(member.size for member in members if member.isfile())
@@ -1056,12 +1119,22 @@ def _validate_tar_members(
         raise TrialEvidenceError("workspace archive byte count mismatch")
 
 
+def _archive_relative_path(member_name: str) -> str:
+    if member_name == "app":
+        return "."
+    if member_name.startswith("app/"):
+        relative = member_name.removeprefix("app/")
+        _safe_relative_path(relative)
+        return relative
+    raise TrialEvidenceError("workspace archive has no top-level app directory")
+
+
 def _tar_member_kind(
     member: tarfile.TarInfo,
-    seen: dict[str, Literal["directory", "file", "symlink", "hardlink"]],
+    seen: dict[str, Literal["directory", "file", "symlink"]],
     symlinks: set[PurePosixPath],
     member_path: PurePosixPath,
-) -> Literal["directory", "file", "symlink", "hardlink"]:
+) -> Literal["directory", "file", "symlink"]:
     if member.isdir():
         return "directory"
     if member.isfile():
@@ -1069,11 +1142,6 @@ def _tar_member_kind(
     if member.issym():
         symlinks.add(member_path)
         return "symlink"
-    if member.islnk():
-        _safe_relative_path(member.linkname)
-        if seen.get(member.linkname) != "file":
-            raise TrialEvidenceError("workspace hardlink target is not a prior file")
-        return "hardlink"
     raise TrialEvidenceError("workspace archive contains unsupported member")
 
 

@@ -60,8 +60,7 @@
       "enum": [
         "directory",
         "file",
-        "symlink",
-        "hardlink"
+        "symlink"
       ],
       "title": "Type",
       "type": "string"

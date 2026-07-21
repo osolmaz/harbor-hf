@@ -457,7 +457,7 @@ The root row is first. Other rows are sorted by UTF-8 path bytes.
 ### Deterministic archive writer
 
 Add `zstandard` as a locked runtime dependency. Write a pax tar stream through
-one Zstandard compression thread at level 6.
+one Zstandard compression thread at level 10.
 
 Normalize outer tar metadata exactly as the specification requires. Preserve
 workspace permission bits. Use the file index as the archive member plan rather
