@@ -4,6 +4,7 @@ from harbor_hf.harbor_adapter.adapter import (
     HarborExecutionOutcome,
     PreparedHarborExecution,
     build_execution_request,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter.errors import (
     HarborTrialFailure,
@@ -28,4 +29,5 @@ __all__ = [
     "PreparedHarborExecution",
     "WorkerError",
     "build_execution_request",
+    "resolve_native_trial_root",
 ]

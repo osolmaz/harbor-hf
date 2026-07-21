@@ -42,6 +42,7 @@ from harbor_hf.harbor_adapter import (
     FilesystemHarborExecutionAdapter,
     WorkerError,
     build_execution_request,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter import (
     HarborTrialFailure as _HarborTrialFailure,
@@ -797,7 +798,7 @@ def _assemble_direct_trial_evidence(
         logical_attempt = attempts.get(native.task_name, 0) + 1
         attempts[native.task_name] = logical_attempt
         assemble_trial_evidence(
-            jobs_dir / native.path,
+            resolve_native_trial_root(jobs_dir, native.path),
             campaign_id=None,
             run_id=lock.run_id,
             execution_id=lock.run_id,

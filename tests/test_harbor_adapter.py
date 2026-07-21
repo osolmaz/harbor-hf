@@ -14,6 +14,7 @@ from harbor_hf.harbor_adapter import (
     HarborVerificationFailure,
     WorkerError,
     build_execution_request,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter.exporter import (
     _openclaw_session_usage,
@@ -26,6 +27,22 @@ from harbor_hf.models import ExperimentSpec
 from harbor_hf.runs import RunLock, build_run_lock
 
 GOLDEN_CONTRACT = Path(__file__).parent / "golden" / "harbor-adapter-contract-v1.json"
+
+
+def test_resolve_native_trial_root_rejects_escaping_paths(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    trial = jobs / "job" / "trial"
+    trial.mkdir(parents=True)
+
+    assert resolve_native_trial_root(jobs, "job/trial") == trial
+    for value in ("../outside", "/absolute", "job/../trial", "job//trial"):
+        with pytest.raises(WorkerError, match="safe relative"):
+            resolve_native_trial_root(jobs, value)
+
+    linked = jobs / "linked"
+    linked.symlink_to(trial, target_is_directory=True)
+    with pytest.raises(WorkerError, match="symbolic link"):
+        resolve_native_trial_root(jobs, "linked")
 
 
 def _session_record(

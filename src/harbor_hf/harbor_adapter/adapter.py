@@ -6,7 +6,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Never, Protocol
 from urllib.parse import urlparse
 
@@ -305,6 +305,30 @@ def _append_export_attempt_log(
         stream.write(content)
         if content and not content.endswith(b"\n"):
             stream.write(b"\n")
+
+
+def resolve_native_trial_root(jobs_dir: Path, value: str) -> Path:
+    relative = PurePosixPath(value)
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != value
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise WorkerError("Harbor trial path is not a safe relative directory")
+    candidate = jobs_dir
+    for part in relative.parts:
+        candidate /= part
+        if candidate.is_symlink():
+            raise WorkerError("Harbor trial path contains a symbolic link")
+    try:
+        root = jobs_dir.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise WorkerError("Harbor trial path does not exist") from error
+    if not resolved.is_relative_to(root) or not resolved.is_dir():
+        raise WorkerError("Harbor trial path escapes its jobs directory")
+    return resolved
 
 
 def build_execution_request(

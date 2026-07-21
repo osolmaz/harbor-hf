@@ -53,6 +53,7 @@ from harbor_hf.evidence import (
 from harbor_hf.harbor_adapter import (
     FilesystemHarborExecutionAdapter,
     HarborVerificationFailure,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
 from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle
@@ -1325,7 +1326,7 @@ def _assemble_execution_trial_evidence(
     native = bundle.trials[0]
     if native.task_name != trial.task_name or native.task_digest != trial.task_digest:
         raise WorkerError("Harbor evidence trial identity does not match campaign lock")
-    native_root = jobs_dir / native.path
+    native_root = resolve_native_trial_root(jobs_dir, native.path)
     assemble_trial_evidence(
         native_root,
         campaign_id=campaign.campaign_id,
