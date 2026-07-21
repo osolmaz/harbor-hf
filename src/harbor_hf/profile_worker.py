@@ -25,15 +25,32 @@ from harbor_hf.evidence import (
     write_checksums,
     write_json,
 )
-from harbor_hf.harbor_adapter import FilesystemHarborExecutionAdapter
+from harbor_hf.harbor_adapter import (
+    FilesystemHarborExecutionAdapter,
+    resolve_native_trial_root,
+)
 from harbor_hf.harbor_adapter.errors import HarborTrialFailure
-from harbor_hf.harbor_adapter.models import HarborCompatibilityTrial
+from harbor_hf.harbor_adapter.exporter import refresh_bundle_artifacts
+from harbor_hf.harbor_adapter.models import (
+    HarborCompatibilityBundle,
+    HarborCompatibilityTrial,
+)
 from harbor_hf.harbor_adapter.validation import load_compatibility_bundle
 from harbor_hf.hf_endpoints import HuggingFaceEndpointAdapter
+from harbor_hf.judge_recorder import (
+    JUDGE_RECORDER_PORT,
+    JudgeEvidenceRecorder,
+    JudgeExchange,
+    JudgeRecorderSummary,
+)
 from harbor_hf.models import EndpointRef, ExperimentSpec
 from harbor_hf.private_artifacts import sanitize_private_artifact_special_files
 from harbor_hf.process import SubprocessRunner, run_streaming
-from harbor_hf.profile_worker_transport import ProfileTransport
+from harbor_hf.profile_worker_transport import (
+    ProfileTransport,
+    job_ingress_base_url,
+    wait_ready,
+)
 from harbor_hf.profiling import (
     ProfilePlan,
     ProfilePoint,
@@ -51,6 +68,7 @@ from harbor_hf.runs import (
     harbor_process_environment,
     run_secret_values,
 )
+from harbor_hf.trial_evidence import JudgeSelection, assemble_trial_evidence
 from harbor_hf.worker import (
     EndpointManager,
     launch_cleanup_watchdog,
@@ -321,13 +339,16 @@ def _profile_transport(
     desired_endpoint: DesiredEndpoint | None,
 ) -> Iterator[ProfileTransport]:
     if isinstance(plan.deployment, ProviderTarget):
-        with ProfileTransport.for_provider(
-            plan.deployment,
-            token=token,
-            evidence_path=destination / "provider-requests.jsonl",
-            deadline=deadline,
-        ) as transport:
-            yield transport
+        with (
+            ProfileTransport.for_provider(
+                plan.deployment,
+                token=token,
+                evidence_path=destination / "provider-requests.jsonl",
+                deadline=deadline,
+            ) as transport,
+            _profile_judge_transport(run_lock, transport, token, deadline) as selected,
+        ):
+            yield selected
         return
     deployment = run_lock.deployment
     if isinstance(deployment, ProviderTarget):
@@ -370,10 +391,34 @@ def _profile_transport(
             token,
             readiness_timeout_seconds=min(3600, _remaining(deadline)),
         )
-        yield ProfileTransport.for_endpoint(base_url, endpoint.served_model_name)
+        transport = ProfileTransport.for_endpoint(base_url, endpoint.served_model_name)
+        with _profile_judge_transport(run_lock, transport, token, deadline) as selected:
+            yield selected
     finally:
         if cleanup_required:
             _cleanup_profile_endpoint(manager, provisioner, desired_endpoint)
+
+
+@contextmanager
+def _profile_judge_transport(
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    token: str,
+    deadline: float,
+) -> Iterator[ProfileTransport]:
+    if not run_lock.judge_required_tasks:
+        yield transport
+        return
+    recorder = JudgeEvidenceRecorder(token=token, deadline=deadline)
+    base_url = job_ingress_base_url(JUDGE_RECORDER_PORT)
+    try:
+        recorder.start(port=JUDGE_RECORDER_PORT)
+        wait_ready(base_url, token, deadline)
+        transport.attach_judge_recorder(recorder, base_url)
+        yield transport
+    finally:
+        transport.detach_judge_recorder()
+        recorder.close()
 
 
 def _prepare_managed_profile_endpoint(
@@ -869,6 +914,8 @@ def _run_staged_point(
     execution_root.mkdir()
     adapter = FilesystemHarborExecutionAdapter()
     scope = f"c{concurrency}-r{repetition}"
+    compatibility_path: Path | None = None
+    outcome = None
     with transport.scope(scope) as (base_url, _model_name, capability):
         prepared = adapter.prepare(
             run_lock,
@@ -883,13 +930,29 @@ def _run_staged_point(
         )
         timeout = _remaining(deadline)
         started = time.monotonic()
+        judge_capability: str | None = None
         try:
-            with harbor_process_environment(
-                run_lock,
-                token=token,
-                inference_base_url=base_url,
-                redaction_secrets=(capability,) if capability else (),
-            ) as environment:
+            with (
+                _profile_point_judge_scope(
+                    plan,
+                    run_lock,
+                    transport,
+                    execution_root,
+                    scope,
+                    tasks,
+                    attempts,
+                    capability,
+                ) as (judge_api_url, judge_capability),
+                harbor_process_environment(
+                    run_lock,
+                    token=token,
+                    inference_base_url=base_url,
+                    judge_api_url=judge_api_url,
+                    redaction_secrets=tuple(
+                        value for value in (capability, judge_capability) if value
+                    ),
+                ) as environment,
+            ):
                 outcome = adapter.execute(
                     prepared,
                     harbor_source,
@@ -900,46 +963,247 @@ def _run_staged_point(
                     stream_runner=run_streaming,
                     deadline=deadline,
                 )
+            compatibility_path = outcome.compatibility_path
         except HarborTrialFailure:
-            elapsed_ms = (time.monotonic() - started) * 1000
-            _scrub_capability(point_root, capability)
             compatibility_path = prepared.request_path.with_name(
                 "harbor-compatibility.json"
-            )
-            try:
-                bundle = load_compatibility_bundle(compatibility_path, prepared.request)
-            except Exception as error:
-                return _failed_point_result(tasks, attempts, elapsed_ms, error)
-            return _PointResult(
-                observations=[_task_observation(trial) for trial in bundle.trials],
-                elapsed_ms=elapsed_ms,
             )
         except Exception as error:
             elapsed_ms = (time.monotonic() - started) * 1000
             _scrub_capability(point_root, capability)
+            _scrub_capability(point_root, judge_capability)
             return _failed_point_result(tasks, attempts, elapsed_ms, error)
         elapsed_ms = (time.monotonic() - started) * 1000
         _scrub_capability(point_root, capability)
-    if outcome.exit_code != 0 or outcome.verification is None:
-        return _PointResult(
-            observations=[
-                _TaskObservation(
-                    False,
-                    elapsed_ms,
-                    0,
-                    0,
-                    task_name,
-                    f"Harbor exited with status {outcome.exit_code}",
-                )
-                for task_name in tasks
-                for _ in range(attempts)
-            ],
-            elapsed_ms=elapsed_ms,
+        _scrub_capability(point_root, judge_capability)
+    if outcome is not None and (outcome.exit_code != 0 or outcome.verification is None):
+        return _failed_point_result(
+            tasks,
+            attempts,
+            elapsed_ms,
+            ProfileWorkerError(f"Harbor exited with status {outcome.exit_code}"),
         )
-    assert outcome.compatibility_path is not None
-    bundle = load_compatibility_bundle(outcome.compatibility_path, prepared.request)
+    if compatibility_path is None:
+        return _failed_point_result(
+            tasks,
+            attempts,
+            elapsed_ms,
+            ProfileWorkerError("Harbor produced no compatibility bundle"),
+        )
+    try:
+        bundle = load_compatibility_bundle(compatibility_path, prepared.request)
+        _assemble_profile_point_evidence(
+            plan,
+            run_lock,
+            bundle,
+            jobs_dir,
+            compatibility_path,
+            execution_root,
+            scope,
+            token,
+            capability,
+            judge_capability,
+        )
+    except Exception as error:
+        return _failed_point_result(tasks, attempts, elapsed_ms, error)
     observations = [_task_observation(trial) for trial in bundle.trials]
     return _PointResult(observations=observations, elapsed_ms=elapsed_ms)
+
+
+@contextmanager
+def _profile_point_judge_scope(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    transport: ProfileTransport,
+    execution_root: Path,
+    scope: str,
+    tasks: dict[str, str],
+    attempts: int,
+    provider_capability: str | None,
+) -> Iterator[tuple[str | None, str | None]]:
+    judged_tasks = set(tasks) & set(run_lock.judge_required_tasks or [])
+    if not judged_tasks:
+        yield None, None
+        return
+    recorder = transport.judge_recorder
+    base_url = transport.judge_base_url
+    policy = run_lock.trial_evidence
+    judge = run_lock.benchmark_judge
+    if recorder is None or base_url is None or policy is None or judge is None:
+        raise ProfileWorkerError("judged profile transport is incomplete")
+    maximum_calls = attempts * len(judged_tasks) * policy.judge_max_calls_per_execution
+    if maximum_calls > 64:
+        raise ProfileWorkerError("judged profile point exceeds recorder call capacity")
+    aggregate_policy = policy.model_copy(
+        update={"judge_max_calls_per_execution": maximum_calls}
+    )
+    identity = f"profile-{plan.profile_id}-{scope}"
+    capability = recorder.register_scope(
+        execution_id=identity,
+        trial_id=identity,
+        model=judge.model,
+        destination=execution_root / "judge-records",
+        policy=aggregate_policy,
+        known_secrets=((provider_capability,) if provider_capability else ()),
+    )
+    try:
+        yield recorder.scoped_url(base_url, capability), capability
+    finally:
+        recorder.revoke_scope(capability)
+
+
+def _assemble_profile_point_evidence(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    bundle: HarborCompatibilityBundle,
+    jobs_dir: Path,
+    compatibility_path: Path,
+    execution_root: Path,
+    scope: str,
+    token: str,
+    provider_capability: str | None,
+    judge_capability: str | None,
+) -> None:
+    policy = run_lock.trial_evidence
+    if policy is None:
+        raise ProfileWorkerError("profile trial evidence policy is missing")
+    secrets = tuple(
+        value
+        for value in (
+            *run_secret_values(run_lock, token),
+            provider_capability,
+            judge_capability,
+        )
+        if value
+    )
+    judge_records = _split_profile_judge_records(
+        plan, run_lock, bundle, jobs_dir, execution_root, scope
+    )
+    logical_attempts: dict[str, int] = {}
+    for native in bundle.trials:
+        native_root = resolve_native_trial_root(jobs_dir, native.path)
+        logical_attempt = logical_attempts.get(native.task_name, 0) + 1
+        logical_attempts[native.task_name] = logical_attempt
+        snapshot = native_root / "artifacts" / "workspace" / "app"
+        if native.exception_type is not None:
+            shutil.rmtree(snapshot, ignore_errors=True)
+            continue
+        redacted = scrub_secret(native_root, secrets, allow_symlinks=True)
+        if redacted:
+            write_json(
+                native_root / "evidence-redactions.json",
+                {"files": redacted},
+            )
+        assert_secret_absent(native_root, secrets, allow_symlinks=True)
+        judge_expected = native.task_name in (run_lock.judge_required_tasks or [])
+        assemble_trial_evidence(
+            native_root,
+            campaign_id=None,
+            run_id=f"profile-{plan.profile_id}",
+            execution_id=f"profile-{plan.profile_id}-{scope}-{native.trial_id}",
+            trial_id=native.trial_id,
+            task_name=native.task_name,
+            task_digest=native.task_digest,
+            logical_attempt=logical_attempt,
+            physical_attempt=1,
+            judge_expected=judge_expected,
+            judge_model=(
+                run_lock.benchmark_judge.model
+                if judge_expected and run_lock.benchmark_judge is not None
+                else None
+            ),
+            policy=policy,
+            judge_records_dir=judge_records.get(native.trial_id),
+            known_secrets=secrets,
+        )
+    refresh_bundle_artifacts(jobs_dir, compatibility_path)
+
+
+def _split_profile_judge_records(
+    plan: ProfilePlan,
+    run_lock: RunLock,
+    bundle: HarborCompatibilityBundle,
+    jobs_dir: Path,
+    execution_root: Path,
+    scope: str,
+) -> dict[str, Path]:
+    judged = [
+        trial
+        for trial in bundle.trials
+        if trial.task_name in (run_lock.judge_required_tasks or [])
+    ]
+    if not judged:
+        return {}
+    aggregate = execution_root / "judge-records"
+    summary = _profile_judge_summary(aggregate)
+    selected = _profile_judge_selections(judged, jobs_dir)
+    exchange_dirs = {
+        path.name: path
+        for path in aggregate.glob("judge-*")
+        if path.is_dir() and not path.is_symlink()
+    }
+    if set(exchange_dirs) != set(selected) or summary.exchange_count != len(selected):
+        raise ProfileWorkerError("profile judge exchanges cannot be assigned exactly")
+    destinations: dict[str, Path] = {}
+    for exchange_id, native in selected.items():
+        destination = execution_root / "profile-judge-records" / native.trial_id
+        destination.mkdir(parents=True)
+        exchange_dir = exchange_dirs[exchange_id]
+        metadata_path = exchange_dir / "exchange.json"
+        exchange = JudgeExchange.model_validate_json(metadata_path.read_text())
+        execution_id = f"profile-{plan.profile_id}-{scope}-{native.trial_id}"
+        exchange = exchange.model_copy(
+            update={"execution_id": execution_id, "trial_id": native.trial_id}
+        )
+        write_json(metadata_path, exchange.model_dump(mode="json"))
+        shutil.move(str(exchange_dir), destination / exchange_id)
+        trial_summary = JudgeRecorderSummary(
+            execution_id=execution_id,
+            trial_id=native.trial_id,
+            model=summary.model,
+            exchange_count=1,
+            rejected_call_count=0,
+            closed_at=summary.closed_at,
+        )
+        write_json(destination / "recorder.json", trial_summary.model_dump(mode="json"))
+        destinations[native.trial_id] = destination
+    (aggregate / "recorder.json").unlink()
+    aggregate.rmdir()
+    return destinations
+
+
+def _profile_judge_summary(aggregate: Path) -> JudgeRecorderSummary:
+    try:
+        summary = JudgeRecorderSummary.model_validate_json(
+            (aggregate / "recorder.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as error:
+        raise ProfileWorkerError("profile judge recorder summary is invalid") from error
+    if summary.rejected_call_count:
+        raise ProfileWorkerError("profile judge recorder rejected a call")
+    return summary
+
+
+def _profile_judge_selections(
+    judged: list[HarborCompatibilityTrial], jobs_dir: Path
+) -> dict[str, HarborCompatibilityTrial]:
+    selected: dict[str, HarborCompatibilityTrial] = {}
+    for native in judged:
+        if native.exception_type is not None:
+            raise ProfileWorkerError("judged profile trial did not complete")
+        native_root = resolve_native_trial_root(jobs_dir, native.path)
+        try:
+            selection = JudgeSelection.model_validate_json(
+                (native_root / "verifier" / "judge-selection.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, ValueError) as error:
+            raise ProfileWorkerError("profile judge selection is invalid") from error
+        if selection.exchange_id in selected:
+            raise ProfileWorkerError("profile judge exchange was selected twice")
+        selected[selection.exchange_id] = native
+    return selected
 
 
 def _point_workload(plan: ProfilePlan, concurrency: int) -> tuple[dict[str, str], int]:
