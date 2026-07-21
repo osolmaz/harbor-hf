@@ -788,6 +788,35 @@ def test_compatibility_inventory_refreshes_after_redaction(tmp_path: Path) -> No
         assert entry["digest"] == sha256_digest(path.read_bytes())
 
 
+def test_compatibility_inventory_excludes_raw_workspace(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "job"
+    trial_dir = job_dir / "trial"
+    workspace = trial_dir / "artifacts" / "workspace" / "app"
+    workspace.mkdir(parents=True)
+    (job_dir / "lock.json").write_text("{}\n", encoding="utf-8")
+    (job_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    (trial_dir / "lock.json").write_text("{}\n", encoding="utf-8")
+    (trial_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    (workspace / "answer.txt").write_text("answer\n", encoding="utf-8")
+    (workspace / "answer-link").symlink_to("answer.txt")
+    output = tmp_path / "harbor-compatibility.json"
+    output.write_text(
+        json.dumps(
+            {
+                "jobs": [{"path": "job"}],
+                "trials": [{"path": "job/trial"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    refresh_bundle_artifacts(jobs_dir, output)
+
+    artifacts = json.loads(output.read_text())["trials"][0]["artifacts"]
+    assert {entry["path"] for entry in artifacts} == {"lock.json", "result.json"}
+
+
 def test_typed_bundle_reports_trial_and_multistep_failures(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

@@ -82,6 +82,7 @@ artifacts:
     workspace_capture_timeout_seconds: 300
     judge_max_request_bytes: 33554432
     judge_max_response_bytes: 33554432
+    judge_timeout_seconds: 300
     judge_max_calls_per_execution: 4
 publishing:
   dataset: example/shellbench-results

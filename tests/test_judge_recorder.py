@@ -29,6 +29,7 @@ def _policy() -> TrialEvidencePolicy:
         workspace_capture_timeout_seconds=60,
         judge_max_request_bytes=1024 * 1024,
         judge_max_response_bytes=1024 * 1024,
+        judge_timeout_seconds=300,
         judge_max_calls_per_execution=4,
     )
 
@@ -86,6 +87,12 @@ def test_records_exact_bodies_and_enforces_model(tmp_path: Path) -> None:
     assert content == b'{"choices":[{"message":{"content":"ok"}}]}'
     assert headers["X-Harbor-Judge-Exchange-ID"] == "judge-0001"
     assert json.loads(observed[0].content)["model"] == "locked/judge"
+    assert observed[0].extensions["timeout"] == {
+        "connect": 300,
+        "read": 300,
+        "write": 300,
+        "pool": 300,
+    }
     exchange = destination / "judge-0001"
     metadata = json.loads((exchange / "exchange.json").read_text())
     assert metadata["transformation"] == "model_enforced"

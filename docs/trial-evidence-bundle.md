@@ -911,11 +911,14 @@ artifacts:
     workspace_capture_timeout_seconds: 300
     judge_max_request_bytes: 33554432
     judge_max_response_bytes: 33554432
+    judge_timeout_seconds: 300
     judge_max_calls_per_execution: 4
 ```
 
 `workspace_root` must equal `/app`. The field is explicit so the lock and
 operator output show the capture boundary. Arbitrary roots are rejected.
+`judge_timeout_seconds` bounds each upstream judge request, including response
+body transfer. It must be long enough for the locked judge model to finish.
 
 All numeric fields are required, positive, and copied into the resolved run and
 campaign locks. Planning includes them in experiment and run identity. Changing

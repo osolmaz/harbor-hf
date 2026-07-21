@@ -102,6 +102,7 @@ def _trial_evidence_policy() -> TrialEvidencePolicy:
         workspace_capture_timeout_seconds=60,
         judge_max_request_bytes=1024 * 1024,
         judge_max_response_bytes=1024 * 1024,
+        judge_timeout_seconds=300,
         judge_max_calls_per_execution=4,
     )
 

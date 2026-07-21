@@ -517,6 +517,7 @@ class JudgeEvidenceRecorder:
                 "Accept-Encoding": "identity",
             },
             content=body,
+            timeout=httpx.Timeout(scope.policy.judge_timeout_seconds),
         )
         response = self._client.send(request, stream=True)
         content = _read_bounded_response(

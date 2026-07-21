@@ -219,6 +219,7 @@ class TrialEvidencePolicy(StrictModel):
     workspace_capture_timeout_seconds: int
     judge_max_request_bytes: int
     judge_max_response_bytes: int
+    judge_timeout_seconds: int
     judge_max_calls_per_execution: int
 
 

@@ -383,6 +383,7 @@ class TrialEvidencePolicy(StrictModel):
     workspace_capture_timeout_seconds: int = Field(ge=1, le=3600)
     judge_max_request_bytes: int = Field(ge=1, le=128 * 1024**2)
     judge_max_response_bytes: int = Field(ge=1, le=128 * 1024**2)
+    judge_timeout_seconds: int = Field(ge=1, le=1200)
     judge_max_calls_per_execution: int = Field(ge=1, le=64)
 
     @model_validator(mode="after")
