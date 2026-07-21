@@ -1055,9 +1055,11 @@ def test_judged_wave_records_and_selects_exact_exchange(
             assert exchange_id is not None
             config_path = Path(command[command.index("--config") + 1])
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            selection = (
-                Path(config["jobs_dir"]) / "job/trial/verifier/judge-selection.json"
+            native = Path(config["jobs_dir"]) / "job/trial"
+            (native / "agent" / "judge-route.log").write_text(
+                environment["AGENT_JUDGE_API_URL"], encoding="utf-8"
             )
+            selection = native / "verifier/judge-selection.json"
             selection.write_text(
                 json.dumps(
                     {
@@ -1097,8 +1099,12 @@ def test_judged_wave_records_and_selects_exact_exchange(
     assert payload["judge"]["recorder_summary"]["path"].endswith(
         "evidence/judge/recorder.json"
     )
-    selection_path = evidence_manifest.parent.parent / "verifier/judge-selection.json"
+    trial_root = evidence_manifest.parent.parent
+    selection_path = trial_root / "verifier/judge-selection.json"
     assert json.loads(selection_path.read_text())["exchange_id"] == "judge-0001"
+    route_log = (trial_root / "agent/judge-route.log").read_text()
+    assert route_log == "http://127.0.0.1:8001/scopes/[REDACTED]/v1/chat/completions"
+    assert "j" * 32 not in route_log
     exchange = evidence_manifest.parent / "judge/judge-0001"
     assert json.loads((exchange / "request-received.bin").read_bytes())["model"] == (
         "wrong/model"

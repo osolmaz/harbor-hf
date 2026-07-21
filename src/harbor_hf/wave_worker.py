@@ -1329,6 +1329,14 @@ def _assemble_execution_trial_evidence(
     if native.task_name != trial.task_name or native.task_digest != trial.task_digest:
         raise WorkerError("Harbor evidence trial identity does not match campaign lock")
     native_root = resolve_native_trial_root(jobs_dir, native.path)
+    redacted = scrub_secret(native_root, known_secrets)
+    if redacted:
+        append_event(
+            execution_root / "events.jsonl",
+            "evidence_secrets_redacted",
+            files=redacted,
+        )
+    assert_secret_absent(native_root, known_secrets)
     assemble_trial_evidence(
         native_root,
         campaign_id=campaign.campaign_id,
