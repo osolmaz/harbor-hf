@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import os
@@ -769,12 +768,24 @@ def _decoded_for_scan(headers: httpx.Headers, content: bytes, limit: int) -> byt
     if not encoding:
         return content
     if encoding == "gzip":
-        decoded = gzip.decompress(content)
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
     elif encoding == "deflate":
-        decoded = zlib.decompress(content)
+        decompressor = zlib.decompressobj()
     else:
         raise JudgeRecorderError("unsupported judge response content encoding")
-    if len(decoded) > limit:
+    try:
+        decoded = decompressor.decompress(content, limit + 1)
+        if len(decoded) > limit or decompressor.unconsumed_tail:
+            raise JudgeRecorderError(
+                "decoded judge response exceeds configured byte limit"
+            )
+        tail = decompressor.flush(limit - len(decoded) + 1)
+    except zlib.error as error:
+        raise JudgeRecorderError(
+            "judge response content encoding is invalid"
+        ) from error
+    decoded += tail
+    if len(decoded) > limit or not decompressor.eof or decompressor.unused_data:
         raise JudgeRecorderError("decoded judge response exceeds configured byte limit")
     return decoded
 

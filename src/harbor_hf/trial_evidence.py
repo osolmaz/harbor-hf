@@ -361,7 +361,11 @@ def verify_workspace_package(
     if deep:
         with tempfile.TemporaryDirectory(prefix="harbor-hf-workspace-verify-") as raw:
             restore_workspace(trial_root, evidence, Path(raw))
-            observed = list(_workspace_entries(Path(raw) / "app", None))
+            observed = list(
+                _workspace_entries(
+                    Path(raw) / "app", None, max_nodes=evidence.entry_count
+                )
+            )
             if observed != entries:
                 raise TrialEvidenceError("restored workspace does not match file index")
     return entries
@@ -390,7 +394,11 @@ def restore_workspace(
                 staging = Path(staging_raw)
                 archive.extractall(staging, filter="fully_trusted")
                 restored_app = staging / "app"
-                observed = list(_workspace_entries(restored_app, None))
+                observed = list(
+                    _workspace_entries(
+                        restored_app, None, max_nodes=evidence.entry_count
+                    )
+                )
                 _validate_workspace_symlink_graph(restored_app, observed)
                 expected = _load_workspace_index(trial_root / evidence.file_index.path)
                 if observed != expected:
@@ -910,6 +918,7 @@ def _workspace_entries(
     policy: TrialEvidencePolicy | None,
     *,
     deadline: float | None = None,
+    max_nodes: int | None = None,
 ) -> Iterator[WorkspaceFile]:
     total = 0
     root_metadata = snapshot.lstat()
@@ -920,10 +929,8 @@ def _workspace_entries(
     )
     _validate_workspace_limits(root_entry, 1, total, policy)
     yield root_entry
-    paths = sorted(
-        snapshot.rglob("*"),
-        key=lambda item: item.relative_to(snapshot).as_posix().encode(),
-    )
+    effective_max = policy.workspace_max_nodes if policy is not None else max_nodes
+    paths = _bounded_workspace_paths(snapshot, effective_max)
     for count, path in enumerate(paths, 2):
         _check_workspace_deadline(deadline)
         entry = _workspace_entry(snapshot, path, deadline=deadline)
@@ -931,6 +938,28 @@ def _workspace_entries(
             total += entry.size_bytes or 0
         _validate_workspace_limits(entry, count, total, policy)
         yield entry
+
+
+def _bounded_workspace_paths(snapshot: Path, max_nodes: int | None) -> list[Path]:
+    paths: list[Path] = []
+    pending = [snapshot]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError as error:
+            raise TrialEvidenceError("workspace directory cannot be read") from error
+        with entries:
+            for item in entries:
+                path = Path(item.path)
+                paths.append(path)
+                if max_nodes is not None and len(paths) + 1 > max_nodes:
+                    raise TrialEvidenceError("workspace exceeds configured file limit")
+                if item.is_dir(follow_symlinks=False):
+                    pending.append(path)
+    return sorted(
+        paths, key=lambda item: item.relative_to(snapshot).as_posix().encode()
+    )
 
 
 def _validate_workspace_symlink_graph(

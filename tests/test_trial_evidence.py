@@ -132,6 +132,21 @@ def test_workspace_limits_fail_closed(tmp_path: Path) -> None:
         )
 
 
+def test_workspace_node_limit_fails_during_traversal(tmp_path: Path) -> None:
+    source = tmp_path / "app"
+    source.mkdir()
+    for index in range(3):
+        (source / f"file-{index}").write_text("x")
+    root = tmp_path / "trial"
+    root.mkdir()
+    with pytest.raises(TrialEvidenceError, match="file limit"):
+        package_workspace(
+            source,
+            root / "evidence",
+            policy=_policy(workspace_max_nodes=2),
+        )
+
+
 def test_workspace_capture_timeout_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
