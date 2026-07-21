@@ -797,8 +797,17 @@ def _assemble_direct_trial_evidence(
     for native in sorted(bundle.trials, key=lambda item: (item.task_name, item.path)):
         logical_attempt = attempts.get(native.task_name, 0) + 1
         attempts[native.task_name] = logical_attempt
+        native_root = resolve_native_trial_root(jobs_dir, native.path)
+        redacted = scrub_secret(native_root, known_secrets)
+        if redacted:
+            append_event(
+                root / "events.jsonl",
+                "evidence_secrets_redacted",
+                files=redacted,
+            )
+        assert_secret_absent(native_root, known_secrets)
         assemble_trial_evidence(
-            resolve_native_trial_root(jobs_dir, native.path),
+            native_root,
             campaign_id=None,
             run_id=lock.run_id,
             execution_id=lock.run_id,

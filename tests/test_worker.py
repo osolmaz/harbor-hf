@@ -3258,12 +3258,34 @@ def test_worker_publishes_success_after_cleanup(
 
     monkeypatch.setattr(EndpointManager, "wait_ready", record_wait_ready)
 
+    def stream_with_native_secret(
+        command: Sequence[str],
+        log_path: Path,
+        *,
+        environment: dict[str, str],
+        timeout_seconds: int,
+    ) -> int:
+        result = _successful_stream(
+            command,
+            log_path,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+        if "--config" in command:
+            config_path = Path(command[command.index("--config") + 1])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            trial = Path(config["jobs_dir"]) / "job" / "trial"
+            (trial / "agent" / "runtime.log").write_text(
+                environment["HF_TOKEN"], encoding="utf-8"
+            )
+        return result
+
     root = run_worker(
         remote_manifest,
         lock_path,
         tmp_path / "output",
         runner=runner,
-        stream_runner=_successful_stream,
+        stream_runner=stream_with_native_secret,
         source_preparer=_prepare_source,
         watchdog_launcher=_launch_watchdog,
         claim_store=claims,
@@ -3291,6 +3313,9 @@ def test_worker_publishes_success_after_cleanup(
     )
     assert b"test-token" not in (root / "artifacts.tar.gz").read_bytes()
     assert (root / "harbor.log").read_text() == "completed [REDACTED]\n"
+    assert (
+        root / "harbor-jobs/job/trial/agent/runtime.log"
+    ).read_text() == "[REDACTED]"
     assert json.loads((root / "run.lock.json").read_text()) == lock.model_dump(
         mode="json"
     )
@@ -3343,6 +3368,10 @@ def test_worker_publishes_success_after_cleanup(
         {"event": "runtime_probed"},
         {"event": "harbor_started"},
         {"event": "harbor_finished", "exit_code": 0},
+        {
+            "event": "evidence_secrets_redacted",
+            "files": ["agent/runtime.log"],
+        },
         {"event": "verification_validated"},
         {"event": "endpoint_pause_requested"},
         {
@@ -3367,6 +3396,7 @@ def test_worker_publishes_success_after_cleanup(
         "harbor-jobs/job/trial/lock.json",
         "harbor-jobs/job/trial/private-artifacts.json",
         "harbor-jobs/job/trial/agent/openclaw-sessions/session.jsonl",
+        "harbor-jobs/job/trial/agent/runtime.log",
         "harbor-jobs/job/trial/agent/trajectory.json",
         "harbor-jobs/job/trial/evidence/manifest.json",
         "harbor-jobs/job/trial/evidence/workspace-files.jsonl",
