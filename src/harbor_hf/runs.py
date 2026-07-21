@@ -233,15 +233,13 @@ def build_run_lock(
 
 
 def _judge_process_environment(
-    lock: RunLock, token: str, judge_api_url: str | None
+    lock: RunLock, judge_api_url: str | None
 ) -> dict[str, str]:
     judge = lock.benchmark_judge
-    if judge is None:
+    if judge is None or judge_api_url is None:
         return {}
-    if judge_api_url is None:
-        raise ValueError("judge-required run has no trusted judge recorder route")
     return {
-        "AGENT_JUDGE_API_KEY": token,
+        "AGENT_JUDGE_API_KEY": "harbor-hf-recorder",
         "AGENT_JUDGE_API_URL": judge_api_url,
         "AGENT_JUDGE_MODEL": judge.model,
     }
@@ -262,7 +260,7 @@ def harbor_process_environment(
         "OPENAI_API_KEY": token,
         "OPENAI_BASE_URL": f"{inference_base_url.rstrip('/')}/v1",
     }
-    environment.update(_judge_process_environment(lock, token, judge_api_url))
+    environment.update(_judge_process_environment(lock, judge_api_url))
     blocked = set(blocked_secret_names)
     redaction_values = [value for value in redaction_secrets if value]
     source = lock.benchmark_source

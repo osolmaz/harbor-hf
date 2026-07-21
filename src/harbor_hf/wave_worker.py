@@ -586,7 +586,7 @@ def _prepare_judge_transport(
     deadline: float,
     monotonic: Callable[[], float],
 ) -> tuple[str | None, JudgeEvidenceRecorder | None]:
-    if not any(run.configuration.benchmark_judge is not None for run in lock.runs):
+    if not any(run.configuration.judge_required_tasks for run in lock.runs):
         return None, None
     recorder = JudgeEvidenceRecorder(token=token)
     base_url = _job_ingress_base_url(JUDGE_RECORDER_PORT, "judge recorder")
@@ -1071,9 +1071,11 @@ def _execute_trial(
             judge_recorder,
             judge_base_url,
             execution_id,
+            trial.trial_id,
+            trial.task_name,
             execution_root,
             events,
-            token,
+            tuple(value for value in (token, capability) if value is not None),
         )
         adapter = FilesystemHarborExecutionAdapter()
         prepared = adapter.prepare(
@@ -1129,6 +1131,9 @@ def _execute_trial(
             execution_root / "verification.json",
             outcome.verification.model_dump(mode="json"),
         )
+        evidence_secrets = _execution_secret_values(
+            wave, token, capability, judge_capability
+        )
         _assemble_execution_trial_evidence(
             outcome.compatibility_path,
             jobs_dir,
@@ -1137,7 +1142,11 @@ def _execute_trial(
             trial,
             execution,
             execution_root,
-            token,
+            (
+                (evidence_secrets,)
+                if isinstance(evidence_secrets, str)
+                else tuple(evidence_secrets)
+            ),
         )
         build_private_artifact_manifest(execution_root, strict_session=True)
         append_event(events, "execution_succeeded")
@@ -1155,10 +1164,7 @@ def _execute_trial(
         )
     failure_record: dict[str, object] | None = None
     failure_category: RetryCategory | None = None
-    secrets = _secret_values_with(
-        _secret_values_with(_wave_secret_values(wave, token), capability),
-        judge_capability,
-    )
+    secrets = _execution_secret_values(wave, token, capability, judge_capability)
     if error is not None:
         failure_category = _execution_failure_category(
             error, failure_phase, evidence_root=execution_root
@@ -1242,22 +1248,25 @@ def _register_trial_judge_route(
     recorder: JudgeEvidenceRecorder | None,
     base_url: str | None,
     execution_id: str,
+    trial_id: str,
+    task_name: str,
     execution_root: Path,
     events: Path,
-    token: str,
+    known_secrets: tuple[str, ...],
 ) -> tuple[str | None, str | None]:
     judge = run.benchmark_judge
-    if judge is None:
+    if judge is None or not run.judge_required_for(task_name):
         return None, None
     if recorder is None or base_url is None or run.trial_evidence is None:
         raise WorkerError("judge-required run has no exact evidence recorder")
     destination = execution_root / "judge-records"
     capability = recorder.register_scope(
         execution_id=execution_id,
+        trial_id=trial_id,
         model=judge.model,
         destination=destination,
         policy=run.trial_evidence,
-        known_secrets=(token,),
+        known_secrets=known_secrets,
     )
     append_event(
         events,
@@ -1287,7 +1296,7 @@ def _assemble_execution_trial_evidence(
     trial: CampaignTrialLock,
     execution: ExecutionLock,
     execution_root: Path,
-    token: str,
+    known_secrets: tuple[str, ...],
 ) -> None:
     if compatibility_path is None or run.trial_evidence is None:
         raise WorkerError("validated trial evidence inputs are missing")
@@ -1314,7 +1323,7 @@ def _assemble_execution_trial_evidence(
         judge_model=(run.benchmark_judge.model if run.benchmark_judge else None),
         policy=run.trial_evidence,
         judge_records_dir=execution_root / "judge-records",
-        known_secrets=(token,),
+        known_secrets=known_secrets,
     )
     append_event(
         execution_root / "events.jsonl",
@@ -1804,6 +1813,18 @@ def _wave_secret_values(lock: WaveLock, token: str) -> SecretValues:
         values.extend((run_values,) if isinstance(run_values, str) else run_values)
     unique = tuple(dict.fromkeys(value for value in values if value))
     return unique[0] if len(unique) == 1 else unique
+
+
+def _execution_secret_values(
+    wave: WaveLock,
+    token: str,
+    provider_capability: str | None,
+    judge_capability: str | None,
+) -> SecretValues:
+    return _secret_values_with(
+        _secret_values_with(_wave_secret_values(wave, token), provider_capability),
+        judge_capability,
+    )
 
 
 def _secret_values_with(secrets: SecretValues, value: str | None) -> SecretValues:

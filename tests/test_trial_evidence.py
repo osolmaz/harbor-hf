@@ -75,7 +75,7 @@ def test_workspace_package_is_deterministic_and_restorable(tmp_path: Path) -> No
     first = package_workspace(source, first_root / "evidence", policy=policy)
     second = package_workspace(source, second_root / "evidence", policy=policy)
     assert first.evidence.archive.sha256 == second.evidence.archive.sha256
-    assert first.evidence.index.sha256 == second.evidence.index.sha256
+    assert first.evidence.file_index.sha256 == second.evidence.file_index.sha256
     restored = tmp_path / "restored"
     restore_workspace(first_root, first.evidence, restored)
     assert (restored / "a" / "x.txt").read_text() == "x"
@@ -125,6 +125,28 @@ def test_special_workspace_file_is_rejected(tmp_path: Path) -> None:
         package_workspace(source, root / "evidence", policy=_policy())
 
 
+def test_assemble_rejects_capability_in_any_trial_file(tmp_path: Path) -> None:
+    root = _trial(tmp_path)
+    capability = "opaque-execution-capability"
+    (root / "agent" / "agent.txt").write_text(f"route={capability}\n")
+    with pytest.raises(TrialEvidenceError, match="known secret"):
+        assemble_trial_evidence(
+            root,
+            campaign_id="campaign",
+            run_id="run",
+            execution_id="execution",
+            trial_id="trial",
+            task_name="task",
+            task_digest="sha256:" + "a" * 64,
+            logical_attempt=1,
+            physical_attempt=1,
+            judge_expected=False,
+            judge_model=None,
+            policy=_policy(),
+            known_secrets=(capability,),
+        )
+
+
 def test_assemble_and_deep_verify_trial(tmp_path: Path) -> None:
     root = _trial(tmp_path)
     manifest = assemble_trial_evidence(
@@ -165,12 +187,48 @@ def test_assemble_requires_judge_recorder_summary(tmp_path: Path) -> None:
         )
 
 
+def test_assemble_rejects_judge_recorder_with_rejected_calls(tmp_path: Path) -> None:
+    root = _trial(tmp_path)
+    records = tmp_path / "judge-records"
+    recorder = JudgeEvidenceRecorder(token="token")
+    capability = recorder.register_scope(
+        execution_id="execution",
+        trial_id="trial",
+        model="judge/model",
+        destination=records,
+        policy=_policy(),
+    )
+    recorder.revoke_scope(capability)
+    recorder.close()
+    summary_path = records / "recorder.json"
+    summary = json.loads(summary_path.read_text())
+    summary["rejected_call_count"] = 1
+    summary_path.write_text(json.dumps(summary))
+    with pytest.raises(TrialEvidenceError, match="rejected one or more calls"):
+        assemble_trial_evidence(
+            root,
+            campaign_id=None,
+            run_id="run",
+            execution_id="execution",
+            trial_id="trial",
+            task_name="task",
+            task_digest="sha256:" + "a" * 64,
+            logical_attempt=1,
+            physical_attempt=1,
+            judge_expected=True,
+            judge_model="judge/model",
+            policy=_policy(),
+            judge_records_dir=records,
+        )
+
+
 def test_assemble_accepts_judge_recorder_with_zero_calls(tmp_path: Path) -> None:
     root = _trial(tmp_path)
     records = tmp_path / "judge-records"
     recorder = JudgeEvidenceRecorder(token="token")
     capability = recorder.register_scope(
         execution_id="execution",
+        trial_id="trial",
         model="judge/model",
         destination=records,
         policy=_policy(),

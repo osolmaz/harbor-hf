@@ -142,11 +142,11 @@ redaction source, so credential text is removed before it reaches HF Job logs.
 
 `benchmark.judge` optionally pins an OpenAI-compatible verifier judge on
 `router.huggingface.co`. Its API URL, model, protocol, and secret name are
-preserved in the run lock. The remote worker maps the existing `HF_TOKEN`
-secret to `AGENT_JUDGE_API_KEY` only for that trusted host and passes the public
-URL and model as `AGENT_JUDGE_API_URL` and `AGENT_JUDGE_MODEL` to Harbor. The
-credential value never appears in the manifest or lock. Arbitrary judge hosts
-require a separate credential mechanism and are rejected by this schema.
+preserved in the run lock. A trusted recorder holds `HF_TOKEN` and gives the
+verifier a non-secret placeholder in `AGENT_JUDGE_API_KEY`, plus an
+execution-scoped capability URL and the locked model in `AGENT_JUDGE_API_URL`
+and `AGENT_JUDGE_MODEL`. The provider credential never enters the verifier
+environment, manifest, or lock. Arbitrary judge hosts are rejected.
 
 ### Matrix
 

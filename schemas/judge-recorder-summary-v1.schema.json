@@ -21,17 +21,29 @@
       "title": "Model",
       "type": "string"
     },
+    "rejected_call_count": {
+      "minimum": 0,
+      "title": "Rejected Call Count",
+      "type": "integer"
+    },
     "schema_version": {
       "const": "harbor-hf/judge-recorder-summary/v1",
       "default": "harbor-hf/judge-recorder-summary/v1",
       "title": "Schema Version",
       "type": "string"
+    },
+    "trial_id": {
+      "minLength": 1,
+      "title": "Trial Id",
+      "type": "string"
     }
   },
   "required": [
     "execution_id",
+    "trial_id",
     "model",
     "exchange_count",
+    "rejected_call_count",
     "closed_at"
   ],
   "title": "JudgeRecorderSummary",

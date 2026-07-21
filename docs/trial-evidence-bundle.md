@@ -5,7 +5,7 @@ execution. A trial evidence bundle contains the complete `/app` workspace that
 existed after the agent stopped, the retained agent session, each recorded judge
 exchange, and the verifier records used to produce the reward.
 
-A bundle has one required entry point, `evidence/trial-evidence.json`. Every
+A bundle has one required entry point, `evidence/manifest.json`. Every
 other file is referenced from that manifest by a safe path relative to the
 Harbor trial root, exact byte count, and SHA-256 digest.
 
@@ -24,13 +24,14 @@ harbor-jobs/<job>/<trial>/
 │   └── workspace/
 │       └── app/                         # Harbor's frozen post-agent copy
 ├── evidence/
-│   ├── trial-evidence.json              # Required entry point
+│   ├── manifest.json                    # Required entry point
 │   ├── workspace.tar.zst                # Complete captured /app tree
 │   ├── workspace-files.jsonl            # One record per workspace node
 │   └── judge/
+│       ├── recorder.json                # Closed call-count summary
 │       └── judge-0001/
-│           ├── request-received.json
-│           ├── request-forwarded.json
+│           ├── request-received.bin
+│           ├── request-forwarded.bin
 │           ├── response-upstream.bin
 │           ├── response-delivered.bin
 │           └── exchange.json
@@ -48,10 +49,9 @@ Harbor exits and before private artifact finalization. Harbor-HF may remove the
 raw workspace directory after the archive and file index pass validation. The
 archive and index are the durable workspace evidence.
 
-A physical execution that fails before one of these components exists still
-writes `trial-evidence.json` when the worker can do so. Each component then has
-an explicit capture status and reason. Such a bundle cannot support a scored
-outcome.
+A physical execution that fails before these components are complete does not
+write a complete manifest. It retains the available native files and a redacted
+execution failure record for diagnosis, but it cannot support a scored outcome.
 
 ## Minimal complete manifest
 
@@ -62,6 +62,8 @@ paths are relative to the Harbor trial root that contains the `evidence/`,
 ```json
 {
   "schema_version": "harbor-hf/trial-evidence/v1",
+  "campaign_id": "campaign-0123456789abcdef",
+  "run_id": "run-0123456789abcdef",
   "execution_id": "exec-0123456789abcdef",
   "trial_id": "trial-0123456789abcdef",
   "task_name": "example-task",
@@ -89,7 +91,7 @@ paths are relative to the Harbor trial root that contains the `evidence/`,
     "regular_file_bytes": 9021,
     "archive_format": "pax",
     "compression": "zstd",
-    "compression_level": 6
+    "compression_level": 10
   },
   "agent": {
     "status": "captured",
@@ -113,6 +115,13 @@ paths are relative to the Harbor trial root that contains the `evidence/`,
   "judge": {
     "status": "captured",
     "expected": true,
+    "model": "google/gemini-3.5-flash",
+    "recorder_summary": {
+      "path": "evidence/judge/recorder.json",
+      "size_bytes": 256,
+      "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "media_type": "application/json"
+    },
     "exchanges": [
       {
         "exchange_id": "judge-0001",
@@ -163,15 +172,16 @@ paths are relative to the Harbor trial root that contains the `evidence/`,
   "completion": {
     "status": "complete",
     "requirements": [
-      "workspace",
       "agent_session",
       "agent_trajectory",
       "judge_exchange",
-      "verifier_scorecard",
+      "judge_recorder",
+      "judge_selection",
       "verifier_reward",
-      "verifier_stdout",
+      "verifier_scorecard",
       "verifier_stderr",
-      "judge_selection"
+      "verifier_stdout",
+      "workspace"
     ]
   }
 }
@@ -200,6 +210,8 @@ small enough to validate before loading large private evidence.
 | Field | Required | Type | Meaning |
 | --- | --- | --- | --- |
 | `schema_version` | Yes | string | Exact bundle schema version. |
+| `campaign_id` | No | string or null | Campaign identity for campaign executions. |
+| `run_id` | Yes | string | Locked run identity. |
 | `execution_id` | Yes | string | Harbor-HF physical execution identity. |
 | `trial_id` | Yes | string | Logical trial identity. |
 | `task_name` | Yes | string | Exact Harbor task name. |
@@ -281,41 +293,13 @@ this format begin with `evidence/`.
 The workspace component captures the complete `/app` tree after the agent and
 all of its child processes have stopped, and before the verifier begins.
 
-### Workspace states
+### Workspace state
 
-`workspace.status` is one of:
-
-| Value | Meaning |
-| --- | --- |
-| `captured` | Archive and file index are complete and validated. |
-| `not_created` | The agent environment never reached workspace creation. |
-| `capture_failed` | A workspace existed but could not be captured safely. |
-| `secret_detected` | A known injected credential appeared in a workspace path or file. |
-
-A `captured` workspace requires every field shown in the minimal example.
-Other states require `reason_code` and must omit the archive and index together
-with count and compression fields.
-
-`reason_code` is a short machine value. Allowed values are:
-
-- `environment_not_started`;
-- `agent_not_started`;
-- `workspace_missing`;
-- `workspace_changed_during_capture`;
-- `unsupported_path`;
-- `unsupported_file_type`;
-- `unsafe_symlink`;
-- `file_limit_exceeded`;
-- `byte_limit_exceeded`;
-- `disk_full`;
-- `archive_failed`;
-- `index_failed`;
-- `known_secret_found`;
-- `unknown_capture_error`.
-
-Free-form exception text does not belong in the bundle manifest. Harbor-HF
-records a redacted exception type and message in its normal execution failure
-record.
+A complete manifest requires `workspace.status: captured` and every field shown
+in the minimal example. Missing workspaces, capture failures, limit failures,
+unsafe file types, and detected secrets fail the physical execution before a
+manifest is written. Harbor-HF records the redacted error category and message
+in the normal execution failure record.
 
 ### Capture boundary
 
@@ -426,7 +410,7 @@ Archive rules:
 - permission bits come from the file index;
 - hard links, sparse members, devices, sockets, FIFOs, pax path escapes, and
   unknown member types are forbidden;
-- the Zstandard frame uses compression level 6 and one compression thread;
+- the Zstandard frame uses compression level 10 and one compression thread;
 - the writer records its Zstandard library version in execution runtime
   evidence, outside the bundle manifest.
 
@@ -457,30 +441,21 @@ The restore command performs no remote fetch. Operators first download the
 private execution evidence and then run:
 
 ```bash
-harbor-hf evidence verify PATH/TO/EXECUTION
-harbor-hf evidence restore PATH/TO/EXECUTION --destination ./restored
+harbor-hf artifacts verify-trial PATH/TO/TRIAL --deep
+harbor-hf artifacts restore-trial PATH/TO/TRIAL ./restored
 ```
 
 ## Agent evidence
 
-`agent.status` is one of `captured`, `not_started`, or `capture_failed`.
-
-A captured OpenClaw execution requires at least one session JSONL and its
-matching trajectory JSONL. Every reference includes an exact digest and byte
-count. Session and trajectory files remain in Harbor's native agent directory;
-the evidence manifest does not duplicate their bytes.
-
-A session file must contain only valid JSON objects separated by newlines. A
-trajectory must also contain valid JSON objects and must match the session
-identity recorded by OpenClaw. Empty files do not satisfy the requirement.
+A complete manifest requires `agent.status: captured`, at least one nonempty
+session JSONL, and at least one nonempty trajectory file. Every reference
+includes an exact digest and byte count. Session and trajectory files remain in
+Harbor's native agent directory; the evidence manifest does not duplicate their
+bytes.
 
 Multiple session pairs are allowed when the agent creates them during one
 physical execution. References are sorted by path. Harbor-HF must not choose the
 largest session and discard the others.
-
-`not_started` is valid only when Harbor reports that agent execution never
-began. `capture_failed` requires a reason code. Neither state can support a
-scored execution.
 
 The bundle preserves model-visible messages and tool records returned by the
 agent runtime. It does not claim to reconstruct files from those records. The
@@ -504,33 +479,31 @@ set of task names or task digests that require a judge.
 | --- | --- |
 | `captured` | Every expected judge call has a complete exchange record. |
 | `not_expected` | The locked task uses no external judge. |
-| `not_called` | A judge was expected but the verifier made no call. |
-| `capture_failed` | A call occurred but its evidence is incomplete. |
-| `secret_detected` | A known credential appeared in a request or response body. |
+| `not_called` | The recorder closed cleanly with zero calls. |
 
 `not_expected` requires `expected: false` and an empty exchange list.
 `captured` requires one or more exchanges when `expected` is true. `not_called`
 can support a scored execution only when the closed recorder summary reports
 zero calls and the verifier took a locked deterministic branch, such as the
-ShellBench no-submission zero path. It must not contain a judge selection.
-`capture_failed` and `secret_detected` cannot support a scored execution.
+ShellBench no-submission zero path. It must not contain a judge selection. A
+rejected, incomplete, secret-bearing, or unsuccessful call fails the physical
+execution before a complete manifest is written.
 
 ### Judge directory
 
 Each HTTP attempt receives a unique execution-local ID in increasing order:
 `judge-0001`, `judge-0002`, and so on. Retried calls are never overwritten.
 
-A judge directory also contains `recorder.json`. It records the execution ID,
-locked model, final exchange count, and close time. This closed summary proves
-that a zero-exchange execution made no judge call through its only configured
-judge route.
+A judge directory also contains `recorder.json`. It records the execution and
+trial IDs, locked model, final exchange count, rejected call count, and close
+time. A zero-exchange execution is complete only when both counts are zero.
 
 An exchange directory contains:
 
 | File | Required | Meaning |
 | --- | --- | --- |
-| `request-received.json` | Yes | Exact HTTP request body received from the verifier. |
-| `request-forwarded.json` | Yes | Exact HTTP request body sent upstream. |
+| `request-received.bin` | Yes | Exact HTTP request body received from the verifier. |
+| `request-forwarded.bin` | Yes | Exact HTTP request body sent upstream. |
 | `response-upstream.bin` | When upstream responded | Exact decoded upstream response bytes before local transformation. |
 | `response-delivered.bin` | Yes | Exact response bytes returned to the verifier. |
 | `exchange.json` | Yes | Strict metadata and references for this attempt. |
@@ -570,28 +543,28 @@ A successful exchange record has this shape:
     "content-type": "application/json"
   },
   "request_received": {
-    "path": "request-received.json",
+    "path": "request-received.bin",
     "size_bytes": 42112,
     "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "media_type": "application/json"
+    "media_type": "application/octet-stream"
   },
   "request_forwarded": {
-    "path": "request-forwarded.json",
+    "path": "request-forwarded.bin",
     "size_bytes": 42112,
     "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "media_type": "application/json"
+    "media_type": "application/octet-stream"
   },
   "response_upstream": {
     "path": "response-upstream.bin",
     "size_bytes": 2901,
     "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "media_type": "application/json"
+    "media_type": "application/octet-stream"
   },
   "response_delivered": {
     "path": "response-delivered.bin",
     "size_bytes": 2901,
     "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "media_type": "application/json"
+    "media_type": "application/octet-stream"
   },
   "upstream_http_status": 200,
   "delivered_http_status": 200,
@@ -604,7 +577,8 @@ A successful exchange record has this shape:
     "content-type": "application/json",
     "x-harbor-judge-exchange-id": "judge-0001"
   },
-  "transport_status": "complete",
+  "total_ms": 4751.0,
+  "outcome": "success",
   "transformation": "none"
 }
 ```
@@ -617,8 +591,8 @@ Rules:
 - Identity fields must match the parent trial evidence manifest.
 - `attempt` starts at 1 and exchange records are contiguous.
 - Times use RFC 3339 with UTC offsets, and finish cannot precede start.
-- The requested model must match the locked judge model.
-- The forwarded model must also match the locked judge model.
+- The forwarded model must match the locked judge model.
+- A different requested model is replaced and recorded as `model_enforced`.
 - `stream: true` requests are rejected in this schema. Judge calls are bounded
   non-streaming JSON responses.
 - Request and response bodies are bounded by the locked judge evidence policy.
@@ -639,10 +613,10 @@ Rules:
 - Header names are lowercase. Any header outside the allowlist is omitted from
   evidence. Authorization, proxy authorization, cookies, and set-cookie are
   always omitted.
-- `transport_status` is `complete`, `upstream_error`, `timeout`,
-  `client_disconnected`, `response_too_large`, or `recorder_error`.
-- `transformation` is `none`, `model_enforced`, `provider_route_normalized`, or
-  `local_error_response`.
+- `outcome` is `success`, `upstream_error`, `transport_error`, or
+  `recorder_error`.
+- `transformation` is `none` or `model_enforced`.
+- Failed outcomes include bounded `error_type` and `error_message` metadata.
 
 The recorder saves the exact HTTP body bytes. Parsing and reserializing JSON is
 not an acceptable substitute. Metadata may contain parsed values for
@@ -688,24 +662,18 @@ The trial evidence manifest copies the selected ID into
 complete, belong to the same execution, and contain the response used to build
 `scorecard.json`.
 
-When a verifier uses more than one judge call, it may write an ordered
-`exchange_ids` array instead of one `exchange_id`. The manifest then stores the
-same ordered list in `selected_judge_exchange_ids`. Exactly one of the singular
-or plural forms is allowed.
-
-A scorecard without a valid selection record cannot support a scored outcome
-for a judge-required task.
+When a verifier makes more than one judge call, it still selects exactly one
+complete exchange with `exchange_id`. A scorecard built from a judge response
+without a valid selection record cannot support a scored outcome.
 
 ## Verifier evidence
 
-`verifier.status` is `captured`, `not_started`, or `capture_failed`.
-
-A captured verifier requires:
+A complete manifest requires `verifier.status: captured` and:
 
 - the native Harbor reward file;
 - all native scorecards or deterministic result files required by the task;
 - verifier standard output and standard error files, including empty files;
-- a judge selection record when the task requires a judge;
+- a judge selection record when the verifier made a judge call;
 - Harbor's verifier timing and exception state in the native trial result.
 
 Every retained file has a digest and size reference. The verifier object may
@@ -721,25 +689,27 @@ Its deterministic test results and reward still have to be captured.
 
 ## Completion decision
 
-`completion.status` is `complete` or `incomplete`. `requirements` is a sorted
-list derived from the locked task and execution policy.
+`completion.status` is `complete`. `requirements` is a sorted list derived
+from the locked task and execution policy. Incomplete physical executions keep
+failure evidence but do not publish a trial evidence manifest.
 
 Allowed requirement names are:
 
-- `workspace`;
 - `agent_session`;
 - `agent_trajectory`;
 - `judge_exchange`;
-- `verifier_scorecard`;
+- `judge_recorder`;
+- `judge_selection`;
 - `verifier_reward`;
-- `verifier_stdout`;
+- `verifier_scorecard`;
 - `verifier_stderr`;
-- `judge_selection`.
+- `verifier_stdout`;
+- `workspace`.
 
-A normally scored OpenClaw task with an external judge requires every item. A
-deterministic task omits `judge_exchange` and `judge_selection`. A task that
-fails before the agent starts records the applicable statuses but cannot have a
-complete scored bundle.
+A judge-capable task always requires `judge_recorder`. It requires
+`judge_exchange` and `judge_selection` only when the verifier made a call. A
+deterministic task omits all three judge requirements. A task that fails before
+the agent starts cannot have a complete scored bundle.
 
 A scored public task outcome is valid only when `completion.status` is
 `complete`. Missing or rejected evidence causes a physical execution failure
@@ -794,7 +764,7 @@ prompts, judge responses, or scorecards.
 ## Atomicity and immutability
 
 Writers use a temporary file in the destination directory, flush it, and rename
-it atomically. `trial-evidence.json` is written last inside the bundle. The
+it atomically. `manifest.json` is written last inside the bundle. The
 physical execution's root checksum manifest and terminal marker are written
 after trial evidence validation.
 
@@ -915,7 +885,7 @@ One physical execution follows this order:
 7. Judge-required verifier calls pass through the execution-scoped recorder.
 8. Harbor downloads verifier logs and writes its native result.
 9. Harbor-HF packages and deep-validates workspace evidence.
-10. Harbor-HF assembles and validates `trial-evidence.json`.
+10. Harbor-HF assembles and validates `manifest.json`.
 11. Harbor-HF scans exact evidence for known injected secrets.
 12. Harbor-HF writes private artifact inventories, root checksums, and the
     terminal marker.

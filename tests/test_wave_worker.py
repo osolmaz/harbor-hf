@@ -1063,6 +1063,60 @@ def test_judged_wave_records_and_selects_exact_exchange(
     )
 
 
+def test_judge_excluded_task_records_deterministic_evidence(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_name = next(iter(remote_spec.benchmark.task_digests))
+    judge = BenchmarkJudgeSpec(
+        api_url="https://router.huggingface.co/v1/chat/completions",
+        model="judge/model",
+        exclude_task_names=[task_name],
+    )
+    judged_spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        judged_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", lambda *_args: {"probes": {}})
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker._job_ingress_base_url",
+        lambda port, _label: f"http://127.0.0.1:{port}",
+    )
+    output = tmp_path / "output"
+    run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=EndpointRunner(
+            [
+                endpoint_snapshot("paused", 0),
+                endpoint_snapshot("running", 1),
+                endpoint_snapshot("paused", 0),
+            ]
+        ),
+        stream_runner=HarborStream(spec.benchmark.task_digests, expected_calls=1),
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+    evidence_manifest = next(output.rglob("evidence/manifest.json"))
+    payload = json.loads(evidence_manifest.read_text())
+    assert payload["judge"] == {
+        "status": "not_expected",
+        "expected": False,
+        "model": None,
+        "recorder_summary": None,
+        "exchanges": [],
+    }
+    assert not (evidence_manifest.parent / "judge").exists()
+    assert "judge_recorder" not in payload["completion"]["requirements"]
+
+
 def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
@@ -1461,7 +1515,7 @@ def test_missing_required_session_publishes_terminal_failed_evidence(
     assert failure == {
         "category": "evidence",
         "error_type": "TrialEvidenceError",
-        "message": "agent execution has no session JSONL",
+        "message": "agent execution has no session JSONL with content",
     }
     assert private["requirements"] == [
         {

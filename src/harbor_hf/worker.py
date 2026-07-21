@@ -719,7 +719,7 @@ def _execute_benchmark(
     stream_runner: Callable[..., int],
     harbor_source: Path,
 ) -> None:
-    if lock.benchmark_judge is not None:
+    if lock.judge_required_tasks:
         raise WorkerError(
             "judge-required runs must use campaign execution for per-trial evidence"
         )
@@ -786,6 +786,10 @@ def _assemble_direct_trial_evidence(
     bundle = HarborCompatibilityBundle.model_validate_json(
         compatibility_path.read_text(encoding="utf-8")
     )
+    secret_values = run_secret_values(lock, token)
+    known_secrets = (
+        (secret_values,) if isinstance(secret_values, str) else tuple(secret_values)
+    )
     attempts: dict[str, int] = {}
     for native in sorted(bundle.trials, key=lambda item: (item.task_name, item.path)):
         logical_attempt = attempts.get(native.task_name, 0) + 1
@@ -803,7 +807,7 @@ def _assemble_direct_trial_evidence(
             judge_expected=False,
             judge_model=None,
             policy=policy,
-            known_secrets=(token,),
+            known_secrets=known_secrets,
         )
 
 

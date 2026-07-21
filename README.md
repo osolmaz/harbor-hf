@@ -66,8 +66,9 @@ is defined in the [run specification](docs/run-spec.md), and
 To reproduce the public ShellBench trace methodology, use the
 [six-run example](examples/shellbench-public-six-run.yaml). It sets
 `execution.attempts: 6`, producing six fresh logical trials per task while
-keeping infrastructure retries separate. Report the mean and strict pass rate
-across every trial; do not use an any-of-six result as the headline score.
+keeping infrastructure retries separate. Report mean reward, strict trial pass
+rate, and each task's 0–6 pass count. Do not use an any-of-six result as the
+headline score.
 
 ## Run a Campaign
 

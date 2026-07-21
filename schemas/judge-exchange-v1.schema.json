@@ -3,6 +3,12 @@
     "BodyReference": {
       "additionalProperties": false,
       "properties": {
+        "media_type": {
+          "const": "application/octet-stream",
+          "default": "application/octet-stream",
+          "title": "Media Type",
+          "type": "string"
+        },
         "path": {
           "title": "Path",
           "type": "string"
@@ -12,15 +18,15 @@
           "title": "Sha256",
           "type": "string"
         },
-        "size": {
+        "size_bytes": {
           "minimum": 0,
-          "title": "Size",
+          "title": "Size Bytes",
           "type": "integer"
         }
       },
       "required": [
         "path",
-        "size",
+        "size_bytes",
         "sha256"
       ],
       "title": "BodyReference",
@@ -50,6 +56,7 @@
     "error_message": {
       "anyOf": [
         {
+          "maxLength": 400,
           "type": "string"
         },
         {
@@ -62,6 +69,7 @@
     "error_type": {
       "anyOf": [
         {
+          "maxLength": 200,
           "type": "string"
         },
         {
@@ -173,6 +181,10 @@
       "title": "Transformation",
       "type": "string"
     },
+    "trial_id": {
+      "title": "Trial Id",
+      "type": "string"
+    },
     "upstream_http_status": {
       "anyOf": [
         {
@@ -216,6 +228,7 @@
   "required": [
     "exchange_id",
     "execution_id",
+    "trial_id",
     "attempt",
     "requested_model",
     "forwarded_model",

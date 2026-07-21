@@ -66,8 +66,9 @@ class FrozenModel(BaseModel):
 
 class BodyReference(FrozenModel):
     path: str
-    size: int = Field(ge=0)
+    size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    media_type: Literal["application/octet-stream"] = "application/octet-stream"
 
     @field_validator("path")
     @classmethod
@@ -83,8 +84,10 @@ class JudgeRecorderSummary(FrozenModel):
         "harbor-hf/judge-recorder-summary/v1"
     )
     execution_id: str = Field(min_length=1)
+    trial_id: str = Field(min_length=1)
     model: str = Field(min_length=1)
     exchange_count: int = Field(ge=0)
+    rejected_call_count: int = Field(ge=0)
     closed_at: datetime
 
     @model_validator(mode="after")
@@ -100,6 +103,7 @@ class JudgeExchange(FrozenModel):
     )
     exchange_id: str = Field(pattern=r"^judge-[0-9]{4}$")
     execution_id: str
+    trial_id: str
     attempt: int = Field(ge=1)
     provider: Literal["hf-inference-provider"] = "hf-inference-provider"
     upstream_url: Literal["https://router.huggingface.co/v1/chat/completions"] = (
@@ -123,8 +127,8 @@ class JudgeExchange(FrozenModel):
     finished_at: datetime
     total_ms: float = Field(ge=0)
     outcome: Literal["success", "upstream_error", "transport_error", "recorder_error"]
-    error_type: str | None = None
-    error_message: str | None = None
+    error_type: str | None = Field(default=None, max_length=200)
+    error_message: str | None = Field(default=None, max_length=400)
 
     @model_validator(mode="after")
     def identity_and_time_are_consistent(self) -> JudgeExchange:
@@ -177,6 +181,7 @@ class JudgeExchange(FrozenModel):
 @dataclass(frozen=True)
 class _Scope:
     execution_id: str
+    trial_id: str
     model: str
     destination: Path
     policy: TrialEvidencePolicy
@@ -203,6 +208,7 @@ class JudgeEvidenceRecorder:
         )
         self._scopes: dict[str, _Scope] = {}
         self._counts: dict[str, int] = {}
+        self._rejections: dict[str, int] = {}
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -252,6 +258,7 @@ class JudgeEvidenceRecorder:
         with self._lock:
             self._scopes.clear()
             self._counts.clear()
+            self._rejections.clear()
         if self._owns_client:
             self._client.close()
 
@@ -259,13 +266,16 @@ class JudgeEvidenceRecorder:
         self,
         *,
         execution_id: str,
+        trial_id: str,
         model: str,
         destination: Path,
         policy: TrialEvidencePolicy,
         known_secrets: tuple[str, ...] = (),
     ) -> str:
-        if not execution_id or not model:
-            raise ValueError("judge scope requires execution and model identity")
+        if not execution_id or not trial_id or not model:
+            raise ValueError(
+                "judge scope requires execution, trial, and model identity"
+            )
         if destination.exists():
             raise JudgeRecorderError("judge evidence destination already exists")
         destination.mkdir(parents=True)
@@ -279,12 +289,16 @@ class JudgeEvidenceRecorder:
                 if capability not in self._scopes:
                     self._scopes[capability] = _Scope(
                         execution_id=execution_id,
+                        trial_id=trial_id,
                         model=model,
                         destination=destination,
                         policy=policy,
-                        secrets=tuple(dict.fromkeys((self._token, *known_secrets))),
+                        secrets=tuple(
+                            dict.fromkeys((self._token, *known_secrets, capability))
+                        ),
                     )
                     self._counts[execution_id] = 0
+                    self._rejections[execution_id] = 0
                     return capability
         raise JudgeRecorderError("judge capability generation collided")
 
@@ -292,12 +306,15 @@ class JudgeEvidenceRecorder:
         with self._lock:
             scope = self._scopes.pop(capability, None)
             count = self._counts.pop(scope.execution_id, 0) if scope else 0
+            rejected = self._rejections.pop(scope.execution_id, 0) if scope else 0
         if scope is None:
             return
         summary = JudgeRecorderSummary(
             execution_id=scope.execution_id,
+            trial_id=scope.trial_id,
             model=scope.model,
             exchange_count=count,
+            rejected_call_count=rejected,
             closed_at=datetime.now(UTC),
         )
         try:
@@ -437,6 +454,7 @@ class JudgeEvidenceRecorder:
         error: Exception,
     ) -> None:
         if exchange_id is None or attempt is None:
+            self._record_rejection(scope)
             self._send_error(handler, 502, "judge recorder rejected request")
             return
         error_body = json.dumps(
@@ -475,6 +493,12 @@ class JudgeEvidenceRecorder:
             self._send_error(handler, 502, "judge evidence recording failed")
             return
         self._send(handler, 502, error_body, delivered_headers)
+
+    def _record_rejection(self, scope: _Scope) -> None:
+        with self._lock:
+            self._rejections[scope.execution_id] = (
+                self._rejections.get(scope.execution_id, 0) + 1
+            )
 
     def _allocate(self, scope: _Scope) -> tuple[str, int]:
         with self._lock:
@@ -568,6 +592,7 @@ class JudgeEvidenceRecorder:
             exchange = JudgeExchange(
                 exchange_id=exchange_id,
                 execution_id=scope.execution_id,
+                trial_id=scope.trial_id,
                 attempt=attempt,
                 requested_model=requested_model,
                 forwarded_model=scope.model,
@@ -675,7 +700,7 @@ def verify_judge_exchange(exchange_dir: Path) -> JudgeExchange:
             raise JudgeRecorderError("judge exchange body is missing")
         content = path.read_bytes()
         digest = "sha256:" + hashlib.sha256(content).hexdigest()
-        if len(content) != reference.size or digest != reference.sha256:
+        if len(content) != reference.size_bytes or digest != reference.sha256:
             raise JudgeRecorderError("judge exchange body digest mismatch")
     return exchange
 
@@ -752,7 +777,7 @@ def _body_reference(path: Path) -> BodyReference:
     content = path.read_bytes()
     return BodyReference(
         path=path.name,
-        size=len(content),
+        size_bytes=len(content),
         sha256="sha256:" + hashlib.sha256(content).hexdigest(),
     )
 

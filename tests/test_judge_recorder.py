@@ -13,6 +13,7 @@ from harbor_hf.judge_recorder import (
     JudgeEvidenceRecorder,
     JudgeRecorderError,
     verify_judge_exchange,
+    verify_judge_recorder_summary,
 )
 from harbor_hf.models import TrialEvidencePolicy
 
@@ -68,6 +69,7 @@ def test_records_exact_bodies_and_enforces_model(tmp_path: Path) -> None:
     destination = tmp_path / "judge"
     capability = recorder.register_scope(
         execution_id="exec",
+        trial_id="trial",
         model="locked/judge",
         destination=destination,
         policy=_policy(),
@@ -115,6 +117,7 @@ def test_rejects_streaming_without_upstream_call(tmp_path: Path) -> None:
     base = recorder.start(host="127.0.0.1", port=0)
     capability = recorder.register_scope(
         execution_id="exec",
+        trial_id="trial",
         model="judge",
         destination=tmp_path / "judge",
         policy=_policy(),
@@ -143,6 +146,7 @@ def test_known_secret_in_prompt_fails_closed(tmp_path: Path) -> None:
     base = recorder.start(host="127.0.0.1", port=0)
     capability = recorder.register_scope(
         execution_id="exec",
+        trial_id="trial",
         model="judge",
         destination=tmp_path / "judge",
         policy=_policy(),
@@ -157,10 +161,13 @@ def test_known_secret_in_prompt_fails_closed(tmp_path: Path) -> None:
             },
         )
     finally:
+        recorder.revoke_scope(capability)
         recorder.close()
     assert status == 502
     assert json.loads(body) == {"error": "judge recorder rejected request"}
-    assert list((tmp_path / "judge").iterdir()) == []
+    summary = verify_judge_recorder_summary(tmp_path / "judge" / "recorder.json")
+    assert summary.exchange_count == 0
+    assert summary.rejected_call_count == 1
 
 
 def test_records_transport_errors_and_delivered_response(tmp_path: Path) -> None:
@@ -176,6 +183,7 @@ def test_records_transport_errors_and_delivered_response(tmp_path: Path) -> None
     destination = tmp_path / "judge"
     capability = recorder.register_scope(
         execution_id="exec",
+        trial_id="trial",
         model="judge",
         destination=destination,
         policy=_policy(),
@@ -213,6 +221,7 @@ def test_revoked_scope_is_unavailable(tmp_path: Path) -> None:
     base = recorder.start(host="127.0.0.1", port=0)
     capability = recorder.register_scope(
         execution_id="exec",
+        trial_id="trial",
         model="judge",
         destination=tmp_path / "judge",
         policy=_policy(),

@@ -607,7 +607,7 @@ When a task is judge-required, set:
 ```text
 AGENT_JUDGE_API_URL=<scoped recorder URL>/v1/chat/completions
 AGENT_JUDGE_MODEL=<locked judge model>
-AGENT_JUDGE_API_KEY=<HF Job ingress credential>
+AGENT_JUDGE_API_KEY=harbor-hf-recorder
 ```
 
 The upstream judge API URL remains in the immutable lock and is known only to

@@ -24,6 +24,13 @@ JUDGE_SELECTION_SCHEMA = "harbor-hf/judge-selection/v1"
 WORKSPACE_SOURCE = PurePosixPath("/app")
 WORKSPACE_DESTINATION = PurePosixPath("workspace/app")
 _CHUNK = 1024 * 1024
+MediaType = Literal[
+    "application/json",
+    "application/octet-stream",
+    "application/vnd.harbor-hf.workspace+tar+zstd",
+    "application/x-ndjson",
+    "text/plain",
+]
 
 
 class _BinaryWriter(Protocol):
@@ -40,8 +47,9 @@ class FrozenModel(BaseModel):
 
 class FileReference(FrozenModel):
     path: str = Field(min_length=1)
-    size: int = Field(ge=0)
+    size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    media_type: MediaType
 
     @model_validator(mode="after")
     def path_is_safe(self) -> FileReference:
@@ -54,21 +62,27 @@ class WorkspaceFile(FrozenModel):
     path: str = Field(min_length=1)
     type: Literal["directory", "file", "symlink", "hardlink"]
     mode: int = Field(ge=0, le=0o7777)
-    size: int = Field(ge=0)
+    size_bytes: int | None = Field(default=None, ge=0)
     sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
     target: str | None = None
 
     @model_validator(mode="after")
     def fields_match_type(self) -> WorkspaceFile:
-        _safe_relative_path(self.path)
-        if self.type == "file" and self.sha256 is None:
-            raise ValueError("workspace file requires sha256")
+        if self.path == ".":
+            if self.type != "directory":
+                raise ValueError("workspace root index entry must be a directory")
+        else:
+            _safe_relative_path(self.path)
+        if self.type == "file" and (self.sha256 is None or self.size_bytes is None):
+            raise ValueError("workspace file requires size and sha256")
         if self.type in {"symlink", "hardlink"} and not self.target:
             raise ValueError("workspace link requires target")
         if self.type not in {"symlink", "hardlink"} and self.target is not None:
             raise ValueError("workspace non-link cannot have target")
-        if self.type != "file" and self.sha256 is not None:
-            raise ValueError("workspace non-file cannot have sha256")
+        if self.type != "file" and (
+            self.sha256 is not None or self.size_bytes is not None
+        ):
+            raise ValueError("workspace non-file cannot have size or sha256")
         return self
 
 
@@ -76,15 +90,17 @@ class WorkspaceEvidence(FrozenModel):
     status: Literal["captured"] = "captured"
     root: Literal["/app"] = "/app"
     archive: FileReference
-    index: FileReference
-    entry_count: int = Field(ge=0)
-    file_count: int = Field(ge=0)
-    unpacked_bytes: int = Field(ge=0)
-    archive_bytes: int = Field(ge=0)
+    file_index: FileReference
+    entry_count: int = Field(ge=1)
+    regular_file_count: int = Field(ge=0)
+    regular_file_bytes: int = Field(ge=0)
+    archive_format: Literal["pax"] = "pax"
     compression: Literal["zstd"] = "zstd"
+    compression_level: Literal[10] = 10
 
 
 class AgentEvidence(FrozenModel):
+    status: Literal["captured"] = "captured"
     sessions: list[FileReference]
     trajectories: list[FileReference]
     logs: list[FileReference] = Field(default_factory=list)
@@ -97,15 +113,34 @@ class AgentEvidence(FrozenModel):
         return self
 
 
+class JudgeExchangeReference(FrozenModel):
+    exchange_id: str = Field(pattern=r"^judge-[0-9]{4}$")
+    attempt: int = Field(ge=1)
+    record: FileReference
+
+    @model_validator(mode="after")
+    def identity_is_consistent(self) -> JudgeExchangeReference:
+        if int(self.exchange_id.removeprefix("judge-")) != self.attempt:
+            raise ValueError("judge exchange reference identity mismatch")
+        if PurePosixPath(self.record.path).parent.name != self.exchange_id:
+            raise ValueError("judge exchange record path identity mismatch")
+        return self
+
+
 class JudgeEvidence(FrozenModel):
+    status: Literal["captured", "not_called", "not_expected"]
     expected: bool
     model: str | None = None
     recorder_summary: FileReference | None = None
-    exchanges: list[FileReference] = Field(default_factory=list)
+    exchanges: list[JudgeExchangeReference] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def expectation_is_consistent(self) -> JudgeEvidence:
-        _require_sorted_unique(self.exchanges)
+        exchange_ids = [item.exchange_id for item in self.exchanges]
+        if exchange_ids != sorted(exchange_ids) or len(exchange_ids) != len(
+            set(exchange_ids)
+        ):
+            raise ValueError("judge exchange references must be sorted and unique")
         if self.expected and (not self.model or self.recorder_summary is None):
             raise ValueError("expected judge evidence requires a recorder summary")
         if not self.expected and (
@@ -114,43 +149,59 @@ class JudgeEvidence(FrozenModel):
             or self.exchanges
         ):
             raise ValueError("unexpected judge evidence must be empty")
+        expected_status = (
+            "captured"
+            if self.exchanges
+            else ("not_called" if self.expected else "not_expected")
+        )
+        if self.status != expected_status:
+            raise ValueError("judge status disagrees with recorded exchanges")
         return self
 
 
 class VerifierEvidence(FrozenModel):
+    status: Literal["captured"] = "captured"
     scorecard: FileReference
     reward: FileReference
     stdout: FileReference
     stderr: FileReference
     judge_selection: FileReference | None = None
+    selected_judge_exchange_id: str | None = Field(
+        default=None, pattern=r"^judge-[0-9]{4}$"
+    )
     logs: list[FileReference] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def logs_are_canonical(self) -> VerifierEvidence:
         _require_sorted_unique(self.logs)
+        if (self.judge_selection is None) != (self.selected_judge_exchange_id is None):
+            raise ValueError("judge selection file and selected exchange must agree")
         return self
 
 
-class EvidenceRequirement(FrozenModel):
-    name: Literal["workspace", "agent", "judge", "verifier"]
-    required: bool
-    satisfied: bool
-
-    @model_validator(mode="after")
-    def required_is_satisfied(self) -> EvidenceRequirement:
-        if self.required and not self.satisfied:
-            raise ValueError(f"required evidence is missing: {self.name}")
-        return self
+EvidenceRequirementName = Literal[
+    "agent_session",
+    "agent_trajectory",
+    "judge_exchange",
+    "judge_recorder",
+    "judge_selection",
+    "verifier_reward",
+    "verifier_scorecard",
+    "verifier_stderr",
+    "verifier_stdout",
+    "workspace",
+]
 
 
 class CompletionEvidence(FrozenModel):
     status: Literal["complete"] = "complete"
-    requirements: list[EvidenceRequirement]
+    requirements: list[EvidenceRequirementName]
 
     @model_validator(mode="after")
     def requirements_are_canonical(self) -> CompletionEvidence:
-        names = [item.name for item in self.requirements]
-        if names != sorted(names) or len(names) != len(set(names)):
+        if self.requirements != sorted(self.requirements) or len(
+            self.requirements
+        ) != len(set(self.requirements)):
             raise ValueError("evidence requirements must be sorted and unique")
         return self
 
@@ -186,7 +237,10 @@ def _validate_manifest_capture_time(manifest: TrialEvidenceManifest) -> None:
 
 
 def _validate_manifest_component_paths(manifest: TrialEvidenceManifest) -> None:
-    workspace_paths = [manifest.workspace.archive.path, manifest.workspace.index.path]
+    workspace_paths = [
+        manifest.workspace.archive.path,
+        manifest.workspace.file_index.path,
+    ]
     if any(not path.startswith("evidence/") for path in workspace_paths):
         raise ValueError("workspace evidence must remain under evidence/")
     agent_refs = [
@@ -196,7 +250,7 @@ def _validate_manifest_component_paths(manifest: TrialEvidenceManifest) -> None:
     ]
     if any(not item.path.startswith("agent/") for item in agent_refs):
         raise ValueError("agent evidence must remain under agent/")
-    judge_refs = [*manifest.judge.exchanges]
+    judge_refs = [item.record for item in manifest.judge.exchanges]
     if manifest.judge.recorder_summary is not None:
         judge_refs.append(manifest.judge.recorder_summary)
     if any(not item.path.startswith("evidence/judge/") for item in judge_refs):
@@ -215,22 +269,21 @@ def _validate_manifest_component_paths(manifest: TrialEvidenceManifest) -> None:
 
 
 def _validate_manifest_requirements(manifest: TrialEvidenceManifest) -> None:
-    requirements = {item.name: item for item in manifest.completion.requirements}
-    if set(requirements) != {"agent", "judge", "verifier", "workspace"}:
+    expected: list[EvidenceRequirementName] = [
+        "agent_session",
+        "agent_trajectory",
+        "verifier_reward",
+        "verifier_scorecard",
+        "verifier_stderr",
+        "verifier_stdout",
+        "workspace",
+    ]
+    if manifest.judge.expected:
+        expected.append("judge_recorder")
+    if manifest.judge.exchanges:
+        expected.extend(["judge_exchange", "judge_selection"])
+    if manifest.completion.requirements != sorted(expected):
         raise ValueError("trial evidence has an incomplete requirement set")
-    expected_required: dict[
-        Literal["workspace", "agent", "judge", "verifier"], bool
-    ] = {
-        "agent": True,
-        "judge": manifest.judge.expected,
-        "verifier": True,
-        "workspace": True,
-    }
-    if any(
-        requirements[name].required != required
-        for name, required in expected_required.items()
-    ):
-        raise ValueError("trial evidence requirement policy is inconsistent")
 
 
 class JudgeSelection(FrozenModel):
@@ -275,14 +328,13 @@ def package_workspace(
         archive_path.unlink(missing_ok=True)
         raise TrialEvidenceError("workspace archive exceeds configured byte limit")
     files = [entry for entry in entries if entry.type == "file"]
-    unpacked = sum(entry.size for entry in files)
+    unpacked = sum(entry.size_bytes or 0 for entry in files)
     evidence = WorkspaceEvidence(
         archive=_reference(archive_path, evidence_dir.parent),
-        index=_reference(index_path, evidence_dir.parent),
+        file_index=_reference(index_path, evidence_dir.parent),
         entry_count=len(entries),
-        file_count=len(files),
-        unpacked_bytes=unpacked,
-        archive_bytes=archive_size,
+        regular_file_count=len(files),
+        regular_file_bytes=unpacked,
     )
     package = WorkspacePackage(evidence=evidence, entries=entries)
     verify_workspace_package(evidence_dir.parent, package.evidence, deep=True)
@@ -293,19 +345,17 @@ def verify_workspace_package(
     trial_root: Path, evidence: WorkspaceEvidence, *, deep: bool
 ) -> list[WorkspaceFile]:
     _verify_reference(trial_root, evidence.archive)
-    _verify_reference(trial_root, evidence.index)
-    entries = _load_workspace_index(trial_root / evidence.index.path)
+    _verify_reference(trial_root, evidence.file_index)
+    entries = _load_workspace_index(trial_root / evidence.file_index.path)
     if len(entries) != evidence.entry_count:
         raise TrialEvidenceError("workspace index entry count mismatch")
-    if sum(item.type == "file" for item in entries) != evidence.file_count:
+    if sum(item.type == "file" for item in entries) != evidence.regular_file_count:
         raise TrialEvidenceError("workspace index file count mismatch")
     if (
-        sum(item.size for item in entries if item.type == "file")
-        != evidence.unpacked_bytes
+        sum(item.size_bytes or 0 for item in entries if item.type == "file")
+        != evidence.regular_file_bytes
     ):
         raise TrialEvidenceError("workspace index byte count mismatch")
-    if (trial_root / evidence.archive.path).stat().st_size != evidence.archive_bytes:
-        raise TrialEvidenceError("workspace archive byte count mismatch")
     if deep:
         with tempfile.TemporaryDirectory(prefix="harbor-hf-workspace-verify-") as raw:
             restore_workspace(trial_root, evidence, Path(raw))
@@ -340,7 +390,7 @@ def _decompress_workspace_archive(
 ) -> None:
     maximum = min(
         64 * 1024**3,
-        evidence.unpacked_bytes + evidence.entry_count * 8192 + 1024**2,
+        evidence.regular_file_bytes + evidence.entry_count * 8192 + 1024**2,
     )
     written = 0
     with zstandard.ZstdDecompressor().stream_reader(source) as reader:
@@ -374,13 +424,18 @@ def _collect_agent_evidence(trial_root: Path) -> AgentEvidence:
     trajectories = _references_matching(
         trial_root, agent_dir, lambda path: "trajectory" in path.name.lower()
     )
-    if not sessions:
-        raise TrialEvidenceError("agent execution has no session JSONL")
-    if not trajectories:
-        raise TrialEvidenceError("agent trajectory is missing")
-    logs = _references_matching(
-        trial_root, agent_dir, lambda path: path.suffix in {".log", ".txt"}
-    )
+    if not sessions or any(reference.size_bytes == 0 for reference in sessions):
+        raise TrialEvidenceError("agent execution has no session JSONL with content")
+    if not trajectories or any(reference.size_bytes == 0 for reference in trajectories):
+        raise TrialEvidenceError("agent trajectory is missing or empty")
+    retained = {reference.path for reference in [*sessions, *trajectories]}
+    logs = [
+        _reference(path, trial_root)
+        for path in sorted(agent_dir.rglob("*"))
+        if path.is_file()
+        and not path.is_symlink()
+        and path.relative_to(trial_root).as_posix() not in retained
+    ]
     return AgentEvidence(sessions=sessions, trajectories=trajectories, logs=logs)
 
 
@@ -398,6 +453,7 @@ def _collect_judge_evidence(
     judge_expected: bool,
     judge_model: str | None,
     execution_id: str,
+    trial_id: str,
 ) -> tuple[JudgeEvidence, list[Path]]:
     from harbor_hf.judge_recorder import (
         JudgeRecorderError,
@@ -408,25 +464,51 @@ def _collect_judge_evidence(
     if not judge_expected:
         if (evidence_dir / "judge").exists():
             raise TrialEvidenceError("judge recorder exists for deterministic task")
-        return JudgeEvidence(expected=False), exchanges
+        return JudgeEvidence(status="not_expected", expected=False), exchanges
     summary_path = evidence_dir / "judge" / "recorder.json"
     try:
         summary = verify_judge_recorder_summary(summary_path)
     except JudgeRecorderError as error:
         raise TrialEvidenceError("judge recorder summary is invalid") from error
-    if summary.execution_id != execution_id or summary.model != judge_model:
+    if (
+        summary.execution_id != execution_id
+        or summary.trial_id != trial_id
+        or summary.model != judge_model
+    ):
         raise TrialEvidenceError("judge recorder summary identity mismatch")
+    if summary.rejected_call_count:
+        raise TrialEvidenceError("judge recorder rejected one or more calls")
     if summary.exchange_count != len(exchanges):
         raise TrialEvidenceError("judge recorder exchange count mismatch")
+    _require_successful_judge_exchanges(exchanges)
     return (
         JudgeEvidence(
+            status="captured" if exchanges else "not_called",
             expected=True,
             model=judge_model,
             recorder_summary=_reference(summary_path, trial_root),
-            exchanges=[_reference(path, trial_root) for path in exchanges],
+            exchanges=[
+                JudgeExchangeReference(
+                    exchange_id=path.parent.name,
+                    attempt=int(path.parent.name.removeprefix("judge-")),
+                    record=_reference(path, trial_root),
+                )
+                for path in exchanges
+            ],
         ),
         exchanges,
     )
+
+
+def _require_successful_judge_exchanges(exchanges: list[Path]) -> None:
+    from harbor_hf.judge_recorder import JudgeRecorderError, verify_judge_exchange
+
+    try:
+        recorded = [verify_judge_exchange(path.parent) for path in exchanges]
+    except JudgeRecorderError as error:
+        raise TrialEvidenceError("judge exchange is invalid") from error
+    if any(exchange.outcome != "success" for exchange in recorded):
+        raise TrialEvidenceError("judge exchange did not complete successfully")
 
 
 def _collect_verifier_evidence(
@@ -442,7 +524,7 @@ def _collect_verifier_evidence(
     reward = verifier_dir / "reward.txt"
     if not scorecard.is_file() or not reward.is_file():
         raise TrialEvidenceError("verifier scorecard or reward is missing")
-    selection = _judge_selection_reference(
+    selection, selected_exchange_id = _judge_selection_reference(
         trial_root, verifier_dir, exchanges, judge_expected=judge_expected
     )
     known = {
@@ -463,6 +545,7 @@ def _collect_verifier_evidence(
         stdout=_reference(stdout, trial_root),
         stderr=_reference(stderr, trial_root),
         judge_selection=selection,
+        selected_judge_exchange_id=selected_exchange_id,
         logs=logs,
     )
 
@@ -473,14 +556,14 @@ def _judge_selection_reference(
     exchanges: list[Path],
     *,
     judge_expected: bool,
-) -> FileReference | None:
+) -> tuple[FileReference | None, str | None]:
     path = verifier_dir / "judge-selection.json"
     if not judge_expected:
-        return None
+        return None, None
     if not exchanges:
         if path.exists():
             raise TrialEvidenceError("judge selection exists without an exchange")
-        return None
+        return None, None
     if not path.exists() and len(exchanges) == 1:
         _atomic_write_json(
             path,
@@ -493,7 +576,26 @@ def _judge_selection_reference(
     selection = JudgeSelection.model_validate_json(path.read_text())
     if not any(item.parent.name == selection.exchange_id for item in exchanges):
         raise TrialEvidenceError("judge selection references no complete exchange")
-    return _reference(path, trial_root)
+    return _reference(path, trial_root), selection.exchange_id
+
+
+def _completion_requirements(
+    *, judge_expected: bool, has_exchanges: bool
+) -> list[EvidenceRequirementName]:
+    requirements: list[EvidenceRequirementName] = [
+        "agent_session",
+        "agent_trajectory",
+        "verifier_reward",
+        "verifier_scorecard",
+        "verifier_stderr",
+        "verifier_stdout",
+        "workspace",
+    ]
+    if judge_expected:
+        requirements.append("judge_recorder")
+    if has_exchanges:
+        requirements.extend(["judge_exchange", "judge_selection"])
+    return sorted(requirements)
 
 
 def assemble_trial_evidence(
@@ -520,7 +622,7 @@ def assemble_trial_evidence(
         raise TrialEvidenceError("trial evidence already exists")
     evidence_dir.mkdir()
     snapshot = trial_root / "artifacts" / WORKSPACE_DESTINATION
-    assert_known_secrets_absent(snapshot, known_secrets)
+    assert_known_secrets_absent(trial_root, known_secrets)
     package = package_workspace(snapshot, evidence_dir, policy=policy)
     _move_judge_records(judge_records_dir, evidence_dir)
     agent = _collect_agent_evidence(trial_root)
@@ -530,6 +632,7 @@ def assemble_trial_evidence(
         judge_expected=judge_expected,
         judge_model=judge_model,
         execution_id=execution_id,
+        trial_id=trial_id,
     )
     verifier = _collect_verifier_evidence(
         trial_root, exchanges, judge_expected=judge_expected
@@ -549,20 +652,18 @@ def assemble_trial_evidence(
         judge=judge,
         verifier=verifier,
         completion=CompletionEvidence(
-            requirements=[
-                EvidenceRequirement(name="agent", required=True, satisfied=True),
-                EvidenceRequirement(
-                    name="judge",
-                    required=judge_expected,
-                    satisfied=judge_expected,
-                ),
-                EvidenceRequirement(name="verifier", required=True, satisfied=True),
-                EvidenceRequirement(name="workspace", required=True, satisfied=True),
-            ]
+            requirements=_completion_requirements(
+                judge_expected=judge_expected, has_exchanges=bool(exchanges)
+            )
         ),
     )
-    _atomic_write_json(evidence_dir / "manifest.json", manifest.model_dump(mode="json"))
-    verify_trial_evidence(trial_root, deep=True)
+    manifest_path = evidence_dir / "manifest.json"
+    _atomic_write_json(manifest_path, manifest.model_dump(mode="json"))
+    try:
+        verify_trial_evidence(trial_root, deep=True)
+    except Exception:
+        manifest_path.unlink(missing_ok=True)
+        raise
     if remove_raw_workspace:
         shutil.rmtree(snapshot)
     return manifest
@@ -578,11 +679,11 @@ def verify_trial_evidence(
         raise TrialEvidenceError("trial evidence manifest is invalid") from error
     references = [
         manifest.workspace.archive,
-        manifest.workspace.index,
+        manifest.workspace.file_index,
         *manifest.agent.sessions,
         *manifest.agent.trajectories,
         *manifest.agent.logs,
-        *manifest.judge.exchanges,
+        *(item.record for item in manifest.judge.exchanges),
         manifest.verifier.scorecard,
         manifest.verifier.reward,
         manifest.verifier.stdout,
@@ -598,9 +699,75 @@ def verify_trial_evidence(
         raise TrialEvidenceError("trial evidence references duplicate files")
     for reference in references:
         _verify_reference(trial_root, reference)
+    _verify_component_file_set(
+        trial_root / "agent",
+        {
+            reference.path
+            for reference in [
+                *manifest.agent.sessions,
+                *manifest.agent.trajectories,
+                *manifest.agent.logs,
+            ]
+        },
+        trial_root,
+    )
+    _verify_component_file_set(
+        trial_root / "verifier",
+        {
+            reference.path
+            for reference in [
+                manifest.verifier.scorecard,
+                manifest.verifier.reward,
+                manifest.verifier.stdout,
+                manifest.verifier.stderr,
+                *manifest.verifier.logs,
+                *(
+                    [manifest.verifier.judge_selection]
+                    if manifest.verifier.judge_selection is not None
+                    else []
+                ),
+            ]
+        },
+        trial_root,
+    )
+    _verify_evidence_root_files(trial_root, manifest)
     _verify_manifest_judge_evidence(trial_root, manifest)
     verify_workspace_package(trial_root, manifest.workspace, deep=deep)
     return manifest
+
+
+def _verify_component_file_set(
+    component_root: Path, expected: set[str], trial_root: Path
+) -> None:
+    observed: set[str] = set()
+    for path in component_root.rglob("*"):
+        if path.is_symlink() or (not path.is_file() and not path.is_dir()):
+            raise TrialEvidenceError("evidence component contains unsafe file type")
+        if path.is_file():
+            observed.add(path.relative_to(trial_root).as_posix())
+    if observed != expected:
+        raise TrialEvidenceError("evidence component file set is incomplete")
+
+
+def _verify_evidence_root_files(
+    trial_root: Path, manifest: TrialEvidenceManifest
+) -> None:
+    evidence_root = trial_root / "evidence"
+    expected = {
+        "manifest.json",
+        PurePosixPath(manifest.workspace.archive.path).name,
+        PurePosixPath(manifest.workspace.file_index.path).name,
+    }
+    children = list(evidence_root.iterdir())
+    if any(path.is_symlink() for path in children):
+        raise TrialEvidenceError("evidence root contains a symlink")
+    observed = {path.name for path in children if path.is_file()}
+    if observed != expected:
+        raise TrialEvidenceError("evidence root file set is incomplete")
+    expected_directories = {"judge"} if manifest.judge.expected else set()
+    observed_directories = {path.name for path in children if path.is_dir()}
+    if observed_directories != expected_directories:
+        raise TrialEvidenceError("judge evidence directory expectation mismatch")
 
 
 def _verify_manifest_judge_evidence(
@@ -618,25 +785,45 @@ def _verify_manifest_judge_evidence(
             summary = verify_judge_recorder_summary(trial_root / summary_reference.path)
             if (
                 summary.execution_id != manifest.execution_id
+                or summary.trial_id != manifest.trial_id
                 or summary.model != manifest.judge.model
                 or summary.exchange_count != len(manifest.judge.exchanges)
+                or summary.rejected_call_count != 0
             ):
                 raise TrialEvidenceError(
                     "judge recorder summary disagrees with manifest"
                 )
         exchanges = [
-            verify_judge_exchange((trial_root / reference.path).parent)
+            verify_judge_exchange((trial_root / reference.record.path).parent)
             for reference in manifest.judge.exchanges
         ]
     except JudgeRecorderError as error:
         raise TrialEvidenceError("judge evidence is invalid") from error
+    if manifest.judge.expected:
+        _verify_judge_directory_set(trial_root, manifest.judge.exchanges)
     if any(
         exchange.execution_id != manifest.execution_id
+        or exchange.trial_id != manifest.trial_id
         or exchange.forwarded_model != manifest.judge.model
         for exchange in exchanges
     ):
         raise TrialEvidenceError("judge exchange identity disagrees with manifest")
+    if any(exchange.outcome != "success" for exchange in exchanges):
+        raise TrialEvidenceError("judge exchange did not complete successfully")
     _verify_judge_selection(trial_root, manifest)
+
+
+def _verify_judge_directory_set(
+    trial_root: Path, exchanges: list[JudgeExchangeReference]
+) -> None:
+    judge_dir = trial_root / "evidence" / "judge"
+    children = list(judge_dir.iterdir())
+    if any(path.is_symlink() for path in children):
+        raise TrialEvidenceError("judge evidence contains a symlink")
+    observed = {path.name for path in children}
+    expected = {"recorder.json", *(reference.exchange_id for reference in exchanges)}
+    if observed != expected:
+        raise TrialEvidenceError("judge evidence file set is incomplete")
 
 
 def _verify_judge_selection(trial_root: Path, manifest: TrialEvidenceManifest) -> None:
@@ -653,11 +840,13 @@ def _verify_judge_selection(trial_root: Path, manifest: TrialEvidenceManifest) -
         )
     except (OSError, ValueError) as error:
         raise TrialEvidenceError("judge selection is invalid") from error
-    exchange_ids = {
-        Path(reference.path).parent.name for reference in manifest.judge.exchanges
-    }
+    exchange_ids = {reference.exchange_id for reference in manifest.judge.exchanges}
     if selection.exchange_id not in exchange_ids:
         raise TrialEvidenceError("judge selection references no complete exchange")
+    if selection.exchange_id != manifest.verifier.selected_judge_exchange_id:
+        raise TrialEvidenceError(
+            "selected judge exchange disagrees with selection file"
+        )
 
 
 def assert_known_secrets_absent(root: Path, secrets: tuple[str, ...]) -> None:
@@ -709,15 +898,23 @@ def _workspace_entries(
 ) -> Iterator[WorkspaceFile]:
     total = 0
     inodes: dict[tuple[int, int], str] = {}
+    root_metadata = snapshot.lstat()
+    root_entry = WorkspaceFile(
+        path=".",
+        type="directory",
+        mode=stat.S_IMODE(root_metadata.st_mode),
+    )
+    _validate_workspace_limits(root_entry, 1, total, policy)
+    yield root_entry
     paths = sorted(
         snapshot.rglob("*"),
         key=lambda item: item.relative_to(snapshot).as_posix().encode(),
     )
-    for count, path in enumerate(paths, 1):
+    for count, path in enumerate(paths, 2):
         _check_workspace_deadline(deadline)
         entry = _workspace_entry(snapshot, path, inodes, deadline=deadline)
         if entry.type == "file":
-            total += entry.size
+            total += entry.size_bytes or 0
         _validate_workspace_limits(entry, count, total, policy)
         yield entry
 
@@ -734,14 +931,12 @@ def _workspace_entry(
     metadata = path.lstat()
     mode = stat.S_IMODE(metadata.st_mode)
     if stat.S_ISDIR(metadata.st_mode):
-        return WorkspaceFile(path=relative, type="directory", mode=mode, size=0)
+        return WorkspaceFile(path=relative, type="directory", mode=mode)
     if stat.S_ISLNK(metadata.st_mode):
         target = os.readlink(path)
         if "\x00" in target:
             raise TrialEvidenceError("workspace symlink target contains NUL")
-        return WorkspaceFile(
-            path=relative, type="symlink", mode=mode, size=0, target=target
-        )
+        return WorkspaceFile(path=relative, type="symlink", mode=mode, target=target)
     if not stat.S_ISREG(metadata.st_mode):
         raise TrialEvidenceError(
             f"workspace contains unsupported special file: {relative}"
@@ -752,7 +947,6 @@ def _workspace_entry(
             path=relative,
             type="hardlink",
             mode=mode,
-            size=0,
             target=inodes[inode],
         )
     inodes[inode] = relative
@@ -760,7 +954,7 @@ def _workspace_entry(
         path=relative,
         type="file",
         mode=mode,
-        size=metadata.st_size,
+        size_bytes=metadata.st_size,
         sha256=_digest(path, deadline=deadline),
     )
 
@@ -775,7 +969,11 @@ def _validate_workspace_limits(
         return
     if count > policy.workspace_max_nodes:
         raise TrialEvidenceError("workspace exceeds configured file limit")
-    if entry.type == "file" and entry.size > policy.workspace_max_file_bytes:
+    if (
+        entry.type == "file"
+        and entry.size_bytes is not None
+        and entry.size_bytes > policy.workspace_max_file_bytes
+    ):
         raise TrialEvidenceError("workspace file exceeds configured byte limit")
     if total > policy.workspace_max_total_bytes:
         raise TrialEvidenceError("workspace exceeds configured byte limit")
@@ -818,7 +1016,7 @@ def _write_workspace_archive(
                     archive.addfile(info)
                 else:
                     info.type = tarfile.REGTYPE
-                    info.size = entry.size
+                    info.size = entry.size_bytes or 0
                     with path.open("rb") as stream:
                         archive.addfile(info, stream)
         with tar_path.open("rb") as source, compressed.open("wb") as target:
@@ -843,7 +1041,8 @@ def _validate_tar_members(
     symlinks: set[PurePosixPath] = set()
     members = archive.getmembers()
     for member in members:
-        _safe_relative_path(member.name)
+        if member.name != ".":
+            _safe_relative_path(member.name)
         member_path = PurePosixPath(member.name)
         if member.name in seen:
             raise TrialEvidenceError("workspace archive contains duplicate path")
@@ -853,7 +1052,7 @@ def _validate_tar_members(
     if len(members) != evidence.entry_count:
         raise TrialEvidenceError("workspace archive entry count mismatch")
     unpacked = sum(member.size for member in members if member.isfile())
-    if unpacked != evidence.unpacked_bytes:
+    if unpacked != evidence.regular_file_bytes:
         raise TrialEvidenceError("workspace archive byte count mismatch")
 
 
@@ -922,7 +1121,24 @@ def _reference(path: Path, root: Path) -> FileReference:
         relative = path.relative_to(root).as_posix()
     except ValueError as error:
         raise TrialEvidenceError("evidence reference escapes trial root") from error
-    return FileReference(path=relative, size=path.stat().st_size, sha256=_digest(path))
+    return FileReference(
+        path=relative,
+        size_bytes=path.stat().st_size,
+        sha256=_digest(path),
+        media_type=_media_type(path),
+    )
+
+
+def _media_type(path: Path) -> MediaType:
+    if path.name == "workspace.tar.zst":
+        return "application/vnd.harbor-hf.workspace+tar+zstd"
+    if path.suffix == ".json":
+        return "application/json"
+    if path.suffix == ".jsonl":
+        return "application/x-ndjson"
+    if path.suffix in {".log", ".txt"}:
+        return "text/plain"
+    return "application/octet-stream"
 
 
 def _verify_reference(root: Path, reference: FileReference) -> None:
@@ -935,7 +1151,7 @@ def _verify_reference(root: Path, reference: FileReference) -> None:
         raise TrialEvidenceError(
             f"evidence reference is missing or unsafe: {reference.path}"
         )
-    if path.stat().st_size != reference.size or _digest(path) != reference.sha256:
+    if path.stat().st_size != reference.size_bytes or _digest(path) != reference.sha256:
         raise TrialEvidenceError(
             f"evidence reference digest mismatch: {reference.path}"
         )

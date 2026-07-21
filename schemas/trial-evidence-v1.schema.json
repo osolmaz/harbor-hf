@@ -17,6 +17,12 @@
           "title": "Sessions",
           "type": "array"
         },
+        "status": {
+          "const": "captured",
+          "default": "captured",
+          "title": "Status",
+          "type": "string"
+        },
         "trajectories": {
           "items": {
             "$ref": "#/$defs/FileReference"
@@ -37,7 +43,19 @@
       "properties": {
         "requirements": {
           "items": {
-            "$ref": "#/$defs/EvidenceRequirement"
+            "enum": [
+              "agent_session",
+              "agent_trajectory",
+              "judge_exchange",
+              "judge_recorder",
+              "judge_selection",
+              "verifier_reward",
+              "verifier_scorecard",
+              "verifier_stderr",
+              "verifier_stdout",
+              "workspace"
+            ],
+            "type": "string"
           },
           "title": "Requirements",
           "type": "array"
@@ -55,39 +73,20 @@
       "title": "CompletionEvidence",
       "type": "object"
     },
-    "EvidenceRequirement": {
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "enum": [
-            "workspace",
-            "agent",
-            "judge",
-            "verifier"
-          ],
-          "title": "Name",
-          "type": "string"
-        },
-        "required": {
-          "title": "Required",
-          "type": "boolean"
-        },
-        "satisfied": {
-          "title": "Satisfied",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "name",
-        "required",
-        "satisfied"
-      ],
-      "title": "EvidenceRequirement",
-      "type": "object"
-    },
     "FileReference": {
       "additionalProperties": false,
       "properties": {
+        "media_type": {
+          "enum": [
+            "application/json",
+            "application/octet-stream",
+            "application/vnd.harbor-hf.workspace+tar+zstd",
+            "application/x-ndjson",
+            "text/plain"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
         "path": {
           "minLength": 1,
           "title": "Path",
@@ -98,16 +97,17 @@
           "title": "Sha256",
           "type": "string"
         },
-        "size": {
+        "size_bytes": {
           "minimum": 0,
-          "title": "Size",
+          "title": "Size Bytes",
           "type": "integer"
         }
       },
       "required": [
         "path",
-        "size",
-        "sha256"
+        "size_bytes",
+        "sha256",
+        "media_type"
       ],
       "title": "FileReference",
       "type": "object"
@@ -117,7 +117,7 @@
       "properties": {
         "exchanges": {
           "items": {
-            "$ref": "#/$defs/FileReference"
+            "$ref": "#/$defs/JudgeExchangeReference"
           },
           "title": "Exchanges",
           "type": "array"
@@ -148,12 +148,47 @@
             }
           ],
           "default": null
+        },
+        "status": {
+          "enum": [
+            "captured",
+            "not_called",
+            "not_expected"
+          ],
+          "title": "Status",
+          "type": "string"
         }
       },
       "required": [
+        "status",
         "expected"
       ],
       "title": "JudgeEvidence",
+      "type": "object"
+    },
+    "JudgeExchangeReference": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "exchange_id": {
+          "pattern": "^judge-[0-9]{4}$",
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "record": {
+          "$ref": "#/$defs/FileReference"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "attempt",
+        "record"
+      ],
+      "title": "JudgeExchangeReference",
       "type": "object"
     },
     "VerifierEvidence": {
@@ -183,6 +218,25 @@
         "scorecard": {
           "$ref": "#/$defs/FileReference"
         },
+        "selected_judge_exchange_id": {
+          "anyOf": [
+            {
+              "pattern": "^judge-[0-9]{4}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selected Judge Exchange Id"
+        },
+        "status": {
+          "const": "captured",
+          "default": "captured",
+          "title": "Status",
+          "type": "string"
+        },
         "stderr": {
           "$ref": "#/$defs/FileReference"
         },
@@ -205,10 +259,11 @@
         "archive": {
           "$ref": "#/$defs/FileReference"
         },
-        "archive_bytes": {
-          "minimum": 0,
-          "title": "Archive Bytes",
-          "type": "integer"
+        "archive_format": {
+          "const": "pax",
+          "default": "pax",
+          "title": "Archive Format",
+          "type": "string"
         },
         "compression": {
           "const": "zstd",
@@ -216,18 +271,29 @@
           "title": "Compression",
           "type": "string"
         },
+        "compression_level": {
+          "const": 10,
+          "default": 10,
+          "title": "Compression Level",
+          "type": "integer"
+        },
         "entry_count": {
-          "minimum": 0,
+          "minimum": 1,
           "title": "Entry Count",
           "type": "integer"
         },
-        "file_count": {
+        "file_index": {
+          "$ref": "#/$defs/FileReference"
+        },
+        "regular_file_bytes": {
           "minimum": 0,
-          "title": "File Count",
+          "title": "Regular File Bytes",
           "type": "integer"
         },
-        "index": {
-          "$ref": "#/$defs/FileReference"
+        "regular_file_count": {
+          "minimum": 0,
+          "title": "Regular File Count",
+          "type": "integer"
         },
         "root": {
           "const": "/app",
@@ -240,20 +306,14 @@
           "default": "captured",
           "title": "Status",
           "type": "string"
-        },
-        "unpacked_bytes": {
-          "minimum": 0,
-          "title": "Unpacked Bytes",
-          "type": "integer"
         }
       },
       "required": [
         "archive",
-        "index",
+        "file_index",
         "entry_count",
-        "file_count",
-        "unpacked_bytes",
-        "archive_bytes"
+        "regular_file_count",
+        "regular_file_bytes"
       ],
       "title": "WorkspaceEvidence",
       "type": "object"
