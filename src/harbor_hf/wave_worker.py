@@ -86,7 +86,11 @@ from harbor_hf.runs import (
     require_benchmark_source_secret,
     run_secret_values,
 )
-from harbor_hf.trial_evidence import TrialEvidenceError, assemble_trial_evidence
+from harbor_hf.trial_evidence import (
+    TrialEvidenceError,
+    assemble_trial_evidence,
+    verify_trial_evidence,
+)
 from harbor_hf.worker import (
     EndpointManager,
     HarborTrialFailure,
@@ -1672,6 +1676,7 @@ def _validate_terminal_trial(
             run_id=run_id,
             shard_id=shard_id,
         )
+        _validate_recovered_trial_evidence(execution, execution_lock, expected)
         verify_checksums(execution)
         if execution_checksum != _file_digest(execution / "checksums.json"):
             raise WorkerError("terminal trial summary has the wrong child checksum")
@@ -1682,6 +1687,38 @@ def _validate_terminal_trial(
         raise WorkerError(
             "terminal trial evidence failed checksum validation"
         ) from error
+
+
+def _validate_recovered_trial_evidence(
+    execution_root: Path,
+    execution: ExecutionLock,
+    expected: CampaignTrialLock,
+) -> None:
+    manifests = list(execution_root.glob("harbor-jobs/*/*/evidence/manifest.json"))
+    if len(manifests) != 1:
+        raise WorkerError("terminal execution has no unique trial evidence manifest")
+    try:
+        evidence = verify_trial_evidence(manifests[0].parent.parent, deep=True)
+    except TrialEvidenceError as error:
+        raise WorkerError("terminal trial evidence is incomplete") from error
+    observed = (
+        evidence.execution_id,
+        evidence.trial_id,
+        evidence.task_name,
+        evidence.task_digest,
+        evidence.logical_attempt,
+        evidence.physical_attempt,
+    )
+    locked = (
+        execution.execution_id,
+        expected.trial_id,
+        expected.task_name,
+        expected.task_digest,
+        expected.logical_attempt,
+        execution.physical_attempt,
+    )
+    if observed != locked:
+        raise WorkerError("terminal trial evidence identity does not match its lock")
 
 
 def _validate_execution_identity(

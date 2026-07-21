@@ -2072,6 +2072,7 @@ def test_retry_wave_accepts_a_valid_success_from_an_earlier_wave(
         ("second-marker", "not a valid success"),
         ("trial-summary", "wrong trial identity"),
         ("execution-lock", "execution identity does not match"),
+        ("trial-evidence", "trial evidence manifest"),
         ("execution-content", "checksum validation"),
     ],
 )
@@ -2125,6 +2126,10 @@ def test_wave_recovery_rejects_invalid_terminal_trial(
         execution = json.loads(lock_path.read_text())
         execution["campaign_id"] = "campaign-wrong"
         lock_path.write_text(json.dumps(execution), encoding="utf-8")
+        write_checksums(execution_root)
+        write_checksums(trial_root)
+    elif corruption == "trial-evidence":
+        next(execution_root.glob("harbor-jobs/*/*/evidence/manifest.json")).unlink()
         write_checksums(execution_root)
         write_checksums(trial_root)
     else:
