@@ -186,6 +186,24 @@ def test_evidence_operations_reject_symlinks(tmp_path: Path) -> None:
     assert outside.read_text(encoding="utf-8") == "secret-value"
 
 
+def test_secret_redaction_can_scan_workspace_tree_with_symlinks(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = root / "target.txt"
+    target.write_text("secret-value", encoding="utf-8")
+    (root / "link").symlink_to("target.txt")
+
+    assert scrub_secret(root, "secret-value", allow_symlinks=True) == ["target.txt"]
+    assert_secret_absent(root, "secret-value", allow_symlinks=True)
+    assert (root / "link").is_symlink()
+
+    (root / "secret-value-link").symlink_to("target.txt")
+    with pytest.raises(RuntimeError, match="secret value found in artifact path"):
+        assert_secret_absent(root, "secret-value", allow_symlinks=True)
+
+
 def test_evidence_operations_reject_special_files(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

@@ -798,14 +798,14 @@ def _assemble_direct_trial_evidence(
         logical_attempt = attempts.get(native.task_name, 0) + 1
         attempts[native.task_name] = logical_attempt
         native_root = resolve_native_trial_root(jobs_dir, native.path)
-        redacted = scrub_secret(native_root, known_secrets)
+        redacted = scrub_secret(native_root, known_secrets, allow_symlinks=True)
         if redacted:
             append_event(
                 root / "events.jsonl",
                 "evidence_secrets_redacted",
                 files=redacted,
             )
-        assert_secret_absent(native_root, known_secrets)
+        assert_secret_absent(native_root, known_secrets, allow_symlinks=True)
         assemble_trial_evidence(
             native_root,
             campaign_id=None,
