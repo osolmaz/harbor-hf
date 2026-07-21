@@ -520,15 +520,9 @@ class JudgeEvidenceRecorder:
             content=body,
         )
         response = self._client.send(request, stream=True)
-        content = (
-            response.content
-            if response.is_stream_consumed
-            else b"".join(response.iter_raw())
+        content = _read_bounded_response(
+            response, scope.policy.judge_max_response_bytes
         )
-        if len(content) > scope.policy.judge_max_response_bytes:
-            response.close()
-            raise JudgeRecorderError("judge response exceeds configured byte limit")
-        response.close()
         return httpx.Response(
             response.status_code,
             headers=response.headers,
@@ -711,6 +705,24 @@ def write_judge_exchange_schema(destination: Path) -> None:
         json.dumps(JudgeExchange.model_json_schema(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _read_bounded_response(response: httpx.Response, limit: int) -> bytes:
+    try:
+        if response.is_stream_consumed:
+            if len(response.content) > limit:
+                raise JudgeRecorderError("judge response exceeds configured byte limit")
+            return response.content
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_raw():
+            total += len(chunk)
+            if total > limit:
+                raise JudgeRecorderError("judge response exceeds configured byte limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        response.close()
 
 
 def _write_json_atomic(path: Path, value: object) -> None:
