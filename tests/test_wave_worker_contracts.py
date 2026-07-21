@@ -120,9 +120,7 @@ def _write_trial_evidence(
     verifier = native / "verifier"
     verifier.mkdir()
     (verifier / "reward.txt").write_text("1\n", encoding="utf-8")
-    (verifier / "scorecard.json").write_text(
-        '{"passed":true}\n', encoding="utf-8"
-    )
+    (verifier / "scorecard.json").write_text('{"passed":true}\n', encoding="utf-8")
     assemble_trial_evidence(
         native,
         campaign_id=IDENTITY["campaign_id"],

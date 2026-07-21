@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from time import monotonic
-from typing import BinaryIO, Literal, Protocol
+from typing import BinaryIO, Literal, Protocol, cast
 
 import zstandard
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -36,6 +36,35 @@ MediaType = Literal[
 
 class _BinaryWriter(Protocol):
     def write(self, data: bytes, /) -> int: ...
+
+
+class _BoundedWriter:
+    def __init__(self, target: BinaryIO, maximum: int) -> None:
+        self._target = target
+        self._maximum = maximum
+        self._written = 0
+
+    def write(self, data: bytes, /) -> int:
+        if self._written + len(data) > self._maximum:
+            raise TrialEvidenceError("workspace archive exceeds configured byte limit")
+        written = self._target.write(data)
+        self._written += written
+        return written
+
+    def flush(self) -> None:
+        self._target.flush()
+
+
+class _DeadlineReader:
+    def __init__(self, source: BinaryIO, deadline: float | None) -> None:
+        self._source = source
+        self._deadline = deadline
+
+    def read(self, size: int = -1, /) -> bytes:
+        _check_workspace_deadline(self._deadline)
+        data = self._source.read(size)
+        _check_workspace_deadline(self._deadline)
+        return data
 
 
 class TrialEvidenceError(RuntimeError):
@@ -324,31 +353,41 @@ def package_workspace(
     )
     archive_path = evidence_dir / "workspace.tar.zst"
     _check_workspace_deadline(deadline)
-    _write_workspace_archive(snapshot, entries, archive_path, deadline=deadline)
-    archive_size = archive_path.stat().st_size
-    if archive_size > policy.workspace_max_archive_bytes:
-        archive_path.unlink(missing_ok=True)
-        raise TrialEvidenceError("workspace archive exceeds configured byte limit")
+    _write_workspace_archive(
+        snapshot,
+        entries,
+        archive_path,
+        deadline=deadline,
+        maximum_bytes=policy.workspace_max_archive_bytes,
+    )
     files = [entry for entry in entries if entry.type == "file"]
     unpacked = sum(entry.size_bytes or 0 for entry in files)
     evidence = WorkspaceEvidence(
-        archive=_reference(archive_path, evidence_dir.parent),
-        file_index=_reference(index_path, evidence_dir.parent),
+        archive=_reference(archive_path, evidence_dir.parent, deadline=deadline),
+        file_index=_reference(index_path, evidence_dir.parent, deadline=deadline),
         entry_count=len(entries),
         regular_file_count=len(files),
         regular_file_bytes=unpacked,
     )
     package = WorkspacePackage(evidence=evidence, entries=entries)
-    verify_workspace_package(evidence_dir.parent, package.evidence, deep=True)
+    verify_workspace_package(
+        evidence_dir.parent, package.evidence, deep=True, deadline=deadline
+    )
     return package
 
 
 def verify_workspace_package(
-    trial_root: Path, evidence: WorkspaceEvidence, *, deep: bool
+    trial_root: Path,
+    evidence: WorkspaceEvidence,
+    *,
+    deep: bool,
+    deadline: float | None = None,
 ) -> list[WorkspaceFile]:
-    _verify_reference(trial_root, evidence.archive)
-    _verify_reference(trial_root, evidence.file_index)
-    entries = _load_workspace_index(trial_root / evidence.file_index.path)
+    _verify_reference(trial_root, evidence.archive, deadline=deadline)
+    _verify_reference(trial_root, evidence.file_index, deadline=deadline)
+    entries = _load_workspace_index(
+        trial_root / evidence.file_index.path, deadline=deadline
+    )
     if len(entries) != evidence.entry_count:
         raise TrialEvidenceError("workspace index entry count mismatch")
     if sum(item.type == "file" for item in entries) != evidence.regular_file_count:
@@ -360,10 +399,13 @@ def verify_workspace_package(
         raise TrialEvidenceError("workspace index byte count mismatch")
     if deep:
         with tempfile.TemporaryDirectory(prefix="harbor-hf-workspace-verify-") as raw:
-            restore_workspace(trial_root, evidence, Path(raw))
+            restore_workspace(trial_root, evidence, Path(raw), deadline=deadline)
             observed = list(
                 _workspace_entries(
-                    Path(raw) / "app", None, max_nodes=evidence.entry_count
+                    Path(raw) / "app",
+                    None,
+                    deadline=deadline,
+                    max_nodes=evidence.entry_count,
                 )
             )
             if observed != entries:
@@ -372,7 +414,11 @@ def verify_workspace_package(
 
 
 def restore_workspace(
-    trial_root: Path, evidence: WorkspaceEvidence, destination: Path
+    trial_root: Path,
+    evidence: WorkspaceEvidence,
+    destination: Path,
+    *,
+    deadline: float | None = None,
 ) -> None:
     if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
         raise TrialEvidenceError("workspace restore destination must be a directory")
@@ -384,23 +430,28 @@ def restore_workspace(
         prefix="harbor-hf-workspace-", suffix=".tar"
     ) as raw:
         with archive_path.open("rb") as source:
-            _decompress_workspace_archive(source, raw, evidence)
+            _decompress_workspace_archive(source, raw, evidence, deadline=deadline)
         raw.flush()
         with tarfile.open(raw.name, mode="r:") as archive:
-            _validate_tar_members(archive, evidence)
+            members = _validate_tar_members(archive, evidence, deadline=deadline)
             with tempfile.TemporaryDirectory(
                 prefix=".harbor-hf-restore-", dir=destination
             ) as staging_raw:
                 staging = Path(staging_raw)
-                archive.extractall(staging, filter="fully_trusted")
+                _extract_tar_members(archive, members, staging, deadline=deadline)
                 restored_app = staging / "app"
                 observed = list(
                     _workspace_entries(
-                        restored_app, None, max_nodes=evidence.entry_count
+                        restored_app,
+                        None,
+                        deadline=deadline,
+                        max_nodes=evidence.entry_count,
                     )
                 )
                 _validate_workspace_symlink_graph(restored_app, observed)
-                expected = _load_workspace_index(trial_root / evidence.file_index.path)
+                expected = _load_workspace_index(
+                    trial_root / evidence.file_index.path, deadline=deadline
+                )
                 if observed != expected:
                     raise TrialEvidenceError(
                         "restored workspace does not match file index"
@@ -409,7 +460,11 @@ def restore_workspace(
 
 
 def _decompress_workspace_archive(
-    source: BinaryIO, target: _BinaryWriter, evidence: WorkspaceEvidence
+    source: BinaryIO,
+    target: _BinaryWriter,
+    evidence: WorkspaceEvidence,
+    *,
+    deadline: float | None = None,
 ) -> None:
     maximum = min(
         64 * 1024**3,
@@ -418,6 +473,7 @@ def _decompress_workspace_archive(
     written = 0
     with zstandard.ZstdDecompressor().stream_reader(source) as reader:
         while chunk := reader.read(_CHUNK):
+            _check_workspace_deadline(deadline)
             written += len(chunk)
             if written > maximum:
                 raise TrialEvidenceError("workspace archive expands beyond safe limit")
@@ -1072,61 +1128,69 @@ def _write_workspace_archive(
     destination: Path,
     *,
     deadline: float | None,
+    maximum_bytes: int,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, tar_name = tempfile.mkstemp(
-        prefix=".workspace-", suffix=".tar", dir=destination.parent
-    )
-    os.close(descriptor)
-    tar_path = Path(tar_name)
     compressed = destination.with_name(destination.name + ".tmp")
     try:
-        with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as archive:
-            for entry in entries:
-                _check_workspace_deadline(deadline)
-                path = snapshot / entry.path
-                archive_name = "app" if entry.path == "." else f"app/{entry.path}"
-                info = tarfile.TarInfo(archive_name)
-                info.uid = info.gid = 0
-                info.uname = info.gname = ""
-                info.mtime = 0
-                info.mode = entry.mode
-                if entry.type == "directory":
-                    info.type = tarfile.DIRTYPE
-                    archive.addfile(info)
-                elif entry.type == "symlink":
-                    info.type = tarfile.SYMTYPE
-                    info.linkname = entry.target or ""
-                    archive.addfile(info)
-                else:
-                    info.type = tarfile.REGTYPE
-                    info.size = entry.size_bytes or 0
-                    with path.open("rb") as stream:
-                        archive.addfile(info, stream)
-        with tar_path.open("rb") as source, compressed.open("wb") as target:
+        with compressed.open("wb") as raw_target:
+            target = _BoundedWriter(raw_target, maximum_bytes)
             compressor = zstandard.ZstdCompressor(
                 level=10, threads=0, write_checksum=True
             )
-            with compressor.stream_writer(target, closefd=False) as writer:
-                while chunk := source.read(_CHUNK):
+            with (
+                compressor.stream_writer(
+                    cast(BinaryIO, target), closefd=False
+                ) as writer,
+                tarfile.open(
+                    fileobj=cast(BinaryIO, writer),
+                    mode="w|",
+                    format=tarfile.PAX_FORMAT,
+                ) as archive,
+            ):
+                for entry in entries:
                     _check_workspace_deadline(deadline)
-                    writer.write(chunk)
+                    path = snapshot / entry.path
+                    archive_name = "app" if entry.path == "." else f"app/{entry.path}"
+                    info = tarfile.TarInfo(archive_name)
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    info.mtime = 0
+                    info.mode = entry.mode
+                    if entry.type == "directory":
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                    elif entry.type == "symlink":
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = entry.target or ""
+                        archive.addfile(info)
+                    else:
+                        info.type = tarfile.REGTYPE
+                        info.size = entry.size_bytes or 0
+                        with path.open("rb") as stream:
+                            archive.addfile(
+                                info,
+                                cast(BinaryIO, _DeadlineReader(stream, deadline)),
+                            )
         _check_workspace_deadline(deadline)
         os.replace(compressed, destination)
     finally:
-        tar_path.unlink(missing_ok=True)
         compressed.unlink(missing_ok=True)
 
 
 def _validate_tar_members(
-    archive: tarfile.TarFile, evidence: WorkspaceEvidence
-) -> None:
+    archive: tarfile.TarFile,
+    evidence: WorkspaceEvidence,
+    *,
+    deadline: float | None = None,
+) -> list[tarfile.TarInfo]:
     seen: dict[str, Literal["directory", "file", "symlink"]] = {}
     symlinks: set[PurePosixPath] = set()
     members = archive.getmembers()
     if not members or members[0].name != "app" or not members[0].isdir():
         raise TrialEvidenceError("workspace archive has no top-level app directory")
     for member in members:
+        _check_workspace_deadline(deadline)
         relative = _archive_relative_path(member.name)
         member_path = PurePosixPath(relative)
         if relative in seen:
@@ -1139,6 +1203,33 @@ def _validate_tar_members(
     unpacked = sum(member.size for member in members if member.isfile())
     if unpacked != evidence.regular_file_bytes:
         raise TrialEvidenceError("workspace archive byte count mismatch")
+    return members
+
+
+def _extract_tar_members(
+    archive: tarfile.TarFile,
+    members: list[tarfile.TarInfo],
+    destination: Path,
+    *,
+    deadline: float | None,
+) -> None:
+    for member in members:
+        _check_workspace_deadline(deadline)
+        target = destination / member.name
+        if member.isdir():
+            target.mkdir()
+            target.chmod(member.mode)
+        elif member.issym():
+            os.symlink(member.linkname, target)
+        else:
+            source = archive.extractfile(member)
+            if source is None:
+                raise TrialEvidenceError("workspace archive file cannot be read")
+            with source, target.open("xb") as output:
+                while chunk := source.read(_CHUNK):
+                    _check_workspace_deadline(deadline)
+                    output.write(chunk)
+            target.chmod(member.mode)
 
 
 def _archive_relative_path(member_name: str) -> str:
@@ -1167,11 +1258,14 @@ def _tar_member_kind(
     raise TrialEvidenceError("workspace archive contains unsupported member")
 
 
-def _load_workspace_index(path: Path) -> list[WorkspaceFile]:
+def _load_workspace_index(
+    path: Path, *, deadline: float | None = None
+) -> list[WorkspaceFile]:
     entries: list[WorkspaceFile] = []
     try:
         with path.open(encoding="utf-8") as stream:
             for line in stream:
+                _check_workspace_deadline(deadline)
                 entries.append(WorkspaceFile.model_validate_json(line))
     except (OSError, ValueError) as error:
         raise TrialEvidenceError("workspace file index is invalid") from error
@@ -1204,7 +1298,9 @@ def _references_matching(
     ]
 
 
-def _reference(path: Path, root: Path) -> FileReference:
+def _reference(
+    path: Path, root: Path, *, deadline: float | None = None
+) -> FileReference:
     if path.is_symlink() or not path.is_file():
         raise TrialEvidenceError(f"evidence reference is not a regular file: {path}")
     try:
@@ -1214,7 +1310,7 @@ def _reference(path: Path, root: Path) -> FileReference:
     return FileReference(
         path=relative,
         size_bytes=path.stat().st_size,
-        sha256=_digest(path),
+        sha256=_digest(path, deadline=deadline),
         media_type=_media_type(path),
     )
 
@@ -1231,7 +1327,9 @@ def _media_type(path: Path) -> MediaType:
     return "application/octet-stream"
 
 
-def _verify_reference(root: Path, reference: FileReference) -> None:
+def _verify_reference(
+    root: Path, reference: FileReference, *, deadline: float | None = None
+) -> None:
     path = root / reference.path
     if (
         path.is_symlink()
@@ -1241,7 +1339,10 @@ def _verify_reference(root: Path, reference: FileReference) -> None:
         raise TrialEvidenceError(
             f"evidence reference is missing or unsafe: {reference.path}"
         )
-    if path.stat().st_size != reference.size_bytes or _digest(path) != reference.sha256:
+    if (
+        path.stat().st_size != reference.size_bytes
+        or _digest(path, deadline=deadline) != reference.sha256
+    ):
         raise TrialEvidenceError(
             f"evidence reference digest mismatch: {reference.path}"
         )

@@ -132,6 +132,24 @@ def test_workspace_limits_fail_closed(tmp_path: Path) -> None:
         )
 
 
+def test_workspace_archive_limit_fails_during_compression(tmp_path: Path) -> None:
+    source = tmp_path / "app"
+    source.mkdir()
+    (source / "random").write_bytes(os.urandom(4096))
+    root = tmp_path / "trial"
+    root.mkdir()
+
+    with pytest.raises(TrialEvidenceError, match="archive exceeds"):
+        package_workspace(
+            source,
+            root / "evidence",
+            policy=_policy(workspace_max_archive_bytes=128),
+        )
+
+    assert not (root / "evidence" / "workspace.tar.zst").exists()
+    assert not list((root / "evidence").glob("*.tmp"))
+
+
 def test_workspace_node_limit_fails_during_traversal(tmp_path: Path) -> None:
     source = tmp_path / "app"
     source.mkdir()
@@ -144,6 +162,20 @@ def test_workspace_node_limit_fails_during_traversal(tmp_path: Path) -> None:
             source,
             root / "evidence",
             policy=_policy(workspace_max_nodes=2),
+        )
+
+
+def test_workspace_deep_verification_honors_capture_deadline(tmp_path: Path) -> None:
+    source = tmp_path / "app"
+    source.mkdir()
+    (source / "answer.txt").write_text("answer")
+    root = tmp_path / "trial"
+    root.mkdir()
+    package = package_workspace(source, root / "evidence", policy=_policy())
+
+    with pytest.raises(TrialEvidenceError, match="timeout"):
+        verify_workspace_package(
+            root, package.evidence, deep=True, deadline=trial_evidence.monotonic() - 1
         )
 
 
