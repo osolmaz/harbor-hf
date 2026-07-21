@@ -4,7 +4,7 @@ import json
 import shutil
 import threading
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -1001,11 +1001,15 @@ def test_judged_wave_records_and_selects_exact_exchange(
             content=b'{"choices":[{"message":{"content":"ok"}}]}',
         )
 
-    def recorder_factory(*, token: str) -> RealJudgeEvidenceRecorder:
+    def recorder_factory(
+        *, token: str, deadline: float, monotonic: Callable[[], float]
+    ) -> RealJudgeEvidenceRecorder:
         return RealJudgeEvidenceRecorder(
             token=token,
             client=httpx.Client(transport=httpx.MockTransport(upstream)),
             capability_factory=lambda: "j" * 32,
+            deadline=deadline,
+            monotonic=monotonic,
         )
 
     monkeypatch.setattr("harbor_hf.wave_worker.JudgeEvidenceRecorder", recorder_factory)

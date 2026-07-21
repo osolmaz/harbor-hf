@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import threading
+import time
 import zlib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -196,6 +197,8 @@ class JudgeEvidenceRecorder:
         token: str,
         client: httpx.Client | None = None,
         capability_factory: Callable[[], str] | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not token:
             raise ValueError("judge recorder token must not be empty")
@@ -205,6 +208,8 @@ class JudgeEvidenceRecorder:
         self._capability_factory = capability_factory or (
             lambda: secrets.token_urlsafe(32)
         )
+        self._deadline = deadline
+        self._monotonic = monotonic
         self._scopes: dict[str, _Scope] = {}
         self._counts: dict[str, int] = {}
         self._rejections: dict[str, int] = {}
@@ -508,6 +513,13 @@ class JudgeEvidenceRecorder:
         return f"judge-{attempt:04d}", attempt
 
     def _upstream(self, body: bytes, scope: _Scope) -> httpx.Response:
+        started = self._monotonic()
+        remaining = float(scope.policy.judge_timeout_seconds)
+        if self._deadline is not None:
+            remaining = min(remaining, self._deadline - started)
+        request_deadline = started + remaining
+        if remaining <= 0:
+            raise JudgeRecorderError("judge request deadline expired")
         request = self._client.build_request(
             "POST",
             "https://router.huggingface.co/v1/chat/completions",
@@ -517,11 +529,14 @@ class JudgeEvidenceRecorder:
                 "Accept-Encoding": "identity",
             },
             content=body,
-            timeout=httpx.Timeout(scope.policy.judge_timeout_seconds),
+            timeout=httpx.Timeout(remaining),
         )
         response = self._client.send(request, stream=True)
         content = _read_bounded_response(
-            response, scope.policy.judge_max_response_bytes
+            response,
+            scope.policy.judge_max_response_bytes,
+            deadline=request_deadline,
+            monotonic=self._monotonic,
         )
         return httpx.Response(
             response.status_code,
@@ -702,8 +717,15 @@ def write_judge_exchange_schema(destination: Path) -> None:
     )
 
 
-def _read_bounded_response(response: httpx.Response, limit: int) -> bytes:
+def _read_bounded_response(
+    response: httpx.Response,
+    limit: int,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bytes:
     try:
+        _check_response_deadline(deadline, monotonic)
         if response.is_stream_consumed:
             if len(response.content) > limit:
                 raise JudgeRecorderError("judge response exceeds configured byte limit")
@@ -711,6 +733,7 @@ def _read_bounded_response(response: httpx.Response, limit: int) -> bytes:
         chunks: list[bytes] = []
         total = 0
         for chunk in response.iter_raw():
+            _check_response_deadline(deadline, monotonic)
             total += len(chunk)
             if total > limit:
                 raise JudgeRecorderError("judge response exceeds configured byte limit")
@@ -718,6 +741,13 @@ def _read_bounded_response(response: httpx.Response, limit: int) -> bytes:
         return b"".join(chunks)
     finally:
         response.close()
+
+
+def _check_response_deadline(
+    deadline: float | None, monotonic: Callable[[], float]
+) -> None:
+    if deadline is not None and monotonic() >= deadline:
+        raise JudgeRecorderError("judge request deadline expired")
 
 
 def _write_json_atomic(path: Path, value: object) -> None:

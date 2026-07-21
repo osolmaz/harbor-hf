@@ -596,7 +596,9 @@ def _prepare_judge_transport(
 ) -> tuple[str | None, JudgeEvidenceRecorder | None]:
     if not any(run.configuration.judge_required_tasks for run in lock.runs):
         return None, None
-    recorder = JudgeEvidenceRecorder(token=token)
+    recorder = JudgeEvidenceRecorder(
+        token=token, deadline=deadline, monotonic=monotonic
+    )
     base_url = _job_ingress_base_url(JUDGE_RECORDER_PORT, "judge recorder")
     try:
         recorder.start(port=JUDGE_RECORDER_PORT)

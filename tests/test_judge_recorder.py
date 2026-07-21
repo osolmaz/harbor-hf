@@ -221,6 +221,45 @@ def test_records_transport_errors_and_delivered_response(tmp_path: Path) -> None
     assert (destination / "judge-0001" / "response-delivered.bin").read_bytes() == body
 
 
+def test_absolute_deadline_stops_streamed_judge_response(tmp_path: Path) -> None:
+    times = iter([0.0, 11.0])
+    recorder = JudgeEvidenceRecorder(
+        token="token",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, stream=httpx.ByteStream(b"{}"), request=request
+                )
+            )
+        ),
+        capability_factory=lambda: "g" * 32,
+        deadline=10.0,
+        monotonic=lambda: next(times),
+    )
+    base = recorder.start(host="127.0.0.1", port=0)
+    destination = tmp_path / "judge"
+    capability = recorder.register_scope(
+        execution_id="exec",
+        trial_id="trial",
+        model="judge",
+        destination=destination,
+        policy=_policy(),
+    )
+    try:
+        status, _, _ = _request(
+            recorder.scoped_url(base, capability),
+            {"model": "judge", "messages": []},
+        )
+    finally:
+        recorder.close()
+
+    assert status == 502
+    exchange = verify_judge_exchange(destination / "judge-0001")
+    assert exchange.outcome == "recorder_error"
+    assert exchange.error_type == "JudgeRecorderError"
+    assert exchange.error_message == "judge evidence recorder failed"
+
+
 def test_response_limit_stops_and_records_failed_exchange(tmp_path: Path) -> None:
     recorder = JudgeEvidenceRecorder(
         token="token",
