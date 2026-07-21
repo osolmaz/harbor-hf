@@ -321,12 +321,7 @@ def _private_artifact_entry(
     if not candidate.is_file():
         raise RuntimeError(f"private artifact has unsupported file type: {relative}")
     size = candidate.stat().st_size
-    workspace_archive = "evidence/workspace.tar.zst"
-    effective_limit = (
-        MAX_WORKSPACE_ARCHIVE_BYTES
-        if relative == workspace_archive or relative.endswith(f"/{workspace_archive}")
-        else max_file_bytes
-    )
+    effective_limit = _private_artifact_file_limit(relative, max_file_bytes)
     if size > effective_limit:
         raise RuntimeError(f"private artifact exceeds file size limit: {relative}")
     return PrivateArtifactEntry(
@@ -800,7 +795,7 @@ def _remove_oversized_files(
         if relative in _DERIVED_FILES or relative == _REJECTION_FILE:
             continue
         size = candidate.stat().st_size
-        if size > max_file_bytes:
+        if size > _private_artifact_file_limit(relative, max_file_bytes):
             candidate.unlink()
             rejected.append(
                 PrivateArtifactRejection(
@@ -812,6 +807,13 @@ def _remove_oversized_files(
             continue
         files.append((candidate, relative, size, classify_private_artifact(relative)))
     return files, rejected
+
+
+def _private_artifact_file_limit(relative: str, default: int) -> int:
+    workspace_archive = "evidence/workspace.tar.zst"
+    if relative == workspace_archive or relative.endswith(f"/{workspace_archive}"):
+        return MAX_WORKSPACE_ARCHIVE_BYTES
+    return default
 
 
 def _trim_bundle(

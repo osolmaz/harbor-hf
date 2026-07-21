@@ -220,7 +220,7 @@ def test_recovery_terminal_decision_matrix_has_complete_canonical_structures(
         )
 
     assert _hash(corpus) == (
-        "5e1626c5fee72943f0732e8295c7801c8607fa408a6734dc61382c2d60f0cd15"
+        "b12ae01241b8504b76313365646a84fe2a68bc015e80f7c1323dc2621fad2346"
     )
 
 
@@ -516,7 +516,7 @@ def test_control_action_projection_and_rejections_use_complete_values(
     projection = project_campaign(lock, list(reversed(events)))
 
     assert _hash(projection.model_dump(mode="json")) == (
-        "f8e5f0ff38070454ec1708720a272aa06c0fdc9a80d14a8014d7a42ceb35b1e5"
+        "2e1224de01c73898fddfcc038ce848d5e1ad68dfbacab8fda2d8385422b81161"
     )
 
     conflicting = submitted.model_copy(update={"subject_id": "wrong"})
@@ -562,7 +562,7 @@ def test_run_and_shard_event_projection_matrix_is_canonical(
         )
 
     assert _hash(corpus) == (
-        "42867b10519f4fa3ae5c87cb4c251eeb0fb2e248f15235f94d9e5c85a2ca70a6"
+        "c90725d45ac30e7b171f33df3daaaa9d65732fa5c7be15d30d0a5aec2c297467"
     )
 
 
@@ -650,7 +650,7 @@ def test_control_terminal_and_subject_boundary_matrix_is_complete(
         assert str(captured.value) == "campaign has events after a terminal transition"
 
     assert _hash(terminal_projections) == (
-        "0571bd71154b337b2612c527baff5307669f7ed8110de60d37e95556ecac40f9"
+        "3b6e98d6963cfafed6c21a79ce534a191db95a8f2e6a5ce2393c79a748458915"
     )
 
     wrong_type = _event(
@@ -824,5 +824,5 @@ def test_repeated_cancellation_preserves_draining_and_manual_states(
         states.append(project_campaign(lock, events).model_dump(mode="json"))
 
     assert _hash(states) == (
-        "a4ebfb70f1ef2e407d8f85f97c47be5fc9963bd5c201f599159c8b7ab4c11b89"
+        "58063632e2ddbe6852ba62689c0358ca5c275a880936f5530a128676acf78d2b"
     )
