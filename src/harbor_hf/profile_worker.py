@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import JsonValue
@@ -68,7 +69,7 @@ from harbor_hf.runs import (
     harbor_process_environment,
     run_secret_values,
 )
-from harbor_hf.trial_evidence import JudgeSelection, assemble_trial_evidence
+from harbor_hf.trial_evidence import JudgeCalls, JudgeSelection, assemble_trial_evidence
 from harbor_hf.worker import (
     EndpointManager,
     launch_cleanup_watchdog,
@@ -927,6 +928,7 @@ def _run_staged_point(
             attempts=attempts,
             concurrency=concurrency,
             expected_task_digests=tasks,
+            extra_environment_hosts=_profile_judge_hosts(transport),
         )
         timeout = _remaining(deadline)
         started = time.monotonic()
@@ -1010,6 +1012,16 @@ def _run_staged_point(
     return _PointResult(observations=observations, elapsed_ms=elapsed_ms)
 
 
+def _profile_judge_hosts(transport: ProfileTransport) -> tuple[str, ...]:
+    base_url = getattr(transport, "judge_base_url", None)
+    if base_url is None:
+        return ()
+    host = urlparse(base_url).hostname
+    if not host:
+        raise ProfileWorkerError("profile judge recorder hostname is invalid")
+    return (host,)
+
+
 @contextmanager
 def _profile_point_judge_scope(
     plan: ProfilePlan,
@@ -1032,19 +1044,17 @@ def _profile_point_judge_scope(
     if recorder is None or base_url is None or policy is None or judge is None:
         raise ProfileWorkerError("judged profile transport is incomplete")
     maximum_calls = attempts * len(judged_tasks) * policy.judge_max_calls_per_execution
-    if maximum_calls > 64:
+    if maximum_calls > 4096:
         raise ProfileWorkerError("judged profile point exceeds recorder call capacity")
-    aggregate_policy = policy.model_copy(
-        update={"judge_max_calls_per_execution": maximum_calls}
-    )
     identity = f"profile-{plan.profile_id}-{scope}"
     capability = recorder.register_scope(
         execution_id=identity,
         trial_id=identity,
         model=judge.model,
         destination=execution_root / "judge-records",
-        policy=aggregate_policy,
+        policy=policy,
         known_secrets=((provider_capability,) if provider_capability else ()),
+        max_calls=maximum_calls,
     )
     try:
         yield recorder.scoped_url(base_url, capability), capability
@@ -1136,18 +1146,32 @@ def _split_profile_judge_records(
         return {}
     aggregate = execution_root / "judge-records"
     summary = _profile_judge_summary(aggregate)
-    selected = _profile_judge_selections(judged, jobs_dir)
+    assigned = _profile_judge_assignments(judged, jobs_dir)
     exchange_dirs = {
         path.name: path
         for path in aggregate.glob("judge-*")
         if path.is_dir() and not path.is_symlink()
     }
-    if set(exchange_dirs) != set(selected) or summary.exchange_count != len(selected):
+    if set(exchange_dirs) != set(assigned) or summary.exchange_count != len(assigned):
         raise ProfileWorkerError("profile judge exchanges cannot be assigned exactly")
+    policy = run_lock.trial_evidence
+    if policy is None:
+        raise ProfileWorkerError("profile trial evidence policy is missing")
+    assignment_counts: dict[str, int] = {}
+    for native in assigned.values():
+        assignment_counts[native.trial_id] = (
+            assignment_counts.get(native.trial_id, 0) + 1
+        )
+    if any(
+        count > policy.judge_max_calls_per_execution
+        for count in assignment_counts.values()
+    ):
+        raise ProfileWorkerError("profile trial exceeds its judge call limit")
+    grouped: dict[str, list[str]] = {}
     destinations: dict[str, Path] = {}
-    for exchange_id, native in selected.items():
+    for exchange_id, native in assigned.items():
         destination = execution_root / "profile-judge-records" / native.trial_id
-        destination.mkdir(parents=True)
+        destination.mkdir(parents=True, exist_ok=True)
         exchange_dir = exchange_dirs[exchange_id]
         metadata_path = exchange_dir / "exchange.json"
         exchange = JudgeExchange.model_validate_json(metadata_path.read_text())
@@ -1157,16 +1181,22 @@ def _split_profile_judge_records(
         )
         write_json(metadata_path, exchange.model_dump(mode="json"))
         shutil.move(str(exchange_dir), destination / exchange_id)
+        grouped.setdefault(native.trial_id, []).append(exchange_id)
+        destinations[native.trial_id] = destination
+    for trial_id, exchange_ids in grouped.items():
+        execution_id = f"profile-{plan.profile_id}-{scope}-{trial_id}"
         trial_summary = JudgeRecorderSummary(
             execution_id=execution_id,
-            trial_id=native.trial_id,
+            trial_id=trial_id,
             model=summary.model,
-            exchange_count=1,
+            exchange_count=len(exchange_ids),
             rejected_call_count=0,
             closed_at=summary.closed_at,
         )
-        write_json(destination / "recorder.json", trial_summary.model_dump(mode="json"))
-        destinations[native.trial_id] = destination
+        write_json(
+            destinations[trial_id] / "recorder.json",
+            trial_summary.model_dump(mode="json"),
+        )
     (aggregate / "recorder.json").unlink()
     aggregate.rmdir()
     return destinations
@@ -1184,26 +1214,36 @@ def _profile_judge_summary(aggregate: Path) -> JudgeRecorderSummary:
     return summary
 
 
-def _profile_judge_selections(
+def _profile_judge_assignments(
     judged: list[HarborCompatibilityTrial], jobs_dir: Path
 ) -> dict[str, HarborCompatibilityTrial]:
-    selected: dict[str, HarborCompatibilityTrial] = {}
+    assigned: dict[str, HarborCompatibilityTrial] = {}
     for native in judged:
         if native.exception_type is not None:
             raise ProfileWorkerError("judged profile trial did not complete")
         native_root = resolve_native_trial_root(jobs_dir, native.path)
+        verifier = native_root / "verifier"
         try:
             selection = JudgeSelection.model_validate_json(
-                (native_root / "verifier" / "judge-selection.json").read_text(
-                    encoding="utf-8"
-                )
+                (verifier / "judge-selection.json").read_text(encoding="utf-8")
+            )
+            calls_path = verifier / "judge-calls.json"
+            calls = (
+                JudgeCalls.model_validate_json(calls_path.read_text(encoding="utf-8"))
+                if calls_path.is_file()
+                else JudgeCalls(exchange_ids=[selection.exchange_id])
             )
         except (OSError, ValueError) as error:
-            raise ProfileWorkerError("profile judge selection is invalid") from error
-        if selection.exchange_id in selected:
-            raise ProfileWorkerError("profile judge exchange was selected twice")
-        selected[selection.exchange_id] = native
-    return selected
+            raise ProfileWorkerError(
+                "profile judge call assignment is invalid"
+            ) from error
+        if selection.exchange_id not in calls.exchange_ids:
+            raise ProfileWorkerError("profile judge selection is not a recorded call")
+        for exchange_id in calls.exchange_ids:
+            if exchange_id in assigned:
+                raise ProfileWorkerError("profile judge exchange was assigned twice")
+            assigned[exchange_id] = native
+    return assigned
 
 
 def _point_workload(plan: ProfilePlan, concurrency: int) -> tuple[dict[str, str], int]:

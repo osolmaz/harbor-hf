@@ -188,6 +188,7 @@ class _Scope:
     model: str
     destination: Path
     policy: TrialEvidencePolicy
+    max_calls: int
     secrets: tuple[str, ...]
 
 
@@ -278,6 +279,7 @@ class JudgeEvidenceRecorder:
         destination: Path,
         policy: TrialEvidencePolicy,
         known_secrets: tuple[str, ...] = (),
+        max_calls: int | None = None,
     ) -> str:
         if not execution_id or not trial_id or not model:
             raise ValueError(
@@ -285,6 +287,9 @@ class JudgeEvidenceRecorder:
             )
         if destination.exists():
             raise JudgeRecorderError("judge evidence destination already exists")
+        effective_max_calls = max_calls or policy.judge_max_calls_per_execution
+        if effective_max_calls < 1 or effective_max_calls > 4096:
+            raise JudgeRecorderError("judge scope call limit is invalid")
         destination.mkdir(parents=True)
         for _ in range(8):
             capability = self._capability_factory()
@@ -300,6 +305,7 @@ class JudgeEvidenceRecorder:
                         model=model,
                         destination=destination,
                         policy=policy,
+                        max_calls=effective_max_calls,
                         secrets=tuple(
                             dict.fromkeys((self._token, *known_secrets, capability))
                         ),
@@ -512,7 +518,7 @@ class JudgeEvidenceRecorder:
     def _allocate(self, scope: _Scope) -> tuple[str, int]:
         with self._lock:
             attempt = self._counts.get(scope.execution_id, 0) + 1
-            if attempt > scope.policy.judge_max_calls_per_execution:
+            if attempt > scope.max_calls:
                 raise JudgeRecorderError("judge call limit is exhausted")
             self._counts[scope.execution_id] = attempt
         return f"judge-{attempt:04d}", attempt

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tarfile
@@ -319,6 +320,21 @@ def _validate_manifest_requirements(manifest: TrialEvidenceManifest) -> None:
 class JudgeSelection(FrozenModel):
     schema_version: Literal["harbor-hf/judge-selection/v1"] = JUDGE_SELECTION_SCHEMA
     exchange_id: str = Field(pattern=r"^judge-[0-9]{4}$")
+
+
+class JudgeCalls(FrozenModel):
+    schema_version: Literal["harbor-hf/judge-calls/v1"] = "harbor-hf/judge-calls/v1"
+    exchange_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def exchange_ids_are_unique(self) -> JudgeCalls:
+        if len(self.exchange_ids) != len(set(self.exchange_ids)):
+            raise ValueError("judge call exchange IDs must be unique")
+        if any(
+            not re.fullmatch(r"judge-[0-9]{4}", value) for value in self.exchange_ids
+        ):
+            raise ValueError("judge call exchange ID is invalid")
+        return self
 
 
 class WorkspacePackage(FrozenModel):

@@ -34,6 +34,7 @@ from harbor_hf.profile_worker import (
     _point_workload,
     _PointResult,
     _prepare_profile_destination,
+    _profile_judge_assignments,
     _request,
     _run_ladder,
     _run_point,
@@ -462,6 +463,34 @@ def compatibility_trial(
             "artifacts": [],
         }
     )
+
+
+def test_profile_judge_assignments_preserve_all_calls(tmp_path: Path) -> None:
+    native = compatibility_trial("judged")
+    verifier = tmp_path / "job" / "judged" / "verifier"
+    verifier.mkdir(parents=True)
+    (verifier / "judge-selection.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "harbor-hf/judge-selection/v1",
+                "exchange_id": "judge-0002",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (verifier / "judge-calls.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "harbor-hf/judge-calls/v1",
+                "exchange_ids": ["judge-0001", "judge-0002"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assigned = _profile_judge_assignments([native], tmp_path)
+
+    assert assigned == {"judge-0001": native, "judge-0002": native}
 
 
 def test_profile_point_preserves_individual_harbor_trial_failures(
