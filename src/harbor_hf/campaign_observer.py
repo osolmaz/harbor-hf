@@ -27,6 +27,18 @@ from harbor_hf.wave_worker import ExecutionLock
 _JSON_OBJECT = TypeAdapter(dict[str, object])
 _RETRY_CATEGORY = TypeAdapter(RetryCategory)
 _TERMINAL_MARKERS = frozenset({"_SUCCESS", "_FAILED", "_CANCELLED"})
+_OBSERVATION_FILES = frozenset(
+    {
+        "_FAILED",
+        "checksums.json",
+        "events.jsonl",
+        "execution.lock.json",
+        "failure.json",
+        "verification.json",
+        "wave-summary.json",
+        "wave.lock.json",
+    }
+)
 
 
 class CampaignObservationError(RuntimeError):
@@ -50,6 +62,17 @@ class BucketCampaignObserver:
             bucket=spec.artifacts.bucket,
             prefix=lock.artifact_prefix,
         )
+        prefetch = getattr(self.reader, "prefetch_files", None)
+        if callable(prefetch):
+            prefetch(
+                bucket=spec.artifacts.bucket,
+                prefix=lock.artifact_prefix,
+                paths=[
+                    path
+                    for path in paths
+                    if PurePosixPath(path).name in _OBSERVATION_FILES
+                ],
+            )
         events: list[CampaignEvent] = []
         for path in _wave_lock_paths(paths):
             wave_prefix = str(PurePosixPath(path).parent)

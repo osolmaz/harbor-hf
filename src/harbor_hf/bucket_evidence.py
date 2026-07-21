@@ -86,14 +86,28 @@ class HubBucketEvidenceReader:
         remote = listing.get(path)
         if remote is None:
             raise BucketEvidenceError(f"Bucket evidence object is missing: {path}")
-        self._prefetch(normalized_bucket, normalized_prefix, listing)
         destination = self._cache_path(normalized_bucket, normalized_prefix, path)
+        if not destination.exists():
+            self._prefetch(normalized_bucket, normalized_prefix, listing)
         try:
             return destination.read_bytes()
         except OSError as error:
             raise BucketEvidenceError(
                 f"Bucket evidence object cannot be read: {path}"
             ) from error
+
+    def prefetch_files(self, *, bucket: str, prefix: str, paths: list[str]) -> None:
+        """Batch only caller-selected evidence files into the local cache."""
+        normalized_bucket = bucket_id(bucket)
+        normalized_prefix = prefix.rstrip("/")
+        listing = self._listing(normalized_bucket, normalized_prefix)
+        selected: dict[str, object] = {}
+        for path in paths:
+            remote = listing.get(path)
+            if remote is None:
+                raise BucketEvidenceError(f"Bucket evidence object is missing: {path}")
+            selected[path] = remote
+        self._download_missing(normalized_bucket, normalized_prefix, selected)
 
     def refresh(self) -> None:
         """Discard listings after another component has published new objects."""
@@ -131,6 +145,12 @@ class HubBucketEvidenceReader:
         key = (bucket, prefix)
         if key in self._prefetched:
             return
+        self._download_missing(bucket, prefix, listing)
+        self._prefetched.add(key)
+
+    def _download_missing(
+        self, bucket: str, prefix: str, listing: dict[str, object]
+    ) -> None:
         self.cache_root.mkdir(parents=True, exist_ok=True)
         missing = [
             (path, remote, self._cache_path(bucket, prefix, path))
@@ -161,7 +181,6 @@ class HubBucketEvidenceReader:
             finally:
                 for temporary, _destination in staged:
                     temporary.unlink(missing_ok=True)
-        self._prefetched.add(key)
 
     def _cache_path(self, bucket: str, prefix: str, path: str) -> Path:
         identity = hashlib.sha256(f"{bucket}/{prefix}/{path}".encode()).hexdigest()
