@@ -141,6 +141,14 @@ def test_benchmark_exception_message_does_not_trigger_transport_retry() -> None:
     assert _execution_failure_category(error, "execution") == "benchmark"
 
 
+def test_remote_protocol_failure_is_retryable_infrastructure() -> None:
+    error = HarborTrialFailure(
+        "trial failed", "RemoteProtocolError", "incomplete chunked read"
+    )
+
+    assert _execution_failure_category(error, "execution") == "transient"
+
+
 def test_agent_output_keywords_do_not_trigger_transport_retry() -> None:
     error = HarborTrialFailure(
         "agent failed",

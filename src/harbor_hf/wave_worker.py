@@ -164,6 +164,7 @@ _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
             "internalserver",
             "internal server error",
             "apierror",
+            "remoteprotocolerror",
             "status=500",
             "status=502",
             "status=503",
