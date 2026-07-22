@@ -878,7 +878,7 @@ def test_wildcard_request_counts_resolved_tasks_not_patterns(
 def test_literal_bracketed_task_name_is_not_treated_as_a_pattern(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
-    deprecated = "[DEPRECATED] duplicate-task"
+    deprecated = "[DERPRECATED] duplicate-task"
     lock = build_run_lock(remote_spec, run_id="literal-task-name").model_copy(
         update={
             "benchmark_tasks": [deprecated],
