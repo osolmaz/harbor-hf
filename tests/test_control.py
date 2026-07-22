@@ -510,7 +510,7 @@ def test_hub_store_ensures_identical_event_once(
         store.ensure_event(lock.campaign_id, conflicting)
 
 
-def test_hub_store_ensures_observed_events_in_one_commit(
+def test_hub_store_ensures_observed_events_in_bounded_commits(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
     lock = _lock(remote_spec)
@@ -526,14 +526,14 @@ def test_hub_store_ensures_observed_events_in_one_commit(
             payload=LifecyclePayload(message=f"observation {index}"),
             identifier=lambda index=index: f"{index:032x}",
         )
-        for index in (2, 3)
+        for index in range(2, 53)
     ]
     initial_commits = len(api.commits)
 
     assert store.ensure_events(lock.campaign_id, events)
-    assert len(api.commits) == initial_commits + 1
+    assert len(api.commits) == initial_commits + 2
     assert not store.ensure_events(lock.campaign_id, events)
-    assert len(api.commits) == initial_commits + 1
+    assert len(api.commits) == initial_commits + 2
     assert all(
         f"campaigns/{lock.campaign_id}/events/{event.event_id}.json" in api.files
         for event in events

@@ -18,6 +18,7 @@ from harbor_hf.campaigns import CampaignLock
 from harbor_hf.coordination import coordination_repository
 
 _MAX_COMMIT_ATTEMPTS = 8
+_MAX_EVENT_BATCH_OPERATIONS = 50
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.draining",
@@ -790,29 +791,40 @@ class HubCampaignStore:
         raise ControlError("control repository remained contended")
 
     def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool:
-        """Append a batch of events once in one control repository commit."""
+        """Append observed events in bounded control repository commits."""
         expected_by_path = _event_payloads(campaign_id, events)
+        changed = False
         for _attempt in range(_MAX_COMMIT_ATTEMPTS):
             head = self._head()
-            missing = self._missing_events(expected_by_path, head)
+            missing = self._missing_events_from_listing(expected_by_path, head)
             if not missing:
-                return False
+                return changed
             try:
-                self.api.create_commit(
-                    self.repository,
-                    [
-                        CommitOperationAdd(
-                            path_in_repo=path,
-                            path_or_fileobj=_json_bytes(expected),
-                        )
-                        for path, expected in missing.items()
-                    ],
-                    commit_message="chore: record observed campaign events",
-                    repo_type="dataset",
-                    revision="main",
-                    parent_commit=head,
-                )
-                return True
+                entries = list(missing.items())
+                for offset in range(0, len(entries), _MAX_EVENT_BATCH_OPERATIONS):
+                    batch = entries[offset : offset + _MAX_EVENT_BATCH_OPERATIONS]
+                    result = self.api.create_commit(
+                        self.repository,
+                        [
+                            CommitOperationAdd(
+                                path_in_repo=path,
+                                path_or_fileobj=_json_bytes(expected),
+                            )
+                            for path, expected in batch
+                        ],
+                        commit_message="chore: record observed campaign events",
+                        repo_type="dataset",
+                        revision="main",
+                        parent_commit=head,
+                    )
+                    observed_head = getattr(result, "oid", None)
+                    head = (
+                        observed_head
+                        if isinstance(observed_head, str)
+                        else self._head()
+                    )
+                    changed = True
+                return changed
             except HfHubHTTPError as error:
                 if not _is_parent_conflict(error):
                     raise
@@ -933,6 +945,26 @@ class HubCampaignStore:
                 if not _is_parent_conflict(error):
                     raise
         raise ControlError("control repository remained contended")
+
+    def _missing_events_from_listing(
+        self, expected_by_path: dict[str, dict[str, JsonValue]], head: str
+    ) -> dict[str, dict[str, JsonValue]]:
+        existing = set(
+            self.api.list_repo_files(
+                self.repository,
+                repo_type="dataset",
+                revision=head,
+            )
+        )
+        missing: dict[str, dict[str, JsonValue]] = {}
+        for path, expected in expected_by_path.items():
+            if path not in existing:
+                missing[path] = expected
+                continue
+            observed = self._read_json(path, head)
+            if not _same_event_request(observed, expected):
+                raise CampaignConflict(f"event conflicts: {path}")
+        return missing
 
     def _missing_events(
         self, expected_by_path: dict[str, dict[str, JsonValue]], head: str
@@ -1071,6 +1103,12 @@ class HubCampaignStore:
             return Path(local_path).read_bytes()
         except OSError as error:
             raise ControlError(f"control record cannot be read: {path}") from error
+
+
+def same_event_request(observed: CampaignEvent, expected: CampaignEvent) -> bool:
+    return _same_event_request(
+        observed.model_dump(mode="json"), expected.model_dump(mode="json")
+    )
 
 
 def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> bool:
