@@ -17,6 +17,7 @@ from harbor_hf.reconciler import (
     AdmissionLimits,
     ReconcileAction,
     ReconcileContext,
+    _estimated_retry_cost,
     plan_reconciliation,
 )
 
@@ -318,7 +319,12 @@ def test_reconcile_closed_wave_routes_retryable_evidence_to_retry(
     assert projection.shards[failed_shard].status == "retry_wait"
     assert [item.kind for item in plan.actions] == ["retry-shard"]
     by_kind = {item.kind: item for item in plan.actions}
-    assert by_kind["retry-shard"].shard_ids == [failed_shard]
+    retry = by_kind["retry-shard"]
+    assert retry.shard_ids == [failed_shard]
+    assert (
+        _estimated_retry_cost(lock, action.deployment_digest, 90_000_000, 1)
+        == 45_000_000
+    )
     assert plan.blocked[0].reason == "deployment-budget"
     assert plan.blocked[0].shard_ids == [untouched_shard]
 

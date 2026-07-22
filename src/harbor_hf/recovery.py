@@ -341,7 +341,7 @@ def durable_shard_retry_event(
     eligible = [
         projection.trials[trial_id]
         for trial_id in shard.trial_ids
-        if projection.trials[trial_id].status == "retry_wait"
+        if projection.trials[trial_id].status in {"retry_wait", "failed_infrastructure"}
     ]
     if not eligible:
         raise ValueError("shard has no retryable logical trials")
@@ -519,12 +519,14 @@ def _apply_retry_requests(
         trial_id: (
             trial.model_copy(
                 update={
+                    "status": "retry_wait",
                     "retry_not_before": requested_at[
                         (trial.trial_id, len(trial.executions))
-                    ]
+                    ],
+                    "outcome": None,
                 }
             )
-            if trial.status == "retry_wait"
+            if trial.status in {"retry_wait", "failed_infrastructure"}
             and (trial.trial_id, len(trial.executions)) in requested_at
             else trial
         )

@@ -788,6 +788,44 @@ def test_durable_shard_retry_request_skips_current_backoff(
     assert [action.kind for action in plan.actions] == ["retry-shard"]
 
 
+def test_durable_retry_reopens_spend_exhausted_infrastructure_trial(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    trial_id = lock.runs[0].shards[0].trials[0].trial_id
+    exhausted = new_event(
+        subject_type="trial",
+        subject_id=trial_id,
+        kind="trial.failed-infrastructure",
+        producer="reconciler",
+        payload=LifecyclePayload(message="retry spend cap exhausted"),
+        clock=lambda: NOW + timedelta(seconds=4),
+        identifier=lambda: "f" * 32,
+    )
+    shard_id = lock.runs[0].shards[0].shard_id
+    request, created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed, exhausted],
+        shard_id,
+        "corrected retry estimate",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+
+    projection = project_recovery(lock, [submitted, *failed, exhausted, request])
+
+    assert created
+    assert projection.trials[trial_id].status == "retry_wait"
+    assert projection.trials[trial_id].outcome is None
+    assert projection.counts.retrying == 1
+
+
 def test_legacy_shard_retry_request_preserves_its_event_time_generation(
     remote_spec: ExperimentSpec,
 ) -> None:

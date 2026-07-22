@@ -421,7 +421,12 @@ def _retry_candidates(
                     shard_ids=chunk,
                     trial_ids=trial_ids,
                     target_ids=trial_ids,
-                    estimated_cost_microusd=admission.estimated_wave_cost_microusd,
+                    estimated_cost_microusd=_estimated_retry_cost(
+                        lock,
+                        deployment,
+                        admission.estimated_wave_cost_microusd,
+                        len(trial_ids),
+                    ),
                     spend_cap_microusd=_run_admission(
                         lock, deployment
                     ).spend_cap_microusd,
@@ -438,6 +443,41 @@ def _retry_candidates(
             )
         )
     return candidates, blocked
+
+
+def _estimated_retry_cost(
+    lock: CampaignLock,
+    deployment_digest: str,
+    estimated_wave_cost_microusd: int | None,
+    retry_trial_count: int,
+) -> int | None:
+    if estimated_wave_cost_microusd is None:
+        return None
+    shard_sizes = sorted(
+        (
+            (shard.shard_id, len(shard.trials))
+            for run in lock.runs
+            if run.deployment_digest == deployment_digest
+            for shard in run.shards
+        ),
+        key=lambda item: item[0],
+    )
+    capacities = [
+        sum(
+            size
+            for _shard_id, size in shard_sizes[
+                offset : offset + lock.max_shards_per_wave
+            ]
+        )
+        for offset in range(0, len(shard_sizes), lock.max_shards_per_wave)
+    ]
+    capacity = max(capacities, default=0)
+    if capacity <= 0 or retry_trial_count <= 0:
+        raise ValueError("retry cost requires a non-empty deployment wave")
+    return max(
+        1,
+        (estimated_wave_cost_microusd * retry_trial_count + capacity - 1) // capacity,
+    )
 
 
 def _new_wave_candidates(
