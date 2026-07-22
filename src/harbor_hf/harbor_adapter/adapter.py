@@ -5,7 +5,6 @@ import time
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import Never, Protocol
 from urllib.parse import urlparse
@@ -36,6 +35,7 @@ from harbor_hf.models import (
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock
+from harbor_hf.task_selection import task_matches_selector
 
 _SUCCESSFUL_EXPORT_ATTEMPTS = 6
 
@@ -331,14 +331,6 @@ def resolve_native_trial_root(jobs_dir: Path, value: str) -> Path:
     return resolved
 
 
-def _matches_task_selector(
-    task: str, selector: str, available_tasks: dict[str, str]
-) -> bool:
-    if selector in available_tasks:
-        return task == selector
-    return fnmatch(task, selector)
-
-
 def build_execution_request(
     lock: RunLock,
     jobs_dir: Path,
@@ -357,14 +349,14 @@ def build_execution_request(
         task: digest
         for task, digest in available_tasks.items()
         if any(
-            _matches_task_selector(task, selector, available_tasks)
+            task_matches_selector(task, selector, available_tasks)
             for selector in task_names
         )
     }
     if (
         any(
             not any(
-                _matches_task_selector(task, selector, available_tasks)
+                task_matches_selector(task, selector, available_tasks)
                 for task in available_tasks
             )
             for selector in task_names

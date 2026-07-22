@@ -4,10 +4,10 @@ import json
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from fnmatch import fnmatch
 from pathlib import Path
 
 from harbor_hf.harbor_adapter.errors import HarborTrialFailure, WorkerError
+from harbor_hf.task_selection import task_matches_selector
 
 
 def validate_harbor_result(
@@ -116,8 +116,12 @@ def validate_task_counts(
             count == attempts_per_observed_task for count in observed.values()
         )
     if expected_task_names is not None:
+        available_tasks = set(expected or {}) or set(observed)
         valid = valid and all(
-            any(fnmatch(task, requested) for requested in expected_task_names)
+            any(
+                task_matches_selector(task, requested, available_tasks)
+                for requested in expected_task_names
+            )
             for task in observed
         )
     if not valid:

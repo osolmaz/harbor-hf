@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from fnmatch import fnmatch
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -20,6 +19,7 @@ from harbor_hf.harbor_adapter.models import (
     canonical_json_bytes,
     sha256_digest,
 )
+from harbor_hf.task_selection import task_matches_selector
 
 
 def load_compatibility_bundle(
@@ -139,8 +139,12 @@ def _validate_task_counts(
             count == policy.expected_attempts_per_task for count in observed.values()
         )
     if policy.expected_task_names is not None:
+        available_tasks = set(expected) or set(observed)
         valid = valid and all(
-            any(fnmatch(task, requested) for requested in policy.expected_task_names)
+            any(
+                task_matches_selector(task, requested, available_tasks)
+                for requested in policy.expected_task_names
+            )
             for task in observed
         )
     if not valid:

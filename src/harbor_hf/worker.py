@@ -12,7 +12,6 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
@@ -98,6 +97,7 @@ from harbor_hf.submission import (
     github_repository,
     locked_source_command,
 )
+from harbor_hf.task_selection import task_matches_selector
 from harbor_hf.trial_evidence import assemble_trial_evidence
 
 _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
@@ -380,7 +380,10 @@ def _build_harbor_command(
         expected_task_digests={
             task: digest
             for task, digest in lock.benchmark_task_digests.items()
-            if any(fnmatch(task, selector) for selector in task_names)
+            if any(
+                task_matches_selector(task, selector, lock.benchmark_task_digests)
+                for selector in task_names
+            )
         },
     )
     config_path = jobs_dir.parent / "harbor-job.json"

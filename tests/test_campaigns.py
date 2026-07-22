@@ -36,6 +36,20 @@ def test_builds_content_addressed_campaign_plan(remote_spec: ExperimentSpec) -> 
     )
 
 
+def test_campaign_accepts_literal_bracketed_task_name(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deprecated = "[DERPRECATED] duplicate-task"
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["task_names"] = [deprecated]
+    raw["benchmark"]["task_digests"] = {deprecated: "sha256:" + "6" * 64}
+
+    plan = build_campaign_plan(ExperimentSpec.model_validate(raw))
+
+    assert plan.trial_count == 1
+    assert plan.runs[0].shards[0].trials[0].task_name == deprecated
+
+
 def test_shards_order_logical_attempts_across_distinct_tasks(
     remote_spec: ExperimentSpec,
 ) -> None:

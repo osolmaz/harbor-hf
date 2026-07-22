@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from fnmatch import fnmatch
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
@@ -19,6 +18,7 @@ from pydantic import (
 
 from harbor_hf.evidence import is_sensitive_key
 from harbor_hf.provider_models import ProviderTarget
+from harbor_hf.task_selection import task_matches_selector
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 EvaluationId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
@@ -590,14 +590,18 @@ def resolved_judge_required_tasks(benchmark: BenchmarkSpec) -> list[str]:
     judge = benchmark.judge
     included: set[str] = set()
     for selector in judge.task_names:
-        matched = {task for task in selected if fnmatch(task, selector)}
+        matched = {
+            task for task in selected if task_matches_selector(task, selector, selected)
+        }
         if not matched:
             raise ValueError(
                 f"benchmark judge selector matches no selected task: {selector}"
             )
         included |= matched
     for selector in judge.exclude_task_names:
-        matched = {task for task in selected if fnmatch(task, selector)}
+        matched = {
+            task for task in selected if task_matches_selector(task, selector, selected)
+        }
         if not matched:
             raise ValueError(
                 f"benchmark judge exclusion matches no selected task: {selector}"
@@ -648,12 +652,18 @@ def _validate_task_pins(benchmark: BenchmarkSpec) -> None:
     unmatched_selections = [
         selection
         for selection in benchmark.task_names
-        if not any(fnmatch(task, selection) for task in benchmark.task_digests)
+        if not any(
+            task_matches_selector(task, selection, benchmark.task_digests)
+            for task in benchmark.task_digests
+        )
     ]
     unmatched_tasks = [
         task
         for task in benchmark.task_digests
-        if not any(fnmatch(task, selection) for selection in benchmark.task_names)
+        if not any(
+            task_matches_selector(task, selection, benchmark.task_digests)
+            for selection in benchmark.task_names
+        )
     ]
     if unmatched_selections or unmatched_tasks:
         raise ValueError("remote task digests must exactly resolve the task selection")

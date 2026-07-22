@@ -6,7 +6,6 @@ import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from fnmatch import fnmatch
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -31,6 +30,7 @@ from harbor_hf.models import (
 from harbor_hf.planner import RunCell, experiment_digest, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import RunLock, build_run_lock, validate_provider_cell
+from harbor_hf.task_selection import task_matches_selector
 
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -372,11 +372,15 @@ def _resolved_tasks(spec: ExperimentSpec) -> list[tuple[str, str]]:
     if not digests:
         raise ValueError("campaign planning requires resolved task digests")
     if any(
-        not any(fnmatch(task_name, selection) for task_name in digests)
+        not any(
+            task_matches_selector(task_name, selection, digests)
+            for task_name in digests
+        )
         for selection in spec.benchmark.task_names
     ) or any(
         not any(
-            fnmatch(task_name, selection) for selection in spec.benchmark.task_names
+            task_matches_selector(task_name, selection, digests)
+            for selection in spec.benchmark.task_names
         )
         for task_name in digests
     ):
