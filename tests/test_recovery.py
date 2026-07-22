@@ -825,6 +825,19 @@ def test_durable_retry_reopens_spend_exhausted_infrastructure_trial(
     assert projection.trials[trial_id].outcome is None
     assert projection.counts.retrying == 1
 
+    completed = _execution_events(
+        lock,
+        10,
+        execution_id="execution-two",
+        attempt=2,
+        category=None,
+    )
+    recovered = project_recovery(
+        lock, [submitted, *failed, exhausted, request, *completed]
+    )
+    assert recovered.trials[trial_id].status == "complete"
+    assert recovered.trials[trial_id].outcome == "scored"
+
 
 def test_legacy_shard_retry_request_preserves_its_event_time_generation(
     remote_spec: ExperimentSpec,

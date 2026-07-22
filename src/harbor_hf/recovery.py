@@ -515,23 +515,32 @@ def _apply_retry_requests(
             requested_at[key] = max(
                 requested_at.get(key, event.observed_at), event.observed_at
             )
-    return {
-        trial_id: (
-            trial.model_copy(
-                update={
-                    "status": "retry_wait",
-                    "retry_not_before": requested_at[
-                        (trial.trial_id, len(trial.executions))
-                    ],
-                    "outcome": None,
-                }
+    recovered: dict[str, TrialProjection] = {}
+    for trial_id, trial in trials.items():
+        generations = [
+            generation
+            for requested_trial_id, generation in requested_at
+            if requested_trial_id == trial_id
+        ]
+        if not generations:
+            recovered[trial_id] = trial
+            continue
+        generation = max(generations)
+        current_generation = len(trial.executions)
+        if generation > current_generation:
+            raise ValueError(
+                "retry request generation exceeds physical execution state"
             )
-            if trial.status in {"retry_wait", "failed_infrastructure"}
-            and (trial.trial_id, len(trial.executions)) in requested_at
-            else trial
+        cleared = trial.model_copy(
+            update={"status": "planned", "retry_not_before": None, "outcome": None}
         )
-        for trial_id, trial in trials.items()
-    }
+        derived = _derive_trial(lock, cleared, list(trial.executions.values()))
+        if generation == current_generation and derived.status == "retry_wait":
+            derived = derived.model_copy(
+                update={"retry_not_before": requested_at[(trial_id, generation)]}
+            )
+        recovered[trial_id] = derived
+    return recovered
 
 
 def _validated_retry_generations(
