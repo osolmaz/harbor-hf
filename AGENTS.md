@@ -18,4 +18,4 @@
 - Avoid `Any`; validate untrusted provider data at the adapter boundary.
 - Use Conventional Commits.
 - Apply the standards in
-  `https://github.com/dutifuldev/slophammer/blob/main/docs/AGENT_ENTRYPOINT.md`.
+  `https://github.com/osolmaz/slophammer/blob/main/docs/AGENT_ENTRYPOINT.md`.
