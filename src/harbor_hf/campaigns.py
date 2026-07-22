@@ -322,8 +322,8 @@ def build_campaign_plan(
             task_digest=task_digest,
             logical_attempt=logical_attempt,
         )
-        for task_name, task_digest in tasks
         for logical_attempt in range(1, spec.execution.attempts + 1)
+        for task_name, task_digest in tasks
     ]
     profiles = (
         {profile.id: profile for profile in spec.matrix.models},

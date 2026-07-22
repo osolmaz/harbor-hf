@@ -36,7 +36,7 @@ def test_builds_content_addressed_campaign_plan(remote_spec: ExperimentSpec) -> 
     )
 
 
-def test_shards_ordered_task_attempts_deterministically(
+def test_shards_order_logical_attempts_across_distinct_tasks(
     remote_spec: ExperimentSpec,
 ) -> None:
     tasks = {f"task-{index}": f"sha256:{index:064x}" for index in range(1, 6)}
@@ -62,7 +62,7 @@ def test_shards_ordered_task_attempts_deterministically(
         for trial in shard.trials
     ]
     assert ordered == [
-        (f"task-{index}", attempt) for index in range(1, 6) for attempt in (1, 2)
+        (f"task-{index}", attempt) for attempt in (1, 2) for index in range(1, 6)
     ]
 
 
@@ -379,7 +379,7 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
         separators=(",", ":"),
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "e82ebc9ff941df2d215639f0755ccb90a92d76aba43fc2bdabd16e404bd2ab82"
+        "3d3e0a2ce3a78de387ad59398ff9c4a342ba5867f1bc8019d965be2a6ef85b3f"
     )
 
 

@@ -111,8 +111,10 @@ def _resolved_task_name(
         return observed_name
     matches = [name for name, digest in expected.items() if digest == observed_digest]
     if len(matches) != 1:
+        expected_digest = expected.get(observed_name, "missing")
         raise HarborVerificationFailure(
-            f"Harbor trial {observed_name} task digest does not match the lock"
+            f"Harbor trial {observed_name} task digest does not match the lock: "
+            f"expected {expected_digest}, observed {observed_digest}"
         )
     return matches[0]
 

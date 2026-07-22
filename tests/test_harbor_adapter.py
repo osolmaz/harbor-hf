@@ -875,6 +875,40 @@ def test_wildcard_request_counts_resolved_tasks_not_patterns(
     assert dataset["task_names"] == ["task-*"]
 
 
+def test_literal_bracketed_task_name_is_not_treated_as_a_pattern(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    deprecated = "[DEPRECATED] duplicate-task"
+    lock = build_run_lock(remote_spec, run_id="literal-task-name").model_copy(
+        update={
+            "benchmark_tasks": [deprecated],
+            "benchmark_task_digests": {
+                deprecated: "sha256:" + "6" * 64,
+                "D duplicate-task": "sha256:" + "7" * 64,
+            },
+        }
+    )
+
+    request = build_execution_request(
+        lock,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        task_names=[deprecated],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={deprecated: "sha256:" + "6" * 64},
+    )
+
+    assert request.verification.expected_task_digests == {
+        deprecated: "sha256:" + "6" * 64
+    }
+    datasets = request.harbor_config["datasets"]
+    assert isinstance(datasets, list)
+    dataset = datasets[0]
+    assert isinstance(dataset, dict)
+    assert dataset["task_names"] == [deprecated]
+
+
 @pytest.mark.parametrize(
     "expected_task_digests",
     [

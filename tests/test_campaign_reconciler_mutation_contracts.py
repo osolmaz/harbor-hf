@@ -104,7 +104,7 @@ def test_campaign_plan_lock_reconcile_and_wave_have_one_canonical_output(
     }
 
     assert _hash(corpus) == (
-        "050165e0d53b35b4d93e9a34a3b7e818547fb06f0fed265c0f82b508829730ef"
+        "93c5b5bb0bb9ad00704a7257710bc967ff8132809840301d869f48a9a6852a12"
     )
 
 
@@ -241,7 +241,7 @@ def test_admission_matrix_records_complete_actions_and_blocked_reasons(
     ]
 
     assert _hash(plans) == (
-        "c3790fd94451bab793d783d8c3b9f9df62a912353424f373e13a3dc5ef6a8380"
+        "1e9b1c3b8b97df4013abc24fa8a0c8a0509649bc17b02a205620c67fceee45bf"
     )
     assert [[item["reason"] for item in plan["blocked"]] for plan in plans] == [
         ["spend-cap"],
@@ -357,7 +357,7 @@ def test_reserved_submit_action_removes_all_assigned_shards_from_candidates(
     }
 
     assert _hash(corpus) == (
-        "a22e2bfd592f15502ecb2403c15266bc83d987c27d8509ecc10d7cfb4ef1596c"
+        "443ccb533ce1ff982169580f5668e0149633dc7d3e64bad362214214ffbe7ef2"
     )
     assert _assigned_shards(lock, projection) == set(reserved_action.shard_ids)
     assert {

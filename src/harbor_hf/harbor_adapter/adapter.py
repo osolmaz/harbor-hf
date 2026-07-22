@@ -331,6 +331,14 @@ def resolve_native_trial_root(jobs_dir: Path, value: str) -> Path:
     return resolved
 
 
+def _matches_task_selector(
+    task: str, selector: str, available_tasks: dict[str, str]
+) -> bool:
+    if selector in available_tasks:
+        return task == selector
+    return fnmatch(task, selector)
+
+
 def build_execution_request(
     lock: RunLock,
     jobs_dir: Path,
@@ -344,14 +352,21 @@ def build_execution_request(
 ) -> HarborExecutionRequest:
     if attempts < 1 or concurrency < 1:
         raise WorkerError("Harbor attempts and concurrency must be positive")
+    available_tasks = lock.benchmark_task_digests
     resolved_task_digests = {
         task: digest
-        for task, digest in lock.benchmark_task_digests.items()
-        if any(fnmatch(task, selector) for selector in task_names)
+        for task, digest in available_tasks.items()
+        if any(
+            _matches_task_selector(task, selector, available_tasks)
+            for selector in task_names
+        )
     }
     if (
         any(
-            not any(fnmatch(task, selector) for task in lock.benchmark_task_digests)
+            not any(
+                _matches_task_selector(task, selector, available_tasks)
+                for task in available_tasks
+            )
             for selector in task_names
         )
         or expected_task_digests != resolved_task_digests
