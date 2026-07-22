@@ -286,6 +286,11 @@ class WaveLock(FrozenModel):
     estimated_cost_microusd: int = Field(default=0, ge=0)
     duration_seconds: int
     remote: RemoteExecutionSpec
+    recovery_parent_worker_revision: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+        exclude_if=lambda value: value is None,
+    )
     shard_ids: list[str]
     trial_ids: list[str] = Field(default_factory=list)
     runs: list[WaveRunLock]
@@ -334,6 +339,15 @@ class WaveLock(FrozenModel):
             raise ValueError("wave concurrency must be positive")
         if self.duration_seconds < 1:
             raise ValueError("wave duration must be positive")
+        return self
+
+    @model_validator(mode="after")
+    def recovery_worker_is_only_for_retries(self) -> WaveLock:
+        if (
+            self.recovery_parent_worker_revision is not None
+            and self.action_kind != "retry-shard"
+        ):
+            raise ValueError("only retry waves can pin a recovery worker revision")
         return self
 
 

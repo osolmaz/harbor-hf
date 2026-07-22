@@ -606,6 +606,19 @@ def _require_successful_judge_exchanges(exchanges: list[Path]) -> None:
         raise TrialEvidenceError("judge exchange did not complete successfully")
 
 
+def _ensure_single_judge_selection(
+    trial_root: Path,
+    exchanges: list[Path],
+    *,
+    judge_expected: bool,
+) -> None:
+    selection_path = trial_root / "verifier" / "judge-selection.json"
+    if not judge_expected or selection_path.exists() or len(exchanges) != 1:
+        return
+    selection = JudgeSelection(exchange_id=exchanges[0].parent.name)
+    _atomic_write_json(selection_path, selection.model_dump(mode="json"))
+
+
 def _collect_verifier_evidence(
     trial_root: Path,
     exchanges: list[Path],
@@ -722,6 +735,7 @@ def assemble_trial_evidence(
         execution_id=execution_id,
         trial_id=trial_id,
     )
+    _ensure_single_judge_selection(trial_root, exchanges, judge_expected=judge_expected)
     verifier = _collect_verifier_evidence(
         trial_root, exchanges, judge_expected=judge_expected
     )

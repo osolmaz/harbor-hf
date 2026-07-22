@@ -62,6 +62,7 @@ from harbor_hf.wave_worker import (
     _validate_evidence_trial_identity,
     _wave_model_name,
     run_wave_worker,
+    validate_wave_lock,
 )
 
 
@@ -1111,16 +1112,6 @@ def test_judged_wave_records_and_selects_exact_exchange(
             native = Path(config["jobs_dir"]) / "job/trial"
             (native / "agent" / "judge-route.log").write_text(
                 environment["AGENT_JUDGE_API_URL"], encoding="utf-8"
-            )
-            selection = native / "verifier/judge-selection.json"
-            selection.write_text(
-                json.dumps(
-                    {
-                        "schema_version": "harbor-hf/judge-selection/v1",
-                        "exchange_id": exchange_id,
-                    }
-                ),
-                encoding="utf-8",
             )
         return result
 
@@ -2552,6 +2543,32 @@ def _two_trial_wave(remote_spec: ExperimentSpec) -> tuple[CampaignLock, WaveLock
     )
     action = plan_reconciliation(campaign, [submitted])[1].actions[0]
     return campaign, build_wave_lock(campaign, spec, action)
+
+
+def test_retry_wave_accepts_explicit_recovery_worker_revision(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = _two_trial_spec(remote_spec)
+    campaign, wave = _two_trial_wave(remote_spec)
+    parent = wave.remote.worker.revision
+    recovery_worker = wave.remote.worker.model_copy(update={"revision": "b" * 40})
+    retry = wave.model_copy(
+        update={
+            "action_kind": "retry-shard",
+            "trial_ids": [campaign.runs[0].shards[0].trials[0].trial_id],
+            "remote": wave.remote.model_copy(update={"worker": recovery_worker}),
+            "recovery_parent_worker_revision": parent,
+        }
+    )
+
+    validate_wave_lock(spec, campaign, retry)
+
+    with pytest.raises(WorkerError, match="does not descend"):
+        validate_wave_lock(
+            spec,
+            campaign,
+            retry.model_copy(update={"recovery_parent_worker_revision": "c" * 40}),
+        )
 
 
 def _wave_inputs(

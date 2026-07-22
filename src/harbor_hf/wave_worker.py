@@ -318,6 +318,20 @@ def validate_wave_lock(
         expected = build_wave_lock(campaign, spec, action, endpoint=lock.endpoint)
     except ValueError as error:
         raise WorkerError(f"wave lock cannot be resolved: {error}") from error
+    if lock.recovery_parent_worker_revision is not None:
+        if (
+            lock.recovery_parent_worker_revision != expected.remote.worker.revision
+            or lock.remote.worker.repository != expected.remote.worker.repository
+        ):
+            raise WorkerError("recovery worker does not descend from the campaign pin")
+        expected = expected.model_copy(
+            update={
+                "remote": expected.remote.model_copy(
+                    update={"worker": lock.remote.worker}
+                ),
+                "recovery_parent_worker_revision": lock.recovery_parent_worker_revision,
+            }
+        )
     if lock != expected:
         raise WorkerError("wave lock fields do not match the campaign and manifest")
 
