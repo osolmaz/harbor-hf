@@ -59,6 +59,7 @@ from harbor_hf.wave_worker import (
     _remaining_seconds,
     _sandbox_failure_category,
     _valid_terminal_trial,
+    _validate_evidence_trial_identity,
     _wave_model_name,
     run_wave_worker,
 )
@@ -68,6 +69,50 @@ def test_verification_failure_is_terminal_benchmark_evidence() -> None:
     error = HarborVerificationFailure("task digest does not match")
 
     assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+@pytest.mark.parametrize(
+    "exception_type", ["RewardFileEmptyError", "RewardFileNotFoundError"]
+)
+def test_missing_or_empty_reward_is_terminal_benchmark_failure(
+    exception_type: str,
+) -> None:
+    error = HarborTrialFailure("verifier produced no reward", exception_type)
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_evidence_identity_accepts_internal_name_with_locked_digest(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events.jsonl"
+
+    _validate_evidence_trial_identity(
+        observed_name="task/internal-name",
+        observed_digest="sha256:" + "1" * 64,
+        expected_name="[DERPRECATED] public-name",
+        expected_digest="sha256:" + "1" * 64,
+        events=events,
+    )
+
+    event = json.loads(events.read_text())
+    assert event.pop("at")
+    assert event == {
+        "event": "evidence_task_name_resolved",
+        "locked_task_name": "[DERPRECATED] public-name",
+        "observed_task_name": "task/internal-name",
+    }
+
+
+def test_evidence_identity_rejects_wrong_digest(tmp_path: Path) -> None:
+    with pytest.raises(WorkerError, match="digest does not match"):
+        _validate_evidence_trial_identity(
+            observed_name="task/internal-name",
+            observed_digest="sha256:" + "2" * 64,
+            expected_name="public-name",
+            expected_digest="sha256:" + "1" * 64,
+            events=tmp_path / "events.jsonl",
+        )
 
 
 def test_wrapped_endpoint_server_error_without_log_remains_agent_failure() -> None:

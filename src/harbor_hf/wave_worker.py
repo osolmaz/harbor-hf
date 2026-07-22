@@ -1326,8 +1326,13 @@ def _assemble_execution_trial_evidence(
     if len(bundle.trials) != 1:
         raise WorkerError("campaign physical execution must contain one Harbor trial")
     native = bundle.trials[0]
-    if native.task_name != trial.task_name or native.task_digest != trial.task_digest:
-        raise WorkerError("Harbor evidence trial identity does not match campaign lock")
+    _validate_evidence_trial_identity(
+        observed_name=native.task_name,
+        observed_digest=native.task_digest,
+        expected_name=trial.task_name,
+        expected_digest=trial.task_digest,
+        events=execution_root / "events.jsonl",
+    )
     native_root = resolve_native_trial_root(jobs_dir, native.path)
     redacted = scrub_secret(native_root, known_secrets, allow_symlinks=True)
     if redacted:
@@ -1405,6 +1410,25 @@ def _revoke_trial_provider_route(
     )
 
 
+def _validate_evidence_trial_identity(
+    *,
+    observed_name: str,
+    observed_digest: str,
+    expected_name: str,
+    expected_digest: str,
+    events: Path,
+) -> None:
+    if observed_digest != expected_digest:
+        raise WorkerError("Harbor evidence trial digest does not match campaign lock")
+    if observed_name != expected_name:
+        append_event(
+            events,
+            "evidence_task_name_resolved",
+            observed_task_name=observed_name,
+            locked_task_name=expected_name,
+        )
+
+
 def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
@@ -1433,6 +1457,8 @@ def _harbor_trial_failure_category(
     error: HarborTrialFailure, evidence_root: Path | None
 ) -> RetryCategory:
     exception_type = error.exception_type.lower()
+    if exception_type in {"rewardfileemptyerror", "rewardfilenotfounderror"}:
+        return "benchmark"
     category = _retry_category_from_text(exception_type)
     if category is not None:
         return category
