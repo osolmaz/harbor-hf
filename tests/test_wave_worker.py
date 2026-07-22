@@ -1190,6 +1190,15 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         provider_concurrency=2,
     )
     monkeypatch.setenv("HF_TOKEN", "test-token")
+    start_proxy = ProviderEvidenceProxy.start
+
+    def start_proxy_on_ephemeral_port(
+        proxy: ProviderEvidenceProxy, *, host: str, port: int
+    ) -> str:
+        assert port == 8000
+        return start_proxy(proxy, host=host, port=0)
+
+    monkeypatch.setattr(ProviderEvidenceProxy, "start", start_proxy_on_ephemeral_port)
     runner = EndpointRunner([])
     routed_model = f"{spec.matrix.models[0].repo}:fastest"
     harbor = HarborStream(
