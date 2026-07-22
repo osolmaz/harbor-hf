@@ -8,7 +8,11 @@ from typing import Protocol, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from harbor_hf.campaigns import CampaignLock, WaveLock
+from harbor_hf.campaigns import (
+    CampaignLock,
+    WaveLock,
+    estimated_partial_wave_cost,
+)
 from harbor_hf.control import (
     CampaignEvent,
     EventKind,
@@ -380,11 +384,20 @@ def _wave_events(
         )
         or "hf-inference-endpoints"
     )
+    estimated_cost = wave.estimated_cost_microusd
+    if wave.action_kind == "retry-shard":
+        estimated_cost = estimated_partial_wave_cost(
+            campaign,
+            wave.deployment_digest,
+            estimated_cost,
+            len(wave.trial_ids),
+        )
+        assert estimated_cost is not None
     payload = WaveLifecyclePayload(
         deployment_digest=wave.deployment_digest,
         provider=provider,
         shard_ids=wave.shard_ids,
-        estimated_cost_microusd=wave.estimated_cost_microusd,
+        estimated_cost_microusd=estimated_cost,
     )
     active = _event_time(records, "wave_started")
     finished = _event_time(records, "wave_succeeded", "wave_failed")

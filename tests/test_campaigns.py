@@ -539,10 +539,19 @@ def test_retry_wave_locks_only_trials_admitted_by_its_action(
     action = _wave_action(campaign)
     trial_id = campaign.runs[0].shards[0].trials[0].trial_id
 
-    retry = action.model_copy(update={"kind": "retry-shard", "trial_ids": [trial_id]})
+    retry = action.model_copy(
+        update={
+            "kind": "retry-shard",
+            "trial_ids": [trial_id],
+            "estimated_cost_microusd": 1,
+        }
+    )
     lock = build_wave_lock(campaign, remote_spec, retry)
     assert lock.action_kind == "retry-shard"
     assert lock.trial_ids == [trial_id]
+    assert lock.estimated_cost_microusd == (
+        campaign.runs[0].estimated_wave_cost_microusd or 0
+    )
 
     with pytest.raises(ValueError, match="must admit at least one trial"):
         build_wave_lock(

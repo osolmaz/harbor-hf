@@ -1,6 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
-from harbor_hf.campaigns import CampaignLock, build_campaign_lock, build_campaign_plan
+from harbor_hf.campaigns import (
+    CampaignLock,
+    build_campaign_lock,
+    build_campaign_plan,
+    estimated_partial_wave_cost,
+)
 from harbor_hf.control import (
     ActionOutcomePayload,
     ActionReservedPayload,
@@ -17,7 +22,6 @@ from harbor_hf.reconciler import (
     AdmissionLimits,
     ReconcileAction,
     ReconcileContext,
-    _estimated_retry_cost,
     plan_reconciliation,
 )
 
@@ -322,7 +326,7 @@ def test_reconcile_closed_wave_routes_retryable_evidence_to_retry(
     retry = by_kind["retry-shard"]
     assert retry.shard_ids == [failed_shard]
     assert (
-        _estimated_retry_cost(lock, action.deployment_digest, 90_000_000, 1)
+        estimated_partial_wave_cost(lock, action.deployment_digest, 90_000_000, 1)
         == 45_000_000
     )
     assert plan.blocked[0].reason == "deployment-budget"

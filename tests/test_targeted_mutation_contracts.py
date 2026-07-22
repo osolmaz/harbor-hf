@@ -24,6 +24,7 @@ from harbor_hf.campaign_observer import (
     _legacy_failure_category,
     _wave_events,
 )
+from harbor_hf.campaigns import estimated_partial_wave_cost
 from harbor_hf.endpoints import (
     AmbiguousEndpointCreate,
     AmbiguousEndpointDelete,
@@ -225,6 +226,34 @@ def test_observer_wave_and_execution_event_projection_is_exact(
         "retry_after_seconds": None,
         "message": "provider connection reset",
     }
+
+
+def test_retry_wave_observation_records_prorated_cost(
+    remote_spec: ExperimentSpec,
+) -> None:
+    campaign = _campaign(remote_spec)
+    wave = _wave(campaign, remote_spec)
+    trial_id = campaign.runs[0].shards[0].trials[0].trial_id
+    retry = wave.model_copy(
+        update={
+            "action_kind": "retry-shard",
+            "trial_ids": [trial_id],
+            "estimated_cost_microusd": 765_432,
+        }
+    )
+    records: list[dict[str, object]] = [
+        {"event": "wave_started", "at": "2026-07-14T01:10:00+00:00"},
+        {"event": "wave_succeeded", "at": "2026-07-14T01:15:00+00:00"},
+        {"event": "endpoint_pause_requested", "at": "2026-07-14T01:16:00+00:00"},
+    ]
+
+    events = _wave_events(campaign, retry, "_SUCCESS", records)
+
+    assert events[0].payload.model_dump(mode="json")[
+        "estimated_cost_microusd"
+    ] == estimated_partial_wave_cost(
+        campaign, retry.deployment_digest, retry.estimated_cost_microusd, 1
+    )
 
 
 def test_provider_proxy_request_normalization_is_exact() -> None:

@@ -227,6 +227,41 @@ WaveDeploymentTarget = Annotated[
 ]
 
 
+def estimated_partial_wave_cost(
+    lock: CampaignLock,
+    deployment_digest: str,
+    estimated_wave_cost_microusd: int | None,
+    trial_count: int,
+) -> int | None:
+    if estimated_wave_cost_microusd is None:
+        return None
+    shard_sizes = sorted(
+        (
+            (shard.shard_id, len(shard.trials))
+            for run in lock.runs
+            if run.deployment_digest == deployment_digest
+            for shard in run.shards
+        ),
+        key=lambda item: item[0],
+    )
+    capacities = [
+        sum(
+            size
+            for _shard_id, size in shard_sizes[
+                offset : offset + lock.max_shards_per_wave
+            ]
+        )
+        for offset in range(0, len(shard_sizes), lock.max_shards_per_wave)
+    ]
+    capacity = max(capacities, default=0)
+    if capacity <= 0 or trial_count <= 0:
+        raise ValueError("partial wave cost requires a non-empty deployment wave")
+    return max(
+        1,
+        (estimated_wave_cost_microusd * trial_count + capacity - 1) // capacity,
+    )
+
+
 class WaveLock(FrozenModel):
     schema_version: Literal["harbor-hf/wave-lock/v1alpha1"] = (
         "harbor-hf/wave-lock/v1alpha1"
@@ -570,6 +605,12 @@ def build_wave_lock(
     }
     if set(action.trial_ids) - selected_trial_ids:
         raise ValueError("retry-shard action references trials outside its shards")
+    estimates = {
+        campaign_run.estimated_wave_cost_microusd for campaign_run, _shards in selected
+    }
+    if len(estimates) != 1:
+        raise ValueError("compatible wave shards must use one spend estimate")
+    locked_wave_estimate = estimates.pop() or 0
     run_locks: list[WaveRunLock] = []
     target: EndpointWaveTarget | ProviderWaveTarget | None = None
     requested_endpoint = endpoint
@@ -647,7 +688,7 @@ def build_wave_lock(
             if provider_target is not None
             else None
         ),
-        estimated_cost_microusd=action.estimated_cost_microusd or 0,
+        estimated_cost_microusd=locked_wave_estimate,
         duration_seconds=spec.execution.timeout_seconds,
         remote=spec.remote,
         shard_ids=action.shard_ids,
