@@ -597,6 +597,8 @@ class CampaignStore(Protocol):
 
     def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool: ...
 
+    def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool: ...
+
     def ensure_events_unless_cancelled(
         self, campaign_id: str, events: list[CampaignEvent]
     ) -> bool: ...
@@ -777,6 +779,35 @@ class HubCampaignStore:
                         )
                     ],
                     commit_message=f"chore: record {event.kind}",
+                    repo_type="dataset",
+                    revision="main",
+                    parent_commit=head,
+                )
+                return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool:
+        """Append a batch of events once in one control repository commit."""
+        expected_by_path = _event_payloads(campaign_id, events)
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            missing = self._missing_events(expected_by_path, head)
+            if not missing:
+                return False
+            try:
+                self.api.create_commit(
+                    self.repository,
+                    [
+                        CommitOperationAdd(
+                            path_in_repo=path,
+                            path_or_fileobj=_json_bytes(expected),
+                        )
+                        for path, expected in missing.items()
+                    ],
+                    commit_message="chore: record observed campaign events",
                     repo_type="dataset",
                     revision="main",
                     parent_commit=head,
@@ -1100,6 +1131,27 @@ def _validate_event_scope(campaign_id: str, event: CampaignEvent) -> None:
         raise ValueError("event campaign scope is invalid")
     if event.subject_type == "campaign" and event.subject_id != campaign_id:
         raise ValueError("campaign event subject does not match its scope")
+
+
+def _event_payloads(
+    campaign_id: str, events: list[CampaignEvent]
+) -> dict[str, dict[str, JsonValue]]:
+    if not events:
+        raise ValueError("event commit requires at least one event")
+    for event in events:
+        _validate_event_scope(campaign_id, event)
+        if event.kind in {
+            "campaign.cancel-requested",
+            "campaign.manual-intervention-resolved",
+        }:
+            raise ValueError(f"{event.kind} requires its dedicated atomic operation")
+    expected_by_path = {
+        _event_path(campaign_id, event.event_id): event.model_dump(mode="json")
+        for event in events
+    }
+    if len(expected_by_path) != len(events):
+        raise CampaignConflict("events contain duplicate identities")
+    return expected_by_path
 
 
 def _guarded_event_payloads(

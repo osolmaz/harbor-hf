@@ -117,6 +117,7 @@ class FakeStore:
         self.reservations: dict[str, dict[str, JsonValue]] = {}
         self.win_reservations = True
         self.load_campaign_calls: list[str] = []
+        self.ensure_events_calls: list[list[CampaignEvent]] = []
 
     def create_campaign(
         self, lock: CampaignLock, request: bytes, event: CampaignEvent
@@ -152,6 +153,13 @@ class FakeStore:
             return False
         self.events.append(event)
         return True
+
+    def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool:
+        self.ensure_events_calls.append(list(events))
+        changed = False
+        for event in events:
+            changed = self.ensure_event(campaign_id, event) or changed
+        return changed
 
     def ensure_events_unless_cancelled(
         self, campaign_id: str, events: list[CampaignEvent]
@@ -1195,6 +1203,7 @@ def test_apply_observes_durable_event_reloads_and_uses_refreshed_projection(
 
     assert interactions[0] == ("observe", lock, remote_spec)
     assert store.load_campaign_calls == [lock.campaign_id, lock.campaign_id]
+    assert store.ensure_events_calls == [[observed]]
     assert observed in store.events
     assert result.plan.terminal_decision is not None
     assert result.plan.terminal_decision.status == "completed"

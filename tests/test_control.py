@@ -510,6 +510,36 @@ def test_hub_store_ensures_identical_event_once(
         store.ensure_event(lock.campaign_id, conflicting)
 
 
+def test_hub_store_ensures_observed_events_in_one_commit(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    events = [
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="campaign.draining",
+            producer="wave-controller",
+            payload=LifecyclePayload(message=f"observation {index}"),
+            identifier=lambda index=index: f"{index:032x}",
+        )
+        for index in (2, 3)
+    ]
+    initial_commits = len(api.commits)
+
+    assert store.ensure_events(lock.campaign_id, events)
+    assert len(api.commits) == initial_commits + 1
+    assert not store.ensure_events(lock.campaign_id, events)
+    assert len(api.commits) == initial_commits + 1
+    assert all(
+        f"campaigns/{lock.campaign_id}/events/{event.event_id}.json" in api.files
+        for event in events
+    )
+
+
 def test_hub_store_rejects_resolution_missing_a_current_cleanup_failure(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:

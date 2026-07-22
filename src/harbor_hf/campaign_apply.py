@@ -385,9 +385,9 @@ class CampaignReconciler:
         )
         if self.observer is not None and not terminal_recorded:
             observed = self.observer.observe(lock, spec)
-            changed = False
-            for event in observed:
-                changed = self.store.ensure_event(campaign_id, event) or changed
+            changed = (
+                self.store.ensure_events(campaign_id, observed) if observed else False
+            )
             if changed:
                 lock, events = self.store.load_campaign(campaign_id)
         self._last_observed_at = max(event.observed_at for event in events)
