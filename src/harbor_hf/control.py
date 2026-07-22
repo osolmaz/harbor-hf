@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from harbor_hf.coordination import coordination_repository
 
 _MAX_COMMIT_ATTEMPTS = 8
 _MAX_EVENT_BATCH_OPERATIONS = 50
+_MAX_CONTROL_READ_WORKERS = 20
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.draining",
@@ -687,10 +689,12 @@ class HubCampaignStore:
             )
             if path.startswith(prefix) and path.endswith(".json")
         )
-        return [
-            CampaignEvent.model_validate(self._read_json(path, revision))
-            for path in paths
-        ]
+
+        def load(path: str) -> CampaignEvent:
+            return CampaignEvent.model_validate(self._read_json(path, revision))
+
+        with ThreadPoolExecutor(max_workers=_MAX_CONTROL_READ_WORKERS) as executor:
+            return list(executor.map(load, paths))
 
     def load_request(self, campaign_id: str) -> bytes:
         head = self._head()
