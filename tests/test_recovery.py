@@ -354,6 +354,8 @@ def test_reserved_retry_targets_are_excluded_from_later_retry_wave(
         ("configuration", "failed_infrastructure"),
         ("authentication", "failed_infrastructure"),
         ("cleanup", "failed_infrastructure"),
+        ("agent", "invalid"),
+        ("benchmark", "invalid"),
     ],
 )
 def test_terminal_failure_categories_never_retry(
@@ -374,40 +376,24 @@ def test_terminal_failure_categories_never_retry(
     assert all(action.kind != "retry-shard" for action in plan.actions)
 
 
-def test_benchmark_failure_retries_then_becomes_scored_invalid(
+def test_benchmark_failure_is_immediately_scored_invalid(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock, submitted = _campaign(remote_spec)
-    first = _execution_events(
+    failed = _execution_events(
         lock, 2, execution_id="execution-one", attempt=1, category="benchmark"
     )
 
-    projected = project_recovery(lock, [submitted, *first])
-    retry_at = next(iter(projected.trials.values())).retry_not_before
-    assert retry_at is not None
-    _projection, retry = plan_reconciliation(lock, [submitted, *first], now=retry_at)
-    assert [action.kind for action in retry.actions] == ["retry-shard"]
+    projection, plan = plan_reconciliation(
+        lock, [submitted, *failed], now=NOW + timedelta(days=1)
+    )
 
-    exhausted_lock, exhausted_submitted = _campaign(
-        remote_spec, max_physical_executions_per_trial=1
-    )
-    exhausted = _execution_events(
-        exhausted_lock,
-        2,
-        execution_id="execution-one",
-        attempt=1,
-        category="benchmark",
-    )
-    exhausted_projection, exhausted_plan = plan_reconciliation(
-        exhausted_lock,
-        [exhausted_submitted, *exhausted],
-        now=NOW + timedelta(days=1),
-    )
-    exhausted_trial = next(iter(exhausted_projection.trials.values()))
-    assert exhausted_trial.status == "invalid"
-    assert exhausted_trial.outcome == "benchmark_failed"
-    assert exhausted_plan.terminal_decision is not None
-    assert exhausted_plan.terminal_decision.status == "failed"
+    trial = next(iter(projection.trials.values()))
+    assert trial.status == "invalid"
+    assert trial.outcome == "benchmark_failed"
+    assert all(action.kind != "retry-shard" for action in plan.actions)
+    assert plan.terminal_decision is not None
+    assert plan.terminal_decision.status == "failed"
 
 
 @pytest.mark.parametrize(
@@ -1189,7 +1175,7 @@ def test_spend_cap_exhausts_retryable_trials_without_another_wave(
         3,
         execution_id="execution-one",
         attempt=1,
-        category="benchmark",
+        category="evidence",
     )
     events = [
         submitted,
@@ -1227,14 +1213,14 @@ def test_grouped_retries_share_one_provisional_admission(
             2,
             execution_id="execution-one",
             attempt=1,
-            category="benchmark",
+            category="evidence",
         ),
         *_execution_events(
             lock,
             4,
             execution_id="execution-two",
             attempt=1,
-            category="benchmark",
+            category="evidence",
             shard_index=1,
         ),
     ]
@@ -1268,7 +1254,7 @@ def test_mutable_estimate_cannot_irreversibly_exhaust_a_retry(
         3,
         execution_id="execution-one",
         attempt=1,
-        category="benchmark",
+        category="evidence",
     )
     events = [
         submitted,

@@ -1330,10 +1330,7 @@ def test_apply_context_admission_usage_blocks_new_billable_action(
 
 @pytest.mark.parametrize(
     ("category", "expected_status", "expected_outcome"),
-    [
-        ("benchmark", "invalid", "benchmark_failed"),
-        ("transient", "failed_infrastructure", "infrastructure_exhausted"),
-    ],
+    [("transient", "failed_infrastructure", "infrastructure_exhausted")],
 )
 def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     remote_spec: ExperimentSpec,

@@ -84,8 +84,6 @@ _RETRYABLE_CATEGORIES = {
     "rate-limit",
     "ambiguous",
     "evidence",
-    "agent",
-    "benchmark",
 }
 _TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure", "cancelled"}
 _SCORED_TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure"}
@@ -938,6 +936,8 @@ def _failed_trial_state(
     lock: CampaignLock, execution: ExecutionProjection, execution_count: int
 ) -> tuple[TrialStatus, datetime | None]:
     category = execution.category
+    if category in {"agent", "benchmark"}:
+        return "invalid", None
     if category not in _RETRYABLE_CATEGORIES:
         return "failed_infrastructure", None
     if execution_count >= lock.recovery_policy.max_physical_executions_per_trial:
