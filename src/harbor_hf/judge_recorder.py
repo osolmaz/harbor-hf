@@ -33,8 +33,17 @@ _ALLOWED_REQUEST_HEADERS = frozenset(
         "user-agent",
     }
 )
+_HF_JUDGE_URL = "https://router.huggingface.co/v1/chat/completions"
+_OPENAI_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
+_ALLOWED_JUDGE_PROVIDERS = {
+    _HF_JUDGE_URL: "hf-inference-provider",
+    _OPENAI_JUDGE_URL: "openai-api",
+}
+_ALLOWED_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 _ALLOWED_REQUEST_FIELDS = frozenset(
-    {"messages", "model", "response_format", "temperature"}
+    {"messages", "model", "reasoning_effort", "response_format", "temperature"}
 )
 _ALLOWED_RESPONSE_HEADERS = frozenset(
     {
@@ -100,6 +109,45 @@ class JudgeRecorderSummary(FrozenModel):
         return self
 
 
+JudgeProvider = Literal["hf-inference-provider", "openai-api"]
+JudgeUpstreamUrl = Literal[
+    "https://router.huggingface.co/v1/chat/completions",
+    "https://api.openai.com/v1/chat/completions",
+]
+JudgeTransformation = Literal["none", "model_enforced", "parameters_enforced"]
+
+
+def _enforce_request_parameters(
+    *,
+    received: bytes,
+    payload: dict[str, object],
+    model: str,
+    reasoning_effort: str | None,
+    strip_temperature: bool,
+) -> tuple[bytes, JudgeTransformation]:
+    model_changed = payload.get("model") != model
+    reasoning_changed = (
+        reasoning_effort is not None
+        and payload.get("reasoning_effort") != reasoning_effort
+    )
+    temperature_changed = strip_temperature and "temperature" in payload
+    if model_changed:
+        payload["model"] = model
+    if reasoning_changed:
+        payload["reasoning_effort"] = reasoning_effort
+    if temperature_changed:
+        del payload["temperature"]
+    if not (model_changed or reasoning_changed or temperature_changed):
+        return received, "none"
+    forwarded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    transformation: JudgeTransformation = (
+        "parameters_enforced"
+        if reasoning_changed or temperature_changed
+        else "model_enforced"
+    )
+    return forwarded, transformation
+
+
 class JudgeExchange(FrozenModel):
     schema_version: Literal["harbor-hf/judge-exchange/v1"] = (
         "harbor-hf/judge-exchange/v1"
@@ -108,13 +156,11 @@ class JudgeExchange(FrozenModel):
     execution_id: str
     trial_id: str
     attempt: int = Field(ge=1)
-    provider: Literal["hf-inference-provider"] = "hf-inference-provider"
-    upstream_url: Literal["https://router.huggingface.co/v1/chat/completions"] = (
-        "https://router.huggingface.co/v1/chat/completions"
-    )
+    provider: JudgeProvider = "hf-inference-provider"
+    upstream_url: JudgeUpstreamUrl = _HF_JUDGE_URL
     requested_model: str | None
     forwarded_model: str
-    transformation: Literal["none", "model_enforced"]
+    transformation: JudgeTransformation
     request_received_headers: dict[str, str]
     request_forwarded_headers: dict[str, str]
     request_received: BodyReference
@@ -132,6 +178,12 @@ class JudgeExchange(FrozenModel):
     outcome: Literal["success", "upstream_error", "transport_error", "recorder_error"]
     error_type: str | None = Field(default=None, max_length=200)
     error_message: str | None = Field(default=None, max_length=400)
+
+    @model_validator(mode="after")
+    def provider_is_consistent(self) -> JudgeExchange:
+        if _ALLOWED_JUDGE_PROVIDERS[self.upstream_url] != self.provider:
+            raise ValueError("judge provider disagrees with upstream URL")
+        return self
 
     @model_validator(mode="after")
     def identity_and_time_are_consistent(self) -> JudgeExchange:
@@ -199,6 +251,9 @@ class JudgeEvidenceRecorder:
         self,
         *,
         token: str,
+        upstream_url: JudgeUpstreamUrl = _HF_JUDGE_URL,
+        reasoning_effort: str | None = None,
+        strip_temperature: bool = False,
         client: httpx.Client | None = None,
         capability_factory: Callable[[], str] | None = None,
         deadline: float | None = None,
@@ -206,7 +261,15 @@ class JudgeEvidenceRecorder:
     ) -> None:
         if not token:
             raise ValueError("judge recorder token must not be empty")
+        if upstream_url not in _ALLOWED_JUDGE_PROVIDERS:
+            raise ValueError("judge recorder upstream URL is not allowed")
+        if reasoning_effort not in {None, *_ALLOWED_REASONING_EFFORTS}:
+            raise ValueError("judge recorder reasoning effort is not allowed")
         self._token = token
+        self._upstream_url = upstream_url
+        self._provider = _ALLOWED_JUDGE_PROVIDERS[upstream_url]
+        self._reasoning_effort = reasoning_effort
+        self._strip_temperature = strip_temperature
         self._client = client or httpx.Client(headers={"Accept-Encoding": "identity"})
         self._owns_client = client is None
         self._capability_factory = capability_factory or (
@@ -361,7 +424,7 @@ class JudgeEvidenceRecorder:
         received = b""
         forwarded = b""
         requested_model: str | None = None
-        transformation: Literal["none", "model_enforced"] = "none"
+        transformation: JudgeTransformation = "none"
         response: httpx.Response | None = None
         request_received_headers = _allow_headers(
             handler.headers, _ALLOWED_REQUEST_HEADERS
@@ -382,14 +445,13 @@ class JudgeEvidenceRecorder:
             requested_model = (
                 payload.get("model") if isinstance(payload.get("model"), str) else None
             )
-            if requested_model != scope.model:
-                payload["model"] = scope.model
-                forwarded = json.dumps(
-                    payload, separators=(",", ":"), ensure_ascii=False
-                ).encode()
-                transformation = "model_enforced"
-            else:
-                forwarded = received
+            forwarded, transformation = _enforce_request_parameters(
+                received=received,
+                payload=payload,
+                model=scope.model,
+                reasoning_effort=self._reasoning_effort,
+                strip_temperature=self._strip_temperature,
+            )
             _assert_secret_absent(forwarded, scope.secrets)
             exchange_id, attempt = self._allocate(scope)
             response = self._upstream(forwarded, scope)
@@ -459,7 +521,7 @@ class JudgeEvidenceRecorder:
         exchange_id: str | None,
         attempt: int | None,
         requested_model: str | None,
-        transformation: Literal["none", "model_enforced"],
+        transformation: JudgeTransformation,
         received: bytes,
         forwarded: bytes,
         request_received_headers: dict[str, str],
@@ -533,7 +595,7 @@ class JudgeEvidenceRecorder:
             raise JudgeRecorderError("judge request deadline expired")
         request = self._client.build_request(
             "POST",
-            "https://router.huggingface.co/v1/chat/completions",
+            self._upstream_url,
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Content-Type": "application/json",
@@ -563,7 +625,7 @@ class JudgeEvidenceRecorder:
         exchange_id: str,
         attempt: int,
         requested_model: str | None,
-        transformation: Literal["none", "model_enforced"],
+        transformation: JudgeTransformation,
         received: bytes,
         forwarded: bytes,
         request_received_headers: dict[str, str],
@@ -614,6 +676,8 @@ class JudgeEvidenceRecorder:
                 execution_id=scope.execution_id,
                 trial_id=scope.trial_id,
                 attempt=attempt,
+                provider=self._provider,
+                upstream_url=self._upstream_url,
                 requested_model=requested_model,
                 forwarded_model=scope.model,
                 transformation=transformation,

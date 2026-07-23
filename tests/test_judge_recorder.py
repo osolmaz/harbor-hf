@@ -114,6 +114,71 @@ def test_records_exact_bodies_and_enforces_model(tmp_path: Path) -> None:
         verify_judge_exchange(exchange)
 
 
+def test_records_openai_reasoning_overrides(tmp_path: Path) -> None:
+    observed: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=b'{"choices":[{"message":{"content":"ok"}}]}',
+        )
+
+    recorder = JudgeEvidenceRecorder(
+        token="openai-secret-token",
+        upstream_url="https://api.openai.com/v1/chat/completions",
+        reasoning_effort="xhigh",
+        strip_temperature=True,
+        client=httpx.Client(transport=httpx.MockTransport(upstream)),
+        capability_factory=lambda: "o" * 32,
+    )
+    base = recorder.start(host="127.0.0.1", port=0)
+    destination = tmp_path / "judge"
+    capability = recorder.register_scope(
+        execution_id="exec",
+        trial_id="trial",
+        model="gpt-5.6-luna",
+        destination=destination,
+        policy=_policy(),
+    )
+    try:
+        status, _, _ = _request(
+            recorder.scoped_url(base, capability),
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "grade"}],
+                "temperature": 0,
+            },
+        )
+    finally:
+        recorder.close()
+
+    assert status == 200
+    assert observed[0].url == "https://api.openai.com/v1/chat/completions"
+    forwarded = json.loads(observed[0].content)
+    assert forwarded["reasoning_effort"] == "xhigh"
+    assert "temperature" not in forwarded
+    exchange = verify_judge_exchange(destination / "judge-0001")
+    assert exchange.provider == "openai-api"
+    assert exchange.upstream_url == "https://api.openai.com/v1/chat/completions"
+    assert exchange.transformation == "parameters_enforced"
+    assert "openai-secret-token" not in "".join(
+        path.read_text(errors="ignore")
+        for path in (destination / "judge-0001").iterdir()
+    )
+
+
+def test_rejects_invalid_upstream_and_reasoning_configuration() -> None:
+    with pytest.raises(ValueError, match="upstream URL"):
+        JudgeEvidenceRecorder(
+            token="token",
+            upstream_url="https://example.com/v1/chat/completions",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="reasoning effort"):
+        JudgeEvidenceRecorder(token="token", reasoning_effort="ultra")
+
+
 def test_rejects_streaming_without_upstream_call(tmp_path: Path) -> None:
     calls = 0
 
