@@ -142,8 +142,9 @@ def test_write_fixed_zero_is_append_only(tmp_path: Path) -> None:
     plan = ReassessmentPlan.model_validate_json(json.dumps(payload))
     trial = plan.trials[0]
     source = tmp_path / "source"
-    source.mkdir()
-    (source / "checksums.json").write_text("{}\n")
+    source_execution = source / "executions" / trial.source_execution_id
+    source_execution.mkdir(parents=True)
+    (source_execution / "checksums.json").write_text("{}\n")
     output = tmp_path / "output"
 
     _write_fixed_zero(output, trial, source, plan)

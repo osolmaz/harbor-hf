@@ -207,14 +207,17 @@ def _source_trial_root(evidence_root: Path, trial: ReassessmentTrial) -> Path:
         or root.resolve().is_relative_to(evidence_root.resolve()) is False
     ):
         raise ReassessmentError("source trial root is missing or unsafe")
-    lock = json.loads((root / "trial.lock.json").read_text())
-    summary = json.loads((root / "trial-summary.json").read_text())
+    execution_lock = json.loads(
+        (
+            root / "executions" / trial.source_execution_id / "execution.lock.json"
+        ).read_text()
+    )
     if (
-        lock.get("trial_id") != trial.trial_id
-        or lock.get("task_name") != trial.task_name
-        or lock.get("task_digest") != trial.task_digest
-        or lock.get("logical_attempt") != trial.logical_attempt
-        or summary.get("execution_id") != trial.source_execution_id
+        execution_lock.get("execution_id") != trial.source_execution_id
+        or execution_lock.get("trial_id") != trial.trial_id
+        or execution_lock.get("task_name") != trial.task_name
+        or execution_lock.get("task_digest") != trial.task_digest
+        or execution_lock.get("logical_attempt") != trial.logical_attempt
     ):
         raise ReassessmentError("source trial identity disagrees with plan")
     return root
@@ -428,7 +431,12 @@ def _write_fixed_zero(
             "task_name": trial.task_name,
             "logical_attempt": trial.logical_attempt,
             "source_execution_id": trial.source_execution_id,
-            "source_trial_checksum": _sha256(source_trial_root / "checksums.json"),
+            "source_execution_checksum": _sha256(
+                source_trial_root
+                / "executions"
+                / trial.source_execution_id
+                / "checksums.json"
+            ),
             "action": "fixed_zero",
             "reward": 0.0,
             "strict_pass": False,
