@@ -286,7 +286,9 @@ class JudgeEvidenceRecorder:
         self._counts: dict[str, int] = {}
         self._rejections: dict[str, int] = {}
         self._rejection_errors: dict[str, list[str]] = {}
+        self._active_calls: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -337,6 +339,7 @@ class JudgeEvidenceRecorder:
             self._counts.clear()
             self._rejections.clear()
             self._rejection_errors.clear()
+            self._active_calls.clear()
         if self._owns_client:
             self._client.close()
 
@@ -383,19 +386,27 @@ class JudgeEvidenceRecorder:
                     self._counts[execution_id] = 0
                     self._rejections[execution_id] = 0
                     self._rejection_errors[execution_id] = []
+                    self._active_calls[execution_id] = 0
                     return capability
         raise JudgeRecorderError("judge capability generation collided")
 
     def revoke_scope(self, capability: str) -> None:
-        with self._lock:
+        with self._idle:
             scope = self._scopes.pop(capability, None)
-            count = self._counts.pop(scope.execution_id, 0) if scope else 0
-            rejected = self._rejections.pop(scope.execution_id, 0) if scope else 0
-            rejected_errors = (
-                self._rejection_errors.pop(scope.execution_id, []) if scope else []
-            )
-        if scope is None:
-            return
+            if scope is None:
+                return
+            deadline = self._monotonic() + scope.policy.judge_timeout_seconds + 5
+            while self._active_calls.get(scope.execution_id, 0):
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise JudgeRecorderError(
+                        "judge scope remained active after deadline"
+                    )
+                self._idle.wait(timeout=remaining)
+            self._active_calls.pop(scope.execution_id, None)
+            count = self._counts.pop(scope.execution_id, 0)
+            rejected = self._rejections.pop(scope.execution_id, 0)
+            rejected_errors = self._rejection_errors.pop(scope.execution_id, [])
         summary = JudgeRecorderSummary(
             execution_id=scope.execution_id,
             trial_id=scope.trial_id,
@@ -429,6 +440,7 @@ class JudgeEvidenceRecorder:
         if scope is None:
             self._send_error(handler, 404, "unsupported judge route")
             return
+        self._begin_call(scope)
         started_at = datetime.now(UTC)
         started = perf_counter()
         exchange_id: str | None = None
@@ -524,6 +536,8 @@ class JudgeEvidenceRecorder:
                 started=started,
                 error=error,
             )
+        finally:
+            self._finish_call(scope)
 
     def _handle_failure(
         self,
@@ -582,6 +596,18 @@ class JudgeEvidenceRecorder:
             self._send_error(handler, 502, "judge evidence recording failed")
             return
         self._send(handler, 502, error_body, delivered_headers)
+
+    def _begin_call(self, scope: _Scope) -> None:
+        with self._idle:
+            self._active_calls[scope.execution_id] = (
+                self._active_calls.get(scope.execution_id, 0) + 1
+            )
+
+    def _finish_call(self, scope: _Scope) -> None:
+        with self._idle:
+            active = self._active_calls.get(scope.execution_id, 0)
+            self._active_calls[scope.execution_id] = max(0, active - 1)
+            self._idle.notify_all()
 
     def _record_rejection(self, scope: _Scope, error: Exception) -> None:
         with self._lock:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from harbor_hf.reassessment import (
     ReassessmentTrial,
     _assert_secrets_absent,
     _checksums,
+    _prepare_verifier_tests,
     _publish_success,
     _retain_failed_attempt,
     _reward,
@@ -44,6 +46,7 @@ def _plan_payload() -> dict[str, object]:
             "strip_temperature": True,
             "api_key_secret_name": "OPENAI_API_KEY",
         },
+        "verifier_judge_timeout_seconds": 900,
         "harbor_hf_revision": "d" * 40,
         "benchmark_repository": "ShellBench/public-tasks",
         "benchmark_revision": "e" * 40,
@@ -114,6 +117,11 @@ def test_reward_prefers_strict_score_and_bounds_values(tmp_path: Path) -> None:
     )
     with pytest.raises(ReassessmentError, match="bounded reward"):
         _reward(verifier)
+    (verifier / "agent_judge_results.json").write_text(
+        json.dumps({"status": "infra_error", "reward": 0.0})
+    )
+    with pytest.raises(ReassessmentError, match="infrastructure error"):
+        _reward(verifier)
 
 
 def test_secret_scan_and_checksums_fail_closed(tmp_path: Path) -> None:
@@ -127,6 +135,25 @@ def test_secret_scan_and_checksums_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "unsafe.txt").write_text("contains-secret")
     with pytest.raises(ReassessmentError, match="known secret"):
         _assert_secrets_absent(tmp_path, ("secret",))
+
+
+def test_verifier_timeout_transform_is_recorded(tmp_path: Path) -> None:
+    task = tmp_path / "task"
+    tests = task / "tests"
+    tests.mkdir(parents=True)
+    (tests / "judge.py").write_text(
+        "urllib.request.urlopen(request, timeout=120)\n"
+        "urllib.request.urlopen(local_request, timeout=5)\n"
+    )
+    transformed, metadata = _prepare_verifier_tests(task, 900, "a" * 40)
+    try:
+        content = (transformed / "judge.py").read_text()
+        assert "timeout=900" in content
+        assert "timeout=5" in content
+        assert metadata["timeout_replacement_count"] == 1
+        assert metadata["source_tree_digest"] != metadata["effective_tree_digest"]
+    finally:
+        shutil.rmtree(transformed.parent)
 
 
 def test_failed_attempt_is_preserved_before_retry_success(tmp_path: Path) -> None:

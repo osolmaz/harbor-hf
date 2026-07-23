@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import tarfile
@@ -109,6 +110,7 @@ class ReassessmentPlan(FrozenModel):
     created_at: datetime
     source: SourceEvaluation
     judge: ReassessmentJudge
+    verifier_judge_timeout_seconds: Literal[900] = 900
     harbor_hf_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     benchmark_repository: Literal["ShellBench/public-tasks"] = "ShellBench/public-tasks"
     benchmark_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -232,6 +234,51 @@ def _source_native_trial(source_trial_root: Path, trial: ReassessmentTrial) -> P
     return matches[0]
 
 
+def _tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return "sha256:" + digest.hexdigest()
+
+
+def _prepare_verifier_tests(
+    task_root: Path, timeout_seconds: int, benchmark_revision: str
+) -> tuple[Path, dict[str, object]]:
+    source = task_root / "tests"
+    destination = Path(tempfile.mkdtemp(prefix="harbor-hf-reassessment-tests-"))
+    copied = destination / "tests"
+    shutil.copytree(source, copied, symlinks=True)
+    source_digest = _tree_digest(copied)
+    replacements = 0
+    pattern = re.compile(rb"(urlopen\([^\n]*?timeout\s*=\s*)(60|90|120)(\b)")
+    for path in copied.rglob("*.py"):
+        content = path.read_bytes()
+        transformed, count = pattern.subn(
+            lambda match: (
+                match.group(1) + str(timeout_seconds).encode() + match.group(3)
+            ),
+            content,
+        )
+        if count:
+            path.write_bytes(transformed)
+            replacements += count
+    return copied, {
+        "schema_version": "harbor-hf/verifier-source/v1",
+        "benchmark_revision": benchmark_revision,
+        "source_tree_digest": source_digest,
+        "effective_tree_digest": _tree_digest(copied),
+        "judge_timeout_seconds": timeout_seconds,
+        "timeout_replacement_count": replacements,
+    }
+
+
 def _make_tar_gz(source: Path) -> Path:
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as handle:
         target = Path(handle.name)
@@ -304,24 +351,31 @@ def _download_tree(sandbox: Sandbox, source: str, destination: Path) -> None:
             archive.extractall(destination, filter="data")
 
 
+def _payload_reward(payload: dict[str, object]) -> float | None:
+    if payload.get("status") == "infra_error":
+        raise ReassessmentError("reassessment verifier reported infrastructure error")
+    for key in (
+        "normal_plus_safety_score",
+        "combined_score",
+        "reward",
+        "normal_plus_safety_pass",
+        "combined_pass",
+    ):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, int | float) and 0 <= float(value) <= 1:
+            return float(value)
+    return None
+
+
 def _reward(verifier_dir: Path) -> float:
     result_path = verifier_dir / "agent_judge_results.json"
     reward_path = verifier_dir / "reward.txt"
     if result_path.is_file():
-        payload = json.loads(result_path.read_text())
-        for key in (
-            "normal_plus_safety_score",
-            "combined_score",
-            "reward",
-            "normal_plus_safety_pass",
-            "combined_pass",
-        ):
-            if key in payload:
-                value = payload[key]
-                if isinstance(value, bool):
-                    return float(value)
-                if isinstance(value, int | float) and 0 <= float(value) <= 1:
-                    return float(value)
+        value = _payload_reward(json.loads(result_path.read_text()))
+        if value is not None:
+            return value
     if reward_path.is_file():
         value = float(reward_path.read_text().strip())
         if 0 <= value <= 1:
@@ -453,6 +507,11 @@ def _require_directory(path: Path, label: str) -> None:
         raise ReassessmentError(label)
 
 
+def _remove_optional_tree(path: Path | None) -> None:
+    if path is not None:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def _write_fixed_zero(
     output_root: Path,
     trial: ReassessmentTrial,
@@ -518,6 +577,7 @@ def _execute_rejudge(
     capability: str | None = None
     capability_secret = ""
     sandbox: Sandbox | None = None
+    prepared_tests: Path | None = None
     started = time.monotonic()
     failure: Exception | None = None
     try:
@@ -559,7 +619,14 @@ def _execute_rejudge(
             code, stdout, stderr, "reassessment sandbox reset failed"
         )
         _upload_tree(sandbox, app, "/app")
-        _upload_tree(sandbox, task_root / "tests", "/tests")
+        tests, verifier_source = _prepare_verifier_tests(
+            task_root,
+            plan.verifier_judge_timeout_seconds,
+            plan.benchmark_revision,
+        )
+        prepared_tests = tests.parent
+        _upload_tree(sandbox, tests, "/tests")
+        _json_atomic(staging / "verifier-source.json", verifier_source)
         verifier_env = {
             "AGENT_JUDGE_API_URL": judge_url,
             "AGENT_JUDGE_MODEL": plan.judge.model,
@@ -627,6 +694,7 @@ def _execute_rejudge(
             with suppress(Exception):
                 sandbox.kill()
         shutil.rmtree(restored, ignore_errors=True)
+        _remove_optional_tree(prepared_tests)
         if failure is not None:
             _retain_failed_attempt(
                 staging=staging,

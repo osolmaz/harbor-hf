@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 import urllib.error
 import urllib.request
 from email.message import Message
@@ -178,6 +179,54 @@ def test_rejects_invalid_upstream_and_reasoning_configuration() -> None:
         )
     with pytest.raises(ValueError, match="reasoning effort"):
         JudgeEvidenceRecorder(token="token", reasoning_effort="ultra")
+
+
+def test_revoke_waits_for_inflight_exchange(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        started.set()
+        assert release.wait(timeout=5)
+        return httpx.Response(200, content=b"{}")
+
+    recorder = JudgeEvidenceRecorder(
+        token="token",
+        client=httpx.Client(transport=httpx.MockTransport(upstream)),
+        capability_factory=lambda: "w" * 32,
+    )
+    base = recorder.start(host="127.0.0.1", port=0)
+    destination = tmp_path / "judge"
+    capability = recorder.register_scope(
+        execution_id="exec",
+        trial_id="trial",
+        model="judge",
+        destination=destination,
+        policy=_policy(),
+    )
+    request = threading.Thread(
+        target=lambda: _request(
+            recorder.scoped_url(base, capability),
+            {"model": "judge", "messages": []},
+        )
+    )
+    request.start()
+    assert started.wait(timeout=5)
+    revoked = threading.Event()
+    revoke = threading.Thread(
+        target=lambda: (recorder.revoke_scope(capability), revoked.set())
+    )
+    revoke.start()
+    assert not revoked.wait(timeout=0.05)
+    release.set()
+    revoke.join(timeout=5)
+    request.join(timeout=5)
+    recorder.close()
+
+    assert revoked.is_set()
+    summary = verify_judge_recorder_summary(destination / "recorder.json")
+    assert summary.exchange_count == 1
+    assert (destination / "judge-0001" / "exchange.json").is_file()
 
 
 def test_rejects_streaming_without_upstream_call(tmp_path: Path) -> None:
