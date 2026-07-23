@@ -15,6 +15,7 @@ from harbor_hf.reassessment import (
     _checksums,
     _prepare_verifier_tests,
     _publish_success,
+    _recover_unambiguous_selection,
     _retain_failed_attempt,
     _reward,
     _task_config,
@@ -135,6 +136,31 @@ def test_secret_scan_and_checksums_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "unsafe.txt").write_text("contains-secret")
     with pytest.raises(ReassessmentError, match="known secret"):
         _assert_secrets_absent(tmp_path, ("secret",))
+
+
+def test_recovers_only_unambiguous_missing_judge_selection(tmp_path: Path) -> None:
+    verifier = tmp_path / "verifier"
+    verifier.mkdir()
+    _recover_unambiguous_selection(tmp_path, ["judge-0001"])
+    assert json.loads((verifier / "judge-selection.json").read_text()) == {
+        "schema_version": "harbor-hf/judge-selection/v1",
+        "exchange_id": "judge-0001",
+    }
+    assert json.loads((verifier / "judge-calls.json").read_text())["exchange_ids"] == [
+        "judge-0001"
+    ]
+    assert (
+        json.loads((tmp_path / "judge-selection-recovery.json").read_text())["basis"]
+        == "only_successful_recorded_exchange"
+    )
+
+
+def test_does_not_recover_ambiguous_judge_selection(tmp_path: Path) -> None:
+    verifier = tmp_path / "verifier"
+    verifier.mkdir()
+    _recover_unambiguous_selection(tmp_path, ["judge-0001", "judge-0002"])
+    assert list(verifier.iterdir()) == []
+    assert not (tmp_path / "judge-selection-recovery.json").exists()
 
 
 def test_verifier_timeout_transform_is_recorded(tmp_path: Path) -> None:

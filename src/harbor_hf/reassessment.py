@@ -383,6 +383,36 @@ def _reward(verifier_dir: Path) -> float:
     raise ReassessmentError("reassessment verifier emitted no bounded reward")
 
 
+def _recover_unambiguous_selection(trial_root: Path, exchange_ids: list[str]) -> None:
+    selection = trial_root / "verifier" / "judge-selection.json"
+    calls = trial_root / "verifier" / "judge-calls.json"
+    if selection.exists() or calls.exists() or len(exchange_ids) != 1:
+        return
+    exchange_id = exchange_ids[0]
+    _json_atomic(
+        calls,
+        {
+            "schema_version": "harbor-hf/judge-calls/v1",
+            "exchange_ids": [exchange_id],
+        },
+    )
+    _json_atomic(
+        selection,
+        {
+            "schema_version": "harbor-hf/judge-selection/v1",
+            "exchange_id": exchange_id,
+        },
+    )
+    _json_atomic(
+        trial_root / "judge-selection-recovery.json",
+        {
+            "schema_version": "harbor-hf/judge-selection-recovery/v1",
+            "exchange_id": exchange_id,
+            "basis": "only_successful_recorded_exchange",
+        },
+    )
+
+
 def _validate_selection_evidence(trial_root: Path, exchange_ids: list[str]) -> None:
     selection = trial_root / "verifier" / "judge-selection.json"
     calls = trial_root / "verifier" / "judge-calls.json"
@@ -424,7 +454,9 @@ def _validate_judge_evidence(
             or "temperature" in forwarded
         ):
             raise ReassessmentError("reassessment judge parameters are invalid")
-    _validate_selection_evidence(trial_root, [path.name for path in exchanges])
+    exchange_ids = [path.name for path in exchanges]
+    _recover_unambiguous_selection(trial_root, exchange_ids)
+    _validate_selection_evidence(trial_root, exchange_ids)
     return len(exchanges)
 
 
