@@ -470,8 +470,9 @@ def _validate_selection_evidence(trial_root: Path, exchange_ids: list[str]) -> N
 def _validate_judge_evidence(
     trial_root: Path,
     *,
+    expected_provider: str,
     expected_model: str,
-    expected_reasoning_effort: str,
+    expected_reasoning_effort: str | None,
 ) -> int:
     judge_root = trial_root / "judge-records"
     summary = verify_judge_recorder_summary(judge_root / "recorder.json")
@@ -481,7 +482,7 @@ def _validate_judge_evidence(
     for path in exchanges:
         exchange = verify_judge_exchange(path)
         if (
-            exchange.provider != "openai-api"
+            exchange.provider != expected_provider
             or exchange.forwarded_model != expected_model
             or exchange.outcome != "success"
             or exchange.transformation != "parameters_enforced"
@@ -726,6 +727,7 @@ def _execute_rejudge(
         reward = _reward(staging / "verifier")
         exchange_count = _validate_judge_evidence(
             staging,
+            expected_provider=plan.judge.provider,
             expected_model=plan.judge.model,
             expected_reasoning_effort=plan.judge.reasoning_effort,
         )
