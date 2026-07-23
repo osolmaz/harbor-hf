@@ -417,6 +417,7 @@ class JudgeEvidenceRecorder:
             closed_at=datetime.now(UTC),
         )
         try:
+            scope.destination.mkdir(parents=True, exist_ok=True)
             _write_json_atomic(
                 scope.destination / "recorder.json", summary.model_dump(mode="json")
             )

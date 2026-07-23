@@ -181,6 +181,30 @@ def test_rejects_invalid_upstream_and_reasoning_configuration() -> None:
         JudgeEvidenceRecorder(token="token", reasoning_effort="ultra")
 
 
+def test_revoke_recreates_empty_bucket_directory(tmp_path: Path) -> None:
+    recorder = JudgeEvidenceRecorder(
+        token="token",
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200))
+        ),
+        capability_factory=lambda: "z" * 32,
+    )
+    destination = tmp_path / "judge"
+    capability = recorder.register_scope(
+        execution_id="exec",
+        trial_id="trial",
+        model="judge",
+        destination=destination,
+        policy=_policy(),
+    )
+    destination.rmdir()
+    recorder.revoke_scope(capability)
+    recorder.close()
+
+    summary = verify_judge_recorder_summary(destination / "recorder.json")
+    assert summary.exchange_count == 0
+
+
 def test_revoke_waits_for_inflight_exchange(tmp_path: Path) -> None:
     started = threading.Event()
     release = threading.Event()
