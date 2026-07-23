@@ -370,12 +370,16 @@ def _payload_reward(payload: dict[str, object]) -> float | None:
 
 
 def _reward(verifier_dir: Path) -> float:
-    result_path = verifier_dir / "agent_judge_results.json"
+    result_paths = (
+        verifier_dir / "agent_judge_results.json",
+        verifier_dir / "reward.json",
+    )
     reward_path = verifier_dir / "reward.txt"
-    if result_path.is_file():
-        value = _payload_reward(json.loads(result_path.read_text()))
-        if value is not None:
-            return value
+    for result_path in result_paths:
+        if result_path.is_file():
+            value = _payload_reward(json.loads(result_path.read_text()))
+            if value is not None:
+                return value
     if reward_path.is_file():
         value = float(reward_path.read_text().strip())
         if 0 <= value <= 1:

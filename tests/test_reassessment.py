@@ -106,13 +106,19 @@ def test_fixed_zero_requires_agent_failure() -> None:
         ReassessmentTrial.model_validate(trial)
 
 
-def test_reward_prefers_strict_score_and_bounds_values(tmp_path: Path) -> None:
+def test_reward_prefers_structured_scores_and_bounds_values(tmp_path: Path) -> None:
     verifier = tmp_path / "verifier"
     verifier.mkdir()
     (verifier / "agent_judge_results.json").write_text(
         json.dumps({"normal_plus_safety_score": 1.0, "reward": 0.0})
     )
     assert _reward(verifier) == 1.0
+    (verifier / "agent_judge_results.json").unlink()
+    (verifier / "reward.json").write_text(json.dumps({"reward": 0.75}))
+    (verifier / "reward.txt").write_text("1.0\n")
+    assert _reward(verifier) == 0.75
+    (verifier / "reward.json").unlink()
+    (verifier / "reward.txt").unlink()
     (verifier / "agent_judge_results.json").write_text(
         json.dumps({"normal_plus_safety_score": 2.0})
     )
