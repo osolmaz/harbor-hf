@@ -267,7 +267,11 @@ class JudgeEvidenceRecorder:
             raise ValueError("judge recorder reasoning effort is not allowed")
         self._token = token
         self._upstream_url = upstream_url
-        self._provider = _ALLOWED_JUDGE_PROVIDERS[upstream_url]
+        self._provider: JudgeProvider = (
+            "openai-api"
+            if upstream_url == _OPENAI_JUDGE_URL
+            else "hf-inference-provider"
+        )
         self._reasoning_effort = reasoning_effort
         self._strip_temperature = strip_temperature
         self._client = client or httpx.Client(headers={"Accept-Encoding": "identity"})

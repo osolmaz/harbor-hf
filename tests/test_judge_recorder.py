@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from email.message import Message
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -173,7 +174,7 @@ def test_rejects_invalid_upstream_and_reasoning_configuration() -> None:
     with pytest.raises(ValueError, match="upstream URL"):
         JudgeEvidenceRecorder(
             token="token",
-            upstream_url="https://example.com/v1/chat/completions",  # type: ignore[arg-type]
+            upstream_url=cast(Any, "https://example.com/v1/chat/completions"),
         )
     with pytest.raises(ValueError, match="reasoning effort"):
         JudgeEvidenceRecorder(token="token", reasoning_effort="ultra")
