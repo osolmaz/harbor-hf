@@ -29,7 +29,12 @@ from harbor_hf.campaigns import (
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import assert_secret_absent, verify_checksums, write_checksums
 from harbor_hf.harbor_adapter import HarborTrialFailure, HarborVerificationFailure
-from harbor_hf.judge_recorder import JudgeEvidenceRecorder as RealJudgeEvidenceRecorder
+from harbor_hf.judge_recorder import (
+    JudgeEvidenceRecorder as RealJudgeEvidenceRecorder,
+)
+from harbor_hf.judge_recorder import (
+    JudgeUpstreamUrl,
+)
 from harbor_hf.models import (
     BenchmarkJudgeSpec,
     EndpointRef,
@@ -1027,8 +1032,11 @@ def test_judged_wave_records_and_selects_exact_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     judge = BenchmarkJudgeSpec(
-        api_url="https://router.huggingface.co/v1/chat/completions",
-        model="judge/model",
+        api_url="https://api.openai.com/v1/chat/completions",
+        model="gpt-5.6-luna",
+        api_key_secret_name="OPENAI_API_KEY",
+        reasoning_effort="xhigh",
+        strip_temperature=True,
     )
     judged_spec = remote_spec.model_copy(
         update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
@@ -1037,6 +1045,7 @@ def test_judged_wave_records_and_selects_exact_exchange(
         judged_spec, tmp_path, attempts=1, concurrency=1
     )
     monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-judge-token")
     monkeypatch.setattr(
         "harbor_hf.worker.probe_runtime",
         lambda *_args: {"probes": {"health": {"http_status": 200}}},
@@ -1047,8 +1056,11 @@ def test_judged_wave_records_and_selects_exact_exchange(
     )
 
     def upstream(request: httpx.Request) -> httpx.Response:
-        assert request.url == "https://router.huggingface.co/v1/chat/completions"
-        assert json.loads(request.content)["model"] == "judge/model"
+        assert request.url == "https://api.openai.com/v1/chat/completions"
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-5.6-luna"
+        assert payload["reasoning_effort"] == "xhigh"
+        assert "temperature" not in payload
         return httpx.Response(
             200,
             headers={"Content-Type": "application/json", "X-Request-ID": "judge-req"},
@@ -1058,17 +1070,21 @@ def test_judged_wave_records_and_selects_exact_exchange(
     def recorder_factory(
         *,
         token: str,
-        upstream_url: str,
+        upstream_url: JudgeUpstreamUrl,
         reasoning_effort: str | None,
         strip_temperature: bool,
         deadline: float,
         monotonic: Callable[[], float],
     ) -> RealJudgeEvidenceRecorder:
-        assert upstream_url == "https://router.huggingface.co/v1/chat/completions"
-        assert reasoning_effort is None
-        assert strip_temperature is False
+        assert token == "direct-judge-token"
+        assert upstream_url == "https://api.openai.com/v1/chat/completions"
+        assert reasoning_effort == "xhigh"
+        assert strip_temperature is True
         return RealJudgeEvidenceRecorder(
             token=token,
+            upstream_url=upstream_url,
+            reasoning_effort=reasoning_effort,
+            strip_temperature=strip_temperature,
             client=httpx.Client(transport=httpx.MockTransport(upstream)),
             capability_factory=lambda: "j" * 32,
             deadline=deadline,
@@ -1095,6 +1111,8 @@ def test_judged_wave_records_and_selects_exact_exchange(
                 }
             ).encode()
             assert environment["AGENT_JUDGE_API_KEY"] == "test-token"
+            assert environment["OPENAI_API_KEY"] == "test-token"
+            assert "direct-judge-token" not in environment.values()
             request = urllib.request.Request(
                 environment["AGENT_JUDGE_API_URL"],
                 data=request_body,
@@ -1162,9 +1180,10 @@ def test_judged_wave_records_and_selects_exact_exchange(
     assert json.loads((exchange / "request-received.bin").read_bytes())["model"] == (
         "wrong/model"
     )
-    assert json.loads((exchange / "request-forwarded.bin").read_bytes())["model"] == (
-        "judge/model"
-    )
+    forwarded = json.loads((exchange / "request-forwarded.bin").read_bytes())
+    assert forwarded["model"] == "gpt-5.6-luna"
+    assert forwarded["reasoning_effort"] == "xhigh"
+    assert "temperature" not in forwarded
     assert (exchange / "response-upstream.bin").read_bytes() == (
         exchange / "response-delivered.bin"
     ).read_bytes()

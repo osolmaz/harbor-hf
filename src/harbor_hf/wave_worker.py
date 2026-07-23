@@ -1160,6 +1160,8 @@ def _execute_trial(
             candidate.configuration.benchmark_judge.api_key_secret_name
             for candidate in wave.runs
             if candidate.configuration.benchmark_judge is not None
+            and candidate.configuration.benchmark_judge.api_key_secret_name
+            not in {"HF_TOKEN", "OPENAI_API_KEY"}
         )
         with harbor_process_environment(
             run,
