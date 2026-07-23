@@ -280,6 +280,7 @@ def test_known_secret_in_prompt_fails_closed(tmp_path: Path) -> None:
     summary = verify_judge_recorder_summary(tmp_path / "judge" / "recorder.json")
     assert summary.exchange_count == 0
     assert summary.rejected_call_count == 1
+    assert summary.rejected_error_types == ["TrialEvidenceError"]
 
 
 def test_secret_bearing_retained_header_returns_controlled_failure(

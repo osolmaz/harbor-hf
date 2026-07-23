@@ -396,9 +396,51 @@ def _trial_output_root(output_root: Path, trial: ReassessmentTrial) -> Path:
 def _skip_or_require_absent(final: Path, label: str) -> bool:
     if (final / "_SUCCESS").is_file():
         return True
-    if final.exists():
+    if final.exists() and {path.name for path in final.iterdir()} != {"attempts"}:
         raise ReassessmentError(f"unfinished {label} output already exists")
     return False
+
+
+def _publish_success(staging: Path, final: Path) -> None:
+    final.parent.mkdir(parents=True, exist_ok=True)
+    if not final.exists():
+        os.replace(staging, final)
+        return
+    if {path.name for path in final.iterdir()} != {"attempts"}:
+        raise ReassessmentError("reassessment success destination is contaminated")
+    for path in staging.iterdir():
+        os.replace(path, final / path.name)
+    staging.rmdir()
+
+
+def _retain_failed_attempt(
+    *,
+    staging: Path,
+    final: Path,
+    execution_id: str,
+    error: Exception,
+    known_secrets: tuple[str, ...],
+) -> None:
+    if not staging.is_dir():
+        return
+    _json_atomic(
+        staging / "failure.json",
+        {
+            "schema_version": "harbor-hf/reassessment-failure/v1",
+            "execution_id": execution_id,
+            "error_type": type(error).__name__,
+            "message": "reassessment execution failed",
+            "failed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    _assert_secrets_absent(staging, known_secrets)
+    _json_atomic(staging / "checksums.json", _checksums(staging))
+    (staging / "_FAILED").write_text("")
+    attempt = final / "attempts" / execution_id
+    attempt.parent.mkdir(parents=True, exist_ok=True)
+    if attempt.exists():
+        raise ReassessmentError("reassessment failed-attempt identity collided")
+    os.replace(staging, attempt)
 
 
 def _require_command_success(code: int, stdout: str, stderr: str, label: str) -> None:
@@ -446,8 +488,7 @@ def _write_fixed_zero(
     )
     _json_atomic(staging / "checksums.json", _checksums(staging))
     (staging / "_SUCCESS").write_text("")
-    final.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staging, final)
+    _publish_success(staging, final)
 
 
 def _execute_rejudge(
@@ -478,6 +519,7 @@ def _execute_rejudge(
     capability_secret = ""
     sandbox: Sandbox | None = None
     started = time.monotonic()
+    failure: Exception | None = None
     try:
         evidence_manifest = json.loads(
             (native / "evidence" / "manifest.json").read_text()
@@ -574,8 +616,10 @@ def _execute_rejudge(
         )
         _json_atomic(staging / "checksums.json", _checksums(staging))
         (staging / "_SUCCESS").write_text("")
-        final.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging, final)
+        _publish_success(staging, final)
+    except Exception as error:
+        failure = error
+        raise
     finally:
         if capability is not None:
             recorder.revoke_scope(capability)
@@ -583,6 +627,14 @@ def _execute_rejudge(
             with suppress(Exception):
                 sandbox.kill()
         shutil.rmtree(restored, ignore_errors=True)
+        if failure is not None:
+            _retain_failed_attempt(
+                staging=staging,
+                final=final,
+                execution_id=execution_id,
+                error=failure,
+                known_secrets=(hf_token, openai_token, capability_secret),
+            )
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
 

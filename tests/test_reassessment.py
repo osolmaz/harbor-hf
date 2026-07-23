@@ -12,6 +12,8 @@ from harbor_hf.reassessment import (
     ReassessmentTrial,
     _assert_secrets_absent,
     _checksums,
+    _publish_success,
+    _retain_failed_attempt,
     _reward,
     _task_config,
     _write_fixed_zero,
@@ -125,6 +127,33 @@ def test_secret_scan_and_checksums_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "unsafe.txt").write_text("contains-secret")
     with pytest.raises(ReassessmentError, match="known secret"):
         _assert_secrets_absent(tmp_path, ("secret",))
+
+
+def test_failed_attempt_is_preserved_before_retry_success(tmp_path: Path) -> None:
+    final = tmp_path / "trial"
+    failed = tmp_path / "failed"
+    failed.mkdir()
+    (failed / "recorder.json").write_text(
+        '{"rejected_error_types":["TrialEvidenceError"]}\n'
+    )
+    _retain_failed_attempt(
+        staging=failed,
+        final=final,
+        execution_id="rejudge-" + "1" * 32,
+        error=ReassessmentError("unsafe detail"),
+        known_secrets=("secret",),
+    )
+    attempt = final / "attempts" / ("rejudge-" + "1" * 32)
+    assert (attempt / "_FAILED").is_file()
+    assert "unsafe detail" not in (attempt / "failure.json").read_text()
+
+    success = tmp_path / "success"
+    success.mkdir()
+    (success / "result.json").write_text("{}\n")
+    (success / "_SUCCESS").write_text("")
+    _publish_success(success, final)
+    assert (final / "_SUCCESS").is_file()
+    assert attempt.is_dir()
 
 
 def test_task_config_uses_harbor_default_verifier_command(tmp_path: Path) -> None:

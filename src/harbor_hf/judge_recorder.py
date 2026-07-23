@@ -100,6 +100,7 @@ class JudgeRecorderSummary(FrozenModel):
     model: str = Field(min_length=1)
     exchange_count: int = Field(ge=0)
     rejected_call_count: int = Field(ge=0)
+    rejected_error_types: list[str] = Field(default_factory=list, max_length=4096)
     closed_at: datetime
 
     @model_validator(mode="after")
@@ -284,6 +285,7 @@ class JudgeEvidenceRecorder:
         self._scopes: dict[str, _Scope] = {}
         self._counts: dict[str, int] = {}
         self._rejections: dict[str, int] = {}
+        self._rejection_errors: dict[str, list[str]] = {}
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -334,6 +336,7 @@ class JudgeEvidenceRecorder:
             self._scopes.clear()
             self._counts.clear()
             self._rejections.clear()
+            self._rejection_errors.clear()
         if self._owns_client:
             self._client.close()
 
@@ -379,6 +382,7 @@ class JudgeEvidenceRecorder:
                     )
                     self._counts[execution_id] = 0
                     self._rejections[execution_id] = 0
+                    self._rejection_errors[execution_id] = []
                     return capability
         raise JudgeRecorderError("judge capability generation collided")
 
@@ -387,6 +391,9 @@ class JudgeEvidenceRecorder:
             scope = self._scopes.pop(capability, None)
             count = self._counts.pop(scope.execution_id, 0) if scope else 0
             rejected = self._rejections.pop(scope.execution_id, 0) if scope else 0
+            rejected_errors = (
+                self._rejection_errors.pop(scope.execution_id, []) if scope else []
+            )
         if scope is None:
             return
         summary = JudgeRecorderSummary(
@@ -395,6 +402,7 @@ class JudgeEvidenceRecorder:
             model=scope.model,
             exchange_count=count,
             rejected_call_count=rejected,
+            rejected_error_types=rejected_errors,
             closed_at=datetime.now(UTC),
         )
         try:
@@ -535,7 +543,7 @@ class JudgeEvidenceRecorder:
         error: Exception,
     ) -> None:
         if exchange_id is None or attempt is None:
-            self._record_rejection(scope)
+            self._record_rejection(scope, error)
             self._send_error(handler, 502, "judge recorder rejected request")
             return
         error_body = json.dumps(
@@ -575,10 +583,13 @@ class JudgeEvidenceRecorder:
             return
         self._send(handler, 502, error_body, delivered_headers)
 
-    def _record_rejection(self, scope: _Scope) -> None:
+    def _record_rejection(self, scope: _Scope, error: Exception) -> None:
         with self._lock:
             self._rejections[scope.execution_id] = (
                 self._rejections.get(scope.execution_id, 0) + 1
+            )
+            self._rejection_errors.setdefault(scope.execution_id, []).append(
+                type(error).__name__[:200]
             )
 
     def _allocate(self, scope: _Scope) -> tuple[str, int]:
