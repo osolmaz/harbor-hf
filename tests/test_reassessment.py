@@ -92,6 +92,31 @@ def test_plan_digest_and_identity_are_fail_closed() -> None:
         ReassessmentPlan.model_validate_json(json.dumps(payload))
 
 
+def test_gemini_judge_configuration_is_supported_and_fail_closed() -> None:
+    payload = _plan_payload()
+    payload["judge"] = {
+        "provider": "google-gemini-api",
+        "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "model": "gemini-3.6-flash",
+        "reasoning_effort": None,
+        "strip_temperature": True,
+        "api_key_secret_name": "GEMINI_API_KEY",
+    }
+    payload["plan_digest"] = reassessment_plan_digest(
+        {key: value for key, value in payload.items() if key != "plan_digest"}
+    )
+    plan = ReassessmentPlan.model_validate_json(json.dumps(payload))
+    assert plan.judge.model == "gemini-3.6-flash"
+    judge = payload["judge"]
+    assert isinstance(judge, dict)
+    judge["api_key_secret_name"] = "OPENAI_API_KEY"
+    payload["plan_digest"] = reassessment_plan_digest(
+        {key: value for key, value in payload.items() if key != "plan_digest"}
+    )
+    with pytest.raises(ValueError, match="provider configuration"):
+        ReassessmentPlan.model_validate_json(json.dumps(payload))
+
+
 def test_fixed_zero_requires_agent_failure() -> None:
     base = _plan_payload()["trials"]
     assert isinstance(base, list)

@@ -35,9 +35,13 @@ _ALLOWED_REQUEST_HEADERS = frozenset(
 )
 _HF_JUDGE_URL = "https://router.huggingface.co/v1/chat/completions"
 _OPENAI_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
+_GEMINI_JUDGE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+)
 _ALLOWED_JUDGE_PROVIDERS = {
     _HF_JUDGE_URL: "hf-inference-provider",
     _OPENAI_JUDGE_URL: "openai-api",
+    _GEMINI_JUDGE_URL: "google-gemini-api",
 }
 _ALLOWED_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -110,10 +114,11 @@ class JudgeRecorderSummary(FrozenModel):
         return self
 
 
-JudgeProvider = Literal["hf-inference-provider", "openai-api"]
+JudgeProvider = Literal["hf-inference-provider", "openai-api", "google-gemini-api"]
 JudgeUpstreamUrl = Literal[
     "https://router.huggingface.co/v1/chat/completions",
     "https://api.openai.com/v1/chat/completions",
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
 ]
 JudgeTransformation = Literal["none", "model_enforced", "parameters_enforced"]
 
@@ -268,11 +273,7 @@ class JudgeEvidenceRecorder:
             raise ValueError("judge recorder reasoning effort is not allowed")
         self._token = token
         self._upstream_url = upstream_url
-        self._provider: JudgeProvider = (
-            "openai-api"
-            if upstream_url == _OPENAI_JUDGE_URL
-            else "hf-inference-provider"
-        )
+        self._provider: JudgeProvider = _ALLOWED_JUDGE_PROVIDERS[upstream_url]
         self._reasoning_effort = reasoning_effort
         self._strip_temperature = strip_temperature
         self._client = client or httpx.Client(headers={"Accept-Encoding": "identity"})

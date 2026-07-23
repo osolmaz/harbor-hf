@@ -31,6 +31,9 @@ from harbor_hf.judge_recorder import (
 from harbor_hf.models import TrialEvidencePolicy
 
 _OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
+_GEMINI_CHAT_COMPLETIONS = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+)
 _SAFE_ID = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
 )
@@ -54,14 +57,47 @@ class SourceEvaluation(FrozenModel):
 
 
 class ReassessmentJudge(FrozenModel):
-    provider: Literal["openai-api"] = "openai-api"
-    api_url: Literal["https://api.openai.com/v1/chat/completions"] = (
-        _OPENAI_CHAT_COMPLETIONS
+    provider: Literal["openai-api", "google-gemini-api"] = "openai-api"
+    api_url: Literal[
+        "https://api.openai.com/v1/chat/completions",
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    ] = _OPENAI_CHAT_COMPLETIONS
+    model: Literal["gpt-5.6-luna", "gemini-3.5-flash", "gemini-3.6-flash"] = (
+        "gpt-5.6-luna"
     )
-    model: Literal["gpt-5.6-luna"] = "gpt-5.6-luna"
-    reasoning_effort: Literal["xhigh"] = "xhigh"
+    reasoning_effort: Literal["xhigh"] | None = "xhigh"
     strip_temperature: Literal[True] = True
-    api_key_secret_name: Literal["OPENAI_API_KEY"] = "OPENAI_API_KEY"
+    api_key_secret_name: Literal["OPENAI_API_KEY", "GEMINI_API_KEY"] = "OPENAI_API_KEY"
+
+    @model_validator(mode="after")
+    def provider_configuration_is_consistent(self) -> ReassessmentJudge:
+        if self.provider == "openai-api":
+            expected = (
+                _OPENAI_CHAT_COMPLETIONS,
+                "gpt-5.6-luna",
+                "xhigh",
+                "OPENAI_API_KEY",
+            )
+        else:
+            expected = (
+                _GEMINI_CHAT_COMPLETIONS,
+                self.model,
+                None,
+                "GEMINI_API_KEY",
+            )
+            if not self.model.startswith("gemini-"):
+                raise ValueError("Gemini provider requires a Gemini model")
+        observed = (
+            self.api_url,
+            self.model,
+            self.reasoning_effort,
+            self.api_key_secret_name,
+        )
+        if observed != expected:
+            raise ValueError(
+                "reassessment judge provider configuration is inconsistent"
+            )
+        return self
 
 
 class ReassessmentTrial(FrozenModel):
