@@ -34,6 +34,7 @@ from harbor_hf.profile_worker import (
     _point_workload,
     _PointResult,
     _prepare_profile_destination,
+    _profile_judge_assignments,
     _request,
     _run_ladder,
     _run_point,
@@ -89,7 +90,10 @@ def test_profile_finalizer_retries_transient_bucket_visibility(
     evidence.write_text('{"status":"complete"}\n', encoding="utf-8")
     calls = 0
 
-    def scrub(_root: Path, _secrets: object) -> list[str]:
+    def scrub(
+        _root: Path, _secrets: object, *, allow_symlinks: bool = False
+    ) -> list[str]:
+        del allow_symlinks
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -464,6 +468,34 @@ def compatibility_trial(
     )
 
 
+def test_profile_judge_assignments_preserve_all_calls(tmp_path: Path) -> None:
+    native = compatibility_trial("judged")
+    verifier = tmp_path / "job" / "judged" / "verifier"
+    verifier.mkdir(parents=True)
+    (verifier / "judge-selection.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "harbor-hf/judge-selection/v1",
+                "exchange_id": "judge-0002",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (verifier / "judge-calls.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "harbor-hf/judge-calls/v1",
+                "exchange_ids": ["judge-0001", "judge-0002"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assigned = _profile_judge_assignments([native], tmp_path)
+
+    assert assigned == {"judge-0001": native, "judge-0002": native}
+
+
 def test_profile_point_preserves_individual_harbor_trial_failures(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
@@ -492,6 +524,10 @@ def test_profile_point_preserves_individual_harbor_trial_failures(
     ) -> Iterator[dict[str, str]]:
         yield {}
 
+    @contextmanager
+    def judge_scope(*_args: object, **_kwargs: object) -> Iterator[tuple[None, None]]:
+        yield None, None
+
     monkeypatch.setattr(
         "harbor_hf.profile_worker.FilesystemHarborExecutionAdapter", Adapter
     )
@@ -510,6 +546,14 @@ def test_profile_point_preserves_individual_harbor_trial_failures(
                 compatibility_trial("failure", exception_type="SandboxError"),
             ]
         ),
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker._assemble_profile_point_evidence",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "harbor_hf.profile_worker._profile_point_judge_scope",
+        judge_scope,
     )
 
     result = _run_point(
@@ -1012,6 +1056,28 @@ def test_provider_profile_submit_command_exposes_recorder(
 
     expose = command.index("--expose")
     assert command[expose : expose + 2] == ["--expose", "8000"]
+
+
+def test_judged_profile_submit_command_exposes_judge_recorder(
+    remote_spec: ExperimentSpec,
+) -> None:
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["judge"] = {
+        "api_url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "deepseek-ai/DeepSeek-V3.2",
+    }
+    spec = ExperimentSpec.model_validate(raw)
+
+    command = build_profile_submit_command(
+        plan(spec), input_dir="hf://buckets/input", bucket="osolmaz/results"
+    )
+
+    exposed = [
+        command[index + 1]
+        for index, argument in enumerate(command)
+        if argument == "--expose"
+    ]
+    assert exposed == ["8001"]
 
 
 def test_provider_profile_uses_distinct_tasks_at_maximum_concurrency(

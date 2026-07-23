@@ -354,6 +354,8 @@ def test_reserved_retry_targets_are_excluded_from_later_retry_wave(
         ("configuration", "failed_infrastructure"),
         ("authentication", "failed_infrastructure"),
         ("cleanup", "failed_infrastructure"),
+        ("agent", "invalid"),
+        ("benchmark", "invalid"),
     ],
 )
 def test_terminal_failure_categories_never_retry(
@@ -374,44 +376,29 @@ def test_terminal_failure_categories_never_retry(
     assert all(action.kind != "retry-shard" for action in plan.actions)
 
 
-def test_benchmark_failure_retries_then_becomes_scored_invalid(
+def test_benchmark_failure_is_immediately_scored_invalid(
     remote_spec: ExperimentSpec,
 ) -> None:
     lock, submitted = _campaign(remote_spec)
-    first = _execution_events(
+    failed = _execution_events(
         lock, 2, execution_id="execution-one", attempt=1, category="benchmark"
     )
 
-    projected = project_recovery(lock, [submitted, *first])
-    retry_at = next(iter(projected.trials.values())).retry_not_before
-    assert retry_at is not None
-    _projection, retry = plan_reconciliation(lock, [submitted, *first], now=retry_at)
-    assert [action.kind for action in retry.actions] == ["retry-shard"]
+    projection, plan = plan_reconciliation(
+        lock, [submitted, *failed], now=NOW + timedelta(days=1)
+    )
 
-    exhausted_lock, exhausted_submitted = _campaign(
-        remote_spec, max_physical_executions_per_trial=1
-    )
-    exhausted = _execution_events(
-        exhausted_lock,
-        2,
-        execution_id="execution-one",
-        attempt=1,
-        category="benchmark",
-    )
-    exhausted_projection, exhausted_plan = plan_reconciliation(
-        exhausted_lock,
-        [exhausted_submitted, *exhausted],
-        now=NOW + timedelta(days=1),
-    )
-    exhausted_trial = next(iter(exhausted_projection.trials.values()))
-    assert exhausted_trial.status == "invalid"
-    assert exhausted_trial.outcome == "benchmark_failed"
-    assert exhausted_plan.terminal_decision is not None
-    assert exhausted_plan.terminal_decision.status == "failed"
+    trial = next(iter(projection.trials.values()))
+    assert trial.status == "invalid"
+    assert trial.outcome == "benchmark_failed"
+    assert all(action.kind != "retry-shard" for action in plan.actions)
+    assert plan.terminal_decision is not None
+    assert plan.terminal_decision.status == "failed"
 
 
 @pytest.mark.parametrize(
-    "category", ["lost", "transient", "quota", "rate-limit", "ambiguous"]
+    "category",
+    ["lost", "transient", "quota", "rate-limit", "ambiguous", "evidence"],
 )
 def test_retry_budget_exhaustion_is_terminal(
     remote_spec: ExperimentSpec, category: RetryCategory
@@ -801,6 +788,57 @@ def test_durable_shard_retry_request_skips_current_backoff(
     assert [action.kind for action in plan.actions] == ["retry-shard"]
 
 
+def test_durable_retry_reopens_spend_exhausted_infrastructure_trial(
+    remote_spec: ExperimentSpec,
+) -> None:
+    lock, submitted = _campaign(remote_spec)
+    failed = _execution_events(
+        lock,
+        2,
+        execution_id="execution-one",
+        attempt=1,
+        category="transient",
+    )
+    trial_id = lock.runs[0].shards[0].trials[0].trial_id
+    exhausted = new_event(
+        subject_type="trial",
+        subject_id=trial_id,
+        kind="trial.failed-infrastructure",
+        producer="reconciler",
+        payload=LifecyclePayload(message="retry spend cap exhausted"),
+        clock=lambda: NOW + timedelta(seconds=4),
+        identifier=lambda: "f" * 32,
+    )
+    shard_id = lock.runs[0].shards[0].shard_id
+    request, created = durable_shard_retry_event(
+        lock,
+        [submitted, *failed, exhausted],
+        shard_id,
+        "corrected retry estimate",
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+
+    projection = project_recovery(lock, [submitted, *failed, exhausted, request])
+
+    assert created
+    assert projection.trials[trial_id].status == "retry_wait"
+    assert projection.trials[trial_id].outcome is None
+    assert projection.counts.retrying == 1
+
+    completed = _execution_events(
+        lock,
+        10,
+        execution_id="execution-two",
+        attempt=2,
+        category=None,
+    )
+    recovered = project_recovery(
+        lock, [submitted, *failed, exhausted, request, *completed]
+    )
+    assert recovered.trials[trial_id].status == "complete"
+    assert recovered.trials[trial_id].outcome == "scored"
+
+
 def test_legacy_shard_retry_request_preserves_its_event_time_generation(
     remote_spec: ExperimentSpec,
 ) -> None:
@@ -1188,7 +1226,7 @@ def test_spend_cap_exhausts_retryable_trials_without_another_wave(
         3,
         execution_id="execution-one",
         attempt=1,
-        category="benchmark",
+        category="evidence",
     )
     events = [
         submitted,
@@ -1226,14 +1264,14 @@ def test_grouped_retries_share_one_provisional_admission(
             2,
             execution_id="execution-one",
             attempt=1,
-            category="benchmark",
+            category="evidence",
         ),
         *_execution_events(
             lock,
             4,
             execution_id="execution-two",
             attempt=1,
-            category="benchmark",
+            category="evidence",
             shard_index=1,
         ),
     ]
@@ -1267,7 +1305,7 @@ def test_mutable_estimate_cannot_irreversibly_exhaust_a_retry(
         3,
         execution_id="execution-one",
         attempt=1,
-        category="benchmark",
+        category="evidence",
     )
     events = [
         submitted,
@@ -2179,7 +2217,8 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
 
     retry_lock, retry_submitted = _campaign(remote_spec)
     for offset, category in enumerate(
-        ["lost", "transient", "quota", "rate-limit", "ambiguous"], 40
+        ["lost", "transient", "quota", "rate-limit", "ambiguous", "evidence"],
+        40,
     ):
         events = [
             retry_submitted,
@@ -2239,7 +2278,7 @@ def test_recovery_decision_corpus_is_stable(remote_spec: ExperimentSpec) -> None
         corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "a578b43cad2ee93cabc91a3dce88c017407406dd09d5bff05302088b1a15ccb7"
+        "48d53a88f70df6b9aa079ac371e4c1aa70b2bcac1c68a65c2a006c276d19b856"
     )
 
 

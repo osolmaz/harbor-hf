@@ -102,6 +102,9 @@ def _classify_named_artifact(parts: tuple[str, ...], name: str) -> ArtifactKind:
 def _artifacts(trial_dir: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for path in sorted(trial_dir.rglob("*")):
+        relative = path.relative_to(trial_dir)
+        if relative.parts[:2] == ("artifacts", "workspace"):
+            continue
         if path.is_symlink():
             raise ValueError("Harbor trial artifacts must not contain symlinks")
         if path.is_file():

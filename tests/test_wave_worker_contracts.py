@@ -16,9 +16,10 @@ import harbor_hf.wave_worker as wave_worker
 from harbor_hf.campaigns import CampaignLock, CampaignTrialLock, WaveLock, WaveRunLock
 from harbor_hf.coordination import ClaimConflict
 from harbor_hf.evidence import verify_checksums, write_checksums
-from harbor_hf.models import ExperimentSpec
+from harbor_hf.models import ExperimentSpec, TrialEvidencePolicy
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import RunLock
+from harbor_hf.trial_evidence import assemble_trial_evidence
 from harbor_hf.wave_worker import (
     ExecutionLock,
     LockedSubmitWaveAction,
@@ -70,7 +71,7 @@ def _expected_trial() -> CampaignTrialLock:
         trial_id="trial-1",
         trial_digest="d" * 64,
         task_name="task-a",
-        task_digest="t" * 64,
+        task_digest="sha256:" + "a" * 64,
         logical_attempt=1,
     )
 
@@ -91,6 +92,52 @@ def _execution_lock(expected: CampaignTrialLock, execution_id: str) -> Execution
     )
 
 
+def _trial_evidence_policy() -> TrialEvidencePolicy:
+    return TrialEvidencePolicy(
+        workspace_root="/app",
+        workspace_max_nodes=100,
+        workspace_max_file_bytes=1024 * 1024,
+        workspace_max_total_bytes=8 * 1024 * 1024,
+        workspace_max_archive_bytes=8 * 1024 * 1024,
+        workspace_capture_timeout_seconds=60,
+        judge_max_request_bytes=1024 * 1024,
+        judge_max_response_bytes=1024 * 1024,
+        judge_timeout_seconds=300,
+        judge_max_calls_per_execution=4,
+    )
+
+
+def _write_trial_evidence(
+    execution: Path, expected: CampaignTrialLock, execution_id: str
+) -> None:
+    native = execution / "harbor-jobs" / "job" / expected.task_name
+    workspace = native / "artifacts" / "workspace" / "app"
+    workspace.mkdir(parents=True)
+    (workspace / "answer.txt").write_text("answer\n", encoding="utf-8")
+    agent = native / "agent"
+    agent.mkdir()
+    (agent / "session.jsonl").write_text('{"role":"assistant"}\n', encoding="utf-8")
+    (agent / "trajectory.jsonl").write_text('{"event":"done"}\n', encoding="utf-8")
+    verifier = native / "verifier"
+    verifier.mkdir()
+    (verifier / "reward.txt").write_text("1\n", encoding="utf-8")
+    (verifier / "scorecard.json").write_text('{"passed":true}\n', encoding="utf-8")
+    assemble_trial_evidence(
+        native,
+        campaign_id=IDENTITY["campaign_id"],
+        run_id=IDENTITY["run_id"],
+        execution_id=execution_id,
+        trial_id=expected.trial_id,
+        task_name=expected.task_name,
+        task_digest=expected.task_digest,
+        logical_attempt=expected.logical_attempt,
+        physical_attempt=1,
+        judge_expected=False,
+        judge_model=None,
+        policy=_trial_evidence_policy(),
+    )
+
+
 def _terminal_trial(root: Path) -> tuple[Path, CampaignTrialLock, Path]:
     expected = _expected_trial()
     trial = root / "trial"
@@ -101,6 +148,7 @@ def _terminal_trial(root: Path) -> tuple[Path, CampaignTrialLock, Path]:
         _execution_lock(expected, execution_id).model_dump_json(), encoding="utf-8"
     )
     (execution / "harbor.log").write_text("completed\n", encoding="utf-8")
+    _write_trial_evidence(execution, expected, execution_id)
     (execution / "_SUCCESS").write_text("\n", encoding="utf-8")
     write_checksums(execution)
     (trial / "trial.lock.json").write_text(

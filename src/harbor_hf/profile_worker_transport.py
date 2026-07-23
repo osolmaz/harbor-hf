@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 
+from harbor_hf.judge_recorder import JudgeEvidenceRecorder
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.provider_proxy import PROVIDER_RECORDER_PORT, ProviderEvidenceProxy
 from harbor_hf.providers import routed_provider_model
@@ -32,6 +33,8 @@ class ProfileTransport:
         self.base_url = base_url
         self.model_name = model_name
         self.proxy = proxy
+        self.judge_base_url: str | None = None
+        self.judge_recorder: JudgeEvidenceRecorder | None = None
 
     @classmethod
     def for_endpoint(cls, base_url: str, model_name: str) -> ProfileTransport:
@@ -54,7 +57,7 @@ class ProfileTransport:
         proxy.start(host="0.0.0.0", port=PROVIDER_RECORDER_PORT)
         base_url = f"https://{job_id}--{PROVIDER_RECORDER_PORT}.hf.jobs"
         try:
-            _wait_ready(base_url, token, deadline)
+            wait_ready(base_url, token, deadline)
             yield cls(
                 base_url=base_url,
                 model_name=routed_provider_model(target),
@@ -62,6 +65,18 @@ class ProfileTransport:
             )
         finally:
             proxy.close()
+
+    def attach_judge_recorder(
+        self, recorder: JudgeEvidenceRecorder, base_url: str
+    ) -> None:
+        if self.judge_recorder is not None:
+            raise ProfileTransportError("profile judge recorder is already attached")
+        self.judge_recorder = recorder
+        self.judge_base_url = base_url
+
+    def detach_judge_recorder(self) -> None:
+        self.judge_recorder = None
+        self.judge_base_url = None
 
     @contextmanager
     def scope(self, scope: str) -> Iterator[tuple[str, str, str | None]]:
@@ -79,7 +94,14 @@ class ProfileTransport:
             self.proxy.revoke_scope(capability)
 
 
-def _wait_ready(base_url: str, token: str, deadline: float) -> None:
+def job_ingress_base_url(port: int) -> str:
+    job_id = os.environ.get("JOB_ID", "")
+    if not _HF_JOB_ID.fullmatch(job_id):
+        raise ProfileTransportError("profile transport requires a valid HF Job ID")
+    return f"https://{job_id}--{port}.hf.jobs"
+
+
+def wait_ready(base_url: str, token: str, deadline: float) -> None:
     ready_deadline = min(deadline, time.monotonic() + 120)
     last_failure = "no response"
     with httpx.Client(follow_redirects=False) as client:

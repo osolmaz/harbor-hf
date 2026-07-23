@@ -36,7 +36,21 @@ def test_builds_content_addressed_campaign_plan(remote_spec: ExperimentSpec) -> 
     )
 
 
-def test_shards_ordered_task_attempts_deterministically(
+def test_campaign_accepts_literal_bracketed_task_name(
+    remote_spec: ExperimentSpec,
+) -> None:
+    deprecated = "[DERPRECATED] duplicate-task"
+    raw = remote_spec.model_dump(mode="python")
+    raw["benchmark"]["task_names"] = [deprecated]
+    raw["benchmark"]["task_digests"] = {deprecated: "sha256:" + "6" * 64}
+
+    plan = build_campaign_plan(ExperimentSpec.model_validate(raw))
+
+    assert plan.trial_count == 1
+    assert plan.runs[0].shards[0].trials[0].task_name == deprecated
+
+
+def test_shards_order_logical_attempts_across_distinct_tasks(
     remote_spec: ExperimentSpec,
 ) -> None:
     tasks = {f"task-{index}": f"sha256:{index:064x}" for index in range(1, 6)}
@@ -62,7 +76,7 @@ def test_shards_ordered_task_attempts_deterministically(
         for trial in shard.trials
     ]
     assert ordered == [
-        (f"task-{index}", attempt) for index in range(1, 6) for attempt in (1, 2)
+        (f"task-{index}", attempt) for attempt in (1, 2) for index in range(1, 6)
     ]
 
 
@@ -379,7 +393,7 @@ def test_campaign_recovery_policy_is_content_addressed_and_stable(
         separators=(",", ":"),
     ).encode()
     assert hashlib.sha256(encoded).hexdigest() == (
-        "80ec988f41ff8b1f8dd7e81e338e941cd02ee83767d3d8af529089c282404b5d"
+        "3d3e0a2ce3a78de387ad59398ff9c4a342ba5867f1bc8019d965be2a6ef85b3f"
     )
 
 
@@ -525,10 +539,19 @@ def test_retry_wave_locks_only_trials_admitted_by_its_action(
     action = _wave_action(campaign)
     trial_id = campaign.runs[0].shards[0].trials[0].trial_id
 
-    retry = action.model_copy(update={"kind": "retry-shard", "trial_ids": [trial_id]})
+    retry = action.model_copy(
+        update={
+            "kind": "retry-shard",
+            "trial_ids": [trial_id],
+            "estimated_cost_microusd": 1,
+        }
+    )
     lock = build_wave_lock(campaign, remote_spec, retry)
     assert lock.action_kind == "retry-shard"
     assert lock.trial_ids == [trial_id]
+    assert lock.estimated_cost_microusd == (
+        campaign.runs[0].estimated_wave_cost_microusd or 0
+    )
 
     with pytest.raises(ValueError, match="must admit at least one trial"):
         build_wave_lock(

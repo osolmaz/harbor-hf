@@ -24,11 +24,11 @@ def test_build_run_lock_resolves_one_cell(remote_spec: ExperimentSpec) -> None:
     lock = build_run_lock(remote_spec, clock=lambda: NOW)
     assert isinstance(lock.deployment, DeploymentProfile)
 
-    assert lock.run_id == "20260713T010203Z-a29ba34f33"
+    assert lock.run_id == "20260713T010203Z-d10d27fef9"
     assert lock.benchmark_dataset == "harbor/terminal-bench@2.0"
     assert lock.benchmark_dataset_digest == "sha256:" + "1" * 64
     assert lock.spec_digest == (
-        "sha256:8bad1524bf169d89c25d269e2a29fd8886510cfc523ac5d0d9953ab13e96cf00"
+        "sha256:ad7ca9e3083083c4393c4fdb5a26a47a5306691bbd83e3dc4081ce2ce3215f61"
     )
     assert lock.evaluation_id == "shellbench-qwen-hardware"
     assert lock.publication_role == "final"
@@ -276,8 +276,12 @@ def test_run_lock_preserves_and_renders_hosted_judge(
     spec = ExperimentSpec.model_validate(raw)
 
     lock = build_run_lock(spec, run_id="judge-lock")
+    judge_url = "https://job--8001.hf.jobs/scopes/capability/v1/chat/completions"
     with harbor_process_environment(
-        lock, token="secret-token", inference_base_url="https://endpoint.example/"
+        lock,
+        token="secret-token",
+        inference_base_url="https://endpoint.example/",
+        judge_api_url=judge_url,
     ) as environment:
         observed_environment = environment.copy()
 
@@ -285,7 +289,7 @@ def test_run_lock_preserves_and_renders_hosted_judge(
     assert lock.schema_version == "harbor-hf/run-lock/v1alpha2"
     assert observed_environment == {
         "AGENT_JUDGE_API_KEY": "secret-token",
-        "AGENT_JUDGE_API_URL": "https://router.huggingface.co/v1/chat/completions",
+        "AGENT_JUDGE_API_URL": judge_url,
         "AGENT_JUDGE_MODEL": "deepseek-ai/DeepSeek-V3.2",
         "HF_TOKEN": "secret-token",
         "OPENAI_API_KEY": "secret-token",

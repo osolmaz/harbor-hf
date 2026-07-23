@@ -143,6 +143,31 @@ def test_lists_and_caches_bucket_evidence(tmp_path: Path) -> None:
     ]
 
 
+def test_selective_prefetch_avoids_large_unrequested_evidence(tmp_path: Path) -> None:
+    prefix = "campaigns/campaign-one"
+    api = FakeBucketApi(
+        {
+            f"{prefix}/wave/checksums.json": b"checksums",
+            f"{prefix}/wave/workspace.tar.zst": b"large",
+        }
+    )
+    reader = HubBucketEvidenceReader(tmp_path, api=api)
+
+    reader.prefetch_files(
+        bucket="org/evidence",
+        prefix=prefix,
+        paths=["wave/checksums.json"],
+    )
+
+    assert (
+        reader.read_bytes(
+            bucket="org/evidence", prefix=prefix, path="wave/checksums.json"
+        )
+        == b"checksums"
+    )
+    assert api.download_batches == [[f"{prefix}/wave/checksums.json"]]
+
+
 def test_interrupted_download_never_becomes_a_cached_evidence_object(
     tmp_path: Path,
 ) -> None:

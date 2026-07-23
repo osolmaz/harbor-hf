@@ -19,9 +19,11 @@ benchmark:
     example-task: sha256:0000000000000000000000000000000000000000000000000000000000000000
   judge:
     protocol: openai-compatible
-    api_url: https://router.example/v1/chat/completions
-    model: organization/judge-model
-    api_key_secret_name: HF_TOKEN
+    api_url: https://api.openai.com/v1/chat/completions
+    model: gpt-5.6-luna
+    api_key_secret_name: OPENAI_API_KEY
+    reasoning_effort: xhigh
+    strip_temperature: true
 matrix:
   models:
     - id: model
@@ -140,13 +142,22 @@ prompting is disabled, and final evidence scrubbing covers both the Hugging Face
 and GitHub token values. Live Harbor output also reads the temporary file as a
 redaction source, so credential text is removed before it reaches HF Job logs.
 
-`benchmark.judge` optionally pins an OpenAI-compatible verifier judge on
-`router.huggingface.co`. Its API URL, model, protocol, and secret name are
-preserved in the run lock. The remote worker maps the existing `HF_TOKEN`
-secret to `AGENT_JUDGE_API_KEY` only for that trusted host and passes the public
-URL and model as `AGENT_JUDGE_API_URL` and `AGENT_JUDGE_MODEL` to Harbor. The
-credential value never appears in the manifest or lock. Arbitrary judge hosts
-require a separate credential mechanism and are rejected by this schema.
+`benchmark.judge` optionally pins an OpenAI-compatible verifier judge. The
+allowed upstreams are the Hugging Face router, the direct OpenAI API, and the
+Gemini OpenAI-compatible API. Each upstream requires its matching secret name:
+`HF_TOKEN`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`. The API URL, model, protocol,
+secret name, optional reasoning effort, and temperature policy are preserved in
+the run lock.
+
+A trusted recorder holds the upstream credential. The verifier receives the HF
+Job ingress credential through `AGENT_JUDGE_API_KEY`, plus an execution-scoped
+capability URL and the locked model in `AGENT_JUDGE_API_URL` and
+`AGENT_JUDGE_MODEL`. The recorder can enforce `reasoning_effort` and remove a
+verifier-supplied `temperature` before forwarding a request. It retains exact
+bounded request and response bodies while excluding credentials. Upstream and
+ingress credentials must not enter the manifest, lock, workspace, command, or
+evidence. Arbitrary judge hosts and mismatched provider secret names are
+rejected.
 
 ### Matrix
 

@@ -63,6 +63,13 @@ deterministic, content-addressed runs, shards, and trials. The manifest format
 is defined in the [run specification](docs/run-spec.md), and
 `campaign schema` exports the plan and lock JSON Schemas.
 
+To reproduce the public ShellBench trace methodology, use the
+[six-run example](examples/shellbench-public-six-run.yaml). It sets
+`execution.attempts: 6`, producing six fresh logical trials per task while
+keeping infrastructure retries separate. Report mean reward, strict trial pass
+rate, and each task's 0–6 pass count. Do not use an any-of-six result as the
+headline score.
+
 ## Run a Campaign
 
 ```bash
@@ -153,7 +160,10 @@ coordination Dataset — there is no server to keep alive. The
 deterministic endpoint ownership. The
 [deployment profiling contract](docs/deployment-profiling.md) defines the
 powers-of-two concurrency method, immutable profile evidence, stopping rules,
-and selection criteria used before a full campaign.
+and selection criteria used before a full campaign. The proposed [trial
+evidence bundle](docs/trial-evidence-bundle.md) and its [implementation
+plan](docs/trial-evidence-implementation-plan.md) define complete post-agent
+workspace capture and exact verifier-judge records.
 
 ## License
 

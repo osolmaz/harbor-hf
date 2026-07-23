@@ -510,6 +510,36 @@ def test_hub_store_ensures_identical_event_once(
         store.ensure_event(lock.campaign_id, conflicting)
 
 
+def test_hub_store_ensures_observed_events_in_bounded_commits(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    lock = _lock(remote_spec)
+    api = FakeCampaignApi(tmp_path)
+    store = HubCampaignStore("org", api=api)
+    store.create_campaign(lock, b"manifest", _submitted(lock))
+    events = [
+        new_event(
+            subject_type="campaign",
+            subject_id=lock.campaign_id,
+            kind="campaign.draining",
+            producer="wave-controller",
+            payload=LifecyclePayload(message=f"observation {index}"),
+            identifier=lambda index=index: f"{index:032x}",
+        )
+        for index in range(2, 53)
+    ]
+    initial_commits = len(api.commits)
+
+    assert store.ensure_events(lock.campaign_id, events)
+    assert len(api.commits) == initial_commits + 2
+    assert not store.ensure_events(lock.campaign_id, events)
+    assert len(api.commits) == initial_commits + 2
+    assert all(
+        f"campaigns/{lock.campaign_id}/events/{event.event_id}.json" in api.files
+        for event in events
+    )
+
+
 def test_hub_store_rejects_resolution_missing_a_current_cleanup_failure(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
@@ -823,7 +853,7 @@ def test_campaign_projection_corpus_is_stable(remote_spec: ExperimentSpec) -> No
     ).encode()
 
     assert hashlib.sha256(encoded).hexdigest() == (
-        "ab3bb6224a06579ab418f7753790d58893c2c5b925a1870e1cd9aa59591feb6d"
+        "142805383e16eb52d9e104c56e53f30facb355c1e918c9becf0b245bf2b15a11"
     )
 
 
@@ -1034,7 +1064,7 @@ def test_control_store_commit_corpus_is_stable(
     ).encode()
 
     assert hashlib.sha256(encoded).hexdigest() == (
-        "d89df250af3711c868ecbb7676150eb95878ebb6d249204ec55e3a3d0189780d"
+        "35f89b70ee73eb6dad218f8157ce32337c58a480b625520b4f6fc486ee2cb3ff"
     )
 
 

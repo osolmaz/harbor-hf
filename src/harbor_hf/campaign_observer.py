@@ -8,7 +8,11 @@ from typing import Protocol, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from harbor_hf.campaigns import CampaignLock, WaveLock
+from harbor_hf.campaigns import (
+    CampaignLock,
+    WaveLock,
+    estimated_partial_wave_cost,
+)
 from harbor_hf.control import (
     CampaignEvent,
     EventKind,
@@ -27,6 +31,18 @@ from harbor_hf.wave_worker import ExecutionLock
 _JSON_OBJECT = TypeAdapter(dict[str, object])
 _RETRY_CATEGORY = TypeAdapter(RetryCategory)
 _TERMINAL_MARKERS = frozenset({"_SUCCESS", "_FAILED", "_CANCELLED"})
+_OBSERVATION_FILES = frozenset(
+    {
+        "_FAILED",
+        "checksums.json",
+        "events.jsonl",
+        "execution.lock.json",
+        "failure.json",
+        "verification.json",
+        "wave-summary.json",
+        "wave.lock.json",
+    }
+)
 
 
 class CampaignObservationError(RuntimeError):
@@ -50,6 +66,17 @@ class BucketCampaignObserver:
             bucket=spec.artifacts.bucket,
             prefix=lock.artifact_prefix,
         )
+        prefetch = getattr(self.reader, "prefetch_files", None)
+        if callable(prefetch):
+            prefetch(
+                bucket=spec.artifacts.bucket,
+                prefix=lock.artifact_prefix,
+                paths=[
+                    path
+                    for path in paths
+                    if PurePosixPath(path).name in _OBSERVATION_FILES
+                ],
+            )
         events: list[CampaignEvent] = []
         for path in _wave_lock_paths(paths):
             wave_prefix = str(PurePosixPath(path).parent)
@@ -357,11 +384,20 @@ def _wave_events(
         )
         or "hf-inference-endpoints"
     )
+    estimated_cost = wave.estimated_cost_microusd
+    if wave.action_kind == "retry-shard":
+        estimated_cost = estimated_partial_wave_cost(
+            campaign,
+            wave.deployment_digest,
+            estimated_cost,
+            len(wave.trial_ids),
+        )
+        assert estimated_cost is not None
     payload = WaveLifecyclePayload(
         deployment_digest=wave.deployment_digest,
         provider=provider,
         shard_ids=wave.shard_ids,
-        estimated_cost_microusd=wave.estimated_cost_microusd,
+        estimated_cost_microusd=estimated_cost,
     )
     active = _event_time(records, "wave_started")
     finished = _event_time(records, "wave_succeeded", "wave_failed")

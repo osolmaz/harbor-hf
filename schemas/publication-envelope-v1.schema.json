@@ -109,7 +109,8 @@
                 "benchmark",
                 "configuration",
                 "authentication",
-                "cleanup"
+                "cleanup",
+                "evidence"
               ],
               "type": "string"
             },

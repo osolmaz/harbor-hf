@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 
 from harbor_hf.campaigns import EndpointWaveTarget, WaveLock
 from harbor_hf.coordination import bucket_id, coordination_repository
+from harbor_hf.judge_recorder import JUDGE_RECORDER_PORT
 from harbor_hf.models import DeploymentProfile, EndpointRef, SourcePin
 from harbor_hf.provider_proxy import PROVIDER_RECORDER_PORT
 from harbor_hf.runs import RunLock
@@ -218,7 +219,11 @@ def job_secret_names(lock: RunLock | WaveLock) -> list[str]:
         source = run_lock.benchmark_source
         if source is not None and source.credentials is not None:
             names.add(source.credentials.secret_name)
-    return [lock.remote.job.token_secret_name, *sorted(names - {"HF_TOKEN"})]
+        judge = run_lock.benchmark_judge
+        if judge is not None:
+            names.add(judge.api_key_secret_name)
+    token_name = lock.remote.job.token_secret_name
+    return [token_name, *sorted(names - {token_name})]
 
 
 def _secret_arguments(lock: RunLock | WaveLock) -> list[str]:
@@ -240,6 +245,10 @@ def build_submit_command(
     input_dir: Path | str,
     bucket: str,
 ) -> list[str]:
+    if lock.judge_required_tasks:
+        raise ValueError(
+            "judge-required runs must use campaign execution for per-trial evidence"
+        )
     job = lock.remote.job
     return [
         "hf",
@@ -283,7 +292,7 @@ def build_submit_wave_command(
 ) -> list[str]:
     job = lock.remote.job
     labels = ["--label", f"harbor-hf-wave={lock.wave_id}"]
-    exposed_port: list[str] = []
+    exposed_ports: list[str] = []
     if isinstance(lock.target, EndpointWaveTarget):
         labels.extend(
             (
@@ -295,7 +304,7 @@ def build_submit_wave_command(
             )
         )
     else:
-        exposed_port = ["--expose", str(PROVIDER_RECORDER_PORT)]
+        exposed_ports.extend(["--expose", str(PROVIDER_RECORDER_PORT)])
         labels.extend(
             (
                 "--label",
@@ -305,6 +314,8 @@ def build_submit_wave_command(
                 ],
             )
         )
+    if any(run.configuration.judge_required_tasks for run in lock.runs):
+        exposed_ports.extend(["--expose", str(JUDGE_RECORDER_PORT)])
     return [
         "hf",
         "jobs",
@@ -316,7 +327,7 @@ def build_submit_wave_command(
         job.flavor,
         "--timeout",
         f"{job.timeout_seconds}s",
-        *exposed_port,
+        *exposed_ports,
         *_secret_arguments(lock),
         *labels,
         "--volume",

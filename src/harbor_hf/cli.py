@@ -87,6 +87,10 @@ from harbor_hf.results import CatalogDecision, ResultPublicationError
 from harbor_hf.runs import RunLock, build_run_lock
 from harbor_hf.submission import Submission, build_submit_command
 from harbor_hf.submission import submit as submit_job
+from harbor_hf.trial_evidence import (
+    restore_workspace,
+    verify_trial_evidence,
+)
 from harbor_hf.wave_worker import run_wave_worker
 from harbor_hf.worker import WorkerError, run_endpoint_watchdog, run_worker
 
@@ -533,6 +537,33 @@ def campaign_resume(
     except _OPERATION_ERRORS as error:
         _exit_operation(error)
     _echo_json(result.model_dump(mode="json"))
+
+
+@artifacts_app.command("verify-trial")
+def artifacts_verify_trial(
+    trial_root: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    deep: Annotated[bool, typer.Option("--deep")] = False,
+) -> None:
+    """Validate one local trial evidence bundle and its file digests."""
+    try:
+        manifest = verify_trial_evidence(trial_root, deep=deep)
+    except (OSError, ValueError, RuntimeError) as error:
+        _exit_operation(error)
+    _echo_json(manifest.model_dump(mode="json"))
+
+
+@artifacts_app.command("restore-trial")
+def artifacts_restore_trial(
+    trial_root: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    destination: Annotated[Path, typer.Argument()],
+) -> None:
+    """Deep-validate and restore a frozen trial workspace."""
+    try:
+        manifest = verify_trial_evidence(trial_root, deep=True)
+        restore_workspace(trial_root, manifest.workspace, destination)
+    except (OSError, ValueError, RuntimeError) as error:
+        _exit_operation(error)
+    _echo_json({"destination": str(destination), "status": "restored"})
 
 
 @artifacts_app.command("verify")

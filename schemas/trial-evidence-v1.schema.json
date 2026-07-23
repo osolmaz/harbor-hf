@@ -1,0 +1,415 @@
+{
+  "$defs": {
+    "AgentEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "logs": {
+          "items": {
+            "$ref": "#/$defs/FileReference"
+          },
+          "title": "Logs",
+          "type": "array"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/FileReference"
+          },
+          "title": "Sessions",
+          "type": "array"
+        },
+        "status": {
+          "const": "captured",
+          "default": "captured",
+          "title": "Status",
+          "type": "string"
+        },
+        "trajectories": {
+          "items": {
+            "$ref": "#/$defs/FileReference"
+          },
+          "title": "Trajectories",
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions",
+        "trajectories"
+      ],
+      "title": "AgentEvidence",
+      "type": "object"
+    },
+    "CompletionEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "requirements": {
+          "items": {
+            "enum": [
+              "agent_session",
+              "agent_trajectory",
+              "judge_exchange",
+              "judge_recorder",
+              "judge_selection",
+              "verifier_reward",
+              "verifier_scorecard",
+              "verifier_stderr",
+              "verifier_stdout",
+              "workspace"
+            ],
+            "type": "string"
+          },
+          "title": "Requirements",
+          "type": "array"
+        },
+        "status": {
+          "const": "complete",
+          "default": "complete",
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requirements"
+      ],
+      "title": "CompletionEvidence",
+      "type": "object"
+    },
+    "FileReference": {
+      "additionalProperties": false,
+      "properties": {
+        "media_type": {
+          "enum": [
+            "application/json",
+            "application/octet-stream",
+            "application/vnd.harbor-hf.workspace+tar+zstd",
+            "application/x-ndjson",
+            "text/plain"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size_bytes": {
+          "minimum": 0,
+          "title": "Size Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "size_bytes",
+        "sha256",
+        "media_type"
+      ],
+      "title": "FileReference",
+      "type": "object"
+    },
+    "JudgeEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "exchanges": {
+          "items": {
+            "$ref": "#/$defs/JudgeExchangeReference"
+          },
+          "title": "Exchanges",
+          "type": "array"
+        },
+        "expected": {
+          "title": "Expected",
+          "type": "boolean"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "recorder_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "enum": [
+            "captured",
+            "not_called",
+            "not_expected"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "expected"
+      ],
+      "title": "JudgeEvidence",
+      "type": "object"
+    },
+    "JudgeExchangeReference": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "exchange_id": {
+          "pattern": "^judge-[0-9]{4}$",
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "record": {
+          "$ref": "#/$defs/FileReference"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "attempt",
+        "record"
+      ],
+      "title": "JudgeExchangeReference",
+      "type": "object"
+    },
+    "VerifierEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "judge_selection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "logs": {
+          "items": {
+            "$ref": "#/$defs/FileReference"
+          },
+          "title": "Logs",
+          "type": "array"
+        },
+        "reward": {
+          "$ref": "#/$defs/FileReference"
+        },
+        "scorecard": {
+          "$ref": "#/$defs/FileReference"
+        },
+        "selected_judge_exchange_id": {
+          "anyOf": [
+            {
+              "pattern": "^judge-[0-9]{4}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selected Judge Exchange Id"
+        },
+        "status": {
+          "const": "captured",
+          "default": "captured",
+          "title": "Status",
+          "type": "string"
+        },
+        "stderr": {
+          "$ref": "#/$defs/FileReference"
+        },
+        "stdout": {
+          "$ref": "#/$defs/FileReference"
+        }
+      },
+      "required": [
+        "scorecard",
+        "reward",
+        "stdout",
+        "stderr"
+      ],
+      "title": "VerifierEvidence",
+      "type": "object"
+    },
+    "WorkspaceEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "archive": {
+          "$ref": "#/$defs/FileReference"
+        },
+        "archive_format": {
+          "const": "pax",
+          "default": "pax",
+          "title": "Archive Format",
+          "type": "string"
+        },
+        "compression": {
+          "const": "zstd",
+          "default": "zstd",
+          "title": "Compression",
+          "type": "string"
+        },
+        "compression_level": {
+          "const": 10,
+          "default": 10,
+          "title": "Compression Level",
+          "type": "integer"
+        },
+        "entry_count": {
+          "minimum": 1,
+          "title": "Entry Count",
+          "type": "integer"
+        },
+        "file_index": {
+          "$ref": "#/$defs/FileReference"
+        },
+        "regular_file_bytes": {
+          "minimum": 0,
+          "title": "Regular File Bytes",
+          "type": "integer"
+        },
+        "regular_file_count": {
+          "minimum": 0,
+          "title": "Regular File Count",
+          "type": "integer"
+        },
+        "root": {
+          "const": "/app",
+          "default": "/app",
+          "title": "Root",
+          "type": "string"
+        },
+        "status": {
+          "const": "captured",
+          "default": "captured",
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "archive",
+        "file_index",
+        "entry_count",
+        "regular_file_count",
+        "regular_file_bytes"
+      ],
+      "title": "WorkspaceEvidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "agent": {
+      "$ref": "#/$defs/AgentEvidence"
+    },
+    "campaign_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Campaign Id"
+    },
+    "captured_at": {
+      "format": "date-time",
+      "title": "Captured At",
+      "type": "string"
+    },
+    "completion": {
+      "$ref": "#/$defs/CompletionEvidence"
+    },
+    "execution_id": {
+      "minLength": 1,
+      "title": "Execution Id",
+      "type": "string"
+    },
+    "judge": {
+      "$ref": "#/$defs/JudgeEvidence"
+    },
+    "logical_attempt": {
+      "minimum": 1,
+      "title": "Logical Attempt",
+      "type": "integer"
+    },
+    "physical_attempt": {
+      "minimum": 1,
+      "title": "Physical Attempt",
+      "type": "integer"
+    },
+    "run_id": {
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "harbor-hf/trial-evidence/v1",
+      "default": "harbor-hf/trial-evidence/v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "task_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Task Digest",
+      "type": "string"
+    },
+    "task_name": {
+      "minLength": 1,
+      "title": "Task Name",
+      "type": "string"
+    },
+    "trial_id": {
+      "minLength": 1,
+      "title": "Trial Id",
+      "type": "string"
+    },
+    "verifier": {
+      "$ref": "#/$defs/VerifierEvidence"
+    },
+    "workspace": {
+      "$ref": "#/$defs/WorkspaceEvidence"
+    }
+  },
+  "required": [
+    "run_id",
+    "execution_id",
+    "trial_id",
+    "task_name",
+    "task_digest",
+    "logical_attempt",
+    "physical_attempt",
+    "captured_at",
+    "workspace",
+    "agent",
+    "judge",
+    "verifier",
+    "completion"
+  ],
+  "title": "TrialEvidenceManifest",
+  "type": "object"
+}

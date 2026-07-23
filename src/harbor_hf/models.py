@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from fnmatch import fnmatch
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
@@ -19,6 +18,7 @@ from pydantic import (
 
 from harbor_hf.evidence import is_sensitive_key
 from harbor_hf.provider_models import ProviderTarget
+from harbor_hf.task_selection import task_matches_selector
 
 ProfileId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
 EvaluationId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
@@ -108,23 +108,64 @@ class BenchmarkJudgeSpec(StrictModel):
     protocol: Literal["openai-compatible"] = "openai-compatible"
     api_url: AnyHttpUrl
     model: str = Field(min_length=1)
-    api_key_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
+    api_key_secret_name: Literal["HF_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY"] = (
+        "HF_TOKEN"
+    )
+    reasoning_effort: (
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    strip_temperature: bool = Field(default=False, exclude_if=lambda value: not value)
+    task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
+    exclude_task_names: list[TaskName] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def configuration_is_consistent(self) -> BenchmarkJudgeSpec:
+        for label, values in (
+            ("task_names", self.task_names),
+            ("exclude_task_names", self.exclude_task_names),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"benchmark judge {label} must be unique")
+        expected_secret = {
+            "router.huggingface.co": "HF_TOKEN",
+            "api.openai.com": "OPENAI_API_KEY",
+            "generativelanguage.googleapis.com": "GEMINI_API_KEY",
+        }[str(self.api_url.host)]
+        if self.api_key_secret_name != expected_secret:
+            raise ValueError(
+                "benchmark judge API key secret must match the selected provider"
+            )
+        return self
 
     @field_validator("api_url")
     @classmethod
     def api_url_is_secure(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        allowed_endpoints = {
+            (
+                "router.huggingface.co",
+                "/v1/chat/completions",
+            ),
+            (
+                "api.openai.com",
+                "/v1/chat/completions",
+            ),
+            (
+                "generativelanguage.googleapis.com",
+                "/v1beta/openai/chat/completions",
+            ),
+        }
         if (
             value.scheme != "https"
             or value.username is not None
             or value.password
             or value.query is not None
             or value.fragment is not None
-            or value.host != "router.huggingface.co"
             or value.port != 443
+            or (value.host, value.path) not in allowed_endpoints
         ):
             raise ValueError(
-                "benchmark judge API URL must be credential-free HTTPS on the "
-                "trusted Hugging Face router"
+                "benchmark judge API URL must be an allowed credential-free HTTPS "
+                "chat completions endpoint"
             )
         return value
 
@@ -359,8 +400,32 @@ class ExecutionSpec(StrictModel):
     )
 
 
+class TrialEvidencePolicy(StrictModel):
+    """Locked workspace and judge evidence limits for one remote execution."""
+
+    workspace_root: Literal["/app"]
+    workspace_max_nodes: int = Field(ge=1, le=1_000_000)
+    workspace_max_file_bytes: int = Field(ge=1, le=8 * 1024**3)
+    workspace_max_total_bytes: int = Field(ge=1, le=32 * 1024**3)
+    workspace_max_archive_bytes: int = Field(ge=1, le=32 * 1024**3)
+    workspace_capture_timeout_seconds: int = Field(ge=1, le=3600)
+    judge_max_request_bytes: int = Field(ge=1, le=128 * 1024**2)
+    judge_max_response_bytes: int = Field(ge=1, le=128 * 1024**2)
+    judge_timeout_seconds: int = Field(ge=1, le=1200)
+    judge_max_calls_per_execution: int = Field(ge=1, le=64)
+
+    @model_validator(mode="after")
+    def limits_are_consistent(self) -> TrialEvidencePolicy:
+        if self.workspace_max_file_bytes > self.workspace_max_total_bytes:
+            raise ValueError("workspace file limit cannot exceed the total byte limit")
+        return self
+
+
 class ArtifactStoreSpec(StrictModel):
     bucket: str = Field(min_length=1)
+    trial_evidence: TrialEvidencePolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class PublishingSpec(StrictModel):
@@ -543,12 +608,53 @@ def profile_deployment_digest(deployment: DeploymentTarget) -> str:
     return _canonical_profile_digest(value)
 
 
+def resolved_judge_required_tasks(benchmark: BenchmarkSpec) -> list[str]:
+    """Resolve the exact sorted judge-required task names for a locked run."""
+    if benchmark.judge is None:
+        return []
+    selected = sorted(benchmark.task_digests)
+    if not selected:
+        raise ValueError("judge task selection requires resolved task digests")
+    judge = benchmark.judge
+    included: set[str] = set()
+    for selector in judge.task_names:
+        matched = {
+            task for task in selected if task_matches_selector(task, selector, selected)
+        }
+        if not matched:
+            raise ValueError(
+                f"benchmark judge selector matches no selected task: {selector}"
+            )
+        included |= matched
+    for selector in judge.exclude_task_names:
+        matched = {
+            task for task in selected if task_matches_selector(task, selector, selected)
+        }
+        if not matched:
+            raise ValueError(
+                f"benchmark judge exclusion matches no selected task: {selector}"
+            )
+        outside = matched - included
+        if outside:
+            raise ValueError(
+                "benchmark judge exclusion names a task outside the "
+                f"included judge set: {selector}"
+            )
+        included -= matched
+    return sorted(included)
+
+
 def _validate_remote_input_pins(spec: ExperimentSpec) -> None:
+    if spec.artifacts.trial_evidence is None:
+        raise ValueError(
+            "remote benchmark runs require an artifacts.trial_evidence policy"
+        )
     if spec.benchmark.source is None:
         pinned_harbor_dataset_reference(
             spec.benchmark.dataset, spec.benchmark.dataset_digest
         )
     _validate_task_pins(spec.benchmark)
+    resolved_judge_required_tasks(spec.benchmark)
     if any(
         re.fullmatch(r"[0-9a-f]{40}", model.revision) is None
         for model in spec.matrix.models
@@ -574,12 +680,18 @@ def _validate_task_pins(benchmark: BenchmarkSpec) -> None:
     unmatched_selections = [
         selection
         for selection in benchmark.task_names
-        if not any(fnmatch(task, selection) for task in benchmark.task_digests)
+        if not any(
+            task_matches_selector(task, selection, benchmark.task_digests)
+            for task in benchmark.task_digests
+        )
     ]
     unmatched_tasks = [
         task
         for task in benchmark.task_digests
-        if not any(fnmatch(task, selection) for selection in benchmark.task_names)
+        if not any(
+            task_matches_selector(task, selection, benchmark.task_digests)
+            for selection in benchmark.task_names
+        )
     ]
     if unmatched_selections or unmatched_tasks:
         raise ValueError("remote task digests must exactly resolve the task selection")

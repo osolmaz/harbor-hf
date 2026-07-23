@@ -25,6 +25,8 @@ from harbor_hf.models import (
     PublicationRole,
     RemoteExecutionSpec,
     ServingProfileBinding,
+    TrialEvidencePolicy,
+    resolved_judge_required_tasks,
 )
 from harbor_hf.planner import experiment_digest, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
@@ -70,6 +72,12 @@ class RunLock(BaseModel):
     benchmark_judge: BenchmarkJudgeSpec | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    judge_required_tasks: list[str] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    trial_evidence: TrialEvidencePolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     benchmark_tasks: list[str]
     benchmark_task_digests: dict[str, str]
     model: ModelProfile
@@ -85,6 +93,9 @@ class RunLock(BaseModel):
     artifact_prefix: str
     remote: RemoteExecutionSpec
 
+    def judge_required_for(self, task_name: str) -> bool:
+        return task_name in (self.judge_required_tasks or [])
+
     @model_validator(mode="after")
     def version_matches_fields(self) -> RunLock:
         if self.schema_version == RUN_LOCK_V1ALPHA1 and (
@@ -99,6 +110,20 @@ class RunLock(BaseModel):
             raise ValueError(
                 f"{self.schema_version} cannot contain authenticated source fields"
             )
+        if (self.benchmark_judge is None) != (self.judge_required_tasks is None):
+            raise ValueError(
+                "run lock judge configuration requires its resolved "
+                "judge-required task names"
+            )
+        if self.judge_required_tasks is not None:
+            tasks = self.judge_required_tasks
+            if tasks != sorted(set(tasks)) or any(
+                task not in self.benchmark_task_digests for task in tasks
+            ):
+                raise ValueError(
+                    "run lock judge-required tasks must be sorted, unique, and "
+                    "part of the locked task set"
+                )
         return self
 
 
@@ -186,6 +211,12 @@ def build_run_lock(
         benchmark_dataset_digest=str(spec.benchmark.dataset_digest),
         benchmark_source=spec.benchmark.source,
         benchmark_judge=spec.benchmark.judge,
+        judge_required_tasks=(
+            resolved_judge_required_tasks(spec.benchmark)
+            if spec.benchmark.judge is not None
+            else None
+        ),
+        trial_evidence=spec.artifacts.trial_evidence,
         benchmark_tasks=spec.benchmark.task_names,
         benchmark_task_digests=spec.benchmark.task_digests,
         model=model,
@@ -201,12 +232,26 @@ def build_run_lock(
     )
 
 
+def _judge_process_environment(
+    lock: RunLock, judge_api_url: str | None, ingress_token: str
+) -> dict[str, str]:
+    judge = lock.benchmark_judge
+    if judge is None or judge_api_url is None:
+        return {}
+    return {
+        "AGENT_JUDGE_API_KEY": ingress_token,
+        "AGENT_JUDGE_API_URL": judge_api_url,
+        "AGENT_JUDGE_MODEL": judge.model,
+    }
+
+
 @contextmanager
 def harbor_process_environment(
     lock: RunLock,
     *,
     token: str,
     inference_base_url: str,
+    judge_api_url: str | None = None,
     blocked_secret_names: Iterable[str] = (),
     redaction_secrets: Iterable[str] = (),
 ) -> Iterator[dict[str, str]]:
@@ -215,14 +260,7 @@ def harbor_process_environment(
         "OPENAI_API_KEY": token,
         "OPENAI_BASE_URL": f"{inference_base_url.rstrip('/')}/v1",
     }
-    if lock.benchmark_judge is not None:
-        environment.update(
-            {
-                "AGENT_JUDGE_API_KEY": token,
-                "AGENT_JUDGE_API_URL": str(lock.benchmark_judge.api_url),
-                "AGENT_JUDGE_MODEL": lock.benchmark_judge.model,
-            }
-        )
+    environment.update(_judge_process_environment(lock, judge_api_url, token))
     blocked = set(blocked_secret_names)
     redaction_values = [value for value in redaction_secrets if value]
     source = lock.benchmark_source
@@ -316,6 +354,11 @@ def run_secret_values(lock: RunLock, token: str) -> str | tuple[str, ...]:
         source_token = os.environ.get(source.credentials.secret_name, "")
         if source_token:
             values.append(source_token)
+    judge = lock.benchmark_judge
+    if judge is not None:
+        judge_token = os.environ.get(judge.api_key_secret_name, "")
+        if judge_token:
+            values.append(judge_token)
     unique = tuple(dict.fromkeys(value for value in values if value))
     return unique[0] if len(unique) == 1 else unique
 

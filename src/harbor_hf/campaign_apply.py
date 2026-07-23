@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -34,6 +35,7 @@ from harbor_hf.control import (
     ActionProjection,
     ActionReservedPayload,
     CampaignCancellationWon,
+    CampaignConflict,
     CampaignEvent,
     CampaignStore,
     Clock,
@@ -44,6 +46,7 @@ from harbor_hf.control import (
     TerminalPayload,
     WaveLifecyclePayload,
     new_event,
+    same_event_request,
 )
 from harbor_hf.coordination import (
     ClaimConflict,
@@ -324,6 +327,20 @@ class HuggingFaceWaveJobAdapter:
             ) from error
 
 
+def _missing_observed_events(
+    durable_events: Sequence[CampaignEvent], observed_events: Sequence[CampaignEvent]
+) -> list[CampaignEvent]:
+    durable_by_id = {event.event_id: event for event in durable_events}
+    missing: list[CampaignEvent] = []
+    for event in observed_events:
+        durable = durable_by_id.get(event.event_id)
+        if durable is None:
+            missing.append(event)
+        elif not same_event_request(durable, event):
+            raise CampaignConflict(f"event conflicts: {event.event_id}")
+    return missing
+
+
 class CampaignReconciler:
     """Apply one bounded, stateless campaign reconciliation pass."""
 
@@ -383,10 +400,12 @@ class CampaignReconciler:
             for event in events
         )
         if self.observer is not None and not terminal_recorded:
-            observed = self.observer.observe(lock, spec)
-            changed = False
-            for event in observed:
-                changed = self.store.ensure_event(campaign_id, event) or changed
+            missing = _missing_observed_events(
+                events, self.observer.observe(lock, spec)
+            )
+            changed = (
+                self.store.ensure_events(campaign_id, missing) if missing else False
+            )
             if changed:
                 lock, events = self.store.load_campaign(campaign_id)
         self._last_observed_at = max(event.observed_at for event in events)
@@ -1601,9 +1620,14 @@ def hugging_face_campaign_reconciler(
     from harbor_hf.result_publisher import DatasetApi, HubDatasetPublisher
 
     evidence_api = HfApi()
-    evidence_cache = tempfile.TemporaryDirectory(prefix="harbor-hf-evidence-")
+    evidence_cache = Path(
+        os.environ.get(
+            "HARBOR_HF_EVIDENCE_CACHE",
+            str(Path.home() / ".cache" / "harbor-hf" / "evidence"),
+        )
+    ).expanduser()
     reader = HubBucketEvidenceReader(
-        Path(evidence_cache.name),
+        evidence_cache,
         api=cast(BucketEvidenceApi, evidence_api),
     )
     token = get_token()
@@ -1645,7 +1669,7 @@ def hugging_face_campaign_reconciler(
         observer=BucketCampaignObserver(reader),
         finalizer=BucketCampaignFinalizer(reader, writer),
         result_publisher=result_publisher,
-        cleanup=evidence_cache.cleanup,
+        cleanup=lambda: None,
     )
 
 

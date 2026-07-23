@@ -13,7 +13,12 @@ from harbor_hf.campaigns import (
     build_wave_lock,
 )
 from harbor_hf.control import CampaignSubmittedPayload, new_event
-from harbor_hf.models import ExperimentSpec, GitBenchmarkSource, GitHubTokenCredentials
+from harbor_hf.models import (
+    BenchmarkJudgeSpec,
+    ExperimentSpec,
+    GitBenchmarkSource,
+    GitHubTokenCredentials,
+)
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.reconciler import plan_reconciliation
 from harbor_hf.runs import build_run_lock
@@ -156,6 +161,38 @@ def test_build_submit_command_contains_only_secret_name(
     assert "super-secret" not in " ".join(command)
 
 
+def test_direct_submit_rejects_judge_required_run(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    judge = BenchmarkJudgeSpec(
+        api_url="https://router.huggingface.co/v1/chat/completions",
+        model="judge/model",
+    )
+    spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+    lock = build_run_lock(spec)
+    with pytest.raises(ValueError, match="must use campaign execution"):
+        build_submit_command(lock, input_dir=tmp_path, bucket="osolmaz/benchmark-runs")
+
+
+def test_judged_wave_exposes_recorder_port(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    judge = BenchmarkJudgeSpec(
+        api_url="https://router.huggingface.co/v1/chat/completions",
+        model="judge/model",
+    )
+    spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+    command = build_submit_wave_command(
+        _wave_lock(spec), input_dir=tmp_path, bucket="osolmaz/benchmark-runs"
+    )
+    expose = command.index("--expose")
+    assert command[expose : expose + 2] == ["--expose", "8001"]
+
+
 def test_build_submit_wave_command_targets_hidden_worker(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
@@ -245,6 +282,23 @@ def test_authenticated_source_adds_named_secret_to_controller_jobs(
         "GITHUB_TOKEN",
     ]
     assert "github-secret" not in " ".join(run_command + wave_command)
+
+
+def test_direct_judge_adds_provider_secret_to_wave_job(
+    remote_spec: ExperimentSpec,
+) -> None:
+    judge = BenchmarkJudgeSpec(
+        api_url="https://api.openai.com/v1/chat/completions",
+        model="gpt-5.6-luna",
+        api_key_secret_name="OPENAI_API_KEY",
+        reasoning_effort="xhigh",
+        strip_temperature=True,
+    )
+    spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+
+    assert job_secret_names(_wave_lock(spec)) == ["HF_TOKEN", "OPENAI_API_KEY"]
 
 
 def test_private_source_submission_requires_local_secret_before_staging(

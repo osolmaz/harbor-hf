@@ -120,6 +120,7 @@ def test_run_command_is_the_complete_ordered_process_contract(
         "n_attempts": 3,
         "n_concurrent_trials": 4,
         "retry": {"max_retries": 0},
+        "artifacts": [{"source": "/app", "destination": "workspace/app"}],
         "environment": {
             "type": "environment-contract",
             "kwargs": {"flavor": "flavor-contract", "job_timeout": 4321},

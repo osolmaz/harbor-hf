@@ -9,7 +9,11 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from harbor_hf.campaigns import CampaignLock, CampaignRunLock
+from harbor_hf.campaigns import (
+    CampaignLock,
+    CampaignRunLock,
+    estimated_partial_wave_cost,
+)
 from harbor_hf.control import ActionKind, ActionProjection, CampaignEvent
 from harbor_hf.recovery import (
     RecoveryProjection,
@@ -421,7 +425,12 @@ def _retry_candidates(
                     shard_ids=chunk,
                     trial_ids=trial_ids,
                     target_ids=trial_ids,
-                    estimated_cost_microusd=admission.estimated_wave_cost_microusd,
+                    estimated_cost_microusd=estimated_partial_wave_cost(
+                        lock,
+                        deployment,
+                        admission.estimated_wave_cost_microusd,
+                        len(trial_ids),
+                    ),
                     spend_cap_microusd=_run_admission(
                         lock, deployment
                     ).spend_cap_microusd,

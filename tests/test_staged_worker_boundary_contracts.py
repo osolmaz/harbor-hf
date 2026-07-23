@@ -282,8 +282,10 @@ def test_staged_provider_wave_finalizes_then_publishes_exact_success(
         shard_kwargs.update(kwargs)
         return checksums
 
-    def cleanup(lifecycle: object, provider_proxy: object) -> None:
-        calls.append(("cleanup", lifecycle, provider_proxy))
+    def cleanup(
+        lifecycle: object, provider_proxy: object, judge_recorder: object
+    ) -> None:
+        calls.append(("cleanup", lifecycle, provider_proxy, judge_recorder))
         return None
 
     def finalize(root: Path, token: str) -> None:
@@ -294,6 +296,9 @@ def test_staged_provider_wave_finalizes_then_publishes_exact_success(
         calls.append(("publish", source, destination, (source / "_SUCCESS").is_file()))
 
     monkeypatch.setattr(wave_worker, "_prepare_wave_transport", prepare_transport)
+    monkeypatch.setattr(
+        wave_worker, "_prepare_judge_transport", lambda *args: (None, None)
+    )
     monkeypatch.setattr(wave_worker, "_execute_shards", execute_shards)
     monkeypatch.setattr(wave_worker, "_cleanup_wave_transport", cleanup)
     monkeypatch.setattr(wave_worker, "_finalize_unit", finalize)
@@ -338,8 +343,12 @@ def test_staged_provider_wave_finalizes_then_publishes_exact_success(
         / "sources"
         / f"harbor-{wave.remote.harbor.source.revision}"
     )
-    assert calls[4] == ("cleanup", None, proxy)
-    assert shard_kwargs == {"provider_proxy": proxy}
+    assert calls[4] == ("cleanup", None, proxy, None)
+    assert shard_kwargs == {
+        "provider_proxy": proxy,
+        "judge_recorder": None,
+        "judge_base_url": None,
+    }
     assert calls[5] == ("finalize", wave_root, "contract-token", False)
     assert calls[6] == (
         "publish",

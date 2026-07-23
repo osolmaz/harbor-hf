@@ -166,22 +166,32 @@ def verify_checksums(root: Path) -> dict[str, str]:
 SecretValues = str | Iterable[str]
 
 
-def assert_secret_absent(root: Path, secrets: SecretValues) -> None:
+def assert_secret_absent(
+    root: Path, secrets: SecretValues, *, allow_symlinks: bool = False
+) -> None:
     for secret in _secret_values(secrets):
         needle = secret.encode()
-        for path in _evidence_paths(root):
+        for path in _evidence_paths(root, allow_symlinks=allow_symlinks):
             if secret in str(path.relative_to(root)):
                 raise RuntimeError("secret value found in artifact path")
+            if path.is_symlink():
+                if secret in os.readlink(path):
+                    raise RuntimeError("secret value found in artifact symlink")
+                continue
             if path.is_file() and _file_contains(path, needle):
                 relative = path.relative_to(root)
                 raise RuntimeError(f"secret value found in artifact {relative}")
 
 
-def scrub_secret_paths(root: Path, secrets: SecretValues) -> int:
+def scrub_secret_paths(
+    root: Path, secrets: SecretValues, *, allow_symlinks: bool = False
+) -> int:
     changed = 0
     for secret in _secret_values(secrets):
         paths = sorted(
-            _evidence_paths(root), key=lambda path: len(path.parts), reverse=True
+            _evidence_paths(root, allow_symlinks=allow_symlinks),
+            key=lambda path: len(path.parts),
+            reverse=True,
         )
         for path in paths:
             if secret not in path.name:
@@ -194,11 +204,17 @@ def scrub_secret_paths(root: Path, secrets: SecretValues) -> int:
     return changed
 
 
-def scrub_secret(root: Path, secrets: SecretValues) -> list[str]:
+def scrub_secret(
+    root: Path, secrets: SecretValues, *, allow_symlinks: bool = False
+) -> list[str]:
     changed: list[str] = []
     for secret in _secret_values(secrets):
         needle = secret.encode()
-        for path in _evidence_paths(root):
+        for path in _evidence_paths(root, allow_symlinks=allow_symlinks):
+            if path.is_symlink():
+                if secret in os.readlink(path):
+                    raise RuntimeError("secret value found in artifact symlink")
+                continue
             if not path.is_file():
                 continue
             relative = str(path.relative_to(root))
@@ -212,11 +228,14 @@ def _secret_values(secrets: SecretValues) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))
 
 
-def _evidence_paths(root: Path) -> list[Path]:
+def _evidence_paths(root: Path, *, allow_symlinks: bool = False) -> list[Path]:
     paths = sorted(root.rglob("*"))
-    if any(path.is_symlink() for path in paths):
+    if not allow_symlinks and any(path.is_symlink() for path in paths):
         raise RuntimeError("symbolic links are not allowed in run evidence")
-    if any(not path.is_dir() and not path.is_file() for path in paths):
+    if any(
+        not path.is_symlink() and not path.is_dir() and not path.is_file()
+        for path in paths
+    ):
         raise RuntimeError("special files are not allowed in run evidence")
     return paths
 

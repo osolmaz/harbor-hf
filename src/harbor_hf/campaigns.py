@@ -6,7 +6,6 @@ import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from fnmatch import fnmatch
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -31,6 +30,7 @@ from harbor_hf.models import (
 from harbor_hf.planner import RunCell, experiment_digest, resolved_cells
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.runs import RunLock, build_run_lock, validate_provider_cell
+from harbor_hf.task_selection import task_matches_selector
 
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
@@ -227,6 +227,41 @@ WaveDeploymentTarget = Annotated[
 ]
 
 
+def estimated_partial_wave_cost(
+    lock: CampaignLock,
+    deployment_digest: str,
+    estimated_wave_cost_microusd: int | None,
+    trial_count: int,
+) -> int | None:
+    if estimated_wave_cost_microusd is None:
+        return None
+    shard_sizes = sorted(
+        (
+            (shard.shard_id, len(shard.trials))
+            for run in lock.runs
+            if run.deployment_digest == deployment_digest
+            for shard in run.shards
+        ),
+        key=lambda item: item[0],
+    )
+    capacities = [
+        sum(
+            size
+            for _shard_id, size in shard_sizes[
+                offset : offset + lock.max_shards_per_wave
+            ]
+        )
+        for offset in range(0, len(shard_sizes), lock.max_shards_per_wave)
+    ]
+    capacity = max(capacities, default=0)
+    if capacity <= 0 or trial_count <= 0:
+        raise ValueError("partial wave cost requires a non-empty deployment wave")
+    return max(
+        1,
+        (estimated_wave_cost_microusd * trial_count + capacity - 1) // capacity,
+    )
+
+
 class WaveLock(FrozenModel):
     schema_version: Literal["harbor-hf/wave-lock/v1alpha1"] = (
         "harbor-hf/wave-lock/v1alpha1"
@@ -251,6 +286,11 @@ class WaveLock(FrozenModel):
     estimated_cost_microusd: int = Field(default=0, ge=0)
     duration_seconds: int
     remote: RemoteExecutionSpec
+    recovery_parent_worker_revision: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+        exclude_if=lambda value: value is None,
+    )
     shard_ids: list[str]
     trial_ids: list[str] = Field(default_factory=list)
     runs: list[WaveRunLock]
@@ -301,6 +341,15 @@ class WaveLock(FrozenModel):
             raise ValueError("wave duration must be positive")
         return self
 
+    @model_validator(mode="after")
+    def recovery_worker_is_only_for_retries(self) -> WaveLock:
+        if (
+            self.recovery_parent_worker_revision is not None
+            and self.action_kind != "retry-shard"
+        ):
+            raise ValueError("only retry waves can pin a recovery worker revision")
+        return self
+
 
 def build_campaign_plan(
     spec: ExperimentSpec,
@@ -322,8 +371,8 @@ def build_campaign_plan(
             task_digest=task_digest,
             logical_attempt=logical_attempt,
         )
-        for task_name, task_digest in tasks
         for logical_attempt in range(1, spec.execution.attempts + 1)
+        for task_name, task_digest in tasks
     ]
     profiles = (
         {profile.id: profile for profile in spec.matrix.models},
@@ -372,11 +421,15 @@ def _resolved_tasks(spec: ExperimentSpec) -> list[tuple[str, str]]:
     if not digests:
         raise ValueError("campaign planning requires resolved task digests")
     if any(
-        not any(fnmatch(task_name, selection) for task_name in digests)
+        not any(
+            task_matches_selector(task_name, selection, digests)
+            for task_name in digests
+        )
         for selection in spec.benchmark.task_names
     ) or any(
         not any(
-            fnmatch(task_name, selection) for selection in spec.benchmark.task_names
+            task_matches_selector(task_name, selection, digests)
+            for selection in spec.benchmark.task_names
         )
         for task_name in digests
     ):
@@ -566,6 +619,12 @@ def build_wave_lock(
     }
     if set(action.trial_ids) - selected_trial_ids:
         raise ValueError("retry-shard action references trials outside its shards")
+    estimates = {
+        campaign_run.estimated_wave_cost_microusd for campaign_run, _shards in selected
+    }
+    if len(estimates) != 1:
+        raise ValueError("compatible wave shards must use one spend estimate")
+    locked_wave_estimate = estimates.pop() or 0
     run_locks: list[WaveRunLock] = []
     target: EndpointWaveTarget | ProviderWaveTarget | None = None
     requested_endpoint = endpoint
@@ -643,7 +702,7 @@ def build_wave_lock(
             if provider_target is not None
             else None
         ),
-        estimated_cost_microusd=action.estimated_cost_microusd or 0,
+        estimated_cost_microusd=locked_wave_estimate,
         duration_seconds=spec.execution.timeout_seconds,
         remote=spec.remote,
         shard_ids=action.shard_ids,

@@ -10,6 +10,7 @@ from typing import Protocol, cast
 from huggingface_hub import HfApi
 from pydantic import BaseModel, ConfigDict
 
+from harbor_hf.judge_recorder import JUDGE_RECORDER_PORT
 from harbor_hf.models import DeploymentProfile
 from harbor_hf.process import SubprocessRunner
 from harbor_hf.profiling import ProfilePlan, bind_profile_target
@@ -60,7 +61,7 @@ def build_profile_submit_command(
     )
     target = lock.deployment
     labels = ["--label", f"harbor-hf-profile={plan.profile_id}"]
-    exposed_port: list[str] = []
+    exposed_ports: list[str] = []
     if isinstance(target, DeploymentProfile):
         if target.endpoint is None:
             raise ValueError("profile endpoint binding is missing")
@@ -74,7 +75,7 @@ def build_profile_submit_command(
             ]
         )
     else:
-        exposed_port = ["--expose", str(PROVIDER_RECORDER_PORT)]
+        exposed_ports.extend(["--expose", str(PROVIDER_RECORDER_PORT)])
         labels.extend(
             [
                 "--label",
@@ -82,6 +83,8 @@ def build_profile_submit_command(
                 + hashlib.sha256(target.model.encode()).hexdigest()[:32],
             ]
         )
+    if lock.judge_required_tasks:
+        exposed_ports.extend(["--expose", str(JUDGE_RECORDER_PORT)])
     secret_args = [
         argument for name in job_secret_names(lock) for argument in ("--secrets", name)
     ]
@@ -97,7 +100,7 @@ def build_profile_submit_command(
         job.flavor,
         "--timeout",
         f"{job.timeout_seconds}s",
-        *exposed_port,
+        *exposed_ports,
         *secret_args,
         *labels,
         "--volume",

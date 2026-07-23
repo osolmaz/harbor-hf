@@ -228,6 +228,38 @@ def test_private_manifest_enforces_file_and_bundle_size_limits(tmp_path: Path) -
         )
 
 
+def test_private_manifest_allows_large_direct_workspace_archive(
+    tmp_path: Path,
+) -> None:
+    root = _execution_root(tmp_path)
+    evidence = root / "evidence"
+    evidence.mkdir()
+    archive = evidence / "workspace.tar.zst"
+    archive.write_bytes(b"x" * 2048)
+
+    manifest = build_private_artifact_manifest(
+        root,
+        strict_session=True,
+        max_file_bytes=1024,
+        max_bundle_bytes=1024 * 1024,
+    )
+
+    assert any(entry.path == "evidence/workspace.tar.zst" for entry in manifest.entries)
+
+
+def test_private_sanitizer_preserves_large_workspace_archive(tmp_path: Path) -> None:
+    root = _execution_root(tmp_path)
+    evidence = root / "evidence"
+    evidence.mkdir()
+    archive = evidence / "workspace.tar.zst"
+    archive.write_bytes(b"x" * 2048)
+
+    rejected = sanitize_private_artifact_tree(root, max_file_bytes=1024)
+
+    assert archive.read_bytes() == b"x" * 2048
+    assert all(item.path != "evidence/workspace.tar.zst" for item in rejected)
+
+
 def test_private_manifest_rejects_symlinks(tmp_path: Path) -> None:
     root = _execution_root(tmp_path)
     (root / "linked").symlink_to(root / "events.jsonl")

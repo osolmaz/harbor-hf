@@ -12,7 +12,6 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlparse
@@ -42,6 +41,7 @@ from harbor_hf.harbor_adapter import (
     FilesystemHarborExecutionAdapter,
     WorkerError,
     build_execution_request,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter import (
     HarborTrialFailure as _HarborTrialFailure,
@@ -58,6 +58,7 @@ from harbor_hf.harbor_adapter.legacy import (
     validate_task_counts,
     validate_trial_count,
 )
+from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle
 from harbor_hf.harbor_native_bundle import write_harbor_native_bundle
 from harbor_hf.io import load_experiment
 from harbor_hf.models import (
@@ -96,6 +97,8 @@ from harbor_hf.submission import (
     github_repository,
     locked_source_command,
 )
+from harbor_hf.task_selection import task_matches_selector
+from harbor_hf.trial_evidence import assemble_trial_evidence
 
 _WATCHDOG_READY_LABEL = "harbor-hf-watchdog-ready"
 _WATCHDOG_STARTUP_TIMEOUT_SECONDS = 300
@@ -377,7 +380,10 @@ def _build_harbor_command(
         expected_task_digests={
             task: digest
             for task, digest in lock.benchmark_task_digests.items()
-            if any(fnmatch(task, selector) for selector in task_names)
+            if any(
+                task_matches_selector(task, selector, lock.benchmark_task_digests)
+                for selector in task_names
+            )
         },
     )
     config_path = jobs_dir.parent / "harbor-job.json"
@@ -598,6 +604,8 @@ def _failure_details(
 
 
 def validate_run_lock(spec: ExperimentSpec, lock: RunLock) -> None:
+    if lock.trial_evidence is None:
+        raise WorkerError("run lock requires a complete trial evidence policy")
     if lock.spec_digest != experiment_digest(spec):
         raise WorkerError("manifest digest does not match the run lock")
     try:
@@ -717,6 +725,10 @@ def _execute_benchmark(
     stream_runner: Callable[..., int],
     harbor_source: Path,
 ) -> None:
+    if lock.judge_required_tasks:
+        raise WorkerError(
+            "judge-required runs must use campaign execution for per-trial evidence"
+        )
     base_url = resume_and_probe_endpoint(root, events, lock, manager, token)
 
     jobs_dir = root / "harbor-jobs"
@@ -760,8 +772,58 @@ def _execute_benchmark(
     if outcome.verification is None:
         raise WorkerError("Harbor produced no validated compatibility bundle")
     write_json(root / "verification.json", outcome.verification.model_dump(mode="json"))
+    _assemble_direct_trial_evidence(
+        root, jobs_dir, lock, outcome.compatibility_path, token
+    )
     _validate_direct_private_artifacts(root, lock)
     append_event(events, "verification_validated")
+
+
+def _assemble_direct_trial_evidence(
+    root: Path,
+    jobs_dir: Path,
+    lock: RunLock,
+    compatibility_path: Path | None,
+    token: str,
+) -> None:
+    policy = lock.trial_evidence
+    if policy is None or compatibility_path is None:
+        raise WorkerError("direct run has no locked trial evidence policy")
+    bundle = HarborCompatibilityBundle.model_validate_json(
+        compatibility_path.read_text(encoding="utf-8")
+    )
+    secret_values = run_secret_values(lock, token)
+    known_secrets = (
+        (secret_values,) if isinstance(secret_values, str) else tuple(secret_values)
+    )
+    attempts: dict[str, int] = {}
+    for native in sorted(bundle.trials, key=lambda item: (item.task_name, item.path)):
+        logical_attempt = attempts.get(native.task_name, 0) + 1
+        attempts[native.task_name] = logical_attempt
+        native_root = resolve_native_trial_root(jobs_dir, native.path)
+        redacted = scrub_secret(native_root, known_secrets, allow_symlinks=True)
+        if redacted:
+            append_event(
+                root / "events.jsonl",
+                "evidence_secrets_redacted",
+                files=redacted,
+            )
+        assert_secret_absent(native_root, known_secrets, allow_symlinks=True)
+        assemble_trial_evidence(
+            native_root,
+            campaign_id=None,
+            run_id=lock.run_id,
+            execution_id=lock.run_id,
+            trial_id=native.trial_id,
+            task_name=native.task_name,
+            task_digest=native.task_digest,
+            logical_attempt=logical_attempt,
+            physical_attempt=1,
+            judge_expected=False,
+            judge_model=None,
+            policy=policy,
+            known_secrets=known_secrets,
+        )
 
 
 def resume_and_probe_endpoint(

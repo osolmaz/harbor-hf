@@ -12,6 +12,7 @@ dependencies = [
   "httpx>=0.23.0",
   "pydantic>=2.11.7",
   "pyyaml>=6.0.2",
+  "zstandard>=0.23.0",
   "typer>=0.16.0",
   "uvicorn>=0.35.0",
   "pyarrow>=18.0.0",

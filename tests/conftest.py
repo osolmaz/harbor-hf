@@ -155,7 +155,11 @@ def remote_spec() -> ExperimentSpec:
             ),
             "matrix": spec.matrix.model_copy(update={"deployments": [deployment]}),
             "execution": spec.execution.model_copy(
-                update={"concurrent_trials": 1, "timeout_seconds": 60}
+                update={
+                    "attempts": 1,
+                    "concurrent_trials": 1,
+                    "timeout_seconds": 60,
+                }
             ),
             "remote": RemoteExecutionSpec.model_validate(
                 {

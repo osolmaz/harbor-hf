@@ -5,8 +5,7 @@ import time
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from fnmatch import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Never, Protocol
 from urllib.parse import urlparse
 
@@ -36,6 +35,7 @@ from harbor_hf.models import (
 from harbor_hf.provider_models import ProviderTarget
 from harbor_hf.providers import routed_provider_model
 from harbor_hf.runs import RunLock
+from harbor_hf.task_selection import task_matches_selector
 
 _SUCCESSFUL_EXPORT_ATTEMPTS = 6
 
@@ -68,6 +68,7 @@ class HarborExecutionAdapter(Protocol):
         attempts: int,
         concurrency: int,
         expected_task_digests: dict[str, str],
+        extra_environment_hosts: tuple[str, ...] = (),
     ) -> PreparedHarborExecution: ...
 
     def execute(
@@ -99,6 +100,7 @@ class FilesystemHarborExecutionAdapter:
         attempts: int,
         concurrency: int,
         expected_task_digests: dict[str, str],
+        extra_environment_hosts: tuple[str, ...] = (),
     ) -> PreparedHarborExecution:
         request = build_execution_request(
             lock,
@@ -108,6 +110,7 @@ class FilesystemHarborExecutionAdapter:
             attempts=attempts,
             concurrency=concurrency,
             expected_task_digests=expected_task_digests,
+            extra_environment_hosts=extra_environment_hosts,
         )
         request_path = execution_root / "harbor-request.json"
         config_path = execution_root / "harbor-job.json"
@@ -304,6 +307,30 @@ def _append_export_attempt_log(
             stream.write(b"\n")
 
 
+def resolve_native_trial_root(jobs_dir: Path, value: str) -> Path:
+    relative = PurePosixPath(value)
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != value
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise WorkerError("Harbor trial path is not a safe relative directory")
+    candidate = jobs_dir
+    for part in relative.parts:
+        candidate /= part
+        if candidate.is_symlink():
+            raise WorkerError("Harbor trial path contains a symbolic link")
+    try:
+        root = jobs_dir.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise WorkerError("Harbor trial path does not exist") from error
+    if not resolved.is_relative_to(root) or not resolved.is_dir():
+        raise WorkerError("Harbor trial path escapes its jobs directory")
+    return resolved
+
+
 def build_execution_request(
     lock: RunLock,
     jobs_dir: Path,
@@ -313,17 +340,25 @@ def build_execution_request(
     attempts: int,
     concurrency: int,
     expected_task_digests: dict[str, str],
+    extra_environment_hosts: tuple[str, ...] = (),
 ) -> HarborExecutionRequest:
     if attempts < 1 or concurrency < 1:
         raise WorkerError("Harbor attempts and concurrency must be positive")
+    available_tasks = lock.benchmark_task_digests
     resolved_task_digests = {
         task: digest
-        for task, digest in lock.benchmark_task_digests.items()
-        if any(fnmatch(task, selector) for selector in task_names)
+        for task, digest in available_tasks.items()
+        if any(
+            task_matches_selector(task, selector, available_tasks)
+            for selector in task_names
+        )
     }
     if (
         any(
-            not any(fnmatch(task, selector) for task in lock.benchmark_task_digests)
+            not any(
+                task_matches_selector(task, selector, available_tasks)
+                for task in available_tasks
+            )
             for selector in task_names
         )
         or expected_task_digests != resolved_task_digests
@@ -354,18 +389,29 @@ def build_execution_request(
     if lock.agent.revision_kind == "package":
         agent_kwargs["version"] = lock.agent.revision
     host = urlparse(base_url).hostname or ""
+    environment: dict[str, JsonValue] = {
+        "type": lock.remote.harbor.environment,
+        "kwargs": {
+            "flavor": lock.remote.harbor.sandbox_flavor,
+            "job_timeout": lock.remote.harbor.sandbox_idle_timeout_seconds,
+        },
+    }
+    if extra_environment_hosts:
+        environment["extra_allowed_hosts"] = list(
+            dict.fromkeys(extra_environment_hosts)
+        )
     config: dict[str, JsonValue] = {
         "jobs_dir": str(jobs_dir),
         "n_attempts": attempts,
         "n_concurrent_trials": concurrency,
         "retry": {"max_retries": 0},
-        "environment": {
-            "type": lock.remote.harbor.environment,
-            "kwargs": {
-                "flavor": lock.remote.harbor.sandbox_flavor,
-                "job_timeout": lock.remote.harbor.sandbox_idle_timeout_seconds,
-            },
-        },
+        "artifacts": [
+            {
+                "source": "/app",
+                "destination": "workspace/app",
+            }
+        ],
+        "environment": environment,
         "agents": [
             {
                 "name": lock.agent.name,

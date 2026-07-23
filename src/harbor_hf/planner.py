@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from fnmatch import fnmatch
 from itertools import product
 
 from pydantic import BaseModel, ConfigDict
 
 from harbor_hf.models import ExperimentSpec, MatrixRule
+from harbor_hf.task_selection import task_matches_selector
 
 
 class RunCell(BaseModel):
@@ -100,7 +100,10 @@ def _rule_matches(rule: MatrixRule, cell: RunCell) -> bool:
 def build_plan(spec: ExperimentSpec) -> ExperimentPlan:
     cells = resolved_cells(spec)
     task_count = sum(
-        any(fnmatch(task, selection) for selection in spec.benchmark.task_names)
+        any(
+            task_matches_selector(task, selection, spec.benchmark.task_digests)
+            for selection in spec.benchmark.task_names
+        )
         for task in spec.benchmark.task_digests
     ) or (
         None

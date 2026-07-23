@@ -20,6 +20,9 @@ from harbor_hf.models import (
 )
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "shellbench.yaml"
+SIX_RUN_EXAMPLE = (
+    Path(__file__).parent.parent / "examples" / "shellbench-public-six-run.yaml"
+)
 
 
 def test_load_example() -> None:
@@ -60,6 +63,13 @@ def test_rejects_duplicate_yaml_mapping_keys(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestError, match="found duplicate key 'execution'"):
         load_experiment(manifest)
+
+
+def test_public_shellbench_example_uses_six_independent_attempts() -> None:
+    spec = load_experiment(SIX_RUN_EXAMPLE)
+
+    assert spec.execution.attempts == 6
+    assert spec.artifacts.trial_evidence is not None
 
 
 def test_yaml_merge_allows_explicit_override(tmp_path: Path) -> None:
@@ -237,7 +247,58 @@ def test_benchmark_judge_round_trips_without_a_credential() -> None:
         "api_url": "https://router.huggingface.co/v1/chat/completions",
         "model": "deepseek-ai/DeepSeek-V3.2",
         "protocol": "openai-compatible",
+        "task_names": ["*"],
+        "exclude_task_names": [],
     }
+
+
+def test_benchmark_judge_accepts_direct_openai_with_enforced_reasoning() -> None:
+    benchmark = BenchmarkSpec.model_validate(
+        {
+            "dataset": "harbor/terminal-bench@2.0",
+            "dataset_digest": "sha256:" + "1" * 64,
+            "judge": {
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-5.6-luna",
+                "api_key_secret_name": "OPENAI_API_KEY",
+                "reasoning_effort": "xhigh",
+                "strip_temperature": True,
+            },
+        }
+    )
+
+    assert benchmark.judge is not None
+    assert benchmark.judge.api_key_secret_name == "OPENAI_API_KEY"
+    assert benchmark.judge.reasoning_effort == "xhigh"
+    assert benchmark.judge.strip_temperature is True
+
+
+@pytest.mark.parametrize(
+    ("api_url", "secret_name"),
+    [
+        ("https://api.openai.com/v1/chat/completions", "HF_TOKEN"),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "OPENAI_API_KEY",
+        ),
+        ("https://router.huggingface.co/v1/chat/completions", "GEMINI_API_KEY"),
+    ],
+)
+def test_benchmark_judge_secret_must_match_provider(
+    api_url: str, secret_name: str
+) -> None:
+    with pytest.raises(ValueError, match="secret must match"):
+        BenchmarkSpec.model_validate(
+            {
+                "dataset": "harbor/terminal-bench@2.0",
+                "dataset_digest": "sha256:" + "1" * 64,
+                "judge": {
+                    "api_url": api_url,
+                    "model": "judge/model",
+                    "api_key_secret_name": secret_name,
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -249,6 +310,7 @@ def test_benchmark_judge_round_trips_without_a_credential() -> None:
         "https://router.example/v1/chat/completions#token=secret",
         "https://api.example.com/v1/chat/completions",
         "https://router.huggingface.co:8443/v1/chat/completions",
+        "https://router.huggingface.co/v1/responses",
     ],
 )
 def test_benchmark_judge_requires_secure_credential_free_url(api_url: str) -> None:

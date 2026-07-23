@@ -139,6 +139,19 @@ class HarborStream:
             json.dumps({"task": {"digest": self.task_digest}}, sort_keys=True),
             encoding="utf-8",
         )
+        workspace = result_root / "artifacts" / "workspace" / "app" / "output"
+        workspace.mkdir(parents=True)
+        (workspace / "answer.txt").write_text("answer\n", encoding="utf-8")
+        sessions = result_root / "agent" / "openclaw-sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "session.jsonl").write_text('{"role":"assistant"}\n')
+        (result_root / "agent" / "trajectory.json").write_text("{}\n")
+        verifier = result_root / "verifier"
+        verifier.mkdir()
+        (verifier / "scorecard.json").write_text('{"passed":true}\n')
+        (verifier / "reward.txt").write_text("1\n")
+        (verifier / "test-stdout.txt").write_text("ok\n")
+        (verifier / "test-stderr.txt").write_text("")
         log_path.write_text("wave completed with contract-token\n", encoding="utf-8")
         return 0
 
@@ -326,6 +339,23 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         f"waves/{wave.wave_id}/wave-summary.json",
         f"waves/{wave.wave_id}/wave.lock.json",
     }
+    native = (
+        f"runs/{run.configuration.run_id}/trials/{trial.trial_id}/executions/"
+        f"{execution_id}/harbor-jobs/job-contract/trial-contract"
+    )
+    expected_files.update(
+        {
+            f"{native}/agent/openclaw-sessions/session.jsonl",
+            f"{native}/agent/trajectory.json",
+            f"{native}/evidence/manifest.json",
+            f"{native}/evidence/workspace-files.jsonl",
+            f"{native}/evidence/workspace.tar.zst",
+            f"{native}/verifier/reward.txt",
+            f"{native}/verifier/scorecard.json",
+            f"{native}/verifier/test-stderr.txt",
+            f"{native}/verifier/test-stdout.txt",
+        }
+    )
     assert {
         str(path.relative_to(campaign_root))
         for path in campaign_root.rglob("*")
@@ -351,6 +381,7 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
         {"event": "execution_started", "execution_id": execution_id},
         {"event": "harbor_started"},
         {"event": "harbor_finished", "exit_code": 0},
+        {"event": "trial_evidence_validated", "trial_id": trial.trial_id},
         {"event": "execution_succeeded"},
         {"event": "secrets_redacted", "files": ["harbor.log"]},
     ]
@@ -363,10 +394,19 @@ def test_wave_execution_publishes_complete_linked_evidence_contract(
     assert private_artifacts["requirements"] == [
         {
             "name": "openclaw_session_jsonl",
-            "paths": [],
+            "paths": [
+                "harbor-jobs/job-contract/trial-contract/agent/"
+                "openclaw-sessions/session.jsonl"
+            ],
             "required": False,
-            "satisfied": False,
-        }
+            "satisfied": True,
+        },
+        {
+            "name": "trial_evidence_complete",
+            "paths": ["harbor-jobs/job-contract/trial-contract/evidence/manifest.json"],
+            "required": True,
+            "satisfied": True,
+        },
     ]
     assert all(
         entry["classification"] == "private" for entry in private_artifacts["entries"]

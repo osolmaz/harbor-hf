@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 import threading
-from collections.abc import Sequence
+import urllib.request
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 import yaml
 from conftest import write_fake_compatibility_bundle
@@ -27,7 +29,14 @@ from harbor_hf.campaigns import (
 from harbor_hf.control import CampaignSubmittedPayload, new_event
 from harbor_hf.evidence import assert_secret_absent, verify_checksums, write_checksums
 from harbor_hf.harbor_adapter import HarborTrialFailure, HarborVerificationFailure
+from harbor_hf.judge_recorder import (
+    JudgeEvidenceRecorder as RealJudgeEvidenceRecorder,
+)
+from harbor_hf.judge_recorder import (
+    JudgeUpstreamUrl,
+)
 from harbor_hf.models import (
+    BenchmarkJudgeSpec,
     EndpointRef,
     ExperimentSpec,
     GitBenchmarkSource,
@@ -55,8 +64,10 @@ from harbor_hf.wave_worker import (
     _remaining_seconds,
     _sandbox_failure_category,
     _valid_terminal_trial,
+    _validate_evidence_trial_identity,
     _wave_model_name,
     run_wave_worker,
+    validate_wave_lock,
 )
 
 
@@ -64,6 +75,50 @@ def test_verification_failure_is_terminal_benchmark_evidence() -> None:
     error = HarborVerificationFailure("task digest does not match")
 
     assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+@pytest.mark.parametrize(
+    "exception_type", ["RewardFileEmptyError", "RewardFileNotFoundError"]
+)
+def test_missing_or_empty_reward_is_terminal_benchmark_failure(
+    exception_type: str,
+) -> None:
+    error = HarborTrialFailure("verifier produced no reward", exception_type)
+
+    assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_evidence_identity_accepts_internal_name_with_locked_digest(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events.jsonl"
+
+    _validate_evidence_trial_identity(
+        observed_name="task/internal-name",
+        observed_digest="sha256:" + "1" * 64,
+        expected_name="[DERPRECATED] public-name",
+        expected_digest="sha256:" + "1" * 64,
+        events=events,
+    )
+
+    event = json.loads(events.read_text())
+    assert event.pop("at")
+    assert event == {
+        "event": "evidence_task_name_resolved",
+        "locked_task_name": "[DERPRECATED] public-name",
+        "observed_task_name": "task/internal-name",
+    }
+
+
+def test_evidence_identity_rejects_wrong_digest(tmp_path: Path) -> None:
+    with pytest.raises(WorkerError, match="digest does not match"):
+        _validate_evidence_trial_identity(
+            observed_name="task/internal-name",
+            observed_digest="sha256:" + "2" * 64,
+            expected_name="public-name",
+            expected_digest="sha256:" + "1" * 64,
+            events=tmp_path / "events.jsonl",
+        )
 
 
 def test_wrapped_endpoint_server_error_without_log_remains_agent_failure() -> None:
@@ -90,6 +145,14 @@ def test_benchmark_exception_message_does_not_trigger_transport_retry() -> None:
     )
 
     assert _execution_failure_category(error, "execution") == "benchmark"
+
+
+def test_remote_protocol_failure_is_retryable_infrastructure() -> None:
+    error = HarborTrialFailure(
+        "trial failed", "RemoteProtocolError", "incomplete chunked read"
+    )
+
+    assert _execution_failure_category(error, "execution") == "transient"
 
 
 def test_agent_output_keywords_do_not_trigger_transport_retry() -> None:
@@ -693,6 +756,22 @@ class HarborStream:
                 json.dumps({"task": {"digest": self.task_digests[task_name]}}),
                 encoding="utf-8",
             )
+            workspace = trial / "artifacts" / "workspace" / "app" / "output"
+            workspace.mkdir(parents=True)
+            (workspace / "answer.txt").write_text("answer\n", encoding="utf-8")
+            agent = trial / "agent"
+            agent.mkdir()
+            (agent / "trajectory.json").write_text("{}\n")
+            if not self.agent_started:
+                sessions = agent / "openclaw-sessions"
+                sessions.mkdir()
+                (sessions / "session.jsonl").write_text('{"role":"assistant"}\n')
+            verifier = trial / "verifier"
+            verifier.mkdir()
+            (verifier / "scorecard.json").write_text('{"passed":true}\n')
+            (verifier / "reward.txt").write_text("1\n")
+            (verifier / "test-stdout.txt").write_text("ok\n")
+            (verifier / "test-stderr.txt").write_text("")
             return 0
         finally:
             with self.lock:
@@ -865,6 +944,7 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
             {"event": "execution_started", "execution_id": execution_root.name},
             {"event": "harbor_started"},
             {"event": "harbor_finished", "exit_code": 0},
+            {"event": "trial_evidence_validated", "trial_id": trial.trial_id},
             {"event": "execution_succeeded"},
             {"event": "secrets_redacted", "files": ["harbor.log"]},
         ]
@@ -919,6 +999,256 @@ def test_wave_runs_two_attempt_shards_under_one_endpoint_startup(
     ) == campaign.model_dump(mode="json")
 
 
+def test_wave_rejects_missing_trial_evidence_before_remote_setup(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+) -> None:
+    _, _, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        remote_spec, tmp_path, attempts=1, concurrency=1
+    )
+    run = wave.runs[0]
+    legacy_run = run.model_copy(
+        update={
+            "configuration": run.configuration.model_copy(
+                update={"trial_evidence": None}
+            )
+        }
+    )
+    legacy_wave = wave.model_copy(update={"runs": [legacy_run]})
+    wave_path.write_text(legacy_wave.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(WorkerError, match="complete trial evidence policy"):
+        run_wave_worker(
+            manifest,
+            campaign_path,
+            wave_path,
+            tmp_path / "output",
+        )
+
+
+def test_judged_wave_records_and_selects_exact_exchange(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = BenchmarkJudgeSpec(
+        api_url="https://api.openai.com/v1/chat/completions",
+        model="gpt-5.6-luna",
+        api_key_secret_name="OPENAI_API_KEY",
+        reasoning_effort="xhigh",
+        strip_temperature=True,
+    )
+    judged_spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        judged_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-judge-token")
+    monkeypatch.setattr(
+        "harbor_hf.worker.probe_runtime",
+        lambda *_args: {"probes": {"health": {"http_status": 200}}},
+    )
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker._job_ingress_base_url",
+        lambda port, _label: f"http://127.0.0.1:{port}",
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://api.openai.com/v1/chat/completions"
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-5.6-luna"
+        assert payload["reasoning_effort"] == "xhigh"
+        assert "temperature" not in payload
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json", "X-Request-ID": "judge-req"},
+            content=b'{"choices":[{"message":{"content":"ok"}}]}',
+        )
+
+    def recorder_factory(
+        *,
+        token: str,
+        upstream_url: JudgeUpstreamUrl,
+        reasoning_effort: str | None,
+        strip_temperature: bool,
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> RealJudgeEvidenceRecorder:
+        assert token == "direct-judge-token"
+        assert upstream_url == "https://api.openai.com/v1/chat/completions"
+        assert reasoning_effort == "xhigh"
+        assert strip_temperature is True
+        return RealJudgeEvidenceRecorder(
+            token=token,
+            upstream_url=upstream_url,
+            reasoning_effort=reasoning_effort,
+            strip_temperature=strip_temperature,
+            client=httpx.Client(transport=httpx.MockTransport(upstream)),
+            capability_factory=lambda: "j" * 32,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+
+    monkeypatch.setattr("harbor_hf.wave_worker.JudgeEvidenceRecorder", recorder_factory)
+    base_stream = HarborStream(spec.benchmark.task_digests, expected_calls=1)
+
+    def judged_stream(
+        command: list[str],
+        log_path: Path,
+        *,
+        environment: dict[str, str],
+        timeout_seconds: int,
+    ) -> int:
+        is_export = "--output" in command and "--request-digest" in command
+        exchange_id: str | None = None
+        if not is_export:
+            request_body = json.dumps(
+                {
+                    "model": "wrong/model",
+                    "messages": [{"role": "user", "content": "grade"}],
+                }
+            ).encode()
+            assert environment["AGENT_JUDGE_API_KEY"] == "test-token"
+            assert environment["OPENAI_API_KEY"] == "test-token"
+            assert "direct-judge-token" not in environment.values()
+            request = urllib.request.Request(
+                environment["AGENT_JUDGE_API_URL"],
+                data=request_body,
+                headers={
+                    "Authorization": (f"Bearer {environment['AGENT_JUDGE_API_KEY']}"),
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert response.status == 200
+                exchange_id = response.headers["X-Harbor-Judge-Exchange-ID"]
+                assert exchange_id == "judge-0001"
+        result = base_stream(
+            command,
+            log_path,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+        if not is_export:
+            assert exchange_id is not None
+            config_path = Path(command[command.index("--config") + 1])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            native = Path(config["jobs_dir"]) / "job/trial"
+            (native / "agent" / "judge-route.log").write_text(
+                environment["AGENT_JUDGE_API_URL"], encoding="utf-8"
+            )
+        return result
+
+    output = tmp_path / "output"
+    run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=EndpointRunner(
+            [
+                endpoint_snapshot("paused", 0),
+                endpoint_snapshot("running", 1),
+                endpoint_snapshot("paused", 0),
+            ]
+        ),
+        stream_runner=judged_stream,
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+
+    harbor_config = json.loads(next(output.rglob("harbor-job.json")).read_text())
+    assert harbor_config["environment"]["extra_allowed_hosts"] == ["127.0.0.1"]
+    evidence_manifest = next(output.rglob("evidence/manifest.json"))
+    payload = json.loads(evidence_manifest.read_text())
+    assert payload["judge"]["expected"] is True
+    assert len(payload["judge"]["exchanges"]) == 1
+    assert payload["judge"]["recorder_summary"]["path"].endswith(
+        "evidence/judge/recorder.json"
+    )
+    trial_root = evidence_manifest.parent.parent
+    selection_path = trial_root / "verifier/judge-selection.json"
+    assert json.loads(selection_path.read_text())["exchange_id"] == "judge-0001"
+    route_log = (trial_root / "agent/judge-route.log").read_text()
+    assert route_log == "http://127.0.0.1:8001/scopes/[REDACTED]/v1/chat/completions"
+    assert "j" * 32 not in route_log
+    exchange = evidence_manifest.parent / "judge/judge-0001"
+    assert json.loads((exchange / "request-received.bin").read_bytes())["model"] == (
+        "wrong/model"
+    )
+    forwarded = json.loads((exchange / "request-forwarded.bin").read_bytes())
+    assert forwarded["model"] == "gpt-5.6-luna"
+    assert forwarded["reasoning_effort"] == "xhigh"
+    assert "temperature" not in forwarded
+    assert (exchange / "response-upstream.bin").read_bytes() == (
+        exchange / "response-delivered.bin"
+    ).read_bytes()
+    assert (
+        json.loads((evidence_manifest.parent / "judge/recorder.json").read_text())[
+            "exchange_count"
+        ]
+        == 1
+    )
+
+
+def test_judge_excluded_task_records_deterministic_evidence(
+    remote_spec: ExperimentSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_name = next(iter(remote_spec.benchmark.task_digests))
+    judge = BenchmarkJudgeSpec(
+        api_url="https://router.huggingface.co/v1/chat/completions",
+        model="judge/model",
+        exclude_task_names=[task_name],
+    )
+    judged_spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+    spec, _campaign, wave, manifest, campaign_path, wave_path = _wave_inputs(
+        judged_spec, tmp_path, attempts=1, concurrency=1
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("harbor_hf.worker.probe_runtime", lambda *_args: {"probes": {}})
+    monkeypatch.setattr(
+        "harbor_hf.wave_worker._job_ingress_base_url",
+        lambda port, _label: f"http://127.0.0.1:{port}",
+    )
+    output = tmp_path / "output"
+    run_wave_worker(
+        manifest,
+        campaign_path,
+        wave_path,
+        output,
+        runner=EndpointRunner(
+            [
+                endpoint_snapshot("paused", 0),
+                endpoint_snapshot("running", 1),
+                endpoint_snapshot("paused", 0),
+            ]
+        ),
+        stream_runner=HarborStream(spec.benchmark.task_digests, expected_calls=1),
+        source_preparer=prepare_source,
+        watchdog_launcher=launch_watchdog,
+        identifier=IdentifierSequence(),
+    )
+    evidence_manifest = next(output.rglob("evidence/manifest.json"))
+    payload = json.loads(evidence_manifest.read_text())
+    assert payload["judge"] == {
+        "status": "not_expected",
+        "expected": False,
+        "model": None,
+        "recorder_summary": None,
+        "exchanges": [],
+    }
+    assert not (evidence_manifest.parent / "judge").exists()
+    assert "judge_recorder" not in payload["completion"]["requirements"]
+
+
 def test_provider_wave_runs_shards_without_endpoint_lifecycle(
     remote_spec: ExperimentSpec,
     tmp_path: Path,
@@ -932,6 +1262,15 @@ def test_provider_wave_runs_shards_without_endpoint_lifecycle(
         provider_concurrency=2,
     )
     monkeypatch.setenv("HF_TOKEN", "test-token")
+    start_proxy = ProviderEvidenceProxy.start
+
+    def start_proxy_on_ephemeral_port(
+        proxy: ProviderEvidenceProxy, *, host: str, port: int
+    ) -> str:
+        assert port == 8000
+        return start_proxy(proxy, host=host, port=0)
+
+    monkeypatch.setattr(ProviderEvidenceProxy, "start", start_proxy_on_ephemeral_port)
     runner = EndpointRunner([])
     routed_model = f"{spec.matrix.models[0].repo}:fastest"
     harbor = HarborStream(
@@ -1315,9 +1654,9 @@ def test_missing_required_session_publishes_terminal_failed_evidence(
         (execution / "private-artifacts.json").read_text(encoding="utf-8")
     )
     assert failure == {
-        "category": "configuration",
-        "error_type": "PrivateArtifactRequirementError",
-        "message": "successful OpenClaw execution has no session JSONL",
+        "category": "evidence",
+        "error_type": "TrialEvidenceError",
+        "message": "agent execution has no session JSONL with content",
     }
     assert private["requirements"] == [
         {
@@ -1824,6 +2163,7 @@ def test_retry_wave_accepts_a_valid_success_from_an_earlier_wave(
         ("second-marker", "not a valid success"),
         ("trial-summary", "wrong trial identity"),
         ("execution-lock", "execution identity does not match"),
+        ("trial-evidence", "trial evidence manifest"),
         ("execution-content", "checksum validation"),
     ],
 )
@@ -1877,6 +2217,10 @@ def test_wave_recovery_rejects_invalid_terminal_trial(
         execution = json.loads(lock_path.read_text())
         execution["campaign_id"] = "campaign-wrong"
         lock_path.write_text(json.dumps(execution), encoding="utf-8")
+        write_checksums(execution_root)
+        write_checksums(trial_root)
+    elif corruption == "trial-evidence":
+        next(execution_root.glob("harbor-jobs/*/*/evidence/manifest.json")).unlink()
         write_checksums(execution_root)
         write_checksums(trial_root)
     else:
@@ -2227,6 +2571,32 @@ def _two_trial_wave(remote_spec: ExperimentSpec) -> tuple[CampaignLock, WaveLock
     )
     action = plan_reconciliation(campaign, [submitted])[1].actions[0]
     return campaign, build_wave_lock(campaign, spec, action)
+
+
+def test_retry_wave_accepts_explicit_recovery_worker_revision(
+    remote_spec: ExperimentSpec,
+) -> None:
+    spec = _two_trial_spec(remote_spec)
+    campaign, wave = _two_trial_wave(remote_spec)
+    parent = wave.remote.worker.revision
+    recovery_worker = wave.remote.worker.model_copy(update={"revision": "b" * 40})
+    retry = wave.model_copy(
+        update={
+            "action_kind": "retry-shard",
+            "trial_ids": [campaign.runs[0].shards[0].trials[0].trial_id],
+            "remote": wave.remote.model_copy(update={"worker": recovery_worker}),
+            "recovery_parent_worker_revision": parent,
+        }
+    )
+
+    validate_wave_lock(spec, campaign, retry)
+
+    with pytest.raises(WorkerError, match="does not descend"):
+        validate_wave_lock(
+            spec,
+            campaign,
+            retry.model_copy(update={"recovery_parent_worker_revision": "c" * 40}),
+        )
 
 
 def _wave_inputs(

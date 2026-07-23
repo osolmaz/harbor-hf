@@ -14,7 +14,8 @@ from concurrent.futures import Executor, Future, ThreadPoolExecutor, as_complete
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -52,11 +53,19 @@ from harbor_hf.evidence import (
 from harbor_hf.harbor_adapter import (
     FilesystemHarborExecutionAdapter,
     HarborVerificationFailure,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter.exporter import refresh_retained_bundle
+from harbor_hf.harbor_adapter.models import HarborCompatibilityBundle
 from harbor_hf.harbor_native_bundle import write_harbor_native_bundle
 from harbor_hf.io import load_experiment
-from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.judge_recorder import (
+    JUDGE_RECORDER_PORT,
+    JudgeEvidenceRecorder,
+    JudgeRecorderError,
+    JudgeUpstreamUrl,
+)
+from harbor_hf.models import BenchmarkJudgeSpec, EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.private_artifacts import (
     PrivateArtifactRequirementError,
     build_private_artifact_manifest,
@@ -78,6 +87,11 @@ from harbor_hf.runs import (
     harbor_process_environment,
     require_benchmark_source_secret,
     run_secret_values,
+)
+from harbor_hf.trial_evidence import (
+    TrialEvidenceError,
+    assemble_trial_evidence,
+    verify_trial_evidence,
 )
 from harbor_hf.worker import (
     EndpointManager,
@@ -151,6 +165,7 @@ _TRIAL_FAILURE_MARKERS: tuple[tuple[RetryCategory, tuple[str, ...]], ...] = (
             "internalserver",
             "internal server error",
             "apierror",
+            "remoteprotocolerror",
             "status=500",
             "status=502",
             "status=503",
@@ -280,6 +295,8 @@ class _EndpointWaveLifecycle:
 def validate_wave_lock(
     spec: ExperimentSpec, campaign: CampaignLock, lock: WaveLock
 ) -> None:
+    if any(run.configuration.trial_evidence is None for run in lock.runs):
+        raise WorkerError("wave run locks require a complete trial evidence policy")
     matching_runs = [
         run for run in campaign.runs if run.deployment_digest == lock.deployment_digest
     ]
@@ -302,6 +319,20 @@ def validate_wave_lock(
         expected = build_wave_lock(campaign, spec, action, endpoint=lock.endpoint)
     except ValueError as error:
         raise WorkerError(f"wave lock cannot be resolved: {error}") from error
+    if lock.recovery_parent_worker_revision is not None:
+        if (
+            lock.recovery_parent_worker_revision != expected.remote.worker.revision
+            or lock.remote.worker.repository != expected.remote.worker.repository
+        ):
+            raise WorkerError("recovery worker does not descend from the campaign pin")
+        expected = expected.model_copy(
+            update={
+                "remote": expected.remote.model_copy(
+                    update={"worker": lock.remote.worker}
+                ),
+                "recovery_parent_worker_revision": lock.recovery_parent_worker_revision,
+            }
+        )
     if lock != expected:
         raise WorkerError("wave lock fields do not match the campaign and manifest")
 
@@ -438,6 +469,8 @@ def _run_staged_wave(
     error: Exception | None = None
     cleanup_error: Exception | None = None
     provider_proxy: ProviderEvidenceProxy | None = None
+    judge_recorder: JudgeEvidenceRecorder | None = None
+    judge_base_url: str | None = None
     shard_checksums: dict[str, str] = {}
     secrets = _wave_secret_values(lock, token)
     try:
@@ -458,6 +491,9 @@ def _run_staged_wave(
             deadline,
             monotonic,
         )
+        judge_base_url, judge_recorder = _prepare_judge_transport(
+            lock, events, token, deadline, monotonic
+        )
         shard_checksums = _execute_shards(
             manifest_path,
             campaign,
@@ -473,11 +509,15 @@ def _run_staged_wave(
             clock,
             monotonic,
             provider_proxy=provider_proxy,
+            judge_recorder=judge_recorder,
+            judge_base_url=judge_base_url,
         )
     except Exception as caught:
         error = caught
     finally:
-        cleanup_error = _cleanup_wave_transport(lifecycle, provider_proxy)
+        cleanup_error = _cleanup_wave_transport(
+            lifecycle, provider_proxy, judge_recorder
+        )
 
     terminal_error = error or cleanup_error
     summary: dict[str, object] = {
@@ -553,10 +593,69 @@ def _prepare_wave_transport(
 
 
 def _provider_recorder_base_url() -> str:
+    return _job_ingress_base_url(PROVIDER_RECORDER_PORT, "provider recorder")
+
+
+def _job_ingress_base_url(port: int, label: str) -> str:
     job_id = os.environ.get("JOB_ID", "")
     if not _HF_JOB_ID.fullmatch(job_id):
-        raise WorkerError("provider recorder requires a valid HF JOB_ID")
-    return f"https://{job_id}--{PROVIDER_RECORDER_PORT}.hf.jobs"
+        raise WorkerError(f"{label} requires a valid HF JOB_ID")
+    return f"https://{job_id}--{port}.hf.jobs"
+
+
+def _wave_judge_spec(lock: WaveLock) -> BenchmarkJudgeSpec | None:
+    specs = [
+        run.configuration.benchmark_judge
+        for run in lock.runs
+        if run.configuration.judge_required_tasks
+    ]
+    if not specs:
+        return None
+    if any(spec is None for spec in specs):
+        raise WorkerError("judge-required wave run is missing its judge specification")
+    selected = cast(BenchmarkJudgeSpec, specs[0])
+    selected_payload = selected.model_dump(mode="json")
+    if any(
+        cast(BenchmarkJudgeSpec, spec).model_dump(mode="json") != selected_payload
+        for spec in specs[1:]
+    ):
+        raise WorkerError("all judge-required wave runs must use the same judge")
+    return selected
+
+
+def _prepare_judge_transport(
+    lock: WaveLock,
+    events: Path,
+    token: str,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> tuple[str | None, JudgeEvidenceRecorder | None]:
+    judge = _wave_judge_spec(lock)
+    if judge is None:
+        return None, None
+    judge_token = os.environ.get(judge.api_key_secret_name, "")
+    if not judge_token:
+        raise WorkerError(
+            f"required benchmark judge secret {judge.api_key_secret_name} is missing"
+        )
+    recorder = JudgeEvidenceRecorder(
+        token=judge_token,
+        upstream_url=cast(JudgeUpstreamUrl, str(judge.api_url)),
+        reasoning_effort=judge.reasoning_effort,
+        strip_temperature=judge.strip_temperature,
+        deadline=deadline,
+        monotonic=monotonic,
+    )
+    base_url = _job_ingress_base_url(JUDGE_RECORDER_PORT, "judge recorder")
+    try:
+        recorder.start(port=JUDGE_RECORDER_PORT)
+        append_event(events, "judge_recorder_listening", port=JUDGE_RECORDER_PORT)
+        _wait_for_provider_recorder(base_url, token, deadline, monotonic)
+    except Exception:
+        recorder.close()
+        raise
+    append_event(events, "judge_recorder_ready", port=JUDGE_RECORDER_PORT)
+    return base_url, recorder
 
 
 def _wait_for_provider_recorder(
@@ -617,16 +716,24 @@ def _provider_recorder_readiness_failure(response: httpx.Response) -> str | None
 def _cleanup_wave_transport(
     lifecycle: _EndpointWaveLifecycle | None,
     provider_proxy: ProviderEvidenceProxy | None,
+    judge_recorder: JudgeEvidenceRecorder | None = None,
 ) -> Exception | None:
+    errors: list[Exception] = []
+    for closer in (provider_proxy, judge_recorder):
+        if closer is None:
+            continue
+        try:
+            closer.close()
+        except Exception as error:
+            errors.append(error)
     if lifecycle is not None:
-        return lifecycle.cleanup()
-    if provider_proxy is None:
-        return None
-    try:
-        provider_proxy.close()
-    except Exception as error:
-        return error
-    return None
+        try:
+            lifecycle_error = lifecycle.cleanup()
+            if lifecycle_error is not None:
+                errors.append(lifecycle_error)
+        except Exception as error:
+            errors.append(error)
+    return errors[0] if errors else None
 
 
 def _execute_shards(
@@ -645,6 +752,8 @@ def _execute_shards(
     monotonic: Callable[[], float],
     *,
     provider_proxy: ProviderEvidenceProxy | None = None,
+    judge_recorder: JudgeEvidenceRecorder | None = None,
+    judge_base_url: str | None = None,
 ) -> dict[str, str]:
     shards = [(run, shard) for run in lock.runs for shard in run.shards]
     workers = min(lock.max_concurrent_shards, len(shards))
@@ -674,6 +783,8 @@ def _execute_shards(
                 monotonic,
                 trial_executor=trial_executor,
                 provider_proxy=provider_proxy,
+                judge_recorder=judge_recorder,
+                judge_base_url=judge_base_url,
             ): shard.shard.shard_id
             for run, shard in shards
         }
@@ -754,6 +865,8 @@ def _execute_shard(
     *,
     trial_executor: Executor | None = None,
     provider_proxy: ProviderEvidenceProxy | None = None,
+    judge_recorder: JudgeEvidenceRecorder | None = None,
+    judge_base_url: str | None = None,
 ) -> str | None:
     with _trial_execution_pool(
         trial_executor, wave.max_concurrent_shards
@@ -776,6 +889,8 @@ def _execute_shard(
             monotonic,
             selected_executor,
             provider_proxy=provider_proxy,
+            judge_recorder=judge_recorder,
+            judge_base_url=judge_base_url,
         )
 
 
@@ -809,6 +924,8 @@ def _execute_shard_with_executor(
     trial_executor: Executor,
     *,
     provider_proxy: ProviderEvidenceProxy | None = None,
+    judge_recorder: JudgeEvidenceRecorder | None = None,
+    judge_base_url: str | None = None,
 ) -> str | None:
     shard = locked_shard.shard
     shard_root = (
@@ -868,6 +985,8 @@ def _execute_shard_with_executor(
                 clock,
                 monotonic,
                 provider_proxy=provider_proxy,
+                judge_recorder=judge_recorder,
+                judge_base_url=judge_base_url,
             )
             pending[future] = (trial_index, trial, trial_root)
             continue
@@ -955,6 +1074,8 @@ def _execute_trial(
     monotonic: Callable[[], float],
     *,
     provider_proxy: ProviderEvidenceProxy | None = None,
+    judge_recorder: JudgeEvidenceRecorder | None = None,
+    judge_base_url: str | None = None,
 ) -> RetryCategory | None:
     trial_root.mkdir(parents=True, exist_ok=True)
     executions = trial_root / "executions"
@@ -987,6 +1108,9 @@ def _execute_trial(
     append_event(events, "execution_started", execution_id=execution_id)
     error: Exception | None = None
     capability: str | None = None
+    judge_capability: str | None = None
+    judge_route_revoked = False
+    judge_api_url: str | None = None
     failure_phase: Literal["configuration", "execution", "verification"] = (
         "configuration"
     )
@@ -999,6 +1123,17 @@ def _execute_trial(
             execution_root,
             events,
         )
+        judge_api_url, judge_capability = _register_trial_judge_route(
+            run,
+            judge_recorder,
+            judge_base_url,
+            execution_id,
+            trial.trial_id,
+            trial.task_name,
+            execution_root,
+            events,
+            tuple(value for value in (token, capability) if value is not None),
+        )
         adapter = FilesystemHarborExecutionAdapter()
         prepared = adapter.prepare(
             run,
@@ -1010,6 +1145,7 @@ def _execute_trial(
             attempts=1,
             concurrency=1,
             expected_task_digests={trial.task_name: trial.task_digest},
+            extra_environment_hosts=_judge_environment_hosts(judge_api_url),
         )
         failure_phase = "execution"
         timeout = _remaining_seconds(deadline, monotonic)
@@ -1020,12 +1156,22 @@ def _execute_trial(
             if candidate.configuration.benchmark_source is not None
             and candidate.configuration.benchmark_source.credentials is not None
         }
+        blocked_secret_names.update(
+            candidate.configuration.benchmark_judge.api_key_secret_name
+            for candidate in wave.runs
+            if candidate.configuration.benchmark_judge is not None
+            and candidate.configuration.benchmark_judge.api_key_secret_name
+            not in {"HF_TOKEN", "OPENAI_API_KEY"}
+        )
         with harbor_process_environment(
             run,
             token=token,
             inference_base_url=trial_base_url,
+            judge_api_url=judge_api_url,
             blocked_secret_names=blocked_secret_names,
-            redaction_secrets=(capability,) if capability is not None else (),
+            redaction_secrets=tuple(
+                value for value in (capability, judge_capability) if value is not None
+            ),
         ) as environment:
             outcome = adapter.execute(
                 prepared,
@@ -1041,12 +1187,31 @@ def _execute_trial(
         append_event(events, "harbor_finished", exit_code=outcome.exit_code)
         if outcome.exit_code != 0:
             raise WorkerError(f"Harbor exited with status {outcome.exit_code}")
+        _revoke_trial_judge_route(judge_recorder, judge_capability, events)
+        judge_route_revoked = True
         failure_phase = "verification"
         if outcome.verification is None:
             raise WorkerError("Harbor produced no validated compatibility bundle")
         write_json(
             execution_root / "verification.json",
             outcome.verification.model_dump(mode="json"),
+        )
+        evidence_secrets = _execution_secret_values(
+            wave, token, capability, judge_capability
+        )
+        _assemble_execution_trial_evidence(
+            outcome.compatibility_path,
+            jobs_dir,
+            run,
+            campaign,
+            trial,
+            execution,
+            execution_root,
+            (
+                (evidence_secrets,)
+                if isinstance(evidence_secrets, str)
+                else tuple(evidence_secrets)
+            ),
         )
         build_private_artifact_manifest(execution_root, strict_session=True)
         append_event(events, "execution_succeeded")
@@ -1055,9 +1220,16 @@ def _execute_trial(
         append_event(events, "execution_failed", error_type=type(caught).__name__)
     finally:
         _revoke_trial_provider_route(provider_proxy, capability, events)
+        error = _finish_trial_judge_route(
+            judge_recorder,
+            judge_capability,
+            events,
+            already_revoked=judge_route_revoked,
+            existing_error=error,
+        )
     failure_record: dict[str, object] | None = None
     failure_category: RetryCategory | None = None
-    secrets = _secret_values_with(_wave_secret_values(wave, token), capability)
+    secrets = _execution_secret_values(wave, token, capability, judge_capability)
     if error is not None:
         failure_category = _execution_failure_category(
             error, failure_phase, evidence_root=execution_root
@@ -1114,6 +1286,139 @@ def _execute_trial(
     return None
 
 
+def _finish_trial_judge_route(
+    recorder: JudgeEvidenceRecorder | None,
+    capability: str | None,
+    events: Path,
+    *,
+    already_revoked: bool,
+    existing_error: Exception | None,
+) -> Exception | None:
+    if already_revoked:
+        return existing_error
+    try:
+        _revoke_trial_judge_route(recorder, capability, events)
+    except Exception as revoke_error:
+        append_event(
+            events,
+            "judge_route_revoke_failed",
+            error_type=type(revoke_error).__name__,
+        )
+        return existing_error or revoke_error
+    return existing_error
+
+
+def _judge_environment_hosts(judge_api_url: str | None) -> tuple[str, ...]:
+    if judge_api_url is None:
+        return ()
+    host = urlparse(judge_api_url).hostname
+    if not host:
+        raise WorkerError("judge recorder URL has no hostname")
+    return (host,)
+
+
+def _register_trial_judge_route(
+    run: RunLock,
+    recorder: JudgeEvidenceRecorder | None,
+    base_url: str | None,
+    execution_id: str,
+    trial_id: str,
+    task_name: str,
+    execution_root: Path,
+    events: Path,
+    known_secrets: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    judge = run.benchmark_judge
+    if judge is None or not run.judge_required_for(task_name):
+        return None, None
+    if recorder is None or base_url is None or run.trial_evidence is None:
+        raise WorkerError("judge-required run has no exact evidence recorder")
+    destination = execution_root / "judge-records"
+    capability = recorder.register_scope(
+        execution_id=execution_id,
+        trial_id=trial_id,
+        model=judge.model,
+        destination=destination,
+        policy=run.trial_evidence,
+        known_secrets=known_secrets,
+    )
+    append_event(
+        events,
+        "judge_route_registered",
+        capability_digest=recorder.capability_digest(capability),
+    )
+    return recorder.scoped_url(base_url, capability), capability
+
+
+def _revoke_trial_judge_route(
+    recorder: JudgeEvidenceRecorder | None,
+    capability: str | None,
+    events: Path,
+) -> None:
+    if recorder is None or capability is None:
+        return
+    digest = recorder.capability_digest(capability)
+    recorder.revoke_scope(capability)
+    append_event(events, "judge_route_revoked", capability_digest=digest)
+
+
+def _assemble_execution_trial_evidence(
+    compatibility_path: Path | None,
+    jobs_dir: Path,
+    run: RunLock,
+    campaign: CampaignLock,
+    trial: CampaignTrialLock,
+    execution: ExecutionLock,
+    execution_root: Path,
+    known_secrets: tuple[str, ...],
+) -> None:
+    if compatibility_path is None or run.trial_evidence is None:
+        raise WorkerError("validated trial evidence inputs are missing")
+    bundle = HarborCompatibilityBundle.model_validate_json(
+        compatibility_path.read_text(encoding="utf-8")
+    )
+    if len(bundle.trials) != 1:
+        raise WorkerError("campaign physical execution must contain one Harbor trial")
+    native = bundle.trials[0]
+    _validate_evidence_trial_identity(
+        observed_name=native.task_name,
+        observed_digest=native.task_digest,
+        expected_name=trial.task_name,
+        expected_digest=trial.task_digest,
+        events=execution_root / "events.jsonl",
+    )
+    native_root = resolve_native_trial_root(jobs_dir, native.path)
+    redacted = scrub_secret(native_root, known_secrets, allow_symlinks=True)
+    if redacted:
+        append_event(
+            execution_root / "events.jsonl",
+            "evidence_secrets_redacted",
+            files=redacted,
+        )
+    assert_secret_absent(native_root, known_secrets, allow_symlinks=True)
+    assemble_trial_evidence(
+        native_root,
+        campaign_id=campaign.campaign_id,
+        run_id=run.run_id,
+        execution_id=execution.execution_id,
+        trial_id=trial.trial_id,
+        task_name=trial.task_name,
+        task_digest=trial.task_digest,
+        logical_attempt=trial.logical_attempt,
+        physical_attempt=execution.physical_attempt,
+        judge_expected=run.judge_required_for(trial.task_name),
+        judge_model=(run.benchmark_judge.model if run.benchmark_judge else None),
+        policy=run.trial_evidence,
+        judge_records_dir=execution_root / "judge-records",
+        known_secrets=known_secrets,
+    )
+    append_event(
+        execution_root / "events.jsonl",
+        "trial_evidence_validated",
+        trial_id=trial.trial_id,
+    )
+
+
 def _register_trial_provider_route(
     wave: WaveLock,
     provider_proxy: ProviderEvidenceProxy | None,
@@ -1159,14 +1464,35 @@ def _revoke_trial_provider_route(
     )
 
 
+def _validate_evidence_trial_identity(
+    *,
+    observed_name: str,
+    observed_digest: str,
+    expected_name: str,
+    expected_digest: str,
+    events: Path,
+) -> None:
+    if observed_digest != expected_digest:
+        raise WorkerError("Harbor evidence trial digest does not match campaign lock")
+    if observed_name != expected_name:
+        append_event(
+            events,
+            "evidence_task_name_resolved",
+            observed_task_name=observed_name,
+            locked_task_name=expected_name,
+        )
+
+
 def _execution_failure_category(
     error: Exception,
     phase: Literal["configuration", "execution", "verification"],
     *,
     evidence_root: Path | None = None,
 ) -> RetryCategory:
+    if isinstance(error, (JudgeRecorderError, TrialEvidenceError)):
+        return "evidence"
     if isinstance(error, PrivateArtifactRequirementError):
-        return "configuration"
+        return "evidence"
     if isinstance(error, HarborVerificationFailure):
         return "benchmark"
     if isinstance(error, HarborTrialFailure):
@@ -1185,6 +1511,8 @@ def _harbor_trial_failure_category(
     error: HarborTrialFailure, evidence_root: Path | None
 ) -> RetryCategory:
     exception_type = error.exception_type.lower()
+    if exception_type in {"rewardfileemptyerror", "rewardfilenotfounderror"}:
+        return "benchmark"
     category = _retry_category_from_text(exception_type)
     if category is not None:
         return category
@@ -1439,6 +1767,7 @@ def _validate_terminal_trial(
             run_id=run_id,
             shard_id=shard_id,
         )
+        _validate_recovered_trial_evidence(execution, execution_lock, expected)
         verify_checksums(execution)
         if execution_checksum != _file_digest(execution / "checksums.json"):
             raise WorkerError("terminal trial summary has the wrong child checksum")
@@ -1449,6 +1778,38 @@ def _validate_terminal_trial(
         raise WorkerError(
             "terminal trial evidence failed checksum validation"
         ) from error
+
+
+def _validate_recovered_trial_evidence(
+    execution_root: Path,
+    execution: ExecutionLock,
+    expected: CampaignTrialLock,
+) -> None:
+    manifests = list(execution_root.glob("harbor-jobs/*/*/evidence/manifest.json"))
+    if len(manifests) != 1:
+        raise WorkerError("terminal execution has no unique trial evidence manifest")
+    try:
+        evidence = verify_trial_evidence(manifests[0].parent.parent, deep=True)
+    except TrialEvidenceError as error:
+        raise WorkerError("terminal trial evidence is incomplete") from error
+    observed = (
+        evidence.execution_id,
+        evidence.trial_id,
+        evidence.task_name,
+        evidence.task_digest,
+        evidence.logical_attempt,
+        evidence.physical_attempt,
+    )
+    locked = (
+        execution.execution_id,
+        expected.trial_id,
+        expected.task_name,
+        expected.task_digest,
+        expected.logical_attempt,
+        execution.physical_attempt,
+    )
+    if observed != locked:
+        raise WorkerError("terminal trial evidence identity does not match its lock")
 
 
 def _validate_execution_identity(
@@ -1593,6 +1954,18 @@ def _wave_secret_values(lock: WaveLock, token: str) -> SecretValues:
         values.extend((run_values,) if isinstance(run_values, str) else run_values)
     unique = tuple(dict.fromkeys(value for value in values if value))
     return unique[0] if len(unique) == 1 else unique
+
+
+def _execution_secret_values(
+    wave: WaveLock,
+    token: str,
+    provider_capability: str | None,
+    judge_capability: str | None,
+) -> SecretValues:
+    return _secret_values_with(
+        _secret_values_with(_wave_secret_values(wave, token), provider_capability),
+        judge_capability,
+    )
 
 
 def _secret_values_with(secrets: SecretValues, value: str | None) -> SecretValues:

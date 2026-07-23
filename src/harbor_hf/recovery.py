@@ -83,8 +83,7 @@ _RETRYABLE_CATEGORIES = {
     "quota",
     "rate-limit",
     "ambiguous",
-    "agent",
-    "benchmark",
+    "evidence",
 }
 _TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure", "cancelled"}
 _SCORED_TERMINAL_STATUSES = {"complete", "invalid", "failed_infrastructure"}
@@ -342,7 +341,7 @@ def durable_shard_retry_event(
     eligible = [
         projection.trials[trial_id]
         for trial_id in shard.trial_ids
-        if projection.trials[trial_id].status == "retry_wait"
+        if projection.trials[trial_id].status in {"retry_wait", "failed_infrastructure"}
     ]
     if not eligible:
         raise ValueError("shard has no retryable logical trials")
@@ -516,21 +515,32 @@ def _apply_retry_requests(
             requested_at[key] = max(
                 requested_at.get(key, event.observed_at), event.observed_at
             )
-    return {
-        trial_id: (
-            trial.model_copy(
-                update={
-                    "retry_not_before": requested_at[
-                        (trial.trial_id, len(trial.executions))
-                    ]
-                }
+    recovered: dict[str, TrialProjection] = {}
+    for trial_id, trial in trials.items():
+        generations = [
+            generation
+            for requested_trial_id, generation in requested_at
+            if requested_trial_id == trial_id
+        ]
+        if not generations:
+            recovered[trial_id] = trial
+            continue
+        generation = max(generations)
+        current_generation = len(trial.executions)
+        if generation > current_generation:
+            raise ValueError(
+                "retry request generation exceeds physical execution state"
             )
-            if trial.status == "retry_wait"
-            and (trial.trial_id, len(trial.executions)) in requested_at
-            else trial
+        cleared = trial.model_copy(
+            update={"status": "planned", "retry_not_before": None, "outcome": None}
         )
-        for trial_id, trial in trials.items()
-    }
+        derived = _derive_trial(lock, cleared, list(trial.executions.values()))
+        if generation == current_generation and derived.status == "retry_wait":
+            derived = derived.model_copy(
+                update={"retry_not_before": requested_at[(trial_id, generation)]}
+            )
+        recovered[trial_id] = derived
+    return recovered
 
 
 def _validated_retry_generations(
@@ -937,6 +947,8 @@ def _failed_trial_state(
     lock: CampaignLock, execution: ExecutionProjection, execution_count: int
 ) -> tuple[TrialStatus, datetime | None]:
     category = execution.category
+    if category in {"agent", "benchmark"}:
+        return "invalid", None
     if category not in _RETRYABLE_CATEGORIES:
         return "failed_infrastructure", None
     if execution_count >= lock.recovery_policy.max_physical_executions_per_trial:

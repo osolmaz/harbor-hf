@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,8 @@ from harbor_hf.campaigns import CampaignLock
 from harbor_hf.coordination import coordination_repository
 
 _MAX_COMMIT_ATTEMPTS = 8
+_MAX_EVENT_BATCH_OPERATIONS = 50
+_MAX_CONTROL_READ_WORKERS = 20
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _RECONCILER_DURABLE_EVENT_KINDS = {
     "campaign.draining",
@@ -45,6 +48,7 @@ RetryCategory = Literal[
     "configuration",
     "authentication",
     "cleanup",
+    "evidence",
 ]
 EventKind = Literal[
     "campaign.submitted",
@@ -596,6 +600,8 @@ class CampaignStore(Protocol):
 
     def ensure_event(self, campaign_id: str, event: CampaignEvent) -> bool: ...
 
+    def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool: ...
+
     def ensure_events_unless_cancelled(
         self, campaign_id: str, events: list[CampaignEvent]
     ) -> bool: ...
@@ -683,10 +689,12 @@ class HubCampaignStore:
             )
             if path.startswith(prefix) and path.endswith(".json")
         )
-        return [
-            CampaignEvent.model_validate(self._read_json(path, revision))
-            for path in paths
-        ]
+
+        def load(path: str) -> CampaignEvent:
+            return CampaignEvent.model_validate(self._read_json(path, revision))
+
+        with ThreadPoolExecutor(max_workers=_MAX_CONTROL_READ_WORKERS) as executor:
+            return list(executor.map(load, paths))
 
     def load_request(self, campaign_id: str) -> bytes:
         head = self._head()
@@ -781,6 +789,46 @@ class HubCampaignStore:
                     parent_commit=head,
                 )
                 return True
+            except HfHubHTTPError as error:
+                if not _is_parent_conflict(error):
+                    raise
+        raise ControlError("control repository remained contended")
+
+    def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool:
+        """Append observed events in bounded control repository commits."""
+        expected_by_path = _event_payloads(campaign_id, events)
+        changed = False
+        for _attempt in range(_MAX_COMMIT_ATTEMPTS):
+            head = self._head()
+            missing = self._missing_events_from_listing(expected_by_path, head)
+            if not missing:
+                return changed
+            try:
+                entries = list(missing.items())
+                for offset in range(0, len(entries), _MAX_EVENT_BATCH_OPERATIONS):
+                    batch = entries[offset : offset + _MAX_EVENT_BATCH_OPERATIONS]
+                    result = self.api.create_commit(
+                        self.repository,
+                        [
+                            CommitOperationAdd(
+                                path_in_repo=path,
+                                path_or_fileobj=_json_bytes(expected),
+                            )
+                            for path, expected in batch
+                        ],
+                        commit_message="chore: record observed campaign events",
+                        repo_type="dataset",
+                        revision="main",
+                        parent_commit=head,
+                    )
+                    observed_head = getattr(result, "oid", None)
+                    head = (
+                        observed_head
+                        if isinstance(observed_head, str)
+                        else self._head()
+                    )
+                    changed = True
+                return changed
             except HfHubHTTPError as error:
                 if not _is_parent_conflict(error):
                     raise
@@ -901,6 +949,26 @@ class HubCampaignStore:
                 if not _is_parent_conflict(error):
                     raise
         raise ControlError("control repository remained contended")
+
+    def _missing_events_from_listing(
+        self, expected_by_path: dict[str, dict[str, JsonValue]], head: str
+    ) -> dict[str, dict[str, JsonValue]]:
+        existing = set(
+            self.api.list_repo_files(
+                self.repository,
+                repo_type="dataset",
+                revision=head,
+            )
+        )
+        missing: dict[str, dict[str, JsonValue]] = {}
+        for path, expected in expected_by_path.items():
+            if path not in existing:
+                missing[path] = expected
+                continue
+            observed = self._read_json(path, head)
+            if not _same_event_request(observed, expected):
+                raise CampaignConflict(f"event conflicts: {path}")
+        return missing
 
     def _missing_events(
         self, expected_by_path: dict[str, dict[str, JsonValue]], head: str
@@ -1041,6 +1109,12 @@ class HubCampaignStore:
             raise ControlError(f"control record cannot be read: {path}") from error
 
 
+def same_event_request(observed: CampaignEvent, expected: CampaignEvent) -> bool:
+    return _same_event_request(
+        observed.model_dump(mode="json"), expected.model_dump(mode="json")
+    )
+
+
 def _same_event_request(observed: object, expected: dict[str, JsonValue]) -> bool:
     """Adopt the same deterministic event even when reconcilers used new clocks."""
     if not isinstance(observed, dict):
@@ -1099,6 +1173,27 @@ def _validate_event_scope(campaign_id: str, event: CampaignEvent) -> None:
         raise ValueError("event campaign scope is invalid")
     if event.subject_type == "campaign" and event.subject_id != campaign_id:
         raise ValueError("campaign event subject does not match its scope")
+
+
+def _event_payloads(
+    campaign_id: str, events: list[CampaignEvent]
+) -> dict[str, dict[str, JsonValue]]:
+    if not events:
+        raise ValueError("event commit requires at least one event")
+    for event in events:
+        _validate_event_scope(campaign_id, event)
+        if event.kind in {
+            "campaign.cancel-requested",
+            "campaign.manual-intervention-resolved",
+        }:
+            raise ValueError(f"{event.kind} requires its dedicated atomic operation")
+    expected_by_path = {
+        _event_path(campaign_id, event.event_id): event.model_dump(mode="json")
+        for event in events
+    }
+    if len(expected_by_path) != len(events):
+        raise CampaignConflict("events contain duplicate identities")
+    return expected_by_path
 
 
 def _guarded_event_payloads(

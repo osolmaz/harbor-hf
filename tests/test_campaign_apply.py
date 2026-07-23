@@ -117,6 +117,7 @@ class FakeStore:
         self.reservations: dict[str, dict[str, JsonValue]] = {}
         self.win_reservations = True
         self.load_campaign_calls: list[str] = []
+        self.ensure_events_calls: list[list[CampaignEvent]] = []
 
     def create_campaign(
         self, lock: CampaignLock, request: bytes, event: CampaignEvent
@@ -152,6 +153,13 @@ class FakeStore:
             return False
         self.events.append(event)
         return True
+
+    def ensure_events(self, campaign_id: str, events: list[CampaignEvent]) -> bool:
+        self.ensure_events_calls.append(list(events))
+        changed = False
+        for event in events:
+            changed = self.ensure_event(campaign_id, event) or changed
+        return changed
 
     def ensure_events_unless_cancelled(
         self, campaign_id: str, events: list[CampaignEvent]
@@ -1195,6 +1203,7 @@ def test_apply_observes_durable_event_reloads_and_uses_refreshed_projection(
 
     assert interactions[0] == ("observe", lock, remote_spec)
     assert store.load_campaign_calls == [lock.campaign_id, lock.campaign_id]
+    assert store.ensure_events_calls == [[observed]]
     assert observed in store.events
     assert result.plan.terminal_decision is not None
     assert result.plan.terminal_decision.status == "completed"
@@ -1330,10 +1339,7 @@ def test_apply_context_admission_usage_blocks_new_billable_action(
 
 @pytest.mark.parametrize(
     ("category", "expected_status", "expected_outcome"),
-    [
-        ("benchmark", "invalid", "benchmark_failed"),
-        ("transient", "failed_infrastructure", "infrastructure_exhausted"),
-    ],
+    [("transient", "failed_infrastructure", "infrastructure_exhausted")],
 )
 def test_apply_exhausts_retry_when_immutable_spend_cap_is_reached(
     remote_spec: ExperimentSpec,
@@ -2523,7 +2529,6 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     endpoint_adapter = cast(HuggingFaceEndpointAdapter, object())
     evidence_api = SimpleNamespace(identity="shared-evidence-api")
     api_calls: list[dict[str, object]] = []
-    cache_prefixes: list[str] = []
 
     def create_api(**kwargs: object) -> object:
         api_calls.append(kwargs)
@@ -2533,21 +2538,7 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     monkeypatch.setattr(huggingface_hub, "HfApi", create_api)
     token = "publication-token"
     monkeypatch.setattr(huggingface_hub, "get_token", lambda: token)
-    cleanup_calls: list[bool] = []
-
-    class FakeTemporaryDirectory:
-        def __init__(self, *, prefix: str) -> None:
-            cache_prefixes.append(prefix)
-            self.name = str(cache_root)
-
-        def cleanup(self) -> None:
-            cleanup_calls.append(True)
-
-    monkeypatch.setattr(
-        campaign_apply_module.tempfile,
-        "TemporaryDirectory",
-        FakeTemporaryDirectory,
-    )
+    monkeypatch.setenv("HARBOR_HF_EVIDENCE_CACHE", str(cache_root))
     monkeypatch.setattr(
         campaign_apply_module.uuid,
         "uuid4",
@@ -2564,7 +2555,6 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     )
 
     assert api_calls == [{}]
-    assert cache_prefixes == ["harbor-hf-evidence-"]
     assert reconciler.store is store
     endpoints = cast(EndpointProvisioner, reconciler.endpoints)
     jobs = cast(HuggingFaceWaveJobAdapter, reconciler.jobs)
@@ -2599,7 +2589,6 @@ def test_hugging_face_reconciler_factory_wires_exact_shared_adapters(
     assert action_claims.repository == "osolmaz/harbor-hf-coordination"
     reconciler.close()
     reconciler.close()
-    assert cleanup_calls == [True]
 
 
 def test_hugging_face_reconciler_factory_requires_hf_token(

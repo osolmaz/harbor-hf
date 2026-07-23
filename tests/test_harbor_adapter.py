@@ -14,6 +14,7 @@ from harbor_hf.harbor_adapter import (
     HarborVerificationFailure,
     WorkerError,
     build_execution_request,
+    resolve_native_trial_root,
 )
 from harbor_hf.harbor_adapter.exporter import (
     _openclaw_session_usage,
@@ -26,6 +27,22 @@ from harbor_hf.models import ExperimentSpec
 from harbor_hf.runs import RunLock, build_run_lock
 
 GOLDEN_CONTRACT = Path(__file__).parent / "golden" / "harbor-adapter-contract-v1.json"
+
+
+def test_resolve_native_trial_root_rejects_escaping_paths(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    trial = jobs / "job" / "trial"
+    trial.mkdir(parents=True)
+
+    assert resolve_native_trial_root(jobs, "job/trial") == trial
+    for value in ("../outside", "/absolute", "job/../trial", "job//trial"):
+        with pytest.raises(WorkerError, match="safe relative"):
+            resolve_native_trial_root(jobs, value)
+
+    linked = jobs / "linked"
+    linked.symlink_to(trial, target_is_directory=True)
+    with pytest.raises(WorkerError, match="symbolic link"):
+        resolve_native_trial_root(jobs, "linked")
 
 
 def _session_record(
@@ -771,6 +788,35 @@ def test_compatibility_inventory_refreshes_after_redaction(tmp_path: Path) -> No
         assert entry["digest"] == sha256_digest(path.read_bytes())
 
 
+def test_compatibility_inventory_excludes_raw_workspace(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "job"
+    trial_dir = job_dir / "trial"
+    workspace = trial_dir / "artifacts" / "workspace" / "app"
+    workspace.mkdir(parents=True)
+    (job_dir / "lock.json").write_text("{}\n", encoding="utf-8")
+    (job_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    (trial_dir / "lock.json").write_text("{}\n", encoding="utf-8")
+    (trial_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    (workspace / "answer.txt").write_text("answer\n", encoding="utf-8")
+    (workspace / "answer-link").symlink_to("answer.txt")
+    output = tmp_path / "harbor-compatibility.json"
+    output.write_text(
+        json.dumps(
+            {
+                "jobs": [{"path": "job"}],
+                "trials": [{"path": "job/trial"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    refresh_bundle_artifacts(jobs_dir, output)
+
+    artifacts = json.loads(output.read_text())["trials"][0]["artifacts"]
+    assert {entry["path"] for entry in artifacts} == {"lock.json", "result.json"}
+
+
 def test_typed_bundle_reports_trial_and_multistep_failures(
     remote_spec: ExperimentSpec, tmp_path: Path
 ) -> None:
@@ -827,6 +873,40 @@ def test_wildcard_request_counts_resolved_tasks_not_patterns(
     dataset = datasets[0]
     assert isinstance(dataset, dict)
     assert dataset["task_names"] == ["task-*"]
+
+
+def test_literal_bracketed_task_name_is_not_treated_as_a_pattern(
+    remote_spec: ExperimentSpec, tmp_path: Path
+) -> None:
+    deprecated = "[DERPRECATED] duplicate-task"
+    lock = build_run_lock(remote_spec, run_id="literal-task-name").model_copy(
+        update={
+            "benchmark_tasks": [deprecated],
+            "benchmark_task_digests": {
+                deprecated: "sha256:" + "6" * 64,
+                "D duplicate-task": "sha256:" + "7" * 64,
+            },
+        }
+    )
+
+    request = build_execution_request(
+        lock,
+        tmp_path / "jobs",
+        "https://endpoint.example",
+        task_names=[deprecated],
+        attempts=1,
+        concurrency=1,
+        expected_task_digests={deprecated: "sha256:" + "6" * 64},
+    )
+
+    assert request.verification.expected_task_digests == {
+        deprecated: "sha256:" + "6" * 64
+    }
+    datasets = request.harbor_config["datasets"]
+    assert isinstance(datasets, list)
+    dataset = datasets[0]
+    assert isinstance(dataset, dict)
+    assert dataset["task_names"] == [deprecated]
 
 
 @pytest.mark.parametrize(

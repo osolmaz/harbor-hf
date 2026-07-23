@@ -15,8 +15,9 @@ from harbor_hf.harbor_adapter.exporter import classify_private_artifact
 from harbor_hf.harbor_adapter.models import Sha256Digest
 
 DEFAULT_MAX_PRIVATE_ARTIFACT_BYTES = 64 * 1024 * 1024
-DEFAULT_MAX_PRIVATE_BUNDLE_BYTES = 512 * 1024 * 1024
-DEFAULT_MAX_PRIVATE_ARTIFACT_FILES = 4096
+DEFAULT_MAX_PRIVATE_BUNDLE_BYTES = 40 * 1024 * 1024 * 1024
+MAX_WORKSPACE_ARCHIVE_BYTES = 32 * 1024 * 1024 * 1024
+DEFAULT_MAX_PRIVATE_ARTIFACT_FILES = 100_000
 _DERIVED_FILES = frozenset(
     {
         "_CANCELLED",
@@ -65,7 +66,7 @@ class PrivateArtifactEntry(FrozenModel):
 
 
 class PrivateArtifactRequirement(FrozenModel):
-    name: Literal["openclaw_session_jsonl"] = "openclaw_session_jsonl"
+    name: Literal["openclaw_session_jsonl", "trial_evidence_complete"]
     required: bool
     satisfied: bool
     paths: list[str]
@@ -201,23 +202,74 @@ def build_private_artifact_manifest(
         if session_required is None
         else session_required
     )
-    requirement = PrivateArtifactRequirement(
+    session_requirement = PrivateArtifactRequirement(
+        name="openclaw_session_jsonl",
         required=required,
         satisfied=bool(session_paths),
         paths=session_paths,
     )
-    if strict_session and required and not requirement.satisfied:
+    evidence_paths = _valid_trial_evidence_manifests(root)
+    evidence_required = strict_session and _trial_evidence_was_requested(root)
+    evidence_requirement = PrivateArtifactRequirement(
+        name="trial_evidence_complete",
+        required=evidence_required,
+        satisfied=bool(evidence_paths),
+        paths=evidence_paths,
+    )
+    if strict_session and required and not session_requirement.satisfied:
         raise PrivateArtifactRequirementError(
             "successful OpenClaw execution has no session JSONL"
+        )
+    if evidence_required and not evidence_requirement.satisfied:
+        raise PrivateArtifactRequirementError(
+            "successful execution has no complete trial evidence bundle"
         )
     return PrivateArtifactManifest(
         execution_id=identity.execution_id,
         trial_id=identity.trial_id,
         total_bytes=total_bytes,
         entries=entries,
-        requirements=[requirement],
+        requirements=[session_requirement]
+        + ([evidence_requirement] if evidence_required else []),
         rejections=_manifest_rejections(root, trust_rejections=trust_rejections),
     )
+
+
+def _trial_evidence_was_requested(root: Path) -> bool:
+    candidates = [root / "harbor-job.json"]
+    candidates.extend(parent / "harbor-job.json" for parent in list(root.parents)[:4])
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            continue
+        artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+        if isinstance(artifacts, list) and any(
+            isinstance(item, dict)
+            and item.get("source") == "/app"
+            and item.get("destination") == "workspace/app"
+            for item in artifacts
+        ):
+            return True
+    return False
+
+
+def _valid_trial_evidence_manifests(root: Path) -> list[str]:
+    from harbor_hf.trial_evidence import TrialEvidenceError, verify_trial_evidence
+
+    manifests: list[str] = []
+    candidates = list(root.glob("harbor-jobs/*/*/evidence/manifest.json"))
+    local_manifest = root / "evidence" / "manifest.json"
+    if local_manifest.is_file():
+        candidates.append(local_manifest)
+    for path in sorted(candidates):
+        trial_root = path.parent.parent
+        try:
+            verify_trial_evidence(trial_root, deep=False)
+        except TrialEvidenceError:
+            continue
+        manifests.append(path.relative_to(root).as_posix())
+    return manifests
 
 
 def _private_artifact_entries(
@@ -269,7 +321,8 @@ def _private_artifact_entry(
     if not candidate.is_file():
         raise RuntimeError(f"private artifact has unsupported file type: {relative}")
     size = candidate.stat().st_size
-    if size > max_file_bytes:
+    effective_limit = _private_artifact_file_limit(relative, max_file_bytes)
+    if size > effective_limit:
         raise RuntimeError(f"private artifact exceeds file size limit: {relative}")
     return PrivateArtifactEntry(
         path=relative,
@@ -742,7 +795,7 @@ def _remove_oversized_files(
         if relative in _DERIVED_FILES or relative == _REJECTION_FILE:
             continue
         size = candidate.stat().st_size
-        if size > max_file_bytes:
+        if size > _private_artifact_file_limit(relative, max_file_bytes):
             candidate.unlink()
             rejected.append(
                 PrivateArtifactRejection(
@@ -754,6 +807,13 @@ def _remove_oversized_files(
             continue
         files.append((candidate, relative, size, classify_private_artifact(relative)))
     return files, rejected
+
+
+def _private_artifact_file_limit(relative: str, default: int) -> int:
+    workspace_archive = "evidence/workspace.tar.zst"
+    if relative == workspace_archive or relative.endswith(f"/{workspace_archive}"):
+        return MAX_WORKSPACE_ARCHIVE_BYTES
+    return default
 
 
 def _trim_bundle(
