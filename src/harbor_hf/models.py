@@ -108,36 +108,64 @@ class BenchmarkJudgeSpec(StrictModel):
     protocol: Literal["openai-compatible"] = "openai-compatible"
     api_url: AnyHttpUrl
     model: str = Field(min_length=1)
-    api_key_secret_name: Literal["HF_TOKEN"] = "HF_TOKEN"
+    api_key_secret_name: Literal["HF_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY"] = (
+        "HF_TOKEN"
+    )
+    reasoning_effort: (
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    strip_temperature: bool = Field(default=False, exclude_if=lambda value: not value)
     task_names: list[TaskName] = Field(default_factory=lambda: ["*"], min_length=1)
     exclude_task_names: list[TaskName] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def task_selectors_are_unique(self) -> BenchmarkJudgeSpec:
+    def configuration_is_consistent(self) -> BenchmarkJudgeSpec:
         for label, values in (
             ("task_names", self.task_names),
             ("exclude_task_names", self.exclude_task_names),
         ):
             if len(values) != len(set(values)):
                 raise ValueError(f"benchmark judge {label} must be unique")
+        expected_secret = {
+            "router.huggingface.co": "HF_TOKEN",
+            "api.openai.com": "OPENAI_API_KEY",
+            "generativelanguage.googleapis.com": "GEMINI_API_KEY",
+        }[str(self.api_url.host)]
+        if self.api_key_secret_name != expected_secret:
+            raise ValueError(
+                "benchmark judge API key secret must match the selected provider"
+            )
         return self
 
     @field_validator("api_url")
     @classmethod
     def api_url_is_secure(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        allowed_endpoints = {
+            (
+                "router.huggingface.co",
+                "/v1/chat/completions",
+            ),
+            (
+                "api.openai.com",
+                "/v1/chat/completions",
+            ),
+            (
+                "generativelanguage.googleapis.com",
+                "/v1beta/openai/chat/completions",
+            ),
+        }
         if (
             value.scheme != "https"
             or value.username is not None
             or value.password
             or value.query is not None
             or value.fragment is not None
-            or value.host != "router.huggingface.co"
             or value.port != 443
-            or value.path != "/v1/chat/completions"
+            or (value.host, value.path) not in allowed_endpoints
         ):
             raise ValueError(
-                "benchmark judge API URL must be credential-free HTTPS on the "
-                "Hugging Face router chat completions endpoint"
+                "benchmark judge API URL must be an allowed credential-free HTTPS "
+                "chat completions endpoint"
             )
         return value
 

@@ -354,6 +354,11 @@ def run_secret_values(lock: RunLock, token: str) -> str | tuple[str, ...]:
         source_token = os.environ.get(source.credentials.secret_name, "")
         if source_token:
             values.append(source_token)
+    judge = lock.benchmark_judge
+    if judge is not None:
+        judge_token = os.environ.get(judge.api_key_secret_name, "")
+        if judge_token:
+            values.append(judge_token)
     unique = tuple(dict.fromkeys(value for value in values if value))
     return unique[0] if len(unique) == 1 else unique
 

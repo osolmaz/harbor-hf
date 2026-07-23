@@ -284,6 +284,23 @@ def test_authenticated_source_adds_named_secret_to_controller_jobs(
     assert "github-secret" not in " ".join(run_command + wave_command)
 
 
+def test_direct_judge_adds_provider_secret_to_wave_job(
+    remote_spec: ExperimentSpec,
+) -> None:
+    judge = BenchmarkJudgeSpec(
+        api_url="https://api.openai.com/v1/chat/completions",
+        model="gpt-5.6-luna",
+        api_key_secret_name="OPENAI_API_KEY",
+        reasoning_effort="xhigh",
+        strip_temperature=True,
+    )
+    spec = remote_spec.model_copy(
+        update={"benchmark": remote_spec.benchmark.model_copy(update={"judge": judge})}
+    )
+
+    assert job_secret_names(_wave_lock(spec)) == ["HF_TOKEN", "OPENAI_API_KEY"]
+
+
 def test_private_source_submission_requires_local_secret_before_staging(
     remote_spec: ExperimentSpec,
     tmp_path: Path,

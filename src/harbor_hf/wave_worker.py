@@ -14,7 +14,7 @@ from concurrent.futures import Executor, Future, ThreadPoolExecutor, as_complete
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -63,8 +63,9 @@ from harbor_hf.judge_recorder import (
     JUDGE_RECORDER_PORT,
     JudgeEvidenceRecorder,
     JudgeRecorderError,
+    JudgeUpstreamUrl,
 )
-from harbor_hf.models import EndpointRef, ExperimentSpec, SourcePin
+from harbor_hf.models import BenchmarkJudgeSpec, EndpointRef, ExperimentSpec, SourcePin
 from harbor_hf.private_artifacts import (
     PrivateArtifactRequirementError,
     build_private_artifact_manifest,
@@ -602,6 +603,26 @@ def _job_ingress_base_url(port: int, label: str) -> str:
     return f"https://{job_id}--{port}.hf.jobs"
 
 
+def _wave_judge_spec(lock: WaveLock) -> BenchmarkJudgeSpec | None:
+    specs = [
+        run.configuration.benchmark_judge
+        for run in lock.runs
+        if run.configuration.judge_required_tasks
+    ]
+    if not specs:
+        return None
+    if any(spec is None for spec in specs):
+        raise WorkerError("judge-required wave run is missing its judge specification")
+    selected = cast(BenchmarkJudgeSpec, specs[0])
+    selected_payload = selected.model_dump(mode="json")
+    if any(
+        cast(BenchmarkJudgeSpec, spec).model_dump(mode="json") != selected_payload
+        for spec in specs[1:]
+    ):
+        raise WorkerError("all judge-required wave runs must use the same judge")
+    return selected
+
+
 def _prepare_judge_transport(
     lock: WaveLock,
     events: Path,
@@ -609,10 +630,21 @@ def _prepare_judge_transport(
     deadline: float,
     monotonic: Callable[[], float],
 ) -> tuple[str | None, JudgeEvidenceRecorder | None]:
-    if not any(run.configuration.judge_required_tasks for run in lock.runs):
+    judge = _wave_judge_spec(lock)
+    if judge is None:
         return None, None
+    judge_token = os.environ.get(judge.api_key_secret_name, "")
+    if not judge_token:
+        raise WorkerError(
+            f"required benchmark judge secret {judge.api_key_secret_name} is missing"
+        )
     recorder = JudgeEvidenceRecorder(
-        token=token, deadline=deadline, monotonic=monotonic
+        token=judge_token,
+        upstream_url=cast(JudgeUpstreamUrl, str(judge.api_url)),
+        reasoning_effort=judge.reasoning_effort,
+        strip_temperature=judge.strip_temperature,
+        deadline=deadline,
+        monotonic=monotonic,
     )
     base_url = _job_ingress_base_url(JUDGE_RECORDER_PORT, "judge recorder")
     try:
@@ -1124,6 +1156,11 @@ def _execute_trial(
             if candidate.configuration.benchmark_source is not None
             and candidate.configuration.benchmark_source.credentials is not None
         }
+        blocked_secret_names.update(
+            candidate.configuration.benchmark_judge.api_key_secret_name
+            for candidate in wave.runs
+            if candidate.configuration.benchmark_judge is not None
+        )
         with harbor_process_environment(
             run,
             token=token,

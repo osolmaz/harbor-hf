@@ -1056,8 +1056,17 @@ def test_judged_wave_records_and_selects_exact_exchange(
         )
 
     def recorder_factory(
-        *, token: str, deadline: float, monotonic: Callable[[], float]
+        *,
+        token: str,
+        upstream_url: str,
+        reasoning_effort: str | None,
+        strip_temperature: bool,
+        deadline: float,
+        monotonic: Callable[[], float],
     ) -> RealJudgeEvidenceRecorder:
+        assert upstream_url == "https://router.huggingface.co/v1/chat/completions"
+        assert reasoning_effort is None
+        assert strip_temperature is False
         return RealJudgeEvidenceRecorder(
             token=token,
             client=httpx.Client(transport=httpx.MockTransport(upstream)),

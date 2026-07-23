@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from time import perf_counter
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -273,7 +273,7 @@ class JudgeEvidenceRecorder:
             raise ValueError("judge recorder reasoning effort is not allowed")
         self._token = token
         self._upstream_url = upstream_url
-        self._provider: JudgeProvider = _ALLOWED_JUDGE_PROVIDERS[upstream_url]
+        self._provider = cast(JudgeProvider, _ALLOWED_JUDGE_PROVIDERS[upstream_url])
         self._reasoning_effort = reasoning_effort
         self._strip_temperature = strip_temperature
         self._client = client or httpx.Client(headers={"Accept-Encoding": "identity"})

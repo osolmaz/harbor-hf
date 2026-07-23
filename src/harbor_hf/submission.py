@@ -219,7 +219,11 @@ def job_secret_names(lock: RunLock | WaveLock) -> list[str]:
         source = run_lock.benchmark_source
         if source is not None and source.credentials is not None:
             names.add(source.credentials.secret_name)
-    return [lock.remote.job.token_secret_name, *sorted(names - {"HF_TOKEN"})]
+        judge = run_lock.benchmark_judge
+        if judge is not None:
+            names.add(judge.api_key_secret_name)
+    token_name = lock.remote.job.token_secret_name
+    return [token_name, *sorted(names - {token_name})]
 
 
 def _secret_arguments(lock: RunLock | WaveLock) -> list[str]:
