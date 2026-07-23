@@ -383,7 +383,7 @@ def _task_config(tasks_root: Path, trial: ReassessmentTrial) -> tuple[Path, str,
     config = tomllib.loads((task_root / "task.toml").read_text())
     try:
         image = str(config["environment"]["docker_image"])
-        command = str(config["verifier"]["command"])
+        command = str(config["verifier"].get("command", "bash tests/test.sh"))
     except (KeyError, TypeError) as error:
         raise ReassessmentError("reassessment task configuration is invalid") from error
     return task_root, image, command

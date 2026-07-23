@@ -13,6 +13,7 @@ from harbor_hf.reassessment import (
     _assert_secrets_absent,
     _checksums,
     _reward,
+    _task_config,
     _write_fixed_zero,
     reassessment_plan_digest,
 )
@@ -124,6 +125,24 @@ def test_secret_scan_and_checksums_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "unsafe.txt").write_text("contains-secret")
     with pytest.raises(ReassessmentError, match="known secret"):
         _assert_secrets_absent(tmp_path, ("secret",))
+
+
+def test_task_config_uses_harbor_default_verifier_command(tmp_path: Path) -> None:
+    tasks = tmp_path / "tasks"
+    task = tasks / "task"
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        '[environment]\ndocker_image = "hf.co/spaces/example/runtime"\n'
+        "[verifier]\ntimeout_sec = 600\n"
+    )
+    raw_trials = _plan_payload()["trials"]
+    assert isinstance(raw_trials, list)
+    first = raw_trials[0]
+    assert isinstance(first, dict)
+    trial = ReassessmentTrial.model_validate(first)
+    _, image, command = _task_config(tasks, trial)
+    assert image == "hf.co/spaces/example/runtime"
+    assert command == "bash tests/test.sh"
 
 
 def test_write_fixed_zero_is_append_only(tmp_path: Path) -> None:
